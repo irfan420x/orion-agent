@@ -1,0 +1,51 @@
+# oriond.service — systemd user unit for the Orion daemon.
+#
+# The daemon serves the Telegram gateway (polling) until interrupted.
+# It needs a Telegram bot token: set telegram_token in
+# ~/.orion/config.json or ORION_TELEGRAM_TOKEN in the environment
+# (never put the token in this file).
+#
+# Install:
+#   ./install.sh --systemd
+#     — installs this unit to ~/.config/systemd/user/oriond.service,
+#       rewriting ExecStart to the binary install.sh actually used,
+#       and enables it when a user systemd instance is reachable.
+#
+#   ... or by hand:
+#   mkdir -p ~/.config/systemd/user
+#   cp oriond.service ~/.config/systemd/user/
+#   # If oriond lives in /usr/local/bin instead of ~/.local/bin,
+#   # change ExecStart below to /usr/local/bin/oriond first.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now oriond
+#
+# Manage:
+#   systemctl --user status oriond
+#   systemctl --user restart oriond
+#   systemctl --user stop oriond
+#   journalctl --user -u oriond -f
+#
+# Notes:
+# - Runs as a user unit (no root needed); oriond reads its config
+#   from ~/.orion/config.json.
+# - Restart=on-failure: a crash (e.g. a transient Telegram/network
+#   error) restarts the daemon after 5s; a clean Ctrl+C / systemctl
+#   stop does not restart it. RestartSec=5s avoids a tight loop if
+#   the token or provider config is wrong — fix the config and
+#   restart with `systemctl --user restart oriond`.
+
+[Unit]
+Description=Orion daemon — model-agnostic OS agent (Telegram gateway)
+Documentation=https://github.com/irfan/orion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/oriond
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

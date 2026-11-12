@@ -1,0 +1,46 @@
+# Orion — Makefile
+#
+#   make build     build orion + oriond into ./bin (with version ldflags)
+#   make install   build and install to /usr/local/bin or ~/.local/bin
+#                  (same rules as install.sh; prefer ./install.sh for
+#                  the full flow including default config + --systemd)
+#   make test      run the full test suite
+#   make vet       go vet ./...
+#   make fmt       gofmt -l (fails if any file needs formatting)
+#   make version   print the version the next build will report
+#   make clean     remove ./bin
+#
+# Build info (commit + date) is baked in with -ldflags -X so
+# `orion version` reports the real build.
+
+GO ?= go
+VERSION_PKG := github.com/irfan/orion/internal/version
+COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -X $(VERSION_PKG).Commit=$(COMMIT) -X $(VERSION_PKG).BuildDate=$(DATE)
+
+BIN_DIR ?= bin
+
+.PHONY: build install test vet fmt version clean
+
+build:
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orion ./cmd/orion
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/oriond ./cmd/oriond
+
+install:
+	./install.sh
+
+test:
+	$(GO) test ./...
+
+vet:
+	$(GO) vet ./...
+
+fmt:
+	@test -z "$$(gofmt -l cmd internal)" || { echo "gofmt -l:"; gofmt -l cmd internal; exit 1; }
+
+version:
+	@echo "orion $(shell grep -E '^const Version' internal/version/version.go | sed -E 's/.*"([^"]+)".*/\1/') commit $(COMMIT) built $(DATE)"
+
+clean:
+	rm -rf $(BIN_DIR)

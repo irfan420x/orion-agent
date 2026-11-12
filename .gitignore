@@ -1,0 +1,19 @@
+# Orion — never commit secrets or local state.
+.env
+*.env
+config.json
+config.yaml
+memory.json
+audit.jsonl
+audit.key
+.orion/
+# Built binaries at the repo root only — anchored so cmd/orion and
+# cmd/oriond (source) are NOT ignored.
+/orion
+/oriond
+bin/
+*.log
+*.tmp
+coverage.out
+.DS_Store
+.e2e-tmp/
