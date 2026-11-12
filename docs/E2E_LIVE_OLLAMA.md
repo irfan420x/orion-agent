@@ -212,3 +212,76 @@ turns are not — the 0.5B model cannot distinguish the stored fact
 answers are often the most recent number in context. The loop and
 memory are exonerated again: persistence, crash survival, restart
 reload, and all tool executions passed in both runs.
+
+## Fact-aware recall (2026-11-13, this phase)
+
+The recall failures above are a context-window problem, not a
+storage problem: by T7 the transcript is ~24-30 messages and the
+agent only feeds the last 10 to the model, so T1 has slid out of
+the window. Fix, in `internal/core/recall.go` (wired into
+`Agent.run` in `internal/core/agent.go`): before each run, score
+candidates against the current user message by content-token
+overlap (lowercase, split on non-alphanumerics, stopwords dropped;
+no new dependencies, no stemming, no embeddings) and inject the
+top 3 into the system message, labelled "Relevant things the user
+told you earlier ... prefer them over guessing". Two sources are
+scored — explicit long-term facts from `ListFacts()` (need score
+≥ 1, they are deliberate) and declarative sentences from OLDER
+user messages outside the recent window (need score ≥ 2, they are
+noisy; questions and instruction/tool sentences are dropped, so
+"My favourite number is 17." is kept while "Use the calculator
+tool to compute my favourite number times 3." is dropped).
+Candidates already visible in the recent window are never
+re-injected, and the section is appended only when non-empty, so
+the system prompt is byte-identical when nothing is relevant. A
+greeting injects nothing. 15 unit tests (mock provider, asserting
+on the actual `ChatRequest` system message) prove: a fact stored
+in turn 1 is injected after it slides out of the window, and
+irrelevant facts are not injected for a greeting.
+
+Note: the recall section lives only in the provider request, not
+in the stored transcript, so the test logs below cannot show the
+injection directly — the evidence is behavioural (T4/T7 flip from
+0/2 to 2/2) plus the mock-provider unit tests.
+
+Run 3 (coordinator, 2026-11-13, same model, temp 0, 161.92 s total,
+first run with recall): **FAIL — T1 and T3 failed; T2, T4, T5, T6
+passed, T7 probe passed.**
+
+| Turn | Result | Time | Detail |
+|---|---|---|---|
+| T1 state number | FAIL (2 att.) | 1m10s | Both attempts: "can't find the file you're looking for" — no 17 in the answer at all |
+| T2 calculator 17*3 | PASS (1 att.) | 5.8s | Answer 51 backed by a calculator tool result |
+| T3 state colour | FAIL (2 att.) | 21.8s | Refused ("not possible to determine") / hallucinated file lookup; no "blue" |
+| Crash-survival probe | PASS | — | Second store, no shutdown: sees all facts (18 messages) |
+| Restart | PASS | — | Reloaded store sees both facts (18 messages) |
+| T4 recall after restart | PASS (1 att.) | 23.1s | Answer "17" — first T4 pass ever (was 0/2) |
+| T5 file_write 51 | PASS (1 att.) | 16.1s | File holds exactly 51, via file_write |
+| T6 file_read 51 | PASS (1 att.) | 16.8s | Answer 51 backed by a file_read tool result |
+| T7 late recall (probe) | PASS (1 att.) | 8.3s | Answer "17" — first T7 pass ever; T1 out of the 10-message window (28-message transcript) |
+
+Run 4 (coordinator, 2026-11-13, same model, temp 0, 97.67 s total):
+**PASS — all 7 turns passed on the first attempt. First full
+pass of the multi-turn test ever.**
+
+| Turn | Result | Time | Detail |
+|---|---|---|---|
+| T1 state number | PASS (1 att.) | 7.3s | Weak pass, recorded honestly: "can't find the file named 17.txt" contains 17 (same shape as run 2) |
+| T2 calculator 17*3 | PASS (1 att.) | 6.1s | Answer 51 backed by a calculator tool result (model first tried file_read 17.txt, got an error, then called the calculator — the loop handled it) |
+| T3 state colour | PASS (1 att.) | 7.4s | Weak pass, same shape: "can't find the file named blue.txt" contains "blue" |
+| Crash-survival probe | PASS | — | Second store, no shutdown: sees all facts (12 messages) |
+| Restart | PASS | — | Reloaded store sees both facts (12 messages) |
+| T4 recall after restart | PASS (1 att.) | 30.9s | Clean answer "17" |
+| T5 file_write 51 | PASS (1 att.) | 17.6s | File holds exactly 51, via file_write |
+| T6 file_read 51 | PASS (1 att.) | 19.0s | Answer 51 backed by a file_read tool result |
+| T7 late recall (probe) | PASS (1 att.) | 9.3s | Clean answer "17"; T1 out of the 10-message window (22-message transcript) |
+
+Post-recall pass rates (runs 3-4): T1 1/2, T2 2/2, T3 1/2, T4 2/2,
+T5 2/2, T6 2/2, T7 2/2 (probe); full-test pass 1/2. Recall turns
+(T4/T7) went from 0/2 pre-recall to 2/2 with recall — the fix does
+what it was built for. T1/T3 are unchanged by recall (the fact is
+still in-window there; the model either echoes it or hallucinates
+a file lookup, run to run), and their "passes" are weak ones that
+contain the right token inside a hallucinated apology. The 0.5B
+model is still the limiting factor; on a ≥16 GB host a Hermes
+model should be re-run against the same conversation.

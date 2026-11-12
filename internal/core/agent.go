@@ -212,15 +212,25 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 
 	// Build the conversation: system prompt, recent memory, user input.
 	messages := []model.Message{{Role: "system", Content: systemPrompt}}
-	if recent, err := a.memory.RecentMessages(maxRecentMessages); err != nil {
+	var recent []model.Message
+	if r, err := a.memory.RecentMessages(maxRecentMessages); err != nil {
 		a.logf("memory RecentMessages failed (continuing without history): %v", err)
 	} else {
+		recent = r
 		messages = append(messages, recent...)
 	}
 	userMsg := model.Message{Role: "user", Content: input}
 	messages = append(messages, userMsg)
 	if err := a.memory.AddMessage(userMsg); err != nil {
 		a.logf("memory AddMessage (user) failed: %v", err)
+	}
+
+	// Fact-aware recall: facts and statements from older turns that
+	// the recent window no longer covers are injected into the system
+	// message. The section is appended only when non-empty, so the
+	// system prompt is byte-identical when nothing is relevant.
+	if items := a.recallFor(input, recent); len(items) > 0 {
+		messages[0].Content += formatRecallSection(items)
 	}
 
 	// deferred holds tool calls the model requested in a turn where

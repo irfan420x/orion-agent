@@ -64,13 +64,11 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-14/14 packages, 326 tests passing, 3 skipped (the live Ollama and
+14/14 packages, 341 tests passing, 3 skipped (the live Ollama and
 live Telegram tests, which need a running Ollama server and a bot
 chat respectively), race detector clean — `go test ./... -race
--count=1` passes, verified 2026-11-13. Run the suite with
-`go test ./...` or `make test`.
-
-<!-- TEST COUNTS: coordinator updates after recall integration -->
+-count=1` passes, verified 2026-11-13 (includes 15 fact-recall
+tests). Run the suite with `go test ./...` or `make test`.
 
 ## Configuration
 
