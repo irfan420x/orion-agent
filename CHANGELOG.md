@@ -8,6 +8,44 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Memory v2 — Claude Code-inspired typed memories**
+  (`internal/memory/typed.go`, `gate.go`, `dates.go`, `feedback.go`,
+  `migrate.go`, `session.go`, `internal/core/recall_v2.go`,
+  `drift.go`, `extraction.go`, `internal/app/memory_v2.go`,
+  `internal/messaging/commands.go`, `render.go`): memories are now
+  markdown files under `~/.orion/memories/*.md` with frontmatter
+  (`name`, `description`, `type: user|feedback|project|reference`).
+  Feedback memories carry a rule + `Why:` + `How to apply:`;
+  corrections AND confirmations are saved. A what-not-to-save gate
+  refuses derivable things (code patterns, architecture, git
+  history, file structure); even explicit save requests keep only
+  what was surprising or non-obvious. Relative dates are converted
+  to absolute dates on save for project memories. Existing JSON
+  facts are migrated into typed files on open (copied, never
+  deleted; idempotent) and the JSON store stays the message log.
+  Recall v2 scans a header manifest (max 200, newest-first) and a
+  small provider side-query selects at most 5, with the existing
+  keyword token-overlap scorer as fallback/offline; already-surfaced
+  memories are excluded and warnings/gotchas for tools in active
+  use are kept. Drift verification checks a recalled memory's
+  file/function/flag references against the current tree before
+  injecting; on conflict the current state wins and the memory is
+  marked stale (`stale: true` in frontmatter, persistent) and never
+  re-surfaced. Background session-memory extraction runs after 10
+  tool calls / 5 turns into `session-memory.md` (single-flight,
+  best-effort); `/compress` feeds from it and cites it in the saved
+  fact. `/memory` lists typed memories grouped by type with ages
+  and forget-by-name; the Telegram footer shows `· N memories`
+  when typed memories were injected. Live proof (DeepSeek): a typed
+  memory "Favourite number is 17" (in no message) was recalled in
+  a later turn, and a feedback "keep replies to one or two
+  sentences" rule changed a later reply to a single sentence.
+  Feedback memories are standing guidance: they bypass the topical
+  selector and the surfaced exclusion and are injected every turn
+  (max 2, under their own "Standing guidance" section header) —
+  the topical selector alone did not surface them live.
+  Team-memory sync deliberately not built (single user).
+
 - **Sandbox PID namespace** (`internal/sandbox/sandbox.go`):
   `CLONE_NEWPID` joins the sandbox's user/mount/IPC/UTS/network
   namespaces, so sandboxed processes can no longer see or signal

@@ -3,7 +3,7 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc2.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc4.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
 > built and tested. The TypeScript desktop/web UI is v0.2 only (see
 > [LANGUAGE_DECISION.md](LANGUAGE_DECISION.md)).
@@ -82,13 +82,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-12/14 packages, 562 tests passing, 6 failing, 3 skipped (the live
-Ollama tests, which need a running Ollama server) — `go test
--buildvcs=false -count=1 ./...`, verified 2026-11-13. The 6 failures
-are in `internal/sandbox` (`TestAdversarialPrivilegeEscalation`, an
-Audit 3 adversarial test) and `internal/tools` (5 `web_fetch` SSRF
-tests, another worker's in-flight area), not in this phase's
-packages. Run the suite with `go test ./...` or `make test`.
+14/14 packages, 653 tests passing, 0 failing, 3 skipped (the live
+Ollama tests, which need a running Ollama server), race clean — `go test
+-count=1 ./...`, verified 2026-11-13. Run the suite with `go test ./...` or `make test`.
 
 ## Configuration
 

@@ -1,9 +1,13 @@
 # Memory v2 plan — Claude Code-inspired (patterns only)
 
-Status: **planned, not started** (2026-11-13). Queued after Audit 3
-finishes, because Audit 3 is editing the tree now and two writers would
-collide. Source of the ideas: `~/workspace/claude-code-reference`
-(`src/memdir/`, `src/services/SessionMemory/`,
+Status: **implemented 2026-11-13 (v0.2.0-rc4)** — all 7 steps landed
+and verified (653 tests passing, race clean). One design correction
+during implementation: feedback memories are standing guidance, so
+they bypass the topical selector and the surfaced exclusion and are
+injected every turn (max 2, own section header) — the topical
+selector alone did not surface them live. See CHANGELOG.md. Source
+of the ideas: `~/workspace/claude-code-reference` (`src/memdir/`,
+`src/services/SessionMemory/`,
 `src/services/compact/sessionMemoryCompact.ts`) — see
 `CLAUDE_CODE_REFERENCE.md`. Nothing is copied verbatim; the design is
 re-implemented in Go for Orion.

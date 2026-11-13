@@ -319,3 +319,12 @@ Columns: RSS kB | HWM (peak RSS) kB | VmSize kB | Threads | open FDs | CPU utime
   builds for ~30 min and killed the rc2 daemon via the runtime
   restart; (4) full-suite green is blocked by the P1 phase's
   in-flight web_ssrf_test.go failures (not this workstream).
+2026-11-13T03:23:28Z [rc2b] pid 2971 gone after 4 samples
+| 2026-11-13T03:24:09Z | 11:24:09 | rc2c | 37429 | 05:17 | 8964 | 14532 | 1860520 | 9 | 6 | utime=3 stime=5 | 8024064 | 57344 |
+| 2026-11-13T03:27:07Z | 11:27:07 | rc3 | 45268 | 02:23 | 14180 | 14180 | 1860484 | 9 | 6 | utime=2 stime=6 | 5484544 | 73728 |
+2026-11-13T03:29:09Z [rc2c] pid 37429 gone after 2 samples
+| 2026-11-13T03:32:07Z | 11:32:07 | rc3 | 45268 | 07:23 | 9384 | 13988 | 1860500 | 9 | 6 | utime=3 stime=7 | 13291520 | 73728 |
+| 2026-11-13T03:37:07Z | 11:37:07 | rc3 | 45268 | 12:24 | 9152 | 13988 | 1860500 | 9 | 6 | utime=4 stime=10 | 29634560 | 73728 |
+| 2026-11-13T03:42:07Z | 11:42:07 | rc3 | 45268 | 17:24 | 10644 | 13988 | 1860500 | 9 | 6 | utime=5 stime=16 | 48123904 | 73728 |
+| 2026-11-13T03:47:07Z | 11:47:07 | rc3 | 45268 | 22:24 | 9696 | 13988 | 1860508 | 9 | 6 | utime=5 stime=21 | 74223616 | 73728 |
+| 2026-11-13T03:52:07Z | 11:52:07 | rc3 | 45268 | 27:24 | 10560 | 13988 | 1934240 | 10 | 6 | utime=6 stime=26 | 92262400 | 73728 |

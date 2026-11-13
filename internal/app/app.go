@@ -39,6 +39,12 @@ type App struct {
 	// StatusLine reports uptime from it and omits the line when zero.
 	StartedAt time.Time
 
+	// typedStore and sessionLog are the Memory v2 layers, wired in
+	// Build; nil for hand-built Apps (the Telegram memory commands
+	// degrade gracefully without them).
+	typedStore *memory.TypedStore
+	sessionLog *memory.SessionLog
+
 	// mu guards the Agent/Provider pair against a concurrent
 	// SwitchProvider. agent()/provider() take the read lock;
 	// SwitchProvider takes the write lock.
@@ -85,6 +91,12 @@ func Build(path string) (*App, error) {
 	}
 	agent.SetLogger(logger)
 
+	// Memory v2: typed memories (with a one-time migration of the
+	// JSON facts), session-memory extraction, and the layers the
+	// Telegram memory commands use. Best-effort by design — see
+	// wireMemoryV2.
+	typedStore, sessionLog := wireMemoryV2(logger, cfg.DataDir, mem, agent)
+
 	mgr := subagent.NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
 		return agent.Run(ctx, brief)
 	})
@@ -112,7 +124,8 @@ func Build(path string) (*App, error) {
 	return &App{
 		Config: cfg, Provider: provider, Tools: registry, Memory: mem,
 		Agent: agent, Subagents: mgr, Skills: skillReg, Audit: audit, Logger: logger,
-		StartedAt: time.Now(),
+		StartedAt:  time.Now(),
+		typedStore: typedStore, sessionLog: sessionLog,
 	}, nil
 }
 

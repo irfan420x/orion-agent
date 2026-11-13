@@ -39,6 +39,10 @@ type ProgressEvent struct {
 	// Usage is the accumulated provider usage for the turn so far; set on
 	// every event after the first provider call, final on TurnFinished.
 	Usage model.Usage
+	// MemoriesUsed is the count of typed memories injected this turn
+	// (recall v2); set on TurnFinished only. Callers copy it into
+	// TurnStats for display (e.g. the Telegram footer).
+	MemoriesUsed int
 }
 
 // EventHandler receives ProgressEvents from an Agent run.
@@ -51,6 +55,11 @@ type TurnStats struct {
 	Tokens   int // total tokens (Usage.TotalTokens from TurnFinished)
 	Steps    int // last step number
 	Duration time.Duration
+	// MemoriesUsed counts the typed memories injected this turn
+	// (recall v2). Populated from the TurnFinished event's
+	// MemoriesUsed by the caller that builds the TurnStats
+	// (internal/app HandleStream); zero when none were used.
+	MemoriesUsed int
 }
 
 // EventHandler returns the agent's current progress-event handler, or

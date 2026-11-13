@@ -86,6 +86,10 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 				Tokens:   ev.Usage.TotalTokens,
 				Steps:    ev.Step,
 				Duration: ev.Duration,
+				// MemoriesUsed comes from the TurnFinished event
+				// (the agent counts typed memories injected this
+				// turn); the footer renders it when non-zero.
+				MemoriesUsed: ev.MemoriesUsed,
 			}
 		}
 		if emit != nil {
@@ -422,6 +426,19 @@ const compressRecentWindow = 10
 // before/after, not the error. A provider failure leaves history
 // untouched and returns the error.
 func (a *App) Compress(ctx context.Context, keepRecent int) (before, after, summaryLen int, err error) {
+	return a.compressWith(ctx, keepRecent, "")
+}
+
+// CompressWithSessionMemory is the /compress variant that draws on
+// session memory: the session-memory text (decisions and facts
+// extracted from earlier turns) is included in the summarisation
+// prompt, and the saved fact cites that it drew on session memory.
+// An empty sessionMemory behaves exactly like Compress.
+func (a *App) CompressWithSessionMemory(ctx context.Context, keepRecent int, sessionMemory string) (before, after, summaryLen int, err error) {
+	return a.compressWith(ctx, keepRecent, sessionMemory)
+}
+
+func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory string) (before, after, summaryLen int, err error) {
 	if a == nil || a.Memory == nil {
 		return 0, 0, 0, errors.New("app: Compress called on uninitialised App (nil Memory)")
 	}
@@ -444,6 +461,11 @@ func (a *App) Compress(ctx context.Context, keepRecent int) (before, after, summ
 	}
 	var b strings.Builder
 	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers and anything the user asked to remember. Do not invent anything not in the messages.\n\n")
+	if strings.TrimSpace(sessionMemory) != "" {
+		b.WriteString("Session memory (decisions and facts extracted from earlier turns — treat these as established, and preserve them in the summary):\n")
+		b.WriteString(strings.TrimSpace(sessionMemory))
+		b.WriteString("\n\n")
+	}
 	for _, m := range old {
 		fmt.Fprintf(&b, "%s: %s\n", m.Role, m.Content)
 	}
@@ -459,6 +481,9 @@ func (a *App) Compress(ctx context.Context, keepRecent int) (before, after, summ
 	summary := strings.TrimSpace(resp.Message.Content)
 	if summary == "" {
 		return before, before, 0, errors.New("app: compress: provider returned an empty summary")
+	}
+	if strings.TrimSpace(sessionMemory) != "" {
+		summary += "\n(Drew on session memory.)"
 	}
 	if err := a.Memory.AddFact("conversation-summary", summary); err != nil {
 		return before, before, 0, fmt.Errorf("app: compress: store summary: %w", err)

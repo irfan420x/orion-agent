@@ -30,8 +30,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/memory"
 )
 
 // Command is one slash command.
@@ -111,6 +113,127 @@ type CommandEnv struct {
 	// ForgetFact deletes fact number index (1-based) and returns
 	// the deleted key.
 	ForgetFact func(index int) (string, error)
+	// TypedMemories lists the typed memories (workstream A:
+	// memory.TypedStore.List over <dataDir>/memories/*.md). The
+	// coordinator wires this in cmd/oriond/buildCommandEnv; until
+	// then it is nil and /memory shows facts only, exactly as
+	// before.
+	TypedMemories func() ([]TypedMemory, error)
+	// ForgetTypedMemory deletes the typed memory named name (the
+	// file is removed by the memory store — messaging never
+	// deletes files directly) and returns the deleted name. The
+	// coordinator wires this to memory.TypedStore.Delete; until
+	// then it is nil and /memory forget <name> replies that
+	// typed-memory forgetting is unavailable, while
+	// /memory forget N keeps working for facts.
+	ForgetTypedMemory func(name string) (string, error)
+	// SessionMemory returns the current session-memory.md content
+	// (workstream A: memory.SessionLog.Read, "" when there is
+	// none). The coordinator wires this in cmd/oriond; until then
+	// it is nil. Read errors are best-effort: /compress proceeds
+	// without it and says so.
+	SessionMemory func(ctx context.Context) (string, error)
+	// CompressWithSessionMemory is the /compress variant that
+	// takes the session-memory text so the saved summary preserves
+	// decisions/facts from session memory (not just the raw
+	// messages) and cites that it drew on it. Used instead of
+	// Compress when set and session memory is non-empty. Nil
+	// until the coordinator wires it to the app-side variant
+	// (internal/app Compress lives outside messaging); /compress
+	// then falls back to plain Compress.
+	CompressWithSessionMemory func(ctx context.Context, chatID int64, keepRecent int, sessionMemory string) (before, after, summaryLen int, err error)
+}
+
+// TypedMemory is one typed memory file (workstream A:
+// memory.TypedMemory over <dataDir>/memories/*.md, frontmatter
+// name, description, type). Alias, not a shadow type, so the
+// coordinator can wire TypedMemories straight to
+// memory.TypedStore.List with no conversion.
+type TypedMemory = memory.TypedMemory
+
+// memoryTypeOrder is the display order for /memory groups; types
+// outside this list render after them, sorted by type name.
+var memoryTypeOrder = []string{"user", "feedback", "project", "reference"}
+
+// formatAge renders t as an age relative to now ("just now",
+// "5m ago", "2h ago", "3d ago"). Future timestamps (clock skew, or
+// a memory written a moment ahead) render as "just now", never as a
+// negative age.
+func formatAge(t time.Time) string { return formatAgeAt(t, time.Now()) }
+
+// formatAgeAt is formatAge against an explicit now, for tests.
+func formatAgeAt(t, now time.Time) string {
+	d := now.Sub(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	case d < 365*24*time.Hour:
+		return fmt.Sprintf("%dmo ago", int(d.Hours()/24/30))
+	default:
+		return fmt.Sprintf("%dy ago", int(d.Hours()/24/365))
+	}
+}
+
+// renderTypedMemories renders typed memories grouped by type (user,
+// feedback, project, reference, then any other type sorted by
+// name), newest first within each group, with an age and the
+// description for each entry. mems is not modified.
+func renderTypedMemories(mems []TypedMemory, now time.Time) string {
+	groups := map[string][]TypedMemory{}
+	for _, m := range mems {
+		typ := strings.ToLower(strings.TrimSpace(string(m.Type)))
+		if typ == "" {
+			typ = "other"
+		}
+		groups[typ] = append(groups[typ], m)
+	}
+	ordered := make([]string, 0, len(groups))
+	for _, typ := range memoryTypeOrder {
+		if _, ok := groups[typ]; ok {
+			ordered = append(ordered, typ)
+		}
+	}
+	var rest []string
+	for typ := range groups {
+		known := false
+		for _, k := range memoryTypeOrder {
+			if typ == k {
+				known = true
+				break
+			}
+		}
+		if !known {
+			rest = append(rest, typ)
+		}
+	}
+	sort.Strings(rest)
+	ordered = append(ordered, rest...)
+
+	var b strings.Builder
+	b.WriteString("Typed memories:")
+	for _, typ := range ordered {
+		entries := groups[typ]
+		sort.Slice(entries, func(i, j int) bool {
+			if !entries[i].UpdatedAt.Equal(entries[j].UpdatedAt) {
+				return entries[i].UpdatedAt.After(entries[j].UpdatedAt)
+			}
+			return entries[i].Name < entries[j].Name
+		})
+		fmt.Fprintf(&b, "\n  %s (%d):", typ, len(entries))
+		for _, m := range entries {
+			fmt.Fprintf(&b, "\n    • %s (%s)", m.Name, formatAgeAt(m.UpdatedAt, now))
+			if desc := strings.TrimSpace(m.Description); desc != "" {
+				fmt.Fprintf(&b, " — %s", truncateShort(desc, 80))
+			}
+		}
+	}
+	return b.String()
 }
 
 // Registry is a set of commands, sorted by name for /help and the
@@ -422,7 +545,7 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 
 	r.Register(Command{
 		Name:        "compress",
-		Description: "Compress conversation context",
+		Description: "Compress conversation context (summary draws on session memory when available)",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
 			keep, msg := parseCount(args, 10)
 			if msg != "" {
@@ -431,6 +554,33 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			if keep < 1 {
 				return "Usage: /compress [N] — N must be at least 1.", nil
 			}
+			// Session memory feeds the summary so compression
+			// preserves decisions/facts from session memory, not
+			// just the raw messages. Best-effort: a read failure
+			// never blocks compression, it just falls back to
+			// messages only (and says so). The session-memory
+			// variant is used only when it is wired and there is
+			// session memory to draw on.
+			sessionMem := ""
+			sessionNote := ""
+			if env.CompressWithSessionMemory != nil && env.SessionMemory != nil {
+				sm, err := env.SessionMemory(ctx)
+				if err != nil {
+					sessionNote = " (Note: session memory could not be read, so the summary drew on messages only.)"
+				} else {
+					sessionMem = strings.TrimSpace(sm)
+				}
+			}
+			if sessionMem != "" {
+				before, after, summaryLen, err := env.CompressWithSessionMemory(ctx, env.ChatID, keep, sessionMem)
+				if err != nil {
+					return "", err
+				}
+				if before <= after {
+					return fmt.Sprintf("Nothing old enough to compress — only %d message(s) in history (recent window is %d).", before, keep), nil
+				}
+				return fmt.Sprintf("🗜 Compressed: %d → %d messages. Summary (%d chars) saved as a memory fact, drawing on session memory.", before, after, summaryLen), nil
+			}
 			before, after, summaryLen, err := env.Compress(ctx, env.ChatID, keep)
 			if err != nil {
 				return "", err
@@ -438,7 +588,7 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			if before <= after {
 				return fmt.Sprintf("Nothing old enough to compress — only %d message(s) in history (recent window is %d).", before, keep), nil
 			}
-			return fmt.Sprintf("🗜 Compressed: %d → %d messages. Summary (%d chars) saved as a memory fact.", before, after, summaryLen), nil
+			return fmt.Sprintf("🗜 Compressed: %d → %d messages. Summary (%d chars) saved as a memory fact.%s", before, after, summaryLen, sessionNote), nil
 		},
 	})
 
@@ -473,13 +623,13 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 
 	r.Register(Command{
 		Name:        "footer",
-		Description: "Toggle the runtime footer on final replies",
+		Description: "Toggle the runtime footer on final replies (includes memory usage when memories were used)",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
 			chatID := env.ChatID
 			switch strings.ToLower(strings.TrimSpace(args)) {
 			case "":
 				state := onOff(env.Session(chatID).FooterEnabled)
-				return fmt.Sprintf("Footer: %s.\nThe footer is the line appended to final replies: “— <model> · <tokens> · <steps> · <duration>”.\nUse /footer on or /footer off to change it.", state), nil
+				return fmt.Sprintf("Footer: %s.\nThe footer is the line appended to final replies: “— <model> · <tokens> · <steps> · <duration>”, plus “· <N> memories” when typed memories were used in that turn (e.g. “· 3 memories”; omitted when none were used).\nUse /footer on or /footer off to change it.", state), nil
 			case "on", "off":
 				on := args == "on"
 				if err := env.SetFooter(chatID, on); err != nil {
@@ -494,26 +644,51 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 
 	r.Register(Command{
 		Name:        "memory",
-		Description: "Review memory: facts, messages; '/memory forget N' deletes a fact",
+		Description: "Review memory: facts and typed memories; '/memory forget N' deletes a fact, '/memory forget <name>' deletes a typed memory",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
 			fields := strings.Fields(args)
 			if len(fields) >= 2 && strings.EqualFold(fields[0], "forget") {
-				n, err := strconv.Atoi(fields[1])
-				if err != nil || n < 1 {
-					return "Usage: /memory forget N — N is the fact number from /memory.", nil
+				// A number always refers to the fact list (as
+				// before); anything else is a typed-memory name.
+				if n, err := strconv.Atoi(fields[1]); err == nil {
+					if n < 1 {
+						return "Usage: /memory forget N — N is the fact number from /memory.", nil
+					}
+					key, err := env.ForgetFact(n)
+					if err != nil {
+						return fmt.Sprintf("❌ %v", err), nil
+					}
+					return fmt.Sprintf("🗑 Forgot fact %d (%s).", n, key), nil
 				}
-				key, err := env.ForgetFact(n)
+				name := strings.Join(fields[1:], " ")
+				if env.ForgetTypedMemory == nil {
+					return "Typed-memory forgetting is not wired up yet — the memory store does not expose it. /memory forget N still works for facts.", nil
+				}
+				deleted, err := env.ForgetTypedMemory(name)
 				if err != nil {
 					return fmt.Sprintf("❌ %v", err), nil
 				}
-				return fmt.Sprintf("🗑 Forgot fact %d (%s).", n, key), nil
+				return fmt.Sprintf("🗑 Forgot typed memory %q.", deleted), nil
 			}
 			if len(fields) > 0 {
-				return "Usage: /memory — review memory; /memory forget N — delete fact N.", nil
+				return "Usage: /memory — review memory; /memory forget N — delete fact N; /memory forget <name> — delete the typed memory named <name>.", nil
 			}
 			info, err := env.MemoryInfo()
 			if err != nil {
 				return "", err
+			}
+			// Typed memories (workstream A) render alongside the
+			// facts, grouped by type with ages. Nil/unwired or
+			// empty means facts only, exactly as before; a list
+			// failure degrades to a note, it never hides the
+			// facts.
+			if env.TypedMemories != nil {
+				typed, terr := env.TypedMemories()
+				if terr != nil {
+					info += fmt.Sprintf("\n(Typed memories could not be listed: %v)", terr)
+				} else if len(typed) > 0 {
+					info += "\n\n" + renderTypedMemories(typed, time.Now())
+				}
 			}
 			return info, nil
 		},

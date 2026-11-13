@@ -32,7 +32,11 @@ type TurnFunc func(ctx context.Context, chatID int64, text string, emit func(cor
 // reply, e.g. "— deepseek-chat · 1,240 tokens · 3 steps · 4.2s". It
 // returns "" when stats is nil. The model name is used when set, else
 // the provider name. Durations under 1s render as milliseconds
-// ("850ms"); otherwise seconds with one decimal ("4.2s").
+// ("850ms"); otherwise seconds with one decimal ("4.2s"). When typed
+// memories were used this turn (stats.MemoriesUsed, workstream B),
+// " · <N> memories" is appended ("1 memory" for one); it is omitted
+// when no memories were used, so footers with zero memories render
+// exactly as before.
 func FormatFooter(stats *core.TurnStats) string {
 	if stats == nil {
 		return ""
@@ -41,8 +45,16 @@ func FormatFooter(stats *core.TurnStats) string {
 	if name == "" {
 		name = stats.Provider
 	}
-	return fmt.Sprintf("— %s · %s tokens · %d steps · %s",
+	footer := fmt.Sprintf("— %s · %s tokens · %d steps · %s",
 		name, formatThousands(stats.Tokens), stats.Steps, formatFooterDuration(stats.Duration))
+	switch {
+	case stats.MemoriesUsed <= 0:
+		return footer
+	case stats.MemoriesUsed == 1:
+		return footer + " · 1 memory"
+	default:
+		return fmt.Sprintf("%s · %d memories", footer, stats.MemoriesUsed)
+	}
 }
 
 // formatThousands renders n with "," thousands separators ("1240" ->

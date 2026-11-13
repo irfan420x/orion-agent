@@ -3,7 +3,7 @@
 package version
 
 // Version is the Orion release version, in semantic-version form.
-const Version = "0.2.0-rc3"
+const Version = "0.2.0-rc4"
 
 // Commit and BuildDate are set at build time with -ldflags -X
 // (install.sh and the Makefile do this). Built without ldflags they

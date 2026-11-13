@@ -46,7 +46,14 @@ const systemPrompt = `You are Orion, a model-agnostic OS agent running locally o
 	`When a request is ambiguous, ask for clarification before acting. ` +
 	`When a request is destructive (deleting, overwriting, shutting down, or otherwise irreversible), confirm exactly what will happen and wait for the user to confirm before doing it. ` +
 	`Never run a blocked or destructive command. If a tool refuses an action, explain why and offer a safe alternative. ` +
-	`If you do not know something, say so instead of inventing an answer.`
+	`If you do not know something, say so instead of inventing an answer.` +
+	`
+
+Memory — saving what you learn (typed memories):
+- Types: user (who the user is), feedback (how to work — corrections AND confirmations; a "yes exactly" counts), project (ongoing work, goals, bugs), reference (pointers to external systems).
+- Save only what was surprising or non-obvious. If the user explicitly asks you to save something, keep just the surprising part of it.
+- Never save code patterns, architecture, git history, or file structure — those are derivable from the tree.
+- Before acting on a saved memory that names a file, function, or flag, verify it still exists; if it does not, trust the current state, not the memory.`
 
 // Agent is the core agent loop. Run/RunStream calls are serialised with
 // runMu so at most one run executes at a time; SetLogger,
@@ -70,6 +77,27 @@ type Agent struct {
 	eventHandlerMu sync.RWMutex // guards eventHandler
 	shutMu         sync.Mutex   // guards shutDown
 	shutDown       bool
+	// Recall v2 / drift / extraction state (see recall_v2.go,
+	// drift.go, extraction.go). typedMu guards the wired sources
+	// and roots; surfaced/stale/recentTools have their own locks.
+	typedMu               sync.RWMutex
+	typedMem              typedMemorySource
+	sessionMem            sessionMemoryAppender
+	driftRoot             string
+	memorySelector        memorySelectorFunc
+	surfacedMu            sync.Mutex
+	surfaced              map[string]struct{}
+	staleMu               sync.Mutex
+	stale                 map[string]struct{}
+	recentToolsMu         sync.Mutex
+	recentTools           []string
+	extractMu             sync.Mutex
+	extractRunning        bool
+	extractThresholdTools int
+	extractThresholdTurns int
+	toolCallsSinceExtract int
+	turnsSinceExtract     int
+	sessionExtractor      sessionExtractorFunc
 }
 
 // MaxStepsError is returned by Run/RunStream when the step budget is
@@ -132,6 +160,8 @@ func NewAgent(cfg *config.Config, provider model.Provider, registry *tools.Regis
 		memory:   mem,
 		cfg:      cfg,
 		logger:   log.New(os.Stderr, "orion/core: ", log.LstdFlags),
+		surfaced: map[string]struct{}{},
+		stale:    map[string]struct{}{},
 	}, nil
 }
 
@@ -244,8 +274,12 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 	// across the turn's provider calls, verbatim — a provider that
 	// reports zero usage leaves it zero, it is never estimated here.
 	// lastStep tracks the most recent step for TurnFinished.
+	// memoriesUsed counts the typed memories injected this turn
+	// (recall v2); it is assigned at the recall site below and
+	// carried on the TurnFinished event for TurnStats.
 	turnStart := time.Now()
 	var usage model.Usage
+	var memoriesUsed int
 	lastStep := 0
 	turnFinished := false
 	finishTurn := func(err error) {
@@ -254,11 +288,12 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		}
 		turnFinished = true
 		a.emit(ProgressEvent{
-			Kind:     EventTurnFinished,
-			Step:     lastStep,
-			Duration: time.Since(turnStart),
-			Err:      err,
-			Usage:    usage,
+			Kind:         EventTurnFinished,
+			Step:         lastStep,
+			Duration:     time.Since(turnStart),
+			Err:          err,
+			Usage:        usage,
+			MemoriesUsed: memoriesUsed,
 		})
 	}
 
@@ -303,6 +338,20 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 	if items := a.recallFor(input, recent); len(items) > 0 {
 		messages[0].Content += formatRecallSection(items)
 	}
+	// Recall v2: typed memories are injected alongside the v1
+	// items, under their own section header (at most 5, drift
+	// checked, never failing the run). Their count is the turn's
+	// MemoriesUsed, carried on TurnFinished for TurnStats.
+	if typed := a.recallTypedFor(ctx, input, recent); len(typed) > 0 {
+		memoriesUsed = len(typed)
+		messages[0].Content += formatTypedMemorySection(typed)
+	}
+
+	// Session-memory extraction is counted at the end of this turn
+	// (deferred: it launches a background goroutine and never
+	// blocks the turn). The transcript snapshot is taken when the
+	// deferred call runs, i.e. after the turn's messages are final.
+	defer func() { a.noteTurnCompleted(ctx, messages) }()
 
 	// deferred holds tool calls the model requested in a turn where
 	// only the first was executed (see below). If the model then
@@ -487,6 +536,9 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 			a.emit(ProgressEvent{Kind: EventToolCallStarted, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Usage: usage})
 			result := a.executeTool(toolCtx, tc)
 			toolCancel()
+			// Record the execution for recall v2 (recently-used
+			// tools) and the session-extraction tool-call counter.
+			a.noteToolCallExecuted(tc.Name)
 			// Tool "errors" returned as result text (executeTool
 			// returns "Error: ..." strings) count as Err here too.
 			var toolErr error

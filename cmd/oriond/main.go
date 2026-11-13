@@ -345,5 +345,15 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 		SetFooter:  store.SetFooter,
 		MemoryInfo: a.MemorySummary,
 		ForgetFact: a.ForgetFact,
+		// Memory v2: typed memories, session memory, and the
+		// /compress variant that draws on session memory. The App
+		// methods degrade gracefully when the typed layer is
+		// unavailable (hand-built Apps), so no field is left nil.
+		TypedMemories:     a.TypedMemories,
+		ForgetTypedMemory: a.ForgetTypedMemory,
+		SessionMemory:     a.SessionMemoryText,
+		CompressWithSessionMemory: func(ctx context.Context, chatID int64, keepRecent int, sessionMemory string) (int, int, int, error) {
+			return a.CompressWithSessionMemory(ctx, keepRecent, sessionMemory)
+		},
 	}
 }
