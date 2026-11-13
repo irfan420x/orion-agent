@@ -85,7 +85,11 @@ func TestPollEnforcesAllowedChats(t *testing.T) {
 }
 
 // TestIsChatAllowedNoAllowlist: with no allowlist configured, every
-// chat is allowed (first-run convenience; the daemon warns about it).
+// chat is allowed at the gateway level. That is per-chat enforcement
+// only: the daemon entry points refuse to start polling with an empty
+// allowlist (see CheckTelegramAllowlist) unless the explicit
+// allow_all_telegram_chats opt-in is set, so a gateway with no
+// allowlist should only ever exist in tests or behind that opt-in.
 func TestIsChatAllowedNoAllowlist(t *testing.T) {
 	g, err := NewTelegramGateway(testToken)
 	if err != nil {

@@ -5,14 +5,17 @@ import (
 	"testing"
 )
 
-var semverPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+// semverPattern matches a semantic version, with an optional
+// prerelease suffix (e.g. 0.2.0-rc2): the release candidates carry
+// one, so a bare X.Y.Z pattern would reject the current version.
+var semverPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
 
 func TestVersionIsSemver(t *testing.T) {
 	if Version == "" {
 		t.Fatal("Version must not be empty")
 	}
 	if !semverPattern.MatchString(Version) {
-		t.Fatalf("Version %q is not semantic-version shaped (want e.g. 0.1.0)", Version)
+		t.Fatalf("Version %q is not semantic-version shaped (want e.g. 0.2.0-rc2)", Version)
 	}
 }
 
@@ -31,7 +34,7 @@ func TestStringWithLdflags(t *testing.T) {
 	oldCommit, oldDate := Commit, BuildDate
 	defer func() { Commit, BuildDate = oldCommit, oldDate }()
 	Commit, BuildDate = "abc1234", "2026-11-13T05:00:00Z"
-	want := "0.1.0 commit abc1234 built 2026-11-13T05:00:00Z"
+	want := Version + " commit abc1234 built 2026-11-13T05:00:00Z"
 	if got := String(); got != want {
 		t.Fatalf("String() = %q, want %q", got, want)
 	}

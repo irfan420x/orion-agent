@@ -88,12 +88,35 @@ func TestShellExecSandboxDenylistStillApplies(t *testing.T) {
 	}
 }
 
-// TestShellExecSandboxFallback proves the graceful fallback: with
+// TestShellExecSandboxRefusesWhenSetupFails proves fail-closed: with
 // sandbox mode on but setup impossible (root under /proc, which can
-// never be created), the command still runs unsandboxed and the
-// result carries a warning, instead of failing outright.
-func TestShellExecSandboxFallback(t *testing.T) {
+// never be created), the command is REFUSED — kind "denied", naming
+// the opt-in — and never runs, instead of silently running
+// unsandboxed. The marker file must not exist afterwards.
+func TestShellExecSandboxRefusesWhenSetupFails(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "marker.txt")
 	tool := &shellExecTool{sandboxCfg: sandbox.Config{Enabled: true, Root: "/proc/orion-sandbox-test"}}
+	_, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{"command": fmt.Sprintf("echo ran > %q", marker)}))
+	if err == nil {
+		t.Fatal("Execute with an unestablishable sandbox: want refusal, got nil error")
+	}
+	if kind := toolErrKind(t, err); kind != "denied" {
+		t.Fatalf("expected kind denied, got %q (%v)", kind, err)
+	}
+	if !strings.Contains(err.Error(), "sandbox.allow_unsandboxed_fallback=true") {
+		t.Fatalf("refusal should name the opt-in, got: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("marker file %s exists: the command ran despite the refusal", marker)
+	}
+}
+
+// TestShellExecSandboxFallbackOptIn proves the explicit opt-in: with
+// AllowUnsandboxedFallback set, a command whose sandbox cannot be
+// established still runs unsandboxed and the result carries a
+// warning, instead of failing outright.
+func TestShellExecSandboxFallbackOptIn(t *testing.T) {
+	tool := &shellExecTool{sandboxCfg: sandbox.Config{Enabled: true, Root: "/proc/orion-sandbox-test", AllowUnsandboxedFallback: true}}
 	out, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{"command": "echo fallback-hi"}))
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)

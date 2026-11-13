@@ -26,6 +26,13 @@ Safety: every probe is side-effect-free when unblocked.
     cannot trace itself).
   - keyctl(GET_KEYRING_ID, 0) returns EINVAL when unblocked.
   - clone3(NULL) returns EFAULT when unblocked.
+  - io_uring_setup(2 entries, zeroed params) creates a real ring
+    when unblocked (the process exits right after); enter/register
+    get fd -1 (EBADF when unblocked). io_uring is already blocked
+    by the cell filter on this host, so the host calibration reads
+    BLOCKED for these, like swapon/bpf — the discriminating proof
+    is TestSeccompFilterProgram, not the live probe.
+  - modify_ldt(0, buf, 64) reads the LDT (returns 0 when unblocked).
 
 Deliberately NOT probed here (see the Go test's probeSkipped):
 reboot, sethostname, setdomainname (host side effects if the filter
@@ -60,6 +67,8 @@ TABLES = {
         "clock_settime": 227, "settimeofday": 164, "adjtimex": 159,
         "clock_adjtime": 305, "syslog": 103,
         "process_vm_readv": 310, "process_vm_writev": 311,
+        "io_uring_setup": 425, "io_uring_enter": 426,
+        "io_uring_register": 427, "modify_ldt": 154,
     },
     "aarch64": {
         "mount": 40, "umount2": 39, "pivot_root": 41, "chroot": 51,
@@ -76,6 +85,8 @@ TABLES = {
         "clock_settime": 112, "settimeofday": 170, "adjtimex": 171,
         "clock_adjtime": 266, "syslog": 116,
         "process_vm_readv": 270, "process_vm_writev": 271,
+        "io_uring_setup": 425, "io_uring_enter": 426,
+        "io_uring_register": 427,
     },
 }
 
@@ -148,7 +159,12 @@ def main():
         ("syslog", (3, None, 0)),
         ("process_vm_readv", (os.getpid(), None, 1, None, 0, 0)),
         ("process_vm_writev", (os.getpid(), None, 1, None, 0, 0)),
+        ("io_uring_setup", (2, ctypes.create_string_buffer(256))),
+        ("io_uring_enter", (-1, 0, 0, 0, None, 0)),
+        ("io_uring_register", (-1, 0, None, 0)),
     ]
+    if "modify_ldt" in table:
+        probes.append(("modify_ldt", (0, ctypes.create_string_buffer(64), 64)))
 
     for name, args in probes:
         nr = table[name]

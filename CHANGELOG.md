@@ -41,6 +41,63 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream retries only when nothing usable was delivered, so live
   output is never duplicated. See `ARCHITECTURE.md`.
 
+### Security
+
+- **DNS-rebinding SSRF TOCTOU closed** (`internal/tools/web.go`,
+  `internal/config`, `internal/app`, `internal/tools/tools.go`):
+  `web_fetch` used to `LookupIP` → check public → fetch (resolving
+  a second time), so a rebinding host could answer public once and
+  private on the fetch. Now each hostname is resolved exactly once
+  per fetch, **all** resolved IPs are validated public, and the
+  dial pins the validated IPs directly (custom `DialContext`;
+  TLS SNI and HTTP Host keep the original hostname). Redirect
+  targets go through the same resolve-validate-pin step. Proxy-
+  aware: when an egress proxy is configured the proxy does the
+  dialing, so pinning does not apply and the pre-check is the only
+  guard (documented in code). Regression tests cover a rebinding
+  host, redirect-to-private, SNI/Host preservation, the proxy path,
+  and the trusted-egress path.
+- **198.18/15 benchmarking range is no longer a global exception**
+  (`internal/tools/web.go`, `internal/config`): the range is now in
+  `nonPublicIPNets` (strict by default). Deployments whose egress
+  DNS maps public hosts into it list the range explicitly in the
+  new `trusted_egress_cidrs` config field (validated CIDRs);
+  this deployment uses `198.18.31.0/24`. Without the field,
+  `web_fetch` to public hosts is refused in such deployments.
+- **Sandbox fail-open closed** (`internal/tools/shell.go`,
+  `internal/sandbox/sandbox.go`): when the sandbox is enabled but
+  unavailable or `Prepare` fails, `shell_exec` used to log a
+  warning and run the command unsandboxed. It now refuses the
+  command (`denied`, naming the opt-in) and runs nothing. The old
+  behaviour is available only via the explicit
+  `sandbox.allow_unsandboxed_fallback=true` opt-in (default false).
+- **Telegram empty allowlist no longer means "everyone"**
+  (`internal/messaging/telegram.go`, `cmd/oriond/main.go`,
+  `cmd/orion/main.go`, `internal/config`): the daemon and the
+  `orion telegram poll` / `orion daemon` commands refuse to start
+  polling when `telegram_allowed_chats` is empty, unless
+  `allow_all_telegram_chats=true` is explicitly set. The refusal
+  tells the operator to set their chat ID (via `/whoami` or the
+  daemon log, where dropped-chat IDs are now logged without
+  message text). `Config.Validate()` still accepts an empty
+  allowlist so `config show`/`status`/`test` keep working.
+- **Sandbox root symlink validation order**
+  (`internal/sandbox/sandbox.go`): `Prepare` used to `MkdirAll`
+  the root first and only then `EvalSymlinks` + re-validate. It
+  now canonicalizes (longest existing ancestor + re-join) and
+  validates the canonical root **before** creating any directory;
+  the post-creation re-validate stays as a second check.
+- **Session persistence dir fsync** (`internal/messaging/
+  session.go`): `saveLocked` now fsyncs the parent directory
+  after the temp-file fsync + rename, matching the memory/config
+  stores, so a renamed `sessions.json` survives a crash.
+- **Version + docs sync** (`internal/version`): `Version` is now
+  `0.2.0-rc2` (was `0.1.0` while the tag was `v0.2.0-rc2`);
+  README status, SECURITY.md (seccomp launcher is built/installed
+  by `install.sh`/`Makefile`; Telegram authorisation is refusal,
+  not a warning; sandbox fallback is fail-closed) and
+  ARCHITECTURE.md corrected.
+
 ### Fixed
 
 - **Egress proxy regression caught at integration** (timeout
@@ -109,6 +166,27 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   correctly labelled (were "openai:"); `orion-seccomp` install
   wiring; Anthropic default model aligned (`claude-sonnet-4-5`).
 
+- **Audit 3 (production readiness, 2026-11-13)** — full report in
+  `AUDIT3_2026-11-13.md`: 100+ scripted Telegram-style conversations
+  through the real agent loop (deterministic fake provider), 37
+  provider-stress tests (timeouts, mid-stream drops, malformed
+  streams, retries), 13 sandbox adversarial probes (PID/FS/network
+  isolation, privilege escalation, seccomp filter proof with a
+  discriminating modify_ldt check, bounded resource hogs), daemon
+  soak (rc1 1h39m, RSS flat ~10 MB, no leak; 60s and 5-min SIGSTOP
+  stalls survived), poll-transient logging (F1), SIGTERM drain up to
+  10s (F2), session save on every exit path (F3), config `Load`
+  tightens a lax 0644 config to 0600, daemon start/stop/restart
+  against a fake Bot API. Verdict: NOT production-ready — the
+  24–72h soak was not achieved, live-model volume is small (fake
+  provider is the volume proof), and one new fail-open gap remains
+  (see Known limitations). Close-out also fixed two test defects
+  (a privilege-escalation assertion that matched no emitted string,
+  a data race in the CPU-spin test) and corrected the record: the
+  seccomp filter IS installed for the adversarial probes, and
+  sethostname fails from namespace/capability scoping, not from
+  the filter. 568 tests pass, race clean.
+
 ### Known limitations
 
 - **Telegram round-trip: tested live 2026-11-13.** Irfan messaged
@@ -132,11 +210,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **TypeScript UI is v0.2.** v0.1 is Go only (core, daemon, CLI);
   the desktop/web UI is out of scope for this release.
 - **Sandbox is host-dependent.** It needs unprivileged user
-  namespaces or root; on hosts without them it falls back to the
-  denylist alone with a warning. The seccomp filter needs the
+  namespaces or root; on hosts without them, `shell_exec` with the
+  sandbox enabled **refuses** commands (fail-closed) unless
+  `sandbox.allow_unsandboxed_fallback=true` is explicitly set. The seccomp filter needs the
   `orion-seccomp` binary next to `orion` (installed by
   `install.sh`/`make build`); the arm64 filter table is
   header-checked but unrun on arm64 hardware.
+- **Seccomp filter is fail-open when the launcher is missing.**
+  When the sandbox is enabled and the filter is not disabled, but
+  no `orion-seccomp` binary can be found (or the probe/install
+  fails), the command runs with namespace/chroot containment but
+  NO syscall filtering, with only a once-per-process warning. The
+  next hardening phase should refuse in that case unless an
+  explicit opt-out is set (same pattern as the sandbox fail-closed
+  fix). See `AUDIT3_2026-11-13.md` §10 (F-A3-1).
 
 ## [0.1.0] — 2026-11-13
 

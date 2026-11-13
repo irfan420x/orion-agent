@@ -113,26 +113,76 @@ else
 	BIN_DIR="$HOME/.local/bin"
 fi
 mkdir -p "$BIN_DIR" || die "cannot create $BIN_DIR"
+# Stale staging temps from a SIGKILLed earlier run (SIGKILL cannot run
+# the EXIT trap, so a killed build can leave a 0-byte .install-* file
+# behind). They are inert, but clean them so interrupted installs do
+# not accumulate junk in the bin dir. Installs are not run
+# concurrently; a concurrent install's live temp file would match
+# this pattern, so never run two installs at once.
+rm -f "$BIN_DIR"/.install-*
+
+# Atomic install: every file this script writes to its final location
+# goes through a temp file in the same directory + rename, never a
+# direct write. A direct `go build -o $BIN_DIR/orion` (or `cat >
+# config.json`) leaves a half-written binary / torn config behind if
+# the install is killed mid-write — and a torn config.json is never
+# repaired, because the "already exists, leave it untouched" check
+# below sees the file and skips it. With temp+rename, a kill at any
+# point leaves either the old complete file or no file at all, and a
+# re-run always completes. (The three binaries are still installed
+# one after another, so a kill between them can leave a mixed-version
+# set — each binary is whole, but orion/oriond may briefly be from
+# different builds. Fully atomic multi-binary swaps would need a
+# staged directory + symlink flip, which is out of scope here.)
+#
+# install_file SRC DEST moves a finished file into place atomically
+# (same filesystem: temp files are created in the destination dir)
+# and makes it executable. Dies on failure.
+install_file() {
+	# $1 = temp file, $2 = destination
+	mv -f "$1" "$2" || die "cannot install $2"
+	chmod 0755 "$2" || die "cannot chmod $2"
+}
+
+# Staging temp files, removed on any exit (a SIGKILL cannot run the
+# trap, but a leftover .install-*.tmp in the bin dir is inert and the
+# next run overwrites it via mktemp anyway).
+STAGE_TMP=""
+cleanup_stage() {
+	[ -n "$STAGE_TMP" ] && rm -f $STAGE_TMP
+	# Always succeed: this runs as the EXIT trap, and a failing trap
+	# would override the script's real exit code with 1.
+	return 0
+}
+trap cleanup_stage EXIT
+
+build_one() {
+	# $1 = go package, $2 = binary name: build to a temp file in
+	# BIN_DIR, then rename into place.
+	local pkg="$1" name="$2" tmp
+	tmp="$(mktemp "$BIN_DIR/.install-${name}.XXXXXX")" || die "cannot create temp file in $BIN_DIR"
+	STAGE_TMP="$STAGE_TMP $tmp"
+	"$GO" build -trimpath -ldflags "$LDFLAGS" -o "$tmp" "$pkg" || die "build failed: $pkg"
+	install_file "$tmp" "$BIN_DIR/$name"
+	STAGE_TMP="${STAGE_TMP% $tmp}"
+}
 
 echo "building orion and oriond (commit ${COMMIT}, built ${BUILD_DATE})..."
-"$GO" build -trimpath -ldflags "$LDFLAGS" -o "$BIN_DIR/orion" ./cmd/orion
+build_one ./cmd/orion orion
 if [ -d cmd/oriond ]; then
-	"$GO" build -trimpath -ldflags "$LDFLAGS" -o "$BIN_DIR/oriond" ./cmd/oriond
+	build_one ./cmd/oriond oriond
 	HAS_ORIOND=1
 else
 	echo "note: cmd/oriond not present — installing orion only"
 	HAS_ORIOND=0
 fi
-chmod 0755 "$BIN_DIR/orion"
-[ "$HAS_ORIOND" -eq 1 ] && chmod 0755 "$BIN_DIR/oriond"
 
 # Seccomp launcher: the sandbox's orion-seccomp helper is discovered
 # next to the orion binary, so install it alongside when present in
 # the tree. Without it the sandbox still works (namespaces +
 # pivot_root) but the seccomp filter stays inactive.
 if [ -d internal/sandbox/cmd/launcher ]; then
-	"$GO" build -trimpath -ldflags "$LDFLAGS" -o "$BIN_DIR/orion-seccomp" ./internal/sandbox/cmd/launcher
-	chmod 0755 "$BIN_DIR/orion-seccomp"
+	build_one ./internal/sandbox/cmd/launcher orion-seccomp
 	echo "installed seccomp launcher: $BIN_DIR/orion-seccomp"
 fi
 
@@ -142,12 +192,26 @@ fi
 # written 0600. Secrets are added afterwards by the user, never here.
 CONFIG_DIR="$HOME/.orion"
 CONFIG_PATH="$CONFIG_DIR/config.json"
-if [ -f "$CONFIG_PATH" ]; then
-	echo "config already exists at $CONFIG_PATH — leaving it untouched"
-else
+
+# write_default_config writes the first-install default config to
+# $CONFIG_PATH via temp file + rename (see the atomic-install note
+# above). It never overwrites an existing file — callers check first.
+# This matches config.Default() (default provider ollama, local-first)
+# and is written 0600. Secrets are added afterwards by the user,
+# never here.
+write_default_config() {
 	mkdir -p "$CONFIG_DIR"
 	chmod 0700 "$CONFIG_DIR"
-	cat >"$CONFIG_PATH" <<EOF
+	rm -f "$CONFIG_DIR"/.install-config.*
+	# Write via a temp file + rename, like the binaries above: a
+	# kill during a direct `cat > config.json` would leave a torn
+	# config that this script then refuses to overwrite (the
+	# "already exists" branch), so the install would look done
+	# while Orion cannot start. mktemp is 0600 already; chmod
+	# explicitly so the mode never depends on that.
+	CONFIG_TMP="$(mktemp "$CONFIG_DIR/.install-config.XXXXXX")" || die "cannot create temp config in $CONFIG_DIR"
+	STAGE_TMP="$STAGE_TMP $CONFIG_TMP"
+	cat >"$CONFIG_TMP" <<EOF
 {
   "default_provider": "ollama",
   "providers": {
@@ -184,15 +248,44 @@ else
   "timeout_seconds": 120
 }
 EOF
-	chmod 0600 "$CONFIG_PATH"
+	chmod 0600 "$CONFIG_TMP" || die "cannot chmod temp config"
+	mv -f "$CONFIG_TMP" "$CONFIG_PATH" || die "cannot install $CONFIG_PATH"
+	STAGE_TMP="${STAGE_TMP% $CONFIG_TMP}"
 	echo "wrote default config to $CONFIG_PATH (edit it or use 'orion config' to add keys)"
+}
+
+# Default config, first install only. Never overwrite an existing
+# config: it may hold API keys and a Telegram token.
+if [ -f "$CONFIG_PATH" ]; then
+	echo "config already exists at $CONFIG_PATH — leaving it untouched"
+else
+	write_default_config
 fi
 
 # Sanity check: the installed binary must at least report its version
 # (needs no config, so a broken config cannot fail the install).
 "$BIN_DIR/orion" version
 if ! "$BIN_DIR/orion" config show >/dev/null 2>&1; then
-	echo "warning: installed orion cannot read $CONFIG_PATH — check the config (e.g. a key-less default provider) before running" >&2
+	# A config that is not valid JSON at all cannot hold usable keys
+	# — it is almost certainly a torn write from an interrupted
+	# install (pre-atomic installer) or a bad hand-edit. Back it up
+	# and replace it with a fresh default, so a re-install recovers
+	# instead of leaving Orion unstartable. Any other failure (valid
+	# JSON but a key-less default provider, an unknown provider, ...)
+	# is left alone: the file may hold secrets and the user must fix
+	# it. python3 is only the JSON check; without it, warn as before.
+	if command -v python3 >/dev/null 2>&1 && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$CONFIG_PATH" 2>/dev/null; then
+		BACKUP="$CONFIG_PATH.corrupt.$(date +%Y%m%d%H%M%S)"
+		if mv -f "$CONFIG_PATH" "$BACKUP" 2>/dev/null; then
+			echo "warning: $CONFIG_PATH is not valid JSON — moved it to $BACKUP and writing a fresh default config" >&2
+			write_default_config
+			"$BIN_DIR/orion" config show >/dev/null 2>&1 || echo "warning: fresh default config still unreadable — check $CONFIG_PATH" >&2
+		else
+			echo "warning: installed orion cannot read $CONFIG_PATH — check the config (e.g. a key-less default provider) before running" >&2
+		fi
+	else
+		echo "warning: installed orion cannot read $CONFIG_PATH — check the config (e.g. a key-less default provider) before running" >&2
+	fi
 fi
 
 # Optional systemd user unit for the oriond daemon.
@@ -201,12 +294,18 @@ if [ "$WITH_SYSTEMD" -eq 1 ]; then
 	[ -f "$REPO_ROOT/oriond.service" ] || die "oriond.service not found in $REPO_ROOT"
 	UNIT_DIR="$HOME/.config/systemd/user"
 	mkdir -p "$UNIT_DIR"
+	rm -f "$UNIT_DIR"/.install-oriond.*
 	# Point ExecStart at the binary we actually installed (the unit
 	# file defaults to ~/.local/bin/oriond). Escape sed-special
-	# characters in the path first (|, & and backslash).
+	# characters in the path first (|, & and backslash). Written via
+	# temp+rename like everything else in this script.
 	ESCAPED_BIN_DIR="$(printf '%s' "$BIN_DIR" | sed -e 's/[|&\\]/\\&/g')"
-	sed "s|^ExecStart=.*|ExecStart=$ESCAPED_BIN_DIR/oriond|" "$REPO_ROOT/oriond.service" >"$UNIT_DIR/oriond.service"
-	chmod 0644 "$UNIT_DIR/oriond.service"
+	UNIT_TMP="$(mktemp "$UNIT_DIR/.install-oriond.XXXXXX")" || die "cannot create temp unit in $UNIT_DIR"
+	STAGE_TMP="$STAGE_TMP $UNIT_TMP"
+	sed "s|^ExecStart=.*|ExecStart=$ESCAPED_BIN_DIR/oriond|" "$REPO_ROOT/oriond.service" >"$UNIT_TMP" || die "cannot render oriond.service"
+	chmod 0644 "$UNIT_TMP" || die "cannot chmod temp unit"
+	mv -f "$UNIT_TMP" "$UNIT_DIR/oriond.service" || die "cannot install $UNIT_DIR/oriond.service"
+	STAGE_TMP="${STAGE_TMP% $UNIT_TMP}"
 	echo "installed systemd user unit to $UNIT_DIR/oriond.service"
 	if command -v systemctl >/dev/null 2>&1; then
 		if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable oriond.service 2>/dev/null; then
@@ -235,3 +334,4 @@ esac
 echo "next: orion config set-api-key <openai|anthropic> <key>   (or run Ollama locally)"
 echo "      orion run \"what time is it?\""
 echo "      orion telegram test   (after setting a Telegram bot token)"
+echo "      set telegram_allowed_chats in $CONFIG_PATH to your chat ID — oriond refuses to start with an empty allowlist (send /whoami to the bot to learn it)"

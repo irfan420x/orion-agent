@@ -3,7 +3,7 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.1.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc2.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
 > built and tested. The TypeScript desktop/web UI is v0.2 only (see
 > [LANGUAGE_DECISION.md](LANGUAGE_DECISION.md)).
@@ -46,6 +46,12 @@ orion chat                              # interactive CLI chat
 orion config set-api-key ...            # (no CLI setter for the token;
 #    set telegram_token in ~/.orion/config.json, or export
 #    ORION_TELEGRAM_TOKEN=<YOUR_TELEGRAM_BOT_TOKEN>)
+#    Also set telegram_allowed_chats in ~/.orion/config.json to your
+#    chat ID(s) — oriond, `orion telegram poll` and `orion daemon`
+#    refuse to start with an empty allowlist unless
+#    allow_all_telegram_chats=true is set explicitly (any chat could
+#    otherwise drive the agent). Send /whoami to the bot to learn
+#    your chat ID.
 orion telegram test                     # verify the token (getMe)
 orion telegram poll                     # start the gateway (foreground)
 orion daemon                            # same, via the orion CLI
@@ -76,11 +82,13 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-14/14 packages, 441 tests passing, 3 skipped (the live Ollama and
-live Telegram tests, which need a running Ollama server and a bot
-chat respectively), race detector clean — `go test ./... -race
--count=1` passes, verified 2026-11-13 (includes 15 fact-recall
-tests). Run the suite with `go test ./...` or `make test`.
+12/14 packages, 562 tests passing, 6 failing, 3 skipped (the live
+Ollama tests, which need a running Ollama server) — `go test
+-buildvcs=false -count=1 ./...`, verified 2026-11-13. The 6 failures
+are in `internal/sandbox` (`TestAdversarialPrivilegeEscalation`, an
+Audit 3 adversarial test) and `internal/tools` (5 `web_fetch` SSRF
+tests, another worker's in-flight area), not in this phase's
+packages. Run the suite with `go test ./...` or `make test`.
 
 ## Configuration
 

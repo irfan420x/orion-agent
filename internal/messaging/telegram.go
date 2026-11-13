@@ -120,6 +120,13 @@ type TelegramGateway struct {
 	fetchMu sync.Mutex
 	// allowedChats is nil when no allowlist is set (all chats pass).
 	allowedChats map[int64]bool
+	// logger, when set via WithLogger, receives polling-health notes:
+	// transient getUpdates failures and the recovery after them. It is
+	// nil by default (silent). Only redacted errors are ever passed
+	// to it — call() wraps every token-bearing error — so the token
+	// can never appear in a log line. Fatal poll errors are NOT
+	// logged here; PollStream returns them to the caller.
+	logger func(format string, args ...any)
 }
 
 // Gateway is an alias for TelegramGateway.
@@ -152,6 +159,29 @@ func WithHTTPClient(client *http.Client) GatewayOption {
 	}
 }
 
+// WithLogger sets the polling-health logger: transient getUpdates
+// failures (with the backoff about to be waited) and the recovery
+// once polling succeeds again. A nil logger is ignored and the
+// gateway stays silent. The logger must never receive an unredacted
+// error; PollStream only passes it errors that call() already
+// redacted, so the bot token can never leak into a log line.
+func WithLogger(logf func(format string, args ...any)) GatewayOption {
+	return func(g *TelegramGateway) {
+		if logf != nil {
+			g.logger = logf
+		}
+	}
+}
+
+// logf reports a polling-health note when a logger is set; it is a
+// no-op otherwise.
+func (g *TelegramGateway) logf(format string, args ...any) {
+	if g == nil || g.logger == nil {
+		return
+	}
+	g.logger(format, args...)
+}
+
 // WithAllowedChats restricts Poll to messages from the given chat IDs
 // (private chats are positive, groups negative). With no IDs the option
 // is a no-op; with at least one, every other chat is dropped before the
@@ -173,12 +203,32 @@ func WithAllowedChats(ids ...int64) GatewayOption {
 }
 
 // IsChatAllowed reports whether chatID may drive the agent through this
-// gateway. With no allowlist set, every chat is allowed.
+// gateway. With no allowlist set, every chat is allowed. That is the
+// per-chat enforcement only: the daemon entry points refuse to start
+// polling with an empty allowlist at all (see CheckTelegramAllowlist),
+// so a gateway with no allowlist should only ever exist in tests or
+// behind an explicit allow-all opt-in.
 func (g *TelegramGateway) IsChatAllowed(chatID int64) bool {
 	if len(g.allowedChats) == 0 {
 		return true
 	}
 	return g.allowedChats[chatID]
+}
+
+// CheckTelegramAllowlist enforces the daemon startup rule for the
+// Telegram allowlist: polling may start only when at least one chat
+// is allowlisted, or when allowAll was explicitly opted into. An
+// empty allowlist with allowAll false is an error, because with no
+// allowlist any Telegram chat could drive the agent (including
+// shell_exec). The error tells the operator how to find their chat
+// ID and how to fix the config; every polling entry point
+// (oriond, `orion telegram poll`, `orion daemon`) reports it and
+// exits non-zero.
+func CheckTelegramAllowlist(allowedChats []int64, allowAll bool) error {
+	if len(allowedChats) > 0 || allowAll {
+		return nil
+	}
+	return errors.New("refusing to start Telegram polling: telegram_allowed_chats is empty, so ANY Telegram chat could drive the agent (including shell_exec); set telegram_allowed_chats in config.json to your chat ID(s), or set allow_all_telegram_chats=true only if you really mean to allow every chat — to find your chat ID, start the daemon once with allow_all_telegram_chats=true and send /whoami to the bot, or check the daemon log for the dropped-chat ID logged when a non-allowlisted chat messages the bot while it is polling")
 }
 
 // NewTelegramGateway creates a TelegramGateway for the given bot token.
@@ -845,6 +895,10 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		_ = g.SendMessage(ctx, chatID, reply)
 	}
 
+	// consecutiveFailures counts back-to-back transient getUpdates
+	// failures, so the recovery log can say how long polling was
+	// down. It is only ever read by this loop.
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -866,6 +920,13 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			if errors.As(err, &apiErr) && apiErr.isFatalForPoll() {
 				return fmt.Errorf("messaging: telegram poll: unrecoverable Bot API error: %w", apiErr)
 			}
+			// Transient failure: log it (when a logger is set) and
+			// back off. Without this line a network outage is
+			// completely silent in the daemon log — the process
+			// looks alive while polling is down. The error is
+			// safe to log: call() redacts the token.
+			consecutiveFailures++
+			g.logf("telegram poll: transient getUpdates error (attempt %d, retry in %s): %v", consecutiveFailures, backoff, err)
 			select {
 			case <-ctx.Done():
 				return nil
@@ -877,6 +938,10 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			}
 			continue
 		}
+		if consecutiveFailures > 0 {
+			g.logf("telegram poll: recovered after %d failed getUpdates attempt(s)", consecutiveFailures)
+			consecutiveFailures = 0
+		}
 		backoff = time.Second
 
 		for _, upd := range updates {
@@ -885,8 +950,13 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			}
 			// Sender authorisation: drop messages from chats outside
 			// the allowlist before the handler (and the agent, and
-			// its tools) ever sees them.
+			// its tools) ever sees them. The drop is logged (when a
+			// logger is set) with the chat ID, so an operator who
+			// has not allowlisted themselves yet can find their
+			// chat ID in the daemon log and add it to
+			// telegram_allowed_chats. The text is never logged.
 			if !g.IsChatAllowed(upd.Message.Chat.ID) {
+				g.logf("telegram poll: dropped message from non-allowlisted chat %d (add it to telegram_allowed_chats to allow it)", upd.Message.Chat.ID)
 				continue
 			}
 			if ctx.Err() != nil {

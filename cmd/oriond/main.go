@@ -30,6 +30,11 @@ Usage:
   oriond                  run Telegram polling until interrupted
   oriond --help           show this help
   oriond --version        print version
+
+Environment:
+  ORION_TELEGRAM_BASE_URL override the Telegram Bot API endpoint
+                          (default https://api.telegram.org); for
+                          self-hosted Bot API servers and local tests
 `, version.Version)
 }
 
@@ -73,13 +78,33 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "oriond: no telegram token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
 		return 1
 	}
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, messaging.WithAllowedChats(a.Config.TelegramAllowedChats...))
+	// ORION_TELEGRAM_BASE_URL overrides the Bot API endpoint (default
+	// https://api.telegram.org). It exists for self-hosted Bot API
+	// servers, and it is what lets the daemon be exercised end to end
+	// against a local fake Bot API without a real token or network
+	// (see TestDaemonStartStopRestart in main_audit3_test.go). It
+	// never carries a secret — only the endpoint — so it is safe to
+	// set in a test or staging environment.
+	if baseURL := os.Getenv("ORION_TELEGRAM_BASE_URL"); baseURL != "" {
+		messaging.SetDefaultBaseURL(baseURL)
+	}
+	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
+		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
+		// Polling-health notes (transient getUpdates failures and
+		// the recovery after them) go to stderr, where the rest of
+		// the daemon's lifecycle logging already goes. Without this
+		// a network outage is invisible in the log: the process
+		// looks alive while polling is down.
+		messaging.WithLogger(func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "oriond: "+format+"\n", args...)
+		}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
 		return 1
 	}
-	if len(a.Config.TelegramAllowedChats) == 0 {
-		fmt.Fprintln(os.Stderr, "oriond: WARNING: telegram_allowed_chats is empty — any Telegram chat can drive the agent; set telegram_allowed_chats in config to restrict it")
+	if err := messaging.CheckTelegramAllowlist(a.Config.TelegramAllowedChats, a.Config.AllowAllTelegramChats); err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
+		return 1
 	}
 	username, err := gw.GetMe(ctx)
 	if err != nil {
@@ -105,6 +130,17 @@ func run(args []string) int {
 	if err := store.LoadError(); err != nil {
 		fmt.Fprintf(os.Stderr, "oriond: sessions file unusable, starting with defaults: %v\n", err)
 	}
+	// Persist sessions on every exit path (SIGTERM, /restart, fatal
+	// poll error): mutations already save immediately, but a daemon
+	// that ran with zero turns would otherwise leave no sessions
+	// file at all, and the next start could not tell "no sessions
+	// yet" from "sessions lost". Best-effort: a failed save is
+	// logged, never a reason to change the exit code.
+	defer func() {
+		if err := store.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "oriond: save sessions on shutdown: %v\n", err)
+		}
+	}()
 
 	// /restart signals here (buffered, so the signal is never lost
 	// when nothing is selecting yet). The signal is delayed 500ms so
@@ -160,6 +196,17 @@ func run(args []string) int {
 		// manually — see /restart's reply and ARCHITECTURE.md.
 		return 0
 	case <-ctx.Done():
+		// SIGINT/SIGTERM: let in-flight turns unwind and persist
+		// before Close saves and closes the memory store — the
+		// /restart path drains the same way. Exiting immediately
+		// could close the store under a turn that is still
+		// recording its last step. Turns are already cancelled
+		// (their contexts derive from ctx), so this is prompt
+		// unless a run is stuck in a non-cancellable operation;
+		// the 10s bound keeps shutdown from hanging either way.
+		if !a.Drain(10 * time.Second) {
+			fmt.Fprintln(os.Stderr, "oriond: shutdown: some runs still active after 10s; exiting anyway")
+		}
 		return 0
 	}
 }

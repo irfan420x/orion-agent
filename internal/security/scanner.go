@@ -195,40 +195,129 @@ func redactSchemeToken(scheme, m string) string {
 // only the token; URL credentials keep the user and redact only the
 // password. Ordinary words and URLs without credentials are left
 // unchanged.
+// redactMarkers: Go's regexp engine is slow on large inputs — a
+// single ReplaceAllString over 1 MiB costs 50–400 ms per pattern, so
+// the ~15 detectors in RedactSecrets cost ~1.5 s per MiB (and ~30 s
+// under -race), paid on EVERY tool result the loop handles. Each
+// detector below therefore has a literal marker that MUST be present
+// for the detector to match at all; the regex only runs when its
+// marker is present. A marker is a necessary condition, never a
+// sufficient one: a present marker just runs the regex as before, so
+// redaction behaviour is unchanged — an absent marker proves no
+// match exists, so skipping the regex is safe. The markers are
+// checked against the original text (replacements only ever remove
+// text, and "[REDACTED]" introduces no marker), and the generic
+// detectors use cheap byte scans instead of regexes. (Audit 3,
+// Workstream 1: a 3 MiB file_read was eating the agent step budget
+// in redaction alone.)
+func hasLongTokenRun(s string) bool {
+	// A generic-token match needs a run of 32+ token characters.
+	run := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '=' || c == '_' || c == '-' {
+			run++
+			if run >= 32 {
+				return true
+			}
+		} else {
+			run = 0
+		}
+	}
+	return false
+}
+
+func hasTelegramTokenShape(s string) bool {
+	// A Telegram match needs a maximal digit run of 8–10 digits
+	// immediately followed by ':'.
+	run := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			run++
+			continue
+		}
+		if c == ':' && run >= 8 && run <= 10 {
+			return true
+		}
+		run = 0
+	}
+	return false
+}
+
 func RedactSecrets(text string) string {
 	if text == "" {
 		return text
 	}
+	// One lowercased copy serves every case-insensitive marker
+	// check; strings.ToLower over 1 MiB costs ~2 ms, against
+	// ~1.5 s for the unguarded regexes.
+	lower := strings.ToLower(text)
 	redacted := text
 	// Private-key blocks first so their contents are never re-scanned.
-	redacted = privateKeyRe.ReplaceAllString(redacted, Redacted)
+	if strings.Contains(text, "-----BEGIN ") {
+		redacted = privateKeyRe.ReplaceAllString(redacted, Redacted)
+	}
 	// Anthropic before OpenAI: sk-ant-... must not be swallowed by sk-.
-	redacted = anthropicRe.ReplaceAllString(redacted, Redacted)
-	redacted = stripeRe.ReplaceAllString(redacted, Redacted)
-	redacted = openAIRe.ReplaceAllString(redacted, Redacted)
-	redacted = githubRe.ReplaceAllString(redacted, Redacted)
-	redacted = awsRe.ReplaceAllString(redacted, Redacted)
-	redacted = telegramRe.ReplaceAllString(redacted, Redacted)
-	redacted = slackRe.ReplaceAllString(redacted, Redacted)
+	if strings.Contains(text, "sk-ant-") {
+		redacted = anthropicRe.ReplaceAllString(redacted, Redacted)
+	}
+	if strings.Contains(lower, "sk_") || strings.Contains(lower, "rk_") {
+		redacted = stripeRe.ReplaceAllString(redacted, Redacted)
+	}
+	if strings.Contains(text, "sk-") {
+		redacted = openAIRe.ReplaceAllString(redacted, Redacted)
+	}
+	if strings.Contains(text, "ghp_") || strings.Contains(text, "gho_") ||
+		strings.Contains(text, "ghu_") || strings.Contains(text, "ghs_") ||
+		strings.Contains(text, "ghr_") || strings.Contains(text, "github_pat_") {
+		redacted = githubRe.ReplaceAllString(redacted, Redacted)
+	}
+	if strings.Contains(text, "AKIA") || strings.Contains(text, "ASIA") {
+		redacted = awsRe.ReplaceAllString(redacted, Redacted)
+	}
+	if hasTelegramTokenShape(text) {
+		redacted = telegramRe.ReplaceAllString(redacted, Redacted)
+	}
+	if strings.Contains(text, "xox") {
+		redacted = slackRe.ReplaceAllString(redacted, Redacted)
+	}
 	// Bearer/Basic tokens: keep the scheme, redact only the token — and
 	// only when the token looks like a real token, so ordinary prose
 	// such as "Bearer authentication" is left alone.
-	redacted = bearerRe.ReplaceAllStringFunc(redacted, func(m string) string {
-		return redactSchemeToken("Bearer", m)
-	})
-	redacted = basicRe.ReplaceAllStringFunc(redacted, func(m string) string {
-		return redactSchemeToken("Basic", m)
-	})
-	redacted = jwtRe.ReplaceAllString(redacted, Redacted)
+	if strings.Contains(lower, "bearer") {
+		redacted = bearerRe.ReplaceAllStringFunc(redacted, func(m string) string {
+			return redactSchemeToken("Bearer", m)
+		})
+	}
+	if strings.Contains(lower, "basic") {
+		redacted = basicRe.ReplaceAllStringFunc(redacted, func(m string) string {
+			return redactSchemeToken("Basic", m)
+		})
+	}
+	if strings.Contains(text, "eyJ") {
+		redacted = jwtRe.ReplaceAllString(redacted, Redacted)
+	}
 	// URL credentials: keep "scheme://user:", redact only the password.
-	redacted = urlCredsRe.ReplaceAllString(redacted, "${1}"+Redacted+"@")
+	if strings.Contains(text, "://") && strings.Contains(text, "@") {
+		redacted = urlCredsRe.ReplaceAllString(redacted, "${1}"+Redacted+"@")
+	}
 	// Slack webhook URLs: keep the service prefix, redact the secret path.
-	redacted = slackWebhookRe.ReplaceAllString(redacted, "${1}"+Redacted)
+	if strings.Contains(text, "hooks.slack.com") {
+		redacted = slackWebhookRe.ReplaceAllString(redacted, "${1}"+Redacted)
+	}
 	// Bare high-entropy tokens, guarded by looksLikeHighEntropyToken.
-	redacted = redactGenericTokens(redacted)
+	if hasLongTokenRun(text) {
+		redacted = redactGenericTokens(redacted)
+	}
 	// Generic assignments: keep key name and separator, redact the value.
 	// Values already replaced above read as "[REDACTED]" and stay redacted.
-	redacted = assignmentRe.ReplaceAllString(redacted, "${1}${2}"+Redacted)
+	if strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") ||
+		strings.Contains(lower, "access_key") || strings.Contains(lower, "token") ||
+		strings.Contains(lower, "password") || strings.Contains(lower, "passwd") ||
+		strings.Contains(lower, "secret") {
+		redacted = assignmentRe.ReplaceAllString(redacted, "${1}${2}"+Redacted)
+	}
 	return redacted
 }
 

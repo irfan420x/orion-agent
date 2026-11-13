@@ -27,8 +27,9 @@
 //     number silently breaks a legitimate command. The dangerous
 //     set, by contrast, is small and enumerable: mount/namespace
 //     escapes, kernel-module and reboot calls, keyring and BPF
-//     access, host clock/hostname changes, and cross-process
-//     memory access. The namespace + chroot + read-only mounts
+//     access, host clock/hostname changes, cross-process memory
+//     access, and kernel attack surface no sandbox tool needs
+//     (io_uring, modify_ldt). The namespace + chroot + read-only mounts
 //     remain the primary containment; seccomp is defense in depth
 //     against the sandboxed process reaching the kernel directly.
 //   - Blocked syscalls fail with EPERM, except clone3 which fails
@@ -161,8 +162,12 @@ var seccompTables = []seccompArch{
 			{"fsopen", 430}, {"fsconfig", 431}, {"fsmount", 432}, {"fspick", 433},
 			{"open_tree", 428}, {"move_mount", 429}, {"mount_setattr", 442},
 			// Host control: reboot, swap, modules, clock, hostname.
-			// The sandbox shares the host UTS namespace and clock,
-			// so these would act on the host, not the sandbox.
+			// The sandbox shares the host clock (no CLONE_NEWTIME),
+			// so clock calls would act on the host, not the
+			// sandbox. sethostname/setdomainname are blocked as
+			// defense in depth: the sandbox has its own UTS
+			// namespace (CLONE_NEWUTS), so they would only rename
+			// the sandbox — but there is no reason to allow them.
 			{"reboot", 169}, {"swapon", 167}, {"swapoff", 168},
 			{"kexec_load", 246}, {"kexec_file_load", 320},
 			{"init_module", 175}, {"finit_module", 313}, {"delete_module", 176},
@@ -182,6 +187,18 @@ var seccompTables = []seccompArch{
 			// Cross-process memory access (the agent runs as the
 			// same uid; /proc is empty inside but pids can be guessed).
 			{"process_vm_readv", 310}, {"process_vm_writev", 311},
+			// Kernel attack surface with no legitimate sandbox
+			// use: io_uring (a large, historically exploited
+			// async-I/O surface; no shell tool in the sandbox
+			// needs it) and modify_ldt (16-bit segment setup;
+			// nothing in the sandbox uses it). Found by Audit 3
+			// adversarial probing: modify_ldt was live-proven
+			// UNBLOCKED under the old filter; io_uring was
+			// already EPERM on this host (the cell filter blocks
+			// it), so its Orion-filter blocking is proven by
+			// TestSeccompFilterProgram, not by the live probe.
+			{"io_uring_setup", 425}, {"io_uring_enter", 426}, {"io_uring_register", 427},
+			{"modify_ldt", 154},
 			// The sandboxed process must not install its own filter
 			// (a filter can only restrict further, but a second
 			// filter would make the effective policy unpredictable).
@@ -214,6 +231,10 @@ var seccompTables = []seccompArch{
 			{"syslog", 116},
 			{"acct", 89}, {"quotactl", 60}, {"vhangup", 58},
 			{"process_vm_readv", 270}, {"process_vm_writev", 271},
+			// io_uring: see the amd64 note above. (No
+			// modify_ldt on arm64: asm-generic has no such
+			// syscall.)
+			{"io_uring_setup", 425}, {"io_uring_enter", 426}, {"io_uring_register", 427},
 			{"seccomp", 277},
 		},
 		blockedENOSYS: []blockedSyscall{

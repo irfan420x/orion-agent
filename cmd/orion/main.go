@@ -656,14 +656,23 @@ func cmdTelegram(ctx context.Context, args []string) error {
 	if a.Config.TelegramToken == "" {
 		return fmt.Errorf("telegram: no token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
 	}
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, messaging.WithAllowedChats(a.Config.TelegramAllowedChats...))
+	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
+		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
+		// Polling-health notes and dropped-chat IDs go to stderr,
+		// where the rest of the CLI's lifecycle logging goes.
+		messaging.WithLogger(func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "orion: "+format+"\n", args...)
+		}))
 	if err != nil {
 		return err
 	}
 	switch args[0] {
 	case "poll":
-		if len(a.Config.TelegramAllowedChats) == 0 {
-			fmt.Fprintln(os.Stderr, "telegram: WARNING: telegram_allowed_chats is empty — any Telegram chat can drive the agent; set telegram_allowed_chats in config to restrict it")
+		// An empty allowlist refuses startup (see
+		// messaging.CheckTelegramAllowlist): polling with no
+		// allowlist would let any Telegram chat drive the agent.
+		if err := messaging.CheckTelegramAllowlist(a.Config.TelegramAllowedChats, a.Config.AllowAllTelegramChats); err != nil {
+			return err
 		}
 		fmt.Println("telegram: polling for messages (Ctrl+C to stop)...")
 		return gw.Poll(ctx, func(c context.Context, chatID int64, text string) (string, error) {
@@ -692,16 +701,25 @@ Run Telegram polling until interrupted. Takes no arguments.
 	if a.Config.TelegramToken == "" {
 		return fmt.Errorf("daemon: no telegram token configured; run `orion chat` for CLI mode instead")
 	}
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, messaging.WithAllowedChats(a.Config.TelegramAllowedChats...))
+	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
+		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
+		// Polling-health notes and dropped-chat IDs go to stderr,
+		// where the rest of the CLI's lifecycle logging goes.
+		messaging.WithLogger(func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "orion: "+format+"\n", args...)
+		}))
 	if err != nil {
+		return err
+	}
+	// An empty allowlist refuses startup (see
+	// messaging.CheckTelegramAllowlist): polling with no allowlist
+	// would let any Telegram chat drive the agent.
+	if err := messaging.CheckTelegramAllowlist(a.Config.TelegramAllowedChats, a.Config.AllowAllTelegramChats); err != nil {
 		return err
 	}
 	username, err := gw.GetMe(ctx)
 	if err != nil {
 		return fmt.Errorf("daemon: telegram getMe: %w", err)
-	}
-	if len(a.Config.TelegramAllowedChats) == 0 {
-		fmt.Fprintln(os.Stderr, "daemon: WARNING: telegram_allowed_chats is empty — any Telegram chat can drive the agent; set telegram_allowed_chats in config to restrict it")
 	}
 	active, err := a.Config.ActiveProvider()
 	if err != nil {

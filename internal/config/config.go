@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -116,12 +117,21 @@ type Config struct {
 	// may drive the agent. When non-empty, the gateway drops messages
 	// from any other chat before the handler runs: without it, anyone
 	// who discovers the bot username could run the OS agent (including
-	// shell_exec). When empty, all chats are accepted (first-run
-	// convenience); the daemon logs a warning in that case.
+	// shell_exec). When empty, the daemon refuses to start polling
+	// unless AllowAllTelegramChats is set — an empty allowlist must
+	// never silently mean "everyone".
 	TelegramAllowedChats []int64 `json:"telegram_allowed_chats"`
-	DataDir              string  `json:"data_dir"`
-	MaxSteps             int     `json:"max_steps"`
-	TimeoutSeconds       int     `json:"timeout_seconds"`
+	// AllowAllTelegramChats explicitly permits ANY Telegram chat to
+	// drive the agent even when TelegramAllowedChats is empty.
+	// Default false. Only set this to true if you really mean it:
+	// anyone who discovers the bot username can then run the OS
+	// agent, including shell_exec. The safe path is to leave this
+	// false and list your chat IDs in TelegramAllowedChats (send
+	// /whoami to the bot to learn your chat ID).
+	AllowAllTelegramChats bool   `json:"allow_all_telegram_chats"`
+	DataDir               string `json:"data_dir"`
+	MaxSteps              int    `json:"max_steps"`
+	TimeoutSeconds        int    `json:"timeout_seconds"`
 	// MaxToolResultBytes caps the bytes of any single tool result
 	// that reach the model (enforced centrally in the tools
 	// registry; see TruncateToolResult). Results over the cap are
@@ -153,9 +163,20 @@ type Config struct {
 	// when off, shell_exec behaves exactly as before, protected
 	// only by the IsBlockedCommand denylist. When on and the
 	// mechanism is available, commands run confined to
-	// Sandbox.Root/work; when on but unavailable, shell_exec falls
-	// back to the denylist alone and logs a warning.
+	// Sandbox.Root/work; when on but unavailable, shell_exec
+	// REFUSES the command (fail-closed) unless
+	// sandbox.allow_unsandboxed_fallback is explicitly true.
 	Sandbox sandbox.Config `json:"sandbox"`
+
+	// TrustedEgressCIDRs lists CIDR ranges this deployment's egress
+	// DNS may map public hosts into (for example, this deployment's
+	// egress-gateway range 198.18.31.0/24). Addresses in these ranges count
+	// as public for web_fetch's SSRF guard, even though they would
+	// otherwise be refused. Empty (the default) is strict: no
+	// exception, and 198.18.0.0/15 is treated as non-public. Only
+	// list ranges the deployment actually controls: anything listed
+	// here becomes fetchable by the model.
+	TrustedEgressCIDRs []string `json:"trusted_egress_cidrs"`
 
 	// fileSecrets snapshots the secrets as loaded from the config
 	// file, before environment overrides are applied. envSecrets
@@ -332,7 +353,29 @@ func (c *Config) Validate() error {
 	if err := c.Sandbox.Validate(); err != nil {
 		return err
 	}
+	// Every trusted egress CIDR must parse: a typo here would
+	// otherwise silently leave the range untrusted (fetch failures)
+	// or, worse, be ignored while the operator believes it applies.
+	for _, cidr := range c.TrustedEgressCIDRs {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+			return fmt.Errorf("config: trusted_egress_cidrs entry %q is not a valid CIDR: %v", cidr, err)
+		}
+	}
 	return nil
+}
+
+// tightenConfigPerms chmods a config file to 0600 when its current
+// mode grants anything to group or others. Best effort: every error
+// is swallowed so a read-only or oddly-owned file never breaks Load.
+func tightenConfigPerms(path string) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if fi.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	_ = os.Chmod(path, 0o600)
 }
 
 // validateBaseURL checks a provider base URL is an http(s) URL with a host.
@@ -388,6 +431,15 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
+	// Tighten a lax config file in place: the file may hold API keys
+	// and a Telegram token, and users routinely hand-edit it with an
+	// editor that creates it 0644 (or copy it in with looser modes).
+	// Save already replaces such a file with a 0600 one, but a config
+	// that is only ever *read* — the normal daemon/CLI path — would
+	// otherwise stay world-readable forever. Best effort only: a
+	// failed chmod (read-only filesystem, unusual ownership) must not
+	// stop Orion from starting; the file is still read.
+	tightenConfigPerms(path)
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}

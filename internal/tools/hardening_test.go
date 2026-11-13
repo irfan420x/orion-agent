@@ -195,11 +195,16 @@ func TestFetchCheckRedirectBlocksPrivate(t *testing.T) {
 	if err := fetchCheckRedirect(req, nil); err == nil {
 		t.Fatal("redirect to 127.0.0.1: expected refusal")
 	}
-	public, err := http.NewRequest("GET", "https://example.com/x", nil)
+	// A public target passes the check. This uses a literal public
+	// IP, not a hostname: a hostname would depend on real DNS, and
+	// this deployment's egress DNS maps public hosts into
+	// 198.18.245.0/24, which is non-public unless the deployment
+	// lists it in trusted_egress_cidrs.
+	public, err := http.NewRequest("GET", "https://93.184.216.34/x", nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
 	if err := fetchCheckRedirect(public, nil); err != nil {
-		t.Fatalf("redirect to example.com: %v, want nil (public host passes the check)", err)
+		t.Fatalf("redirect to public IP 93.184.216.34: %v, want nil (public host passes the check)", err)
 	}
 }

@@ -128,11 +128,7 @@ type openAIChatResponse struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
-	Error *struct {
-		Message string `json:"message"`
-		Type    string `json:"type,omitempty"`
-		Code    string `json:"code,omitempty"`
-	} `json:"error,omitempty"`
+	Error *openAIAPIError `json:"error,omitempty"`
 }
 
 type openAIStreamChunk struct {
@@ -143,6 +139,41 @@ type openAIStreamChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
+	// Error is set on SSE error events (data: {"error": {...}}): a
+	// provider-side failure delivered inside a 200 stream. It must
+	// surface as an error, never be skipped as an unusable chunk —
+	// skipping it let the Chat fallback silently mask a failure the
+	// provider explicitly reported (Audit 3 stress).
+	Error *openAIAPIError `json:"error,omitempty"`
+}
+
+// openAIAPIError is one provider error object. Message may be empty
+// (some servers send {"error":{"type":...}} with no message); the
+// error is still an error — describe() falls back to type/code so an
+// empty message can never make an error object look like success.
+type openAIAPIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type,omitempty"`
+	Code    string `json:"code,omitempty"`
+}
+
+func (e *openAIAPIError) describe() string {
+	if e == nil {
+		return "unspecified error"
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Type != "" && e.Code != "" {
+		return e.Type + " (" + e.Code + ")"
+	}
+	if e.Type != "" {
+		return e.Type
+	}
+	if e.Code != "" {
+		return e.Code
+	}
+	return "unspecified error"
 }
 
 // --- conversion ---
@@ -231,8 +262,11 @@ func (p *openAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("%s: decoding response: %w (body: %s)", p.Name(), err, bodyExcerpt(body))
 	}
-	if resp.Error != nil && resp.Error.Message != "" {
-		return nil, fmt.Errorf("%s: API error: %s", p.Name(), resp.Error.Message)
+	if resp.Error != nil {
+		// Any error object is a failure, even with an empty
+		// message: a present-but-empty error used to fall through
+		// and return the choices as success (Audit 3 stress).
+		return nil, fmt.Errorf("%s: API error: %s", p.Name(), resp.Error.describe())
 	}
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("%s: response contained no choices", p.Name())
@@ -248,6 +282,13 @@ func (p *openAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 			Name:      tc.Function.Name,
 			Arguments: tc.Function.Arguments,
 		})
+	}
+	if msg.Content == "" && len(msg.ToolCalls) == 0 {
+		// An empty reply with no tool calls is not an answer:
+		// returning it as success hands the agent loop a blank
+		// turn (Audit 3 stress). A null content with tool calls
+		// is legitimate and unaffected.
+		return nil, fmt.Errorf("%s: response contained no content or tool calls", p.Name())
 	}
 	usage := estimateUsage(req, msg, Usage{
 		PromptTokens:     resp.Usage.PromptTokens,
@@ -318,6 +359,13 @@ func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 			var chunk openAIStreamChunk
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				continue
+			}
+			if chunk.Error != nil {
+				// An explicit provider error inside the
+				// stream: report it, never skip it and
+				// let the Chat fallback mask it.
+				resp.Body.Close()
+				return nil, fmt.Errorf("%s: stream error: %s", p.Name(), chunk.Error.describe())
 			}
 			for _, choice := range chunk.Choices {
 				if choice.Delta.Content != "" {

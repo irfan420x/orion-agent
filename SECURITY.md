@@ -161,13 +161,12 @@ none of them degrades silently:
 3. Availability is probed up front: `sandbox.Available()` runs a
    trivial command through the full wrapper, including the PID
    namespace and the `/proc` mount. If the host cannot do it, the
-   sandbox reports unavailable and `shell_exec` falls back to the
-   denylist alone — loudly: a warning is logged and the result is
-   marked `[warning: sandbox ...]`. That is the pre-existing,
-   deliberate policy for a host that cannot sandbox at all (see
-   "Limits" below); it is a once-per-process capability decision,
-   not a per-command silent downgrade, and it is not changed by
-   this phase.
+   sandbox reports unavailable and `shell_exec` REFUSES the command
+   rather than running it unsandboxed — fail-closed by default (see
+   "Limits" below). Only an explicit opt-in
+   (`sandbox.allow_unsandboxed_fallback=true`) restores the old
+   warn-and-run behaviour. The probe is a once-per-process
+   capability decision, not a per-command silent downgrade.
 
 This makes `unshare(1)` (util-linux, in `/usr`) a sandbox
 availability dependency alongside `python3`: if it is absent the
@@ -201,8 +200,11 @@ between runs; `/tmp` does not.
   `sandbox.Available()` probes the real mechanism (a trivial
   command through the full wrapper) and caches the result. When
   sandbox mode is on but unavailable — or setup fails — `shell_exec`
-  falls back to the denylist alone, logs a warning, and marks the
-  result `[warning: sandbox ...]` instead of failing outright.
+  REFUSES the command (fail-closed) instead of running it
+  unsandboxed; only an explicit
+  `sandbox.allow_unsandboxed_fallback=true` restores the old
+  warn-and-run behaviour (warning logged, result marked
+  `[warning: sandbox ...]`).
 - The sandbox confines the **filesystem, network, and syscall
   surface**, not the process's own capabilities in the abstract:
   the sandboxed process is root inside its own user namespace, so
@@ -310,14 +312,13 @@ When no usable launcher is found (or the kernel probe fails), the
 command still runs — namespaces + pivot_root only — and a warning
 is logged once (`TestSeccompFallbackWithoutLauncher`).
 
-Open: `install.sh`/`Makefile` do not yet build or install
-`orion-seccomp`, so in a normal install the filter is inactive
-until that wiring lands (the sandbox package, tests, and this doc
-are ready for it). The host cell itself already runs under a
-seccomp filter that blocks a subset (`swapon`, `kexec`, `bpf`,
-`userfaultfd`, `setns`, `settimeofday`, `syslog` on this VM); the
-sandbox filter is the portable layer that blocks the rest on any
-host.
+Open: none — `install.sh` and the `Makefile` build and install
+`orion-seccomp` alongside `orion`/`oriond`, so in a normal install
+the filter is active whenever a usable launcher is present. The
+host cell itself already runs under a seccomp filter that blocks a
+subset (`swapon`, `kexec`, `bpf`, `userfaultfd`, `setns`,
+`settimeofday`, `syslog` on this VM); the sandbox filter is the
+portable layer that blocks the rest on any host.
 
 ## Secret handling
 
@@ -346,9 +347,14 @@ verification. The log is created 0600 in a 0700 directory.
 
 - `telegram_allowed_chats` in config lists the chat IDs that may
   drive the agent. The gateway drops messages from any other chat
-  before the handler (and the agent, and its tools) ever sees them.
-  When the list is empty, all chats are accepted and the daemon
-  prints a warning — set the allowlist before exposing the bot.
+  before the handler (and the agent, and its tools) ever sees them,
+  and logs the dropped chat's ID so an operator who has not
+  allowlisted themselves yet can find it in the daemon log. When
+  the list is empty, the daemon refuses to start polling at all
+  unless `allow_all_telegram_chats=true` is set explicitly in
+  config — an empty allowlist must never silently mean "everyone".
+  Set the allowlist (send `/whoami` to the bot to learn your chat
+  ID) before exposing the bot.
 - Gateway errors never leak the bot token: `*url.Error` embeds the
   request URL (which contains the token), so errors are wrapped in
   a redacting error type (`[redacted]` in `Error()`; `Unwrap()` is

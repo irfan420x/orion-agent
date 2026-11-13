@@ -398,6 +398,23 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 				})
 				continue
 			}
+			// An empty final answer — no content and no tool calls
+			// — is an error, not a silent success: the caller
+			// (Telegram, CLI) would otherwise send the user
+			// nothing at all, with no indication anything went
+			// wrong. The provider layer already guards its own
+			// paths (no choices is an error; an empty stream falls
+			// back to Chat), but a choice with empty content and
+			// finish "stop" can still reach the loop, so the loop
+			// enforces the same contract here: the caller never
+			// gets an empty reply with a nil error. The empty
+			// message is not stored, so the next turn starts from
+			// clean history. (Audit 3, Workstream 1.)
+			if strings.TrimSpace(resp.Message.Content) == "" {
+				nerr := fmt.Errorf("core: provider returned an empty response at step %d", step+1)
+				finishTurn(nerr)
+				return "", nerr
+			}
 			assistantMsg := model.Message{Role: "assistant", Content: resp.Message.Content}
 			messages = append(messages, assistantMsg)
 			if err := a.memory.AddMessage(assistantMsg); err != nil {

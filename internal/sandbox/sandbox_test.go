@@ -129,6 +129,81 @@ func TestPrepareRejectsBadConfig(t *testing.T) {
 	}
 }
 
+// TestPrepareRefusesSymlinkedRoot is the regression test for the
+// symlink-validation-order hole: Prepare used to MkdirAll the root
+// tree FIRST and only then EvalSymlinks + re-validate, so a root
+// that is a symlink into a system tree got directories created
+// under the target before validation could stop it. Now the root is
+// canonicalized and validated before anything is created: Prepare
+// must refuse, and no directories may appear under the target.
+// The target is a path under /etc (a real system tree) that must
+// not exist before the test; the symlink itself lives in
+// t.TempDir() and is harmless.
+func TestPrepareRefusesSymlinkedRoot(t *testing.T) {
+	target := "/etc/orion-sandbox-test-root"
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Skipf("refusing to test against pre-existing %s (err %v)", target, err)
+	}
+	t.Cleanup(func() { os.RemoveAll(target) })
+
+	t.Run("root is a symlink into a system tree", func(t *testing.T) {
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("/bin/sh", "-c", "true")
+		cmd.Env = []string{"PATH=/usr/bin:/bin"}
+		if err := (Config{Enabled: true, Root: link}).Prepare(cmd, "true"); err == nil {
+			t.Error("Prepare with a root symlinked into /etc: want error, got nil")
+		}
+		if _, err := os.Lstat(target); !os.IsNotExist(err) {
+			t.Errorf("target %s exists after refused Prepare: directories were created under the system tree (err %v)", target, err)
+		}
+	})
+
+	t.Run("root under a symlinked ancestor into a system tree", func(t *testing.T) {
+		sub := "/etc/orion-sandbox-test-sub"
+		if _, err := os.Lstat(sub); !os.IsNotExist(err) {
+			t.Skipf("refusing to test against pre-existing %s", sub)
+		}
+		t.Cleanup(func() { os.RemoveAll(sub) })
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink("/etc", link); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("/bin/sh", "-c", "true")
+		cmd.Env = []string{"PATH=/usr/bin:/bin"}
+		if err := (Config{Enabled: true, Root: filepath.Join(link, "orion-sandbox-test-sub")}).Prepare(cmd, "true"); err == nil {
+			t.Error("Prepare with a root under a symlink into /etc: want error, got nil")
+		}
+		if _, err := os.Lstat(sub); !os.IsNotExist(err) {
+			t.Errorf("target %s exists after refused Prepare: directories were created under the system tree", sub)
+		}
+	})
+}
+
+// TestPrepareFirstRunRootNotExist proves the normal first-run path
+// still works after the canonicalize-first change: a root that does
+// not exist yet (only its parent does) must be accepted, and the
+// root tree created under it.
+func TestPrepareFirstRunRootNotExist(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root") // does not exist yet
+	cmd := exec.Command("/bin/sh", "-c", "true")
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	if err := (Config{Enabled: true, Root: root}).Prepare(cmd, "true"); err != nil {
+		t.Fatalf("Prepare with a not-yet-existing root: %v", err)
+	}
+	for _, d := range []string{
+		filepath.Join(root, "work"),
+		filepath.Join(root, ".orion-root", "usr"),
+		filepath.Join(root, ".orion-root", "etc"),
+	} {
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+			t.Errorf("expected directory %s after Prepare, err %v", d, err)
+		}
+	}
+}
+
 // TestSandboxContainsDestructiveCommand is the core containment
 // proof. Everything happens inside t.TempDir(): the sandbox root,
 // a canary file OUTSIDE the root, and a canary file inside /work.

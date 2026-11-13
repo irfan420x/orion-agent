@@ -72,10 +72,28 @@ type anthropicResponse struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
-	Error *struct {
-		Type    string `json:"type,omitempty"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
+	Error *anthropicAPIError `json:"error,omitempty"`
+}
+
+// anthropicAPIError is one provider error object. Message may be
+// empty; describe() falls back to the type so an empty message can
+// never make an error object look like success (Audit 3 stress).
+type anthropicAPIError struct {
+	Type    string `json:"type,omitempty"`
+	Message string `json:"message"`
+}
+
+func (e *anthropicAPIError) describe() string {
+	if e == nil {
+		return "unspecified error"
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Type != "" {
+		return e.Type
+	}
+	return "unspecified error"
 }
 
 // --- conversion ---
@@ -299,8 +317,16 @@ func (p *anthropicProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("anthropic: decoding response: %w (body: %s)", err, bodyExcerpt(body))
 	}
-	if resp.Error != nil && resp.Error.Message != "" {
-		return nil, fmt.Errorf("anthropic: API error: %s", resp.Error.Message)
+	if resp.Error != nil {
+		// Any error object is a failure, even with an empty
+		// message: a present-but-empty error used to fall through
+		// and return the content as success (Audit 3 stress).
+		return nil, fmt.Errorf("anthropic: API error: %s", resp.Error.describe())
+	}
+	if len(resp.Content) == 0 {
+		// No content blocks at all is not an answer: it used to
+		// return an empty message as success (Audit 3 stress).
+		return nil, fmt.Errorf("anthropic: response contained no content blocks")
 	}
 	msg := Message{Role: "assistant"}
 	for _, block := range resp.Content {
@@ -318,6 +344,11 @@ func (p *anthropicProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 				Arguments: args,
 			})
 		}
+	}
+	if msg.Content == "" && len(msg.ToolCalls) == 0 {
+		// Content blocks were present but carried nothing usable
+		// (e.g. only unknown block types): still not an answer.
+		return nil, fmt.Errorf("anthropic: response contained no content or tool calls")
 	}
 	usage := estimateUsage(req, msg, Usage{
 		PromptTokens:     resp.Usage.InputTokens,
@@ -418,6 +449,20 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 				continue
 			}
 			switch event {
+			case "error":
+				// An explicit provider error inside the stream:
+				// report it, never skip it and let the Chat
+				// fallback silently mask a failure the provider
+				// explicitly reported (Audit 3 stress).
+				var ev struct {
+					Error anthropicAPIError `json:"error"`
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					resp.Body.Close()
+					return nil, fmt.Errorf("anthropic: stream error event with unparseable payload: %s", bodyExcerpt([]byte(data)))
+				}
+				resp.Body.Close()
+				return nil, fmt.Errorf("anthropic: stream error: %s", ev.Error.describe())
 			case "message_start":
 				var ev struct {
 					Message struct {
@@ -464,6 +509,15 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 				b := blockAt(ev.Index)
 				switch ev.Delta.Type {
 				case "text_delta":
+					// A text delta for a block that never saw a
+					// content_block_start (malformed server, or a
+					// start event lost to a skipped line) is
+					// still text: without this the chunk is
+					// delivered to the callback but dropped from
+					// the returned message (Audit 3 stress).
+					if b.typ == "" {
+						b.typ = "text"
+					}
 					if ev.Delta.Text != "" {
 						emitted++
 						b.text.WriteString(ev.Delta.Text)
@@ -473,6 +527,14 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 						}
 					}
 				case "input_json_delta":
+					// Same defaulting as text: a tool_use block
+					// is recognised by its input fragments even
+					// without a start event. A nameless block
+					// still never reaches the caller — see the
+					// assembly filter below.
+					if b.typ == "" {
+						b.typ = "tool_use"
+					}
 					b.input.WriteString(ev.Delta.PartialJSON)
 				}
 			case "message_delta":
@@ -532,6 +594,14 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 			case "text":
 				content.WriteString(b.text.String())
 			case "tool_use":
+				// A tool_use block with no name can never
+				// execute (e.g. input fragments with no start
+				// event): drop it, like OpenAI drops padded
+				// nameless calls — it must not reach the
+				// agent as a call to "".
+				if strings.TrimSpace(b.name) == "" {
+					continue
+				}
 				args := strings.TrimSpace(b.input.String())
 				if args == "" {
 					args = "{}"

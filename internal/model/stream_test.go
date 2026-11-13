@@ -205,7 +205,11 @@ func TestOpenAIChatNullContentToolCall(t *testing.T) {
 	}
 }
 
-// TestOllamaChatNullContent: same null-content shape on Ollama.
+// TestOllamaChatNullContent: a null content with no tool calls is an
+// empty reply, which Chat now rejects instead of returning as success
+// (Audit 3 stress: an empty reply must be a clear error, never a
+// silent success). Null content WITH a tool call is still fine —
+// see TestStressOllamaChatNullContentWithToolCall.
 func TestOllamaChatNullContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -213,12 +217,12 @@ func TestOllamaChatNullContent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := mustProvider(t, "ollama", srv.URL).Chat(context.Background(), sampleRequest())
-	if err != nil {
-		t.Fatalf("Chat: %v", err)
+	_, err := mustProvider(t, "ollama", srv.URL).Chat(context.Background(), sampleRequest())
+	if err == nil {
+		t.Fatal("Chat with null content and no tool calls: expected an error, got nil")
 	}
-	if resp.Message.Content != "" {
-		t.Fatalf("Content = %q, want empty string for JSON null", resp.Message.Content)
+	if !strings.Contains(err.Error(), "no content") {
+		t.Fatalf("error = %q, want a no-content error", err.Error())
 	}
 }
 

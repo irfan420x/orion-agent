@@ -139,19 +139,37 @@ func TestAudit2IsPublicIPRanges(t *testing.T) {
 		{"8.8.8.8", true},
 		{"93.184.216.34", true}, // example.com's public address
 		{"2001:4860:4860::8888", true},
-		// 198.18/15 is deliberately allowed: this deployment's
-		// egress DNS maps every public host into 198.18.245/24,
-		// so blocking it would refuse every public fetch.
-		{"198.18.245.209", true},
+		// 198.18/15 is non-public by default (strict): the old
+		// global exception for this deployment's egress DNS is
+		// gone, replaced by config trusted_egress_cidrs (see the
+		// trusted-range check below).
+		{"198.18.245.209", false},
 	}
 	for _, tc := range cases {
 		ip := net.ParseIP(tc.ip)
 		if ip == nil {
 			t.Fatalf("ParseIP(%q) failed", tc.ip)
 		}
-		if got := isPublicIP(ip); got != tc.want {
-			t.Errorf("isPublicIP(%s) = %v, want %v", tc.ip, got, tc.want)
+		if got := isPublicIP(ip, nil); got != tc.want {
+			t.Errorf("isPublicIP(%s, nil) = %v, want %v", tc.ip, got, tc.want)
 		}
+	}
+
+	// Trusted egress range: 198.18/15 counts as public only when
+	// listed in trusted_egress_cidrs — and only that range, not
+	// other non-public addresses.
+	trusted, err := parseTrustedEgressCIDRs([]string{"198.18.0.0/15"})
+	if err != nil {
+		t.Fatalf("parseTrustedEgressCIDRs: %v", err)
+	}
+	if !isPublicIP(net.ParseIP("198.18.245.209"), trusted) {
+		t.Errorf("isPublicIP(198.18.245.209, trusted 198.18/15) = false, want true")
+	}
+	if !isPublicIP(net.ParseIP("198.19.0.1"), trusted) {
+		t.Errorf("isPublicIP(198.19.0.1, trusted 198.18/15) = false, want true")
+	}
+	if isPublicIP(net.ParseIP("10.0.0.1"), trusted) {
+		t.Errorf("isPublicIP(10.0.0.1, trusted 198.18/15) = true, want false (unrelated private range stays refused)")
 	}
 }
 

@@ -465,3 +465,53 @@ func TestBuildLocalPartialSkillsDir(t *testing.T) {
 		t.Errorf("skills output should still list the good skill, got %q", out)
 	}
 }
+
+// --- Telegram allowlist startup enforcement (ChatGPT rc2 audit,
+// Finding 3) ---
+
+// writeAllowlistTestConfig writes a config with a fake-but-valid
+// token and the local ollama provider, so polling entry points can
+// be exercised without any network. allowlist is written as
+// telegram_allowed_chats; allowAll as allow_all_telegram_chats.
+func writeAllowlistTestConfig(t *testing.T, home string, allowlist string, allowAll bool) {
+	t.Helper()
+	body := `{"default_provider":"ollama","providers":{"ollama":{"name":"ollama","base_url":"http://localhost:11434","model":"llama3.1"}},"telegram_token":"123456:AAAAAAAAAAAAAAAAAAAA","telegram_allowed_chats":` + allowlist + `,"allow_all_telegram_chats":` + map[bool]string{true: "true", false: "false"}[allowAll] + `,"data_dir":"` + home + `/.orion"}`
+	if err := os.MkdirAll(home+"/.orion", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(home+"/.orion/config.json", []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCmdDaemonEmptyAllowlistRefuses: `orion daemon` with an empty
+// allowlist and no opt-in must fail before any network call (the
+// refusal happens before getMe), with an actionable error.
+func TestCmdDaemonEmptyAllowlistRefuses(t *testing.T) {
+	home := scratchHome(t)
+	writeAllowlistTestConfig(t, home, `[]`, false)
+	_, err := capture(func() error { return cmdDaemon(context.Background(), nil) })
+	if err == nil {
+		t.Fatal("daemon with empty allowlist: got nil, want a refusal error")
+	}
+	for _, want := range []string{"telegram_allowed_chats", "allow_all_telegram_chats", "/whoami"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("daemon refusal %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+// TestCmdTelegramPollEmptyAllowlistRefuses: `orion telegram poll`
+// refuses the same way; `telegram test` (token check only) is
+// unaffected because it never starts polling.
+func TestCmdTelegramPollEmptyAllowlistRefuses(t *testing.T) {
+	home := scratchHome(t)
+	writeAllowlistTestConfig(t, home, `[]`, false)
+	_, err := capture(func() error { return cmdTelegram(context.Background(), []string{"poll"}) })
+	if err == nil {
+		t.Fatal("telegram poll with empty allowlist: got nil, want a refusal error")
+	}
+	if !strings.Contains(err.Error(), "telegram_allowed_chats") {
+		t.Errorf("telegram poll refusal %q does not mention telegram_allowed_chats", err.Error())
+	}
+}

@@ -55,7 +55,7 @@ func Build(path string) (*App, error) {
 	logger := log.New(os.Stderr, "orion: ", log.LstdFlags)
 	cfg, err := config.Load(path)
 	if err != nil {
-		return nil, fmt.Errorf("app: config: %w", err)
+		return nil, fmt.Errorf("app: %w", err)
 	}
 	active, err := cfg.ActiveProvider()
 	if err != nil {
@@ -70,7 +70,7 @@ func Build(path string) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: provider %q: %w", active.Name, err)
 	}
-	registry, err := tools.DefaultRegistryWithSandbox(cfg.Sandbox)
+	registry, err := tools.DefaultRegistryWithSandboxAndTrustedEgress(cfg.Sandbox, cfg.TrustedEgressCIDRs)
 	if err != nil {
 		return nil, err
 	}
@@ -138,9 +138,9 @@ func BuildLocal(path string) (*Local, error) {
 	logger := log.New(os.Stderr, "orion: ", log.LstdFlags)
 	cfg, err := config.Load(path)
 	if err != nil {
-		return nil, fmt.Errorf("app: config: %w", err)
+		return nil, fmt.Errorf("app: %w", err)
 	}
-	registry, err := tools.DefaultRegistryWithSandbox(cfg.Sandbox)
+	registry, err := tools.DefaultRegistryWithSandboxAndTrustedEgress(cfg.Sandbox, cfg.TrustedEgressCIDRs)
 	if err != nil {
 		return nil, err
 	}

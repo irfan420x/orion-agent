@@ -71,9 +71,12 @@
 //     chroot/mount as a further layer.
 //   - The only writable places inside are /work (which persists on
 //     the host at <root>/work) and /tmp (a per-run tmpfs that
-//     vanishes with the namespace). /home, /etc, /usr and every other
-//     host path are either absent or read-only, so even `rm -rf /`
-//     inside can only destroy the sandbox's own contents.
+//     vanishes with the namespace, size-bounded to 256M so filling
+//     it cannot consume host RAM without bound — Audit 3 found
+//     it unbounded before the size=, defaulting to 50% of RAM).
+//     /home, /etc, /usr and every other host path are either
+//     absent or read-only, so even `rm -rf /` inside can only
+//     destroy the sandbox's own contents.
 //   - /proc is a real procfs for the new PID namespace, mounted by
 //     the wrapper before the pivot (see above for why it must be
 //     mounted before the user-namespace switch). It is mounted with
@@ -110,8 +113,9 @@
 //     agent's uid in the host user namespace, so as a non-root agent
 //     the very first mount fails and the probe reports the sandbox
 //     unavailable. Available() probes the real mechanism and reports
-//     false otherwise; shell_exec then falls back to the denylist
-//     alone, with a warning.
+//     false otherwise; shell_exec then refuses the command
+//     (fail-closed) unless the operator explicitly opted into an
+//     unsandboxed fallback with sandbox.allow_unsandboxed_fallback=true.
 //   - /sys is an empty directory inside: no host kernel information
 //     leaks in. /proc, by contrast, is a real procfs for the new PID
 //     namespace (see above) — tools that need it (ps, /proc/self/…)
@@ -157,6 +161,14 @@ type Config struct {
 	// whenever a usable launcher is found, and the command runs
 	// without it (with a warning logged once) when none is.
 	DisableSeccomp bool `json:"disable_seccomp"`
+	// AllowUnsandboxedFallback, when true, lets shell_exec run a
+	// command unsandboxed (with a warning) when the sandbox is
+	// enabled but cannot be established — unavailable mechanism or
+	// a Prepare failure. Default false: fail-closed. With the
+	// default, a command is REFUSED outright rather than run
+	// without the isolation the operator opted into; opt into the
+	// fallback only when that degradation is acceptable.
+	AllowUnsandboxedFallback bool `json:"allow_unsandboxed_fallback"`
 }
 
 // DefaultRoot returns the default sandbox root under dataDir.
@@ -253,7 +265,7 @@ for d in null zero full random urandom; do
     mount --bind "/dev/$d" "$NEWROOT/dev/$d" || exit 126
   fi
 done
-mount -t tmpfs -o nosuid,nodev,noexec tmpfs "$NEWROOT/tmp" || exit 126
+mount -t tmpfs -o nosuid,nodev,noexec,size=256M tmpfs "$NEWROOT/tmp" || exit 126
 mount --bind "$ROOT/work" "$NEWROOT/work" || exit 126
 mount -o remount,bind,rw,nodev,nosuid "$NEWROOT/work" || exit 126
 mount --rbind "$NEWROOT" "$NEWROOT" || exit 126
@@ -366,7 +378,13 @@ func runProbe() {
 		return
 	}
 	defer os.RemoveAll(dir)
-	cfg := Config{Enabled: true, Root: filepath.Join(dir, "root")}
+	// The probe checks namespace/chroot availability only. The
+	// seccomp filter is a separate layer (validated by
+	// probeSeccompLauncher at setup time), so disable it here:
+	// otherwise every process that calls Available() logs a
+	// misleading "seccomp filter unavailable" warning even when
+	// the launcher is present and working for real commands.
+	cfg := Config{Enabled: true, Root: filepath.Join(dir, "root"), DisableSeccomp: true}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "true")
@@ -381,6 +399,39 @@ func runProbe() {
 		probeErr = fmt.Errorf("sandbox: probe command failed: %w", err)
 		return
 	}
+}
+
+// resolveRootCanonical returns the canonical (symlink-free) form of
+// root without creating anything. The root itself may not exist yet
+// (first run), so it resolves the longest existing ancestor with
+// EvalSymlinks and re-joins the not-yet-existing remainder. The
+// result is absolute and Clean.
+func resolveRootCanonical(root string) (string, error) {
+	rest := []string{}
+	cur := filepath.Clean(root)
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("sandbox: stat %s: %w", cur, err)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// The filesystem root always exists, so reaching here
+			// means something stranger than a missing path.
+			return "", fmt.Errorf("sandbox: no existing ancestor of %s", root)
+		}
+		rest = append([]string{filepath.Base(cur)}, rest...)
+		cur = parent
+	}
+	resolved, err := filepath.EvalSymlinks(cur)
+	if err != nil {
+		return "", fmt.Errorf("sandbox: resolve %s: %w", cur, err)
+	}
+	for _, comp := range rest {
+		resolved = filepath.Join(resolved, comp)
+	}
+	return resolved, nil
 }
 
 // Prepare rewrites cmd (a /bin/sh -c <command> invocation) to run
@@ -422,6 +473,21 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 	if root == "" {
 		return errors.New("sandbox: no root configured and no home directory to default from")
 	}
+	// Canonicalize + validate BEFORE creating anything. The root
+	// may be a symlink into a system tree (e.g. /tmp/link -> /etc)
+	// that passes the lexical Validate above; if MkdirAll ran
+	// first it would create sandbox directories under the target
+	// before validation could stop it. The root itself may not
+	// exist yet on first run, so resolve the longest existing
+	// ancestor and re-join the not-yet-existing remainder.
+	resolved, err := resolveRootCanonical(root)
+	if err != nil {
+		return err
+	}
+	if err := (Config{Root: resolved}).Validate(); err != nil {
+		return err
+	}
+	root = resolved
 	newRoot := filepath.Join(root, ".orion-root")
 	dirs := []string{
 		filepath.Join(root, "work"),
@@ -438,12 +504,12 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 			return fmt.Errorf("sandbox: create %s: %w", d, err)
 		}
 	}
-	// Resolve the root through symlinks and re-validate the real
-	// path: a root like /tmp/link where the link points at /etc
-	// would otherwise pass the lexical Validate check and put
-	// sandbox state (and the chroot tree) inside a system tree.
-	// The wrapper is handed the resolved root so $ROOT/work and
-	// $ROOT/.orion-root name the same directories it just created.
+	// Re-resolve after creation and re-validate as a second check:
+	// the root could have been swapped for a symlink between the
+	// canonicalization above and the MkdirAll (a concurrent
+	// replacement). The wrapper is handed the resolved root so
+	// $ROOT/work and $ROOT/.orion-root name the same directories
+	// it just created.
 	if resolved, err := filepath.EvalSymlinks(root); err != nil {
 		return fmt.Errorf("sandbox: resolve root %s: %w", root, err)
 	} else if resolved != root {

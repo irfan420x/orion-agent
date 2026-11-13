@@ -90,6 +90,19 @@ func (s *SessionStore) LoadError() error {
 	return s.loadErr
 }
 
+// Save persists the current in-memory state to disk, creating the
+// sessions file when it does not exist yet. Every mutation already
+// saves immediately, so this is normally a no-op rewrite; it exists
+// for clean shutdown, where it guarantees the sessions file is
+// present for the next start (a daemon that ran with zero turns
+// would otherwise leave no file at all). Best-effort at shutdown:
+// callers log the error but must not fail the exit.
+func (s *SessionStore) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
 // load reads the session file into the store. Callers must not hold
 // s.mu (it takes the write lock). Missing file = no error.
 func (s *SessionStore) load() error {
@@ -175,7 +188,25 @@ func (s *SessionStore) saveLocked() error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("messaging: rename temp sessions file: %w", err)
 	}
+	// Fsync the directory so the rename itself is durable: without
+	// this a crash (or kill -9 followed by a power loss) could roll
+	// sessions.json back to its previous contents even though the
+	// rename returned success. Same pattern as the memory and config
+	// stores.
+	if err := syncSessionDir(dir); err != nil {
+		return fmt.Errorf("messaging: sync sessions dir %q: %w", dir, err)
+	}
 	return nil
+}
+
+// syncSessionDir fsyncs a directory so renames into it survive a crash.
+func syncSessionDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // Get returns a copy of the session for chatID, creating it with

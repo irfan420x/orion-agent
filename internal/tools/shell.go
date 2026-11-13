@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -176,18 +177,34 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Sandbox mode (opt-in via config): confine the command to the
 	// namespace chroot. The denylist above has already run, so this
-	// is a second layer, not a substitute. When the mechanism is
-	// unavailable (or setup fails), fall back to running unsandboxed
-	// with a warning — the denylist still applies — rather than
-	// refusing to run at all.
+	// is a second layer, not a substitute. Fail-closed by default:
+	// when the sandbox is enabled but cannot be established
+	// (mechanism unavailable, or setup failed), the command is
+	// REFUSED rather than run unsandboxed — an operator who opted
+	// into isolation must not silently lose it. Only an explicit
+	// opt-in (sandbox.allow_unsandboxed_fallback=true) restores
+	// the old warn-and-run behaviour.
 	sandboxWarn := ""
 	if t.sandboxCfg.Enabled {
+		var sandboxErr error
 		if !sandbox.Available() {
-			sandboxWarn = fmt.Sprintf("sandbox unavailable (%v); ran without sandbox isolation", sandbox.AvailabilityError())
-			log.Printf("orion: shell_exec: %s", sandboxWarn)
+			if availErr := sandbox.AvailabilityError(); availErr != nil {
+				sandboxErr = fmt.Errorf("sandbox unavailable: %w", availErr)
+			} else {
+				sandboxErr = errors.New("sandbox unavailable: unknown reason")
+			}
 		} else if err := t.sandboxCfg.Prepare(cmd, cmdStr); err != nil {
-			sandboxWarn = fmt.Sprintf("sandbox setup failed (%v); ran without sandbox isolation", err)
-			log.Printf("orion: shell_exec: %s", sandboxWarn)
+			sandboxErr = fmt.Errorf("sandbox setup failed: %w", err)
+		}
+		if sandboxErr != nil {
+			if t.sandboxCfg.AllowUnsandboxedFallback {
+				sandboxWarn = fmt.Sprintf("%v; ran without sandbox isolation", sandboxErr)
+				log.Printf("orion: shell_exec: %s", sandboxWarn)
+			} else {
+				msg := fmt.Sprintf("%v; refusing to run unsandboxed (sandbox is enabled) — set sandbox.allow_unsandboxed_fallback=true to allow unsandboxed fallback", sandboxErr)
+				log.Printf("orion: shell_exec: %s", msg)
+				return "", &ToolError{Tool: t.Name(), Kind: "denied", Err: errors.New(msg)}
+			}
 		}
 	}
 	cmd.Cancel = func() error {

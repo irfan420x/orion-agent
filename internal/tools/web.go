@@ -8,6 +8,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/irfan/orion/internal/model"
@@ -43,6 +45,29 @@ var (
 // silently change search behaviour.
 var searchHTTPClient = &http.Client{Timeout: searchTimeout}
 
+// ipResolver is the minimal DNS interface web_fetch needs. It exists
+// so tests can substitute a scripted resolver (notably one that
+// changes its answer between calls — a DNS-rebinding attack) without
+// touching real DNS. Production uses net.DefaultResolver.
+type ipResolver interface {
+	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
+}
+
+// fetchProxyFunc selects the proxy for a web_fetch request. It
+// defaults to http.ProxyFromEnvironment. It is a variable (like
+// fetchResolver) so tests can select a proxy deterministically:
+// http.ProxyFromEnvironment reads the process environment exactly
+// once (sync.Once) and caches the result for the life of the
+// process, so per-test proxy changes via t.Setenv would otherwise
+// be silently ignored after the first fetch in the process.
+// Production behaviour is unchanged: the environment is fixed for
+// the life of the daemon, so the cached value is the right one.
+var fetchProxyFunc = http.ProxyFromEnvironment
+
+// fetchResolver resolves fetch hostnames. Production code must leave
+// it at net.DefaultResolver; tests swap it and restore it.
+var fetchResolver ipResolver = net.DefaultResolver
+
 // allowPrivateFetchHosts is test-only: tests point web_fetch at httptest
 // servers on 127.0.0.1. Production code must leave it false, or the
 // SSRF guard below is disabled.
@@ -55,19 +80,29 @@ var allowPrivateFetchHosts = false
 // Beyond net.IP's own checks, the ranges it does not cover are
 // refused too: 0/8 ("this network"), 100.64/10 (CGNAT), 192.0.0/24
 // (IETF protocol assignments), 240/4 (reserved), and the IPv6
-// documentation and NAT64 prefixes. 198.18/15 is NOT refused (see
-// nonPublicIPNets: this deployment's DNS maps public hosts there).
-func isPublicIP(ip net.IP) bool {
+// documentation and NAT64 prefixes.
+//
+// trusted lists deployment CIDRs (config trusted_egress_cidrs) whose
+// addresses count as public even though they would otherwise be
+// refused — e.g. an egress-gateway range this deployment's DNS maps
+// public hosts into. With no trusted nets the check is strict:
+// 198.18.0.0/15 (benchmarking) is non-public.
+func isPublicIP(ip net.IP, trusted []*net.IPNet) bool {
 	if ip == nil {
-		return false
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
 		return false
 	}
 	// Normalize IPv4-mapped IPv6 before the range checks.
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
+	}
+	for _, n := range trusted {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
 	}
 	for _, n := range nonPublicIPNets {
 		if n.Contains(ip) {
@@ -89,13 +124,13 @@ var nonPublicIPNets = func() []*net.IPNet {
 		"240.0.0.0/4",   // reserved (includes 255.255.255.255)
 		"2001:db8::/32", // IPv6 documentation
 		"64:ff9b::/96",  // IPv6 NAT64 well-known prefix
-		// NOTE: 198.18.0.0/15 (benchmarking) is deliberately NOT
-		// blocked: this deployment's egress DNS maps every public
-		// host into 198.18.245.0/24 (verified: example.com,
-		// www.google.com and api.deepseek.com all resolve there),
-		// so blocking it would refuse every public fetch. The
-		// range holds only the egress gateway (a router, not a
-		// service endpoint) in this environment.
+		"198.18.0.0/15", // benchmarking (RFC 2544) — non-public by
+		// default. The old global exception for this range (this
+		// deployment's egress DNS maps public hosts there) now lives
+		// in deployment configuration instead: config
+		// trusted_egress_cidrs, which isPublicIP takes as its
+		// trusted parameter and checks before this list. With no
+		// trusted CIDRs configured, 198.18/15 is refused.
 	} {
 		_, n, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -106,50 +141,178 @@ var nonPublicIPNets = func() []*net.IPNet {
 	return nets
 }()
 
-// checkFetchHost refuses hosts that resolve to a non-public address.
-// Literal IPs are checked directly; names are resolved and every
-// returned address must be public. Redirect targets are checked the
-// same way (see CheckRedirect in Execute).
-//
-// Residual risk: this is check-then-fetch, so a DNS-rebinding attack
-// could swap the address between the check and the dial. Fully
-// closing that needs dial-time IP pinning; this guard still blocks
-// every static SSRF target (localhost, RFC1918, 169.254/16).
-func checkFetchHost(ctx context.Context, host string) error {
-	if allowPrivateFetchHosts {
-		return nil
-	}
+// fetchSession is the per-fetch SSRF state: the trusted egress nets
+// for this fetch and the host -> validated-IP pins recorded by
+// resolveHost. One session serves one Execute call (initial URL plus
+// its redirects), so a hostname is resolved exactly once per fetch
+// and the dial can only ever land on an address this fetch validated.
+// A rebinding host that answers public first and private second is
+// therefore harmless: the second answer is never even asked for.
+type fetchSession struct {
+	trusted []*net.IPNet
+	mu      sync.Mutex
+	pins    map[string][]net.IP
+}
+
+func newFetchSession(trusted []*net.IPNet) *fetchSession {
+	return &fetchSession{trusted: trusted, pins: map[string][]net.IP{}}
+}
+
+// stripFetchHost returns the bare hostname of a URL host: port
+// stripped, IPv6 brackets removed. It is the key resolveHost pins
+// under and dialContext looks up.
+func stripFetchHost(host string) string {
 	h := host
 	if hh, _, err := net.SplitHostPort(host); err == nil {
 		h = hh
 	}
-	// IPv6 literals arrive bracketed ("[::1]") when no port is given.
-	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
-	if ip := net.ParseIP(h); ip != nil {
-		if !isPublicIP(ip) {
-			return fmt.Errorf("refusing to fetch non-public address %q", h)
-		}
+	return strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+}
+
+func (s *fetchSession) pinned(host string) ([]net.IP, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ips, ok := s.pins[host]
+	return ips, ok
+}
+
+func (s *fetchSession) setPin(host string, ips []net.IP) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]net.IP, len(ips))
+	copy(cp, ips)
+	s.pins[host] = cp
+}
+
+// resolveHost resolves host ONCE, validates every returned address
+// against the public-address rule (plus this session's trusted egress
+// nets), and records the validated addresses as the dial pin for the
+// host. A second call for the same host returns the recorded pin
+// without resolving again, so a rebinding answer can never reach the
+// dial: dialContext only ever uses addresses this call validated.
+//
+// Literal IPs are checked directly and pinned to themselves. When
+// allowPrivateFetchHosts is set (tests only), validation is skipped
+// but the pin is still recorded, so test fetches to local servers
+// dial the resolved address exactly once as well.
+func (s *fetchSession) resolveHost(ctx context.Context, host string) error {
+	h := stripFetchHost(host)
+	if ips, ok := s.pinned(h); ok && len(ips) > 0 {
 		return nil
 	}
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", h)
+	if ip := net.ParseIP(h); ip != nil {
+		if !allowPrivateFetchHosts && !isPublicIP(ip, s.trusted) {
+			return fmt.Errorf("refusing to fetch non-public address %q", h)
+		}
+		s.setPin(h, []net.IP{ip})
+		return nil
+	}
+	ips, err := fetchResolver.LookupIP(ctx, "ip", h)
 	if err != nil {
 		return fmt.Errorf("cannot resolve host %q: %w", h, err)
 	}
 	if len(ips) == 0 {
 		return fmt.Errorf("host %q has no addresses", h)
 	}
-	for _, ip := range ips {
-		if !isPublicIP(ip) {
-			return fmt.Errorf("host %q resolves to non-public address %s", h, ip)
+	if !allowPrivateFetchHosts {
+		for _, ip := range ips {
+			if !isPublicIP(ip, s.trusted) {
+				return fmt.Errorf("host %q resolves to non-public address %s", h, ip)
+			}
 		}
 	}
+	s.setPin(h, ips)
 	return nil
 }
 
-// fetchCheckRedirect is the http.Client redirect policy for web_fetch:
-// at most 5 redirects, and every redirect target is re-checked against
-// the SSRF guard, so a public URL must not bounce the fetch onto a
-// private address.
+// pinnedDialer dials a validated IP. Its per-attempt timeout is
+// shorter than the fetch timeout so a blackholed first answer does
+// not eat the whole fetch budget before the next validated IP is
+// tried; the fetch context's deadline bounds the total.
+var pinnedDialer = &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+
+// proxyFallbackDialer mirrors http.DefaultTransport's dialer for the
+// one case dialContext does not pin: the egress proxy's own address.
+var proxyFallbackDialer = &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+
+// dialContext dials a pinned host by its validated IP(s), in order,
+// until one connects. Hosts this session never resolved — notably
+// the egress proxy's own address, which the Transport dials instead
+// of the target whenever a proxy is configured for the URL — fall
+// through to the standard dialer, so proxy-side resolution stays
+// the proxy's responsibility (see newClient).
+//
+// The original hostname is preserved for TLS SNI and the HTTP Host
+// header: the Transport derives both from the request URL, not from
+// the address DialContext dials, so dialing a validated IP changes
+// neither (verified by TestFetchPinnedDialPreservesSNIAndHost).
+func (s *fetchSession) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	host = stripFetchHost(host)
+	ips, ok := s.pinned(host)
+	if !ok || len(ips) == 0 {
+		return proxyFallbackDialer.DialContext(ctx, network, address)
+	}
+	var errs []error
+	for _, ip := range ips {
+		conn, err := pinnedDialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, err)
+	}
+	return nil, errors.Join(errs...)
+}
+
+// checkRedirect is the http.Client redirect policy for web_fetch: at
+// most 5 redirects, and every redirect target is resolved, validated
+// and pinned (resolveHost) before the redirect is followed, so a
+// public URL must not bounce the fetch onto a private address — and a
+// rebinding redirect target cannot swap its address between the
+// check and the dial either.
+func (s *fetchSession) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return fmt.Errorf("too many redirects (max 5)")
+	}
+	return s.resolveHost(req.Context(), req.URL.Host)
+}
+
+// newClient builds the per-fetch http.Client: a clone of
+// http.DefaultTransport (so timeouts, keep-alives and HTTP/2 stay at
+// the standard defaults) with the proxy function kept
+// (fetchProxyFunc, default http.ProxyFromEnvironment) — a custom
+// Transport that drops Proxy breaks this deployment's egress proxy —
+// and DialContext replaced by the session's pinned dialer. When a
+// proxy is configured for the URL the Transport dials the proxy, not
+// the target, so the pinned dialer is not consulted for the target
+// and the resolveHost pre-check is the guard; proxy-side resolution
+// is the proxy's responsibility.
+func (s *fetchSession) newClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = fetchProxyFunc
+	tr.DialContext = s.dialContext
+	return &http.Client{CheckRedirect: s.checkRedirect, Transport: tr}
+}
+
+// checkFetchHost refuses hosts that resolve to a non-public address.
+// Literal IPs are checked directly; names are resolved and every
+// returned address must be public. Kept for the package-level
+// redirect policy used by tests; new code should use
+// fetchSession.resolveHost, which additionally pins the validated
+// addresses for the dial.
+func checkFetchHost(ctx context.Context, host string) error {
+	return newFetchSession(nil).resolveHost(ctx, host)
+}
+
+// fetchCheckRedirect is the http.Client redirect policy for web_fetch
+// with strict defaults (no trusted egress CIDRs): at most 5
+// redirects, and every redirect target is re-checked against the
+// SSRF guard, so a public URL must not bounce the fetch onto a
+// private address. Execute uses fetchSession.checkRedirect, which
+// additionally pins each redirect target.
 func fetchCheckRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 {
 		return fmt.Errorf("too many redirects (max 5)")
@@ -160,7 +323,42 @@ func fetchCheckRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-type webFetchTool struct{}
+// parseTrustedEgressCIDRs parses trusted egress CIDRs; an empty or
+// malformed entry is an error, never silently skipped.
+func parseTrustedEgressCIDRs(cidrs []string) ([]*net.IPNet, error) {
+	var nets []*net.IPNet
+	for _, c := range cidrs {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			return nil, fmt.Errorf("trusted egress CIDR must not be empty")
+		}
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted egress CIDR %q: %w", c, err)
+		}
+		nets = append(nets, n)
+	}
+	return nets, nil
+}
+
+type webFetchTool struct {
+	// trusted holds the deployment's trusted egress CIDRs, parsed
+	// once at construction (see newWebFetchTool). The zero value is
+	// the strict default: no trusted ranges.
+	trusted []*net.IPNet
+}
+
+// newWebFetchTool builds a web_fetch tool trusting the given egress
+// CIDRs (config trusted_egress_cidrs). A malformed CIDR is a
+// programmer/configuration error and fails loudly here, at
+// construction, rather than being silently ignored per fetch.
+func newWebFetchTool(trustedCIDRs []string) (*webFetchTool, error) {
+	nets, err := parseTrustedEgressCIDRs(trustedCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("tools: web_fetch: %w", err)
+	}
+	return &webFetchTool{trusted: nets}, nil
+}
 
 func (t *webFetchTool) Name() string { return "web_fetch" }
 
@@ -222,7 +420,14 @@ func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 
 	reqCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
-	if err := checkFetchHost(reqCtx, parsed.Host); err != nil {
+	// Resolve once, validate, and pin: the per-fetch session records
+	// the validated IPs and the client's pinned dialer only ever
+	// dials those, so no second DNS resolution can rebind the host
+	// between this check and the dial. When a proxy is configured
+	// for the URL the dial goes to the proxy instead and this
+	// pre-check is the guard (see fetchSession.newClient).
+	session := newFetchSession(t.trusted)
+	if err := session.resolveHost(reqCtx, parsed.Host); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "denied", Err: err}
 	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, raw, nil)
@@ -231,7 +436,8 @@ func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	}
 	req.Header.Set("User-Agent", userAgent)
 
-	client := &http.Client{CheckRedirect: fetchCheckRedirect}
+	client := session.newClient()
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		if reqCtx.Err() != nil {

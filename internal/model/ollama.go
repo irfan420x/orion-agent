@@ -183,6 +183,13 @@ func (p *ollamaProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	if len(msg.ToolCalls) > 0 {
 		finish = "tool_calls"
 	}
+	if msg.Content == "" && len(msg.ToolCalls) == 0 {
+		// An empty reply with no tool calls is not an answer:
+		// returning it as success hands the agent loop a blank
+		// turn (Audit 3 stress). A null content with tool calls
+		// is legitimate and unaffected.
+		return nil, fmt.Errorf("ollama: response contained no content or tool calls")
+	}
 	// DoneReason describes how the turn ended; it must not overwrite
 	// the tool_calls finish reason for a tool-call turn.
 	if resp.DoneReason != "" && len(msg.ToolCalls) == 0 {
