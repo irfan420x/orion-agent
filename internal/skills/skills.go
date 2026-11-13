@@ -623,9 +623,15 @@ var nonSkillObjectWords = map[string]bool{
 //     instrumental or prepositional head ("Activate the tool
 //     using the skill", "Activate the tool for this skill") is
 //     the object of that phrase, not of "activate", and loads.
-//     "To activate the tool, run it once" (tool only, or no skill
-//     at all) is prose and loads; "Activate the skill using the
-//     tool" (skill first) is a directive and is refused.
+//     A skill after a separator that starts a new clause with
+//     itself (or a compound subject) as the subject ("Activate
+//     the tool, the skill waits", "Activate the tool and the
+//     skill is ready") is likewise not an object (Audit 11
+//     F-A11-1: the clause is recognised by shape — any verb
+//     form — not by a finite verb list). "To activate the tool,
+//     run it once" (tool only, or no skill at all) is prose and
+//     loads; "Activate the skill using the tool" (skill first)
+//     is a directive and is refused.
 //   - Reactivation forms: "reactivate" and "activating" direct
 //     activation like "activate" does (Audit 9 F-A9-P2-4). The
 //     -ion nouns ("activation"/"reactivation") direct it only
@@ -790,6 +796,240 @@ func isClauseVerb(word string) bool {
 	return activateObjectClosers[word] && !objectCloserNonVerbs[word]
 }
 
+// verbFormNonVerbs are words that look like a verb form by suffix
+// (-s, -ed, -ing) but are not verbs in the position after a skill
+// subject, so isVerbForm must not read them as a new clause
+// (F-A11-1):
+//   - nouns that form a noun-noun compound with "skill" ("the
+//     skill tools", "the skill settings") — the compound is still
+//     a list object of "activate", not a clause;
+//   - the subject noun itself ("skill", "skills"), pronouns and
+//     demonstratives ("this", "its", "his");
+//   - prepositions and preposition-like participles that head a
+//     phrase modifying the noun ("the skill during the meeting",
+//     "the skill according to the manual", "the skill including
+//     the venv" — "including X" extends the list with X, so the
+//     skill is still an object);
+//   - the noun "speed" (ends in -ed but is not a past-tense verb
+//     here).
+var verbFormNonVerbs = map[string]bool{
+	// Noun-noun compounds with "skill".
+	"items": true, "options": true, "settings": true,
+	"examples": true, "parts": true, "tools": true,
+	// The subject noun itself, pronouns, demonstratives.
+	"skill": true, "skills": true,
+	"this": true, "its": true, "his": true, "hers": true,
+	"ours": true, "yours": true, "theirs": true, "yes": true,
+	// Prepositions / preposition-like participles.
+	"during": true, "according": true, "including": true,
+	"excluding": true, "regarding": true, "concerning": true,
+	"besides": true, "towards": true,
+	// -ed nouns.
+	"speed": true,
+	// -ing nouns/pronouns.
+	"thing": true, "something": true, "anything": true,
+	"nothing": true, "everything": true,
+}
+
+// baseFormVerbs are common verbs in their base form, recognised
+// only after a plural or compound subject (F-A11-1): a plural
+// subject takes a base-form verb ("the skills wait", "the skill
+// and the venv wait"), and a base form has no distinctive suffix,
+// so morphology cannot recognise it. The set is deliberately
+// small and gated to plural subjects — a singular subject with a
+// base-form verb is ungrammatical, and the word is more likely a
+// noun modifier ("the skill work" = work about skills), so base
+// forms are never recognised after a singular "skill". "start"
+// and "begin" are deliberately absent, as in
+// activateObjectClosers: starting a skill is close enough to
+// activating it that the line errs toward rejection.
+var baseFormVerbs = map[string]bool{
+	"wait": true, "work": true, "explain": true,
+	"finish": true, "complete": true, "happen": true,
+	"remain": true, "continue": true, "stop": true,
+	"fail": true, "succeed": true, "pass": true,
+	"respond": true, "reply": true, "report": true,
+	"provide": true, "support": true, "handle": true,
+	"manage": true, "perform": true, "operate": true,
+	"function": true, "apply": true, "belong": true,
+	"depend": true, "matter": true, "change": true,
+	"grow": true, "improve": true, "appear": true,
+	"seem": true, "become": true, "exist": true,
+	"need": true, "want": true, "include": true,
+	"contain": true, "require": true, "allow": true,
+	"enable": true, "cause": true, "lead": true,
+	"follow": true, "hold": true, "bring": true,
+	"carry": true, "move": true, "stay": true,
+	"live": true, "play": true, "talk": true,
+	"speak": true, "listen": true, "look": true,
+	"feel": true, "think": true, "know": true,
+	"understand": true, "learn": true, "teach": true,
+	"ask": true, "answer": true, "arrive": true,
+	"leave": true, "die": true, "prefer": true,
+	"mean": true,
+}
+
+// clauseAdverbs are adverbs that can sit between a subject and its
+// verb ("the skill then waits", "the skill now works"): the verb
+// after the adverb still starts the clause (F-A11-1).
+var clauseAdverbs = map[string]bool{
+	"then": true, "now": true, "already": true, "still": true,
+	"just": true, "also": true, "always": true, "never": true,
+	"soon": true, "later": true, "first": true, "finally": true,
+	"eventually": true,
+}
+
+// isVerbForm reports whether word looks like a verb form, by shape
+// rather than by a finite verb list (F-A11-1): a copula/auxiliary
+// or an object-region verb (see isClauseVerb), a third-person
+// singular present (-s), a past tense (-ed), or a progressive
+// participle (-ing). After a singular skill subject, the verb of
+// its clause must be one of these shapes, so any of them after
+// "the skill" starts a new clause ("the skill waits / works /
+// explains the plan", "the skill finished", "the skill waiting").
+// The plural flag is for a plural or compound subject, whose verb
+// is a base form ("the skills wait", "the skill and the venv
+// wait") — recognised from baseFormVerbs, because a base form has
+// no distinctive suffix. A small set of words that end in -s/-ed/
+// -ing but are nouns or prepositions in this position (see
+// verbFormNonVerbs) is excluded, so a noun-noun compound ("the
+// skill tools") is still read as a list object.
+func isVerbForm(word string, plural bool) bool {
+	if isClauseVerb(word) {
+		return true
+	}
+	if verbFormNonVerbs[word] {
+		return false
+	}
+	// Progressive participle ("the skill waiting").
+	if strings.HasSuffix(word, "ing") && len(word) > 4 {
+		return true
+	}
+	// Past tense ("the skill finished").
+	if strings.HasSuffix(word, "ed") && len(word) > 3 {
+		return true
+	}
+	// Third-person singular present ("the skill waits"). A
+	// trailing "ss" is a noun ("class"), not a verb.
+	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 {
+		return true
+	}
+	// Base form, only for a plural/compound subject.
+	if plural && baseFormVerbs[word] {
+		return true
+	}
+	return false
+}
+
+// skillStartsNewClause reports whether the skill at fields[j] is
+// the subject of a new clause, so it is not an object of
+// "activate" (F-A11-1). A new clause starts when the word after
+// the skill is a verb (see isVerbForm — a copula/auxiliary, an
+// object-region verb, or any other verb form recognised by shape),
+// possibly after an adverb ("the skill then waits") or after a
+// parenthetical comma ("the skill, is ready"), or when the skill
+// is the first part of a compound subject ("the skill and the
+// venv are ready"). Anything else after the skill — the end of
+// the line, punctuation, a preposition or subordinating
+// conjunction ("the skill for beginners"), another noun ("the
+// skill the tool"), or a further list item ("the skill and the
+// venv", with no verb after it) — leaves the skill a list object.
+func skillStartsNewClause(fields []string, j int) bool {
+	// A plural subject ("the skills ...") takes a base-form verb
+	// ("the skills wait"), a singular one an -s/-ed/-ing form.
+	plural := strings.Trim(fields[j], ".,;:()[]\"'`!?") == "skills"
+	// A parenthetical comma after the skill ("the skill, is
+	// ready") separates the subject from its verb; skip it.
+	k := j + 1
+	for k < len(fields) {
+		word := strings.Trim(fields[k], ".,;:()[]\"'`!?")
+		if word == "" {
+			raw := fields[k]
+			if strings.Contains(raw, ",") && !strings.ContainsAny(raw, ".!?;:") {
+				k++
+				continue
+			}
+			return false
+		}
+		break
+	}
+	if k >= len(fields) {
+		return false
+	}
+	next := strings.Trim(fields[k], ".,;:()[]\"'`!?")
+	if next == "and" || next == "or" {
+		// A conjunction after the skill: either another list
+		// item ("the skill and the venv") or a compound
+		// subject ("the skill and the venv are ready").
+		return compoundSubjectStartsClause(fields, k)
+	}
+	if objectCloserNonVerbs[next] {
+		// A preposition or subordinating conjunction heads a
+		// phrase modifying the noun ("the skill for
+		// beginners", "the skill that helps"), not a clause.
+		return false
+	}
+	if clauseAdverbs[next] {
+		// An adverb between the subject and its verb ("the
+		// skill then waits"): the verb after the adverb
+		// still starts the clause.
+		if k+1 >= len(fields) {
+			return false
+		}
+		after := strings.Trim(fields[k+1], ".,;:()[]\"'`!?")
+		if after == "" {
+			return false
+		}
+		return isVerbForm(after, plural)
+	}
+	return isVerbForm(next, plural)
+}
+
+// compoundSubjectStartsClause reports whether the "and"/"or" at
+// fields[k] joins the skill into a compound subject of a new
+// clause (F-A11-1): "the skill and the venv are ready". It scans
+// the words after the conjunction until it finds a verb (a new
+// clause, with the compound subject as its subject) or a list
+// terminator — the end of the line, a comma or sentence
+// terminator, or a preposition ("the skill and the venv", "the
+// skill and the venv, the tool", "the skill and the venv for
+// beginners" are still lists of objects). A further "and"/"or"
+// continues the compound subject ("the skill and the venv and the
+// tool are ready"). The compound subject is plural, so a verb may
+// be a base form ("the skill and the venv wait") as well as an
+// -s/-ed/-ing form or an auxiliary.
+func compoundSubjectStartsClause(fields []string, k int) bool {
+	for j := k + 1; j < len(fields); j++ {
+		raw := fields[j]
+		word := strings.Trim(raw, ".,;:()[]\"'`!?")
+		if word == "" {
+			// A punctuation-only field ends the list here.
+			return false
+		}
+		if objectCloserNonVerbs[word] {
+			// A preposition or subordinating conjunction
+			// heads a phrase modifying the noun, not a
+			// clause.
+			return false
+		}
+		if word == "and" || word == "or" {
+			// Another part of the compound subject.
+			continue
+		}
+		if isVerbForm(word, true) {
+			return true
+		}
+		if strings.ContainsAny(raw, ".,!?;:") {
+			// A comma or sentence terminator attached to a
+			// non-verb ends the list here.
+			return false
+		}
+		// Otherwise a subject word (an article, an adjective,
+		// or a noun): keep scanning for the verb.
+	}
+	return false
+}
+
 // commaListNamesSkill reports whether the fields after a comma
 // (starting at index i+1) name the skill as another object of
 // the same "activate" — a comma-separated object list (F-A10-3):
@@ -800,10 +1040,12 @@ func isClauseVerb(word string) bool {
 // modifiers (articles, adjectives, further commas and
 // conjunctions); the scan stops at the first word that is a verb,
 // an object closer, or a sentence terminator. A skill found this
-// way is a list object UNLESS the word after it starts a new
-// clause with the skill as subject ("Activate the tool, the skill
-// is ready" — "is" makes the skill the subject of a new clause,
-// not an object), in which case it is not.
+// way is a list object UNLESS it starts a new clause with itself
+// (or a compound subject) as the subject ("Activate the tool, the
+// skill is ready" — "is" makes the skill the subject of a new
+// clause, not an object), in which case it is not (F-A11-1: the
+// clause is recognised by shape, see skillStartsNewClause, not
+// by a finite verb list).
 func commaListNamesSkill(fields []string, i int) bool {
 	for j := i + 1; j < len(fields); j++ {
 		raw := fields[j]
@@ -819,23 +1061,9 @@ func commaListNamesSkill(fields []string, i int) bool {
 		}
 		if word == "skill" || word == "skills" {
 			// The skill, named as a list item. It is an object
-			// of "activate" unless the next word starts a new
-			// clause with it as the subject.
-			if j+1 >= len(fields) {
-				return true
-			}
-			next := strings.Trim(fields[j+1], ".,;:()[]\"'`!?")
-			if next == "" {
-				// Punctuation only after the skill — a
-				// terminator ("the skill.") or another comma
-				// ("the skill, and ...") — keeps it a list
-				// object.
-				return true
-			}
-			if isClauseVerb(next) {
-				return false
-			}
-			return true
+			// of "activate" unless it starts a new clause with
+			// itself (or a compound subject) as the subject.
+			return !skillStartsNewClause(fields, j)
 		}
 		if activateObjectClosers[word] {
 			return false
@@ -863,12 +1091,29 @@ func commaListNamesSkill(fields []string, i int) bool {
 // and the elision "then"; a comma keeps it open only before
 // "then"/"and"/"or" — or before a comma-separated object list
 // naming the skill ("Activate the tool, the skill", F-A10-3),
-// which is still an object of the occurrence unless the word
-// after the skill starts a new clause with the skill as its
+// which is still an object of the occurrence unless the skill
+// starts a new clause with itself (or a compound subject) as the
 // subject ("Activate the tool, the skill is ready"); and a
 // sentence terminator (".", "!", "?", ";", ":") closes it.
+//
+// The new-clause carve-out applies only to a skill reached after
+// a separator (a comma or a conjunction/elision, F-A11-1):
+// "Activate the tool and the skill is ready" and "Activate the
+// tool, and the skill is ready" name the skill as the subject of
+// "is ready", not as an object of "activate". A skill in the
+// direct-object position — immediately after "activate", before
+// any separator ("Activate the skill is ready", "Activate the
+// skill runs the tests") — is the object of "activate" whatever
+// follows it: the verb after it is a relative clause ("the skill
+// [that] runs the tests"), and if it were not the object then
+// "activate" would be bare, which is itself a directive.
 func segmentNamesSkillAsActivateObject(seg string) bool {
 	fields := strings.Fields(seg)
+	// seenSep records whether a comma or a conjunction/elision
+	// ("and"/"or"/"then") has been passed before the skill: only
+	// then is the skill a list/conjoined item that the new-clause
+	// carve-out can excuse (F-A11-1).
+	seenSep := false
 	for i, raw := range fields {
 		word := strings.Trim(raw, ".,;:()[]\"'`!?")
 		if word == "" {
@@ -882,6 +1127,7 @@ func segmentNamesSkillAsActivateObject(seg string) bool {
 			}
 			if strings.Contains(raw, ",") {
 				if i+1 < len(fields) && isObjectContinuationWord(fields[i+1]) {
+					seenSep = true
 					continue
 				}
 				if commaListNamesSkill(fields, i) {
@@ -892,7 +1138,23 @@ func segmentNamesSkillAsActivateObject(seg string) bool {
 			continue
 		}
 		if word == "skill" || word == "skills" {
+			// A skill in the direct-object position is an
+			// object of "activate" whatever follows it; after
+			// a separator it is a list/conjoined item, and it
+			// is not an object when it starts a new clause
+			// with itself (or a compound subject) as the
+			// subject (F-A11-1).
+			if seenSep && skillStartsNewClause(fields, i) {
+				return false
+			}
 			return true
+		}
+		if word == "and" || word == "or" || word == "then" {
+			// A conjunction/elision before the skill: what
+			// follows is a conjoined or elided object, or a
+			// new clause.
+			seenSep = true
+			continue
 		}
 		if activateObjectClosers[word] {
 			return false
@@ -905,6 +1167,7 @@ func segmentNamesSkillAsActivateObject(seg string) bool {
 		}
 		if strings.HasSuffix(raw, ",") {
 			if i+1 < len(fields) && isObjectContinuationWord(fields[i+1]) {
+				seenSep = true
 				continue
 			}
 			// A comma-separated object list naming the skill

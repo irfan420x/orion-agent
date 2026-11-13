@@ -4,6 +4,49 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc16] — 2026-11-14
+
+### Audit 11 fix (v0.2.0-rc16) — see `AUDIT11_2026-11-14.md`
+
+Fixes the single P2 from the fresh-eyes audit of rc15 (0 P0, 0 P1, 1 P2).
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open, and F-A3-2 (no pprof/debug endpoint) is still open.
+Verified by the release coordinator on the final commit: **1,186
+tests pass, 0 fail, 4 skip (total 1,190), 21/21 packages, race clean
+21/21, no data race**; live DeepSeek proof `17*23+5=396` (rc15: 1,185
+total: 1,181 pass, 0 fail, 4 skip).
+
+- **F-A11-1** — The comma-list new-clause carve-out now recognises a
+  new clause by shape, not by a finite verb list: the word after the
+  skill starts a new clause when it is any verb form — a
+  copula/auxiliary, an object-region verb, or a third-person singular
+  present (`-s`), past (`-ed`), or progressive (`-ing`) form
+  recognised morphologically ("Activate the tool, the skill waits /
+  works / explains the plan", "the skill finished", "the skill
+  waiting"), possibly after an adverb ("the skill then waits") or a
+  parenthetical comma ("the skill, is ready") — or when the skill is
+  the first part of a compound subject followed by a verb ("the skill
+  and the venv are ready", "the skill and the venv wait"). The
+  carve-out now also covers the "and"/"then" path, which had none
+  ("Activate the tool, and/then the skill is ready" rejected on both
+  rc14 and rc15): the main loop in
+  `segmentNamesSkillAsActivateObject` consults the following word
+  instead of returning true on a bare "skill". A skill in the
+  direct-object position — immediately after "activate", before any
+  separator ("Activate the skill is ready") — is still the object
+  whatever follows it: the verb after it is a relative clause, and
+  if the skill were not the object then "activate" would be bare,
+  which is itself a directive. A small set of words that look like
+  verb forms but are nouns or prepositions in this position ("the
+  skill tools", "the skill during the meeting", "the skill
+  including the venv") is excluded, so a noun-noun compound is
+  still read as a list object. Regression tests
+  (`internal/skills/rc16_skills_test.go`, 5 test functions, 54
+  subtests: new-clause verbs, compound subjects, the and/then path,
+  all 12 rc15 reject variants, and 14 guard shapes) — verified
+  sensitive: with the fix reverted (rc15 code) all 27 must-load
+  subtests fail while all 26 must-reject guards pass.
+
 ## [0.2.0-rc15] — 2026-11-14
 
 ### Audit 10 fixes (v0.2.0-rc15) — see `AUDIT10_2026-11-14.md`
