@@ -136,11 +136,11 @@ type chatSession struct {
 	// sweptSubagents records subagent task IDs whose finished
 	// tokens the runChatTurn sweep already charged to this chat
 	// (F-A5-7), so a task is never charged twice across turns.
-	// lastSubagentSweep is when the sweep last ran: tasks that
-	// finished after it (including between turns) are sweep
-	// candidates. Both are guarded by chatsMu.
-	sweptSubagents    map[string]bool
-	lastSubagentSweep time.Time
+	// It is the ONLY exactly-once guard: there is deliberately no
+	// time window (F-A7-2b) — a task that finishes mid-sweep must
+	// still be charged by the next sweep, and a FinishedAt window
+	// would skip it forever. Guarded by chatsMu.
+	sweptSubagents map[string]bool
 }
 
 // chatSessionFor returns the chat's session, creating its store (and
@@ -458,7 +458,6 @@ func (a *App) HandleForChat(ctx context.Context, chatID int64, input string) (st
 // prompt/completion/subagent split, so the footer and /usage can
 // show the turn honestly.
 func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
-	turnStart := time.Now()
 	agent, err := a.AgentForChat(chatID)
 	if err != nil {
 		return "", nil, err
@@ -523,7 +522,7 @@ func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit 
 		// nothing, so its swept tokens must stay unswept for a
 		// later turn instead of being marked and lost.
 		if cs, csErr := a.chatSessionFor(chatID); csErr == nil {
-			if swept := a.sweepFinishedSubagents(cs, chatID, turnStart); swept > 0 {
+			if swept := a.sweepFinishedSubagents(cs, chatID); swept > 0 {
 				stats.Tokens += swept
 				stats.SubagentTokens += swept
 			}
@@ -624,10 +623,12 @@ func (a *App) pendingSubagentTokens(chatID int64) int {
 // a task that timed out still spent provider tokens before the
 // deadline (when the executor returned at the deadline its usage
 // is recorded on the result; when it ignored the deadline and
-// never returned, the manager records zero — see the sweep's
-// doc — so charging a timed-out task never invents tokens, it
-// charges exactly what the manager recorded). Running/pending
-// tasks have no result yet and are never charged.
+// returned late, the Manager records the late usage on the entry
+// (F-A7-2a) and the sweep charges it once it has settled; when it
+// never returns, the manager records zero — so charging a timed-out
+// task never invents tokens, it charges exactly what the manager
+// recorded). Running/pending tasks have no result yet and are never
+// charged.
 func isChargeableSubagentStatus(s subagent.Status) bool {
 	return s == subagent.StatusDone || s == subagent.StatusFailed || s == subagent.StatusTimeout
 }
@@ -638,30 +639,34 @@ func isChargeableSubagentStatus(s subagent.Status) bool {
 // swept set are skipped, and a task still running contributes
 // nothing. Timed-out tasks are charged on the same terms
 // (F-A6-P2-7): they spent tokens before timing out, and skipping
-// them made every timeout free. The sweep window starts at the
-// last sweep — so a task that finished BETWEEN turns is caught by
-// the next turn — or at the zero time on the first sweep, so a
-// task that finished after the last turn but before the next
-// turn's start is not missed by a turnStart lower bound (the old
-// bound silently dropped exactly those late finishers).
+// them made every timeout free.
+//
+// There is deliberately NO time window on this sweep (F-A7-2b):
+// the swept set (check-and-mark under chatsMu) is the exactly-once
+// guard, and a FinishedAt window was itself a leak — a task
+// finishing mid-sweep, after the loop passed it but before the
+// sweep recorded its end time, fell before every future window
+// bound and was skipped by every later sweep forever. So the sweep
+// charges every finished, chargeable, unswept task of this chat,
+// whenever it finished.
+//
+// The one skip that remains is an UNSETTLED task (F-A7-2a): a
+// timed-out or cancelled task whose executor is still running has
+// zero recorded usage that may still grow when the executor
+// returns. Charging it now would charge zero AND mark it swept,
+// losing the late usage forever — so the sweep skips it without
+// marking, and the next sweep (or session close) charges it once
+// the Manager has recorded the late usage. An executor that never
+// returns stays unsettled and uncharged; its spend is unknowable,
+// and charging zero for it would change nothing.
+//
 // Attribution is by the task's owning chat (recorded at spawn):
 // a task another chat spawned is skipped here even if it finished
 // inside this chat's window, and is charged by its own chat's
 // sweep instead. Unattributed tasks (chatID 0, e.g. CLI spawns)
 // are never swept; the fetch path still charges them to whoever
 // fetches the result.
-//
-// Limit, stated honestly: a timed-out executor that ignores its
-// context and never returns has its late result discarded by the
-// subagent Manager, so its tokens are unknowable here and the
-// sweep charges the recorded zero. Recovering those tokens needs
-// a Manager change (record a late result's usage when it
-// eventually arrives) — outside this fix; what the sweep
-// guarantees is that no RECORDED token is ever skipped, whatever
-// the terminal status, and that a task finishing after the last
-// turn is charged by the next turn's sweep or at session close
-// (see sweepAndRecordSubagents, called from closeChatAgents).
-func (a *App) sweepFinishedSubagents(cs *chatSession, chatID int64, turnStart time.Time) int {
+func (a *App) sweepFinishedSubagents(cs *chatSession, chatID int64) int {
 	if a == nil || a.Subagents == nil || cs == nil {
 		return 0
 	}
@@ -670,10 +675,6 @@ func (a *App) sweepFinishedSubagents(cs *chatSession, chatID int64, turnStart ti
 		cs.sweptSubagents = map[string]bool{}
 	}
 	swept := cs.sweptSubagents
-	lower := time.Time{}
-	if !cs.lastSubagentSweep.IsZero() {
-		lower = cs.lastSubagentSweep
-	}
 	a.chatsMu.Unlock()
 	total := 0
 	for _, ts := range a.Subagents.List() {
@@ -687,7 +688,11 @@ func (a *App) sweepFinishedSubagents(cs *chatSession, chatID int64, turnStart ti
 		if !isChargeableSubagentStatus(ts.Status) {
 			continue
 		}
-		if res.FinishedAt.Before(lower) {
+		if !res.UsageSettled {
+			// The executor is still running past the timeout /
+			// cancellation: its usage is not final yet. Skip
+			// WITHOUT marking swept, so the next sweep charges
+			// the late usage once it arrives (F-A7-2a).
 			continue
 		}
 		a.chatsMu.Lock()
@@ -701,9 +706,6 @@ func (a *App) sweepFinishedSubagents(cs *chatSession, chatID int64, turnStart ti
 		}
 		total += res.Usage.Tokens
 	}
-	a.chatsMu.Lock()
-	cs.lastSubagentSweep = time.Now()
-	a.chatsMu.Unlock()
 	return total
 }
 
@@ -725,7 +727,7 @@ func (a *App) sweepAndRecordSubagents(chatID int64) int {
 	if err != nil || cs == nil {
 		return 0
 	}
-	swept := a.sweepFinishedSubagents(cs, chatID, time.Now())
+	swept := a.sweepFinishedSubagents(cs, chatID)
 	if swept <= 0 {
 		return 0
 	}
@@ -892,13 +894,30 @@ func (a *App) compressForChatWith(ctx context.Context, chatID int64, keepRecent 
 		return 0, 0, 0, err
 	}
 	provider := a.chatCompressProvider(chatID, cs)
+	// Pre-flight budget refusal (F-A7-1): /compress runs outside
+	// any turn, so without this a chat already at its daily limit
+	// could run /compress repeatedly and the spend would only be
+	// recorded, never refused. Mirror the turn path's pre-flight
+	// (runChatTurn): Check the projected summarisation input
+	// against the chat's Budget BEFORE the provider call. The
+	// returned *BudgetExceededError unwraps to
+	// budget.ErrBudgetExceeded. A nil Budget means unbudgeted,
+	// exactly as for turns.
+	if a.Budget != nil {
+		if err := a.Budget.Check(chatID, projectedCompressTokens(cs.store, keepRecent, sessionMemory)); err != nil {
+			return 0, 0, 0, err
+		}
+	}
 	// Metering (F-A6-1): /compress runs outside any turn, so its
 	// summarisation tokens never pass through TurnFinished — the
 	// sink records them to this chat's Budget directly, at the
-	// chat's provider/model, so a chat at its daily limit cannot
-	// run /compress for free. A nil Budget means unbudgeted (the
-	// sink is still passed: it no-ops, and compressWithOn skips
-	// nil sinks only when the caller passes none). A Record error
+	// chat's provider/model. The pre-flight check above refuses
+	// a chat that cannot afford the call; the sink still records
+	// the spend of a call that does run, so the accounting
+	// reflects reality even when the call pushes the chat over
+	// its limit. A nil Budget means unbudgeted (the sink is
+	// still passed: it no-ops, and compressWithOn skips nil
+	// sinks only when the caller passes none). A Record error
 	// (the compress pushed the chat over its limit) is logged,
 	// never fatal: the summary already happened, and the NEXT
 	// turn is the one that gets refused.

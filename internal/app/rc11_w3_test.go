@@ -27,13 +27,18 @@ import (
 // provider call on the compress path.
 type compressScriptProvider struct {
 	usage model.Usage
-	calls int
+	// calls counts Chat invocations. It is atomic: the agent run
+	// and the async session-extraction goroutine can call Chat
+	// concurrently (rc12 drive-by fix for a pre-existing -race
+	// failure in TestCompressForChatOnlyCompressesCaller; the
+	// counter is otherwise write-only).
+	calls atomic.Int64
 }
 
 func (p *compressScriptProvider) Name() string { return "stub" }
 
 func (p *compressScriptProvider) Chat(_ context.Context, _ model.ChatRequest) (*model.ChatResponse, error) {
-	p.calls++
+	p.calls.Add(1)
 	return &model.ChatResponse{
 		Message:      model.Message{Role: "assistant", Content: "The user discussed the project plan and decided to proceed with the build."},
 		FinishReason: "stop",
@@ -90,6 +95,13 @@ func (p *recordingCompressProvider) Stream(ctx context.Context, req model.ChatRe
 
 // seedChatHistoryRC11 adds n user messages to one chat's store, so
 // /compress has a prefix to summarise (keepRecent 10 needs >10).
+// The turns are varied, not one repeated phrase: the /compress
+// preservation check (F-A7-P2-4) requires the summary to share
+// >= 3 distinct content tokens with the summarised prefix, and a
+// history of one repeated phrase has only two distinct tokens to
+// share — no summary could ever pass. The seeded turns discuss
+// the project plan and build, the same content the script
+// provider's summary preserves.
 func seedChatHistoryRC11(t *testing.T, a *App, chatID int64, n int) {
 	t.Helper()
 	cs, err := a.chatSessionFor(chatID)
@@ -97,7 +109,7 @@ func seedChatHistoryRC11(t *testing.T, a *App, chatID int64, n int) {
 		t.Fatalf("chatSessionFor %d: %v", chatID, err)
 	}
 	for i := 0; i < n; i++ {
-		if err := cs.store.AddMessage(model.Message{Role: "user", Content: "turn message"}); err != nil {
+		if err := cs.store.AddMessage(model.Message{Role: "user", Content: compressFixtureMessages[i%len(compressFixtureMessages)]}); err != nil {
 			t.Fatalf("AddMessage: %v", err)
 		}
 	}
@@ -155,7 +167,7 @@ func TestW3GlobalCompressReportsSideChannelUsage(t *testing.T) {
 	prov := &compressScriptProvider{usage: model.Usage{PromptTokens: 1000, CompletionTokens: 500, TotalTokens: 1500}}
 	a.Provider = prov
 	for i := 0; i < 12; i++ {
-		if err := a.Memory.AddMessage(model.Message{Role: "user", Content: "turn message"}); err != nil {
+		if err := a.Memory.AddMessage(model.Message{Role: "user", Content: compressFixtureMessages[i%len(compressFixtureMessages)]}); err != nil {
 			t.Fatalf("AddMessage: %v", err)
 		}
 	}
@@ -208,10 +220,15 @@ func TestW3CompressRedactsSecretsAndCapsInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chatSessionFor: %v", err)
 	}
-	// One giant message (~25,000 tokens) plus small ones, then
+	// One giant message (~25,000+ tokens) plus small ones, then
 	// the 10-message recent window: the old prefix is far over
-	// the 16,000-token cap on its own.
-	giant := strings.Repeat("word ", 20000)
+	// the 16,000-token cap on its own. The giant repeats varied
+	// words, not one word: the /compress preservation check
+	// (F-A7-P2-4) judges the summary against the truncated
+	// giant, and a one-word giant has only one distinct token
+	// to share — no summary could pass. The repeated phrase
+	// shares project/plan/key with the script summary.
+	giant := strings.Repeat("project plan key discussion ", 20000)
 	msgs := []model.Message{
 		{Role: "user", Content: giant},
 		{Role: "user", Content: "My API key is " + fakeKey + " — remember it for later."},
@@ -405,10 +422,25 @@ func TestW3SweepChargesTimedOutTasks(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+	// F-A7-2a: the executor returned 700 tokens just after the
+	// deadline, so the Manager's late-arrival waiter records them
+	// on the entry. Wait for the usage to settle before the turn:
+	// a turn sweeping first would (correctly) skip the unsettled
+	// task and charge it on the next turn instead.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if res, ok := mgr.GetResult(id); ok && res.UsageSettled && res.Usage.Tokens == 700 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("late usage for task %s never settled (want 700 tokens)", id)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	if _, stats, err := a.HandleStreamForChat(context.Background(), 111, "anything?", nil); err != nil {
 		t.Fatalf("HandleStreamForChat: %v", err)
-	} else if stats == nil || stats.Tokens != 10 {
-		t.Fatalf("TurnStats = %+v, want Tokens 10 (the timed-out task recorded 0 tokens)", stats)
+	} else if stats == nil || stats.Tokens != 710 || stats.SubagentTokens != 700 {
+		t.Fatalf("TurnStats = %+v, want {Tokens:710 SubagentTokens:700} (10 main + 700 late child)", stats)
 	}
 	cs, err := a.chatSessionFor(111)
 	if err != nil {
@@ -426,18 +458,18 @@ func TestW3SweepChargesTimedOutTasks(t *testing.T) {
 	} else if stats == nil || stats.SubagentTokens != 0 || stats.Tokens != 10 {
 		t.Errorf("second TurnStats = %+v, want {Tokens:10 SubagentTokens:0}", stats)
 	}
-	if got := a.Budget.Usage(111); got != 20 {
-		t.Errorf("Budget.Usage(111) = %d, want 20 (two 10-token turns; the timed-out task added 0 recorded tokens, once)", got)
+	if got := a.Budget.Usage(111); got != 720 {
+		t.Errorf("Budget.Usage(111) = %d, want 720 (710 turn 1 + 10 turn 2; the timed-out task's 700 tokens charged exactly once)", got)
 	}
 }
 
 // TestW3SweepChargesLateFinishingTask proves the F-A6-P2-7
 // late-finisher leg at the sweep level: a task that finished
-// before the sweep's turnStart was silently dropped by the old
-// turnStart lower bound (the first sweep of a turn whose start
-// postdates the finish). The window is now anchored at the last
-// sweep (or the zero time on the first sweep), so the task is
-// charged.
+// before the sweep runs is charged. The old turnStart lower bound
+// silently dropped exactly these tasks; the rc12 fix (F-A7-2b)
+// deleted the window entirely, so the sweep charges every
+// finished, chargeable, unswept task whenever it finished — and
+// exactly once.
 func TestW3SweepChargesLateFinishingTask(t *testing.T) {
 	a := testApp(t)
 	defer a.Close()
@@ -468,11 +500,13 @@ func TestW3SweepChargesLateFinishingTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chatSessionFor: %v", err)
 	}
-	// A turnStart AFTER the task finished: the old bound charged 0.
-	if got := a.sweepFinishedSubagents(cs, 111, time.Now().Add(time.Minute)); got != 250 {
-		t.Errorf("sweep with a late turnStart = %d, want 250 (a task finishing before the turn must still be charged)", got)
+	// A task that finished long before the sweep runs: the old
+	// turnStart bound charged 0 for it. The window is gone, so
+	// the sweep charges it.
+	if got := a.sweepFinishedSubagents(cs, 111); got != 250 {
+		t.Errorf("sweep = %d, want 250 (a task finishing before the sweep must still be charged)", got)
 	}
-	if got := a.sweepFinishedSubagents(cs, 111, time.Now()); got != 0 {
+	if got := a.sweepFinishedSubagents(cs, 111); got != 0 {
 		t.Errorf("second sweep = %d, want 0 (already charged)", got)
 	}
 }

@@ -321,12 +321,16 @@ func TestManualCompressResetsBreakerAndRecordsSummary(t *testing.T) {
 
 	// 170 short messages: count pressure 170/200 = 85%, over the
 	// 80% auto-compact trigger, so every turn tries to compact.
+	// The turns are varied (project plan / build), not one
+	// repeated phrase: the manual /compress preservation check
+	// (F-A7-P2-4) requires the summary to share >= 3 distinct
+	// content tokens with the summarised prefix.
 	for i := 0; i < 170; i++ {
 		role := "user"
 		if i%2 == 1 {
 			role = "assistant"
 		}
-		if err := a.Memory.AddMessage(model.Message{Role: role, Content: "filler turn message"}); err != nil {
+		if err := a.Memory.AddMessage(model.Message{Role: role, Content: compressFixtureMessages[i%len(compressFixtureMessages)]}); err != nil {
 			t.Fatalf("seed AddMessage %d: %v", i, err)
 		}
 	}
@@ -346,7 +350,12 @@ func TestManualCompressResetsBreakerAndRecordsSummary(t *testing.T) {
 	// through the chat path's twin (CompactionStatusForChat is
 	// covered by the chat tests); here the agent-level state is
 	// the assertion, plus the manual-compress reset below.
-
+	// The manual /compress uses the script provider, whose
+	// summary preserves the seeded turns (project plan / build),
+	// so the preservation check (F-A7-P2-4) passes; the stub
+	// provider's "ok" shares nothing with any history and is
+	// refused.
+	a.Provider = &compressScriptProvider{usage: model.Usage{}}
 	before, after, summaryLen, err := a.Compress(ctx, 10)
 	if err != nil {
 		t.Fatalf("Compress after trip: %v", err)
@@ -361,12 +370,12 @@ func TestManualCompressResetsBreakerAndRecordsSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transcript Summaries: %v", err)
 	}
-	if len(summaries) != 1 || !strings.Contains(summaries[0], "ok") {
+	if len(summaries) != 1 || !strings.Contains(summaries[0], "project plan") {
 		t.Fatalf("transcript summaries=%v, want the one manual-compress summary", summaries)
 	}
 	// The manual summary also reached the fact, as before.
 	fact, found, err := a.Memory.GetFact("conversation-summary")
-	if err != nil || !found || !strings.Contains(fact.Value, "ok") {
+	if err != nil || !found || !strings.Contains(fact.Value, "project plan") {
 		t.Fatalf("summary fact: found=%v value=%q err=%v", found, fact.Value, err)
 	}
 }

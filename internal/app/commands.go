@@ -660,6 +660,21 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	if a == nil || a.Memory == nil {
 		return 0, 0, 0, errors.New("app: Compress called on uninitialised App (nil Memory)")
 	}
+	// Pre-flight budget refusal (F-A7-1): the CLI/global
+	// /compress runs outside any turn, so without this it could
+	// spend without limit even when the budget is exhausted —
+	// the side-channel sink below only accounts the spend after
+	// the fact. Mirror the turn path's pre-flight (runChatTurn):
+	// Check the projected summarisation input against the
+	// Budget BEFORE the provider call. The CLI has no chat, so
+	// its compress spend is checked against the unattributed
+	// bucket (cliCompressChatID) — the same chatID 0 CLI
+	// subagent spawns use. A nil Budget means unbudgeted.
+	if a.Budget != nil {
+		if err := a.Budget.Check(cliCompressChatID, projectedCompressTokens(a.Memory, keepRecent, sessionMemory)); err != nil {
+			return 0, 0, 0, err
+		}
+	}
 	// Metering (F-A6-1): the CLI/global /compress runs outside
 	// any turn, so its tokens never pass through TurnFinished
 	// either — the sink reports them to the global agent's
@@ -690,6 +705,57 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 		}
 	}
 	return before, after, summaryLen, err
+}
+
+// cliCompressChatID is the budget bucket the CLI/global /compress
+// is checked against (F-A7-1): the CLI has no chat, so its
+// compress spend is checked against the unattributed bucket,
+// chatID 0 — the same bucket CLI subagent spawns use
+// (internal/subagent: Spawn starts unattributed tasks at
+// chatID 0). The check is a refusal gate only; the CLI's
+// compress tokens are still accounted via the side-channel sink
+// (F-A6-1), not recorded to this bucket.
+const cliCompressChatID = 0
+
+// projectedCompressTokens estimates the input tokens the
+// /compress summarisation call will carry: the bounded old
+// prefix actually sent to the provider (same sizing as
+// compressWithOn — boundedCompressPrefix, the prompt overhead
+// and the gated session-memory section), in model.CountTokens
+// units. It is the pre-flight projection for the budget
+// (F-A7-1), mirroring projectedTurnTokens for turns: a chat
+// that cannot afford even the summarisation input is refused
+// before the provider call, instead of spending first and
+// being refused only on the next turn. A store read failure
+// degrades to 0 — compressWithOn fails on the same read with
+// its own error, and no provider call happens either way.
+func projectedCompressTokens(store memory.Store, keepRecent int, sessionMemory string) int {
+	if keepRecent < 1 {
+		keepRecent = compressRecentWindow
+	}
+	if store == nil {
+		return 0
+	}
+	all, err := store.RecentMessages(0)
+	if err != nil || len(all) <= keepRecent {
+		return 0
+	}
+	old := all[:len(all)-keepRecent]
+	// Session memory is gated and capped exactly as
+	// compressWithOn gates it (redaction only shrinks, so the
+	// unredacted estimate is conservative).
+	sessionTokens := 0
+	if strings.TrimSpace(sessionMemory) != "" {
+		if kept, ok := memory.FilterExplicitSave(sessionMemory); ok {
+			sessionTokens = model.CountTokens(truncateCompressRunesToTokens(strings.TrimSpace(kept), compressSessionMemoryMaxTokens)) + 4
+		}
+	}
+	toSummarise := boundedCompressPrefix(old, compressMaxInputTokens-compressPromptOverheadTokens-sessionTokens)
+	n := compressPromptOverheadTokens + sessionTokens
+	for _, m := range toSummarise {
+		n += compressMessageTokens(m)
+	}
+	return n
 }
 
 // compressWithOn summarises store's conversation prefix older than
@@ -936,6 +1002,21 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 		summary = kept
 	} else {
 		return before, before, 0, "", errors.New("app: compress: summary contained nothing worth saving (gate dropped it all)")
+	}
+	// Preservation check (F-A7-P2-4): the summary must preserve
+	// something from the turns it replaces — the same bar
+	// auto-compaction applies (core.SummaryPreservesSource).
+	// Without it a degenerate summary returned on the /compress
+	// path was stored as the conversation-summary fact and the
+	// history dropped, losing turns for a sentence that says
+	// nothing. A failed check refuses the compression and keeps
+	// history, exactly as auto-compaction does. The check runs
+	// against toSummarise — the prefix actually sent to the
+	// provider — not the whole old prefix, so a giant message
+	// truncated to the input cap is judged on its truncated
+	// view, the same view the summary was made from.
+	if !core.SummaryPreservesSource(summary, toSummarise) {
+		return before, before, 0, "", errors.New("app: compress: summary preserved nothing from the summarised turns (no shared content tokens, or below the length floor)")
 	}
 	if strings.TrimSpace(sessionMemory) != "" {
 		summary += "\n(Drew on session memory.)"

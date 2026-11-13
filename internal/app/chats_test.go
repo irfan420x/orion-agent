@@ -300,12 +300,17 @@ func TestCompressForChatOnlyCompressesCaller(t *testing.T) {
 	a := testApp(t)
 	defer a.Close()
 	ctx := context.Background()
+	// The script provider answers every Chat call — turns and
+	// the summarisation — with a summary that preserves the
+	// seeded turns (project plan / build), so the /compress
+	// preservation check (F-A7-P2-4) passes. The stub
+	// provider's "ok" shares nothing with any history and is
+	// refused. Chat A's turns discuss the project plan and
+	// build for the same reason.
+	a.Provider = &compressScriptProvider{usage: model.Usage{}}
 	// 12 user turns in chat A (>10 recent window), 1 in chat B.
-	// The stub provider answers "ok" to everything, including the
-	// summarisation call — the summary is the stub's "ok", which
-	// passes the what-not-to-save gate ("ok" is kept as a fact).
 	for i := 0; i < 12; i++ {
-		if _, _, err := a.HandleStreamForChat(ctx, 111, "turn A", nil); err != nil {
+		if _, _, err := a.HandleStreamForChat(ctx, 111, "turn A about the project plan and build", nil); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -4,7 +4,7 @@
 // and `telegram poll` additionally used the global a.Handle,
 // bypassing per-chat isolation. The tests prove the wiring at
 // three levels: wireGate installs a non-nil gate whose approval
-// card round-trips through handleApprovalCallback; the shared
+// card round-trips through messaging.HandleApprovalCallback; the shared
 // daemonTurnHandler sets the approval context (so spawned
 // subagents are attributed to the chat); and both commands, run
 // end to end against a fake Bot API + fake provider, send an
@@ -344,7 +344,7 @@ func TestW3WireGateApprovesRoundTrip(t *testing.T) {
 		},
 		Data: "perm:approve:" + reqID,
 	}
-	if err := handleApprovalCallback(context.Background(), gw, gate, 111, stranger, cards); err != nil {
+	if err := messaging.HandleApprovalCallback(context.Background(), gw, gate, 111, stranger, cards, "orion"); err != nil {
 		t.Fatalf("stranger tap: %v", err)
 	}
 	if text, ok := bot.answeredText("cb-stranger"); !ok || !strings.Contains(text, "Only the person who asked") {
@@ -366,7 +366,7 @@ func TestW3WireGateApprovesRoundTrip(t *testing.T) {
 		},
 		Data: "perm:approve:" + reqID,
 	}
-	if err := handleApprovalCallback(context.Background(), gw, gate, 111, approve, cards); err != nil {
+	if err := messaging.HandleApprovalCallback(context.Background(), gw, gate, 111, approve, cards, "orion"); err != nil {
 		t.Fatalf("requester tap: %v", err)
 	}
 	select {
@@ -476,7 +476,7 @@ func rc11WriteDaemonTestConfig(t *testing.T, home string, providerURL string) {
 // is needed here: the card itself is the proof the gate is
 // installed and prompting. (The tap → resolve path is covered by
 // TestW3WireGateApprovesRoundTrip, which calls
-// handleApprovalCallback directly and does not depend on
+// messaging.HandleApprovalCallback directly and does not depend on
 // PollStream's callback dispatch.)
 func TestW3DaemonAndTelegramPollGatePrompts(t *testing.T) {
 	for _, cmd := range []struct {

@@ -324,16 +324,41 @@ func parseFile(path string) (Skill, error) {
 // delimiter: the exact form formatSkillBody emits
 // (===== BEGIN SKILL "name" CONTENT ===== /
 // ===== END SKILL "name" CONTENT =====), with the name quoted or
-// bare. The match is anchored at the start of the (trimmed) line
-// and not at its end: a line beginning with a marker reads as a
-// marker to the model even with trailing text after it.
-var skillMarkerLine = regexp.MustCompile(`^===== (BEGIN|END) SKILL\s+.+\sCONTENT =====`)
+// bare. The match is deliberately fuzzy, not exact (Audit 7
+// F-A7-P2-1): a model's reading is fuzzy, so a lowercase marker,
+// a 4- or 6-equals marker, or a marker with the spaces around
+// BEGIN/END dropped is visually near-identical to the emitted
+// delimiter and could plausibly close the block in the model's
+// reading. The match is therefore case-insensitive, tolerates
+// 4-6 "=" on either side, and allows the spaces around BEGIN/END
+// and before the closing run to be dropped. It is anchored at the
+// start of the (trimmed, quote-stripped) line and not at its end:
+// a line beginning with a marker reads as a marker to the model
+// even with trailing text after it. A marker merely mentioned
+// mid-line ("See the ===== END SKILL ... format") does not match.
+var skillMarkerLine = regexp.MustCompile(`(?i)^={4,6}\s*(BEGIN|END)\s+SKILL\b.*CONTENT\s*={4,6}`)
+
+// stripMarkerQuotePrefix removes leading Markdown blockquote
+// markers ("> ") from a trimmed line, so a quoted marker line
+// ("> ===== END SKILL ... =====") is still recognised as a
+// marker: quoting does not stop the line reading as a delimiter.
+// Repeated markers (">> ...") are stripped too.
+func stripMarkerQuotePrefix(line string) string {
+	s := line
+	for strings.HasPrefix(s, ">") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, ">"))
+	}
+	return s
+}
 
 // validateSkillContent rejects skill text that can blur the
-// BEGIN/END delimiter boundary (Audit 6 F-A6-2): any line that
-// parses as a BEGIN/END SKILL marker, and any line shaped as an
-// activation directive ("Activate skill ...", "Activate the ...
-// skill ...", "Activate \"name\""). The delimiters are only
+// BEGIN/END delimiter boundary (Audit 6 F-A6-2, fuzzy variants
+// Audit 7 F-A7-P2-1): any line that parses as a BEGIN/END SKILL
+// marker (case-insensitive, 4-6 "=", optional spaces, optionally
+// blockquoted), and any line shaped as an activation directive
+// ("Activate skill ...", "Activate the ... skill ...",
+// "Activate \"name\"", "Please activate skill ...", a mid-line
+// "activate skill", or a bare "Activate"). The delimiters are only
 // labelling — a body containing its own END marker can close the
 // block early and inject a fake footer plus fresh instructions,
 // and a body-directed switch ("END SKILL" + "BEGIN SKILL
@@ -347,7 +372,7 @@ var skillMarkerLine = regexp.MustCompile(`^===== (BEGIN|END) SKILL\s+.+\sCONTENT
 func validateSkillContent(content string) error {
 	for i, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if skillMarkerLine.MatchString(trimmed) {
+		if skillMarkerLine.MatchString(stripMarkerQuotePrefix(trimmed)) {
 			return fmt.Errorf("line %d contains a skill delimiter marker %q: skill bodies must not contain BEGIN/END SKILL marker lines", i+1, truncateLine(trimmed))
 		}
 		if isActivateDirective(trimmed) {
@@ -371,7 +396,7 @@ func validateSkillContent(content string) error {
 func NeutralizeSkillMarkers(content string) string {
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
-		if skillMarkerLine.MatchString(strings.TrimSpace(line)) {
+		if skillMarkerLine.MatchString(stripMarkerQuotePrefix(strings.TrimSpace(line))) {
 			lines[i] = "[neutralised skill marker] " + line
 		}
 	}
@@ -388,44 +413,87 @@ func truncateLine(line string) string {
 	return line[:maxLen] + "…"
 }
 
+// activateWord matches the whole word "activate" (any case).
+// The word boundaries matter: "deactivate", "reactivate", and
+// "activation" must not match.
+var activateWord = regexp.MustCompile(`(?i)\bactivate\b`)
+
+// skillWord and toolWord match the whole words "skill"/"skills"
+// and "tool"/"tools" (any case) in the text after "activate".
+var (
+	skillWord = regexp.MustCompile(`(?i)\bskills?\b`)
+	toolWord  = regexp.MustCompile(`(?i)\btools?\b`)
+)
+
+// wordIndex reports the index of the first whole-word occurrence
+// of re in s, or -1 when there is none.
+func wordIndex(s string, re *regexp.Regexp) int {
+	if loc := re.FindStringIndex(s); loc != nil {
+		return loc[0]
+	}
+	return -1
+}
+
 // isActivateDirective reports whether line is shaped as an
-// instruction to activate a skill: it starts with "activate"
-// (any case) and then names a skill — "Activate skill ...",
-// "Activate the ... skill ...", or "Activate \"name\" ...".
-// Plain prose that merely contains the word "activate" ("to
-// activate the tool, ...") does not match: the directive has to
-// lead the line and reference a skill. There is no defined
-// textual activation syntax in the codebase — activation goes
-// through the skill tool — so any line shaped like one is a
-// body-directed switch attempt, not a legitimate instruction.
+// instruction to activate a skill (Audit 6 F-A6-2, widened by
+// Audit 7 F-A7-P2-1): the word "activate" appears anywhere in
+// the line — not only leading it, so "Please activate skill
+// ..." and a mid-line "activate skill" count — and what follows
+// it names a skill, or the line is a bare "Activate".
+//
+// What counts as naming a skill, in the text after "activate":
+//   - the word "skill" ("Activate skill ...", "Activate the
+//     other skill", "Please activate skill \"other\"");
+//   - a quoted name ("Activate \"name\" ..."), which in this
+//     context is a skill reference.
+//
+// The "activate the tool" prose control is preserved by an
+// object-order rule: when both "tool" and "skill" follow
+// "activate", the one that comes first is the object of the
+// instruction. "To activate the tool, run it once" (tool first,
+// or no skill at all) is prose and loads; "Activate the skill
+// using the tool" (skill first) is a directive and is refused.
+// A line about a skill that merely mentions activation the
+// other way round ("This skill helps you activate the tool")
+// does not match either, because "skill" precedes "activate".
+// There is no defined textual activation syntax in the codebase
+// — activation goes through the skill tool — so any line shaped
+// like one is a body-directed switch attempt, not a legitimate
+// instruction.
 func isActivateDirective(line string) bool {
-	lower := strings.ToLower(line)
-	if lower != "activate" && !strings.HasPrefix(lower, "activate ") && !strings.HasPrefix(lower, "activate\t") {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if lower == "" {
 		return false
 	}
-	rest := strings.TrimSpace(lower[len("activate"):])
-	// "Activate skill ..." / "Activate skill" (bare).
-	if rest == "skill" || strings.HasPrefix(rest, "skill ") || strings.HasPrefix(rest, "skill\t") || strings.HasPrefix(rest, "skill\"") {
+	// Bare "Activate" (allowing trailing sentence punctuation):
+	// an imperative with no object at all, in a skill body,
+	// can only be read as "activate [a skill]".
+	if bare := strings.TrimRight(lower, ".!:"); bare == "activate" {
 		return true
 	}
-	// "Activate the ... skill ..." / "Activate the skill ...".
-	if strings.HasPrefix(rest, "the ") || strings.HasPrefix(rest, "the\t") {
-		rest = strings.TrimSpace(rest[len("the"):])
-		if rest == "skill" || strings.HasPrefix(rest, "skill ") || strings.HasPrefix(rest, "skill\t") {
-			return true
-		}
-		// "Activate the other skill" — a word between "the" and
-		// "skill" is still a skill reference.
-		if idx := strings.Index(rest, " skill"); idx > 0 && !strings.Contains(rest[:idx], " ") {
-			return true
-		}
+	loc := activateWord.FindStringIndex(lower)
+	if loc == nil {
+		return false
+	}
+	rest := strings.TrimSpace(lower[loc[1]:])
+	if rest == "" {
+		return false
 	}
 	// "Activate \"name\" ..." — a quoted name after Activate is a
 	// skill reference in this context.
-	if strings.HasPrefix(rest, "\"") {
+	if strings.HasPrefix(rest, "\"") || strings.HasPrefix(rest, "'") {
 		return true
 	}
-	return false
+	skillIdx := wordIndex(rest, skillWord)
+	if skillIdx < 0 {
+		return false
+	}
+	// Object-order rule (see above): a "tool" named before the
+	// first "skill" makes the tool the object, not the skill.
+	if toolIdx := wordIndex(rest, toolWord); toolIdx >= 0 && toolIdx < skillIdx {
+		return false
+	}
+	return true
 }
 
 // parseSkill extracts the name, description, and tools from file content.
@@ -514,7 +582,10 @@ func parseSkill(path, content string) (Skill, []string) {
 	// the canonical form is "## Tools"; a level-3 heading that
 	// merely looks like Tools warns the same way a level-2 one
 	// does. Deeper headings (#### and below) still end the
-	// section without opening one.
+	// section without opening one, but they now warn too
+	// (Audit 7 F-A7-P2-5): a "#### Tools" heading used to be
+	// silently ignored, leaving the skill unrestricted with no
+	// hint to the author.
 	inTools := false
 	seenTools := map[string]bool{}
 	for _, line := range lines {
@@ -540,6 +611,22 @@ func parseSkill(path, content string) (Skill, []string) {
 				}
 			default:
 				inTools = false
+				// Level 4+ (level 1 is the name heading, and
+				// is not a Tools section by construction):
+				// a Tools or Tools-like heading this deep
+				// cannot be the Tools section, so warn
+				// instead of silently running unrestricted.
+				if lvl >= 4 {
+					title := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
+					isTools, toolsLike := normalizeToolsHeading(title)
+					if isTools || toolsLike {
+						headingKey := strings.Repeat("#", lvl) + " " + title
+						if !warnedHeadings[headingKey] {
+							warnedHeadings[headingKey] = true
+							warnings = append(warnings, fmt.Sprintf("level-%d Tools heading %q is too deep to be the Tools section — no tool restriction applied; use \"## Tools\"", lvl, title))
+						}
+					}
+				}
 			}
 			continue
 		}

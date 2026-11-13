@@ -445,17 +445,18 @@ removed) so a dead card never looks live. Every prompt, tap, and
 outcome is logged with the request ID. The shell denylist stays
 absolute: a denylisted command can never be approved, gate or no gate.
 
-Wiring (verified in rc10): the gate is installed by `oriond`
+Wiring (verified in rc11, Audit 7 §1.4): the gate is installed by `oriond`
 (`cmd/oriond/main.go`, `SetPermissionGate`) and applied per chat
-(`internal/app/chats.go`). **Known gap (Audit 6, F-A6-3, an rc11
-fix):** `orion daemon` and `orion telegram poll` (`cmd/orion/main.go`)
-did not call `SetPermissionGate` in rc10, and `orion telegram poll`
-used the global handler instead of the per-chat one — so those two
-entrypoints ran Telegram turns ungated and unisolated. The live
-daemon is `oriond`, so there was no live exposure, but do not treat
-`orion daemon` / `orion telegram poll` as gated until the rc11 fix
-is verified in the tree. CLI runs (`orion run`, `orion chat`) stay
-ungated by design (denylist only).
+(`internal/app/chats.go`), and by `orion daemon` and `orion telegram poll`
+(`cmd/orion/main.go`) via the shared `wireGate` helper
+(`app.NewPermissionGate`), with `orion telegram poll` using the
+per-chat handler — so all three Telegram entrypoints run gated and
+per-chat-isolated. (Fixed in rc12, Audit 7 F-A7-P2-2: oriond now
+uses the same shared gate constructor — the prompter, expiry hook,
+and callback handler live in `internal/messaging` and are shared by
+all three entrypoints, so the wirings cannot drift apart again.)
+CLI runs (`orion run`, `orion chat`) stay ungated by design
+(denylist only).
 
 ### Per-chat isolation (`internal/app`, `internal/messaging`)
 
@@ -504,13 +505,20 @@ and remaining, and an estimated USD cost from the versioned price
 table (`internal/cost`, v2026-11-13) — an estimate, never the bill,
 and "unknown" for a model with no price, never $0.
 
-Known metering gaps (Audit 6, rc11 fixes — verify they landed
-before tagging): **F-A6-1** — `/compress` spent provider tokens no
-production caller metered in rc10; **F-A6-P2-6** — the mid-turn
-check reads the main agent's usage and is blind to subagent spend
-during the turn (charged at turn end by the sweep instead);
+Metering (landed in rc11, verified live by Audit 7 §1.2): **F-A6-1** —
+`/compress` is metered — the metering sink is threaded into the
+production path, and Audit 7's live proof recorded the 218-token
+`/compress` summarisation in `budget.json`; **F-A6-P2-6** — the
+mid-turn check reads the main agent's usage and is blind to subagent
+spend during the turn (charged at turn end by the sweep instead);
 **F-A6-P2-7** — timed-out subagent tasks, and tasks finishing after
-the last turn, were never charged in rc10.
+the last turn, are charged by the turn-end sweep. Known remaining
+gap (Audit 7, F-A7-1, rc12 scope): `/compress` is metered but never
+refused — a chat already at its daily limit can still run `/compress`
+repeatedly and the spend is only recorded, so the pre-flight refusal
+at the daily limit is the rc12 fix; likewise the F-A7-2 sweep holes
+(late usage from a ctx-ignoring executor, and the sweep-window race)
+are rc12 scope.
 
 ## MCP confinement (`internal/mcp`)
 
@@ -531,20 +539,28 @@ every `mcp__` tool needs approval — see the permission gate above),
 and the line reader kills a server past the 16 MiB cap, so a
 newline-less flood cannot OOM the daemon. MCP results are delimited
 in the prompt; treat MCP-originated text as untrusted third-party
-data (Audit 6, F-A6-P2-19 — there is no system-prompt warning for it
-yet in rc10).
+data. The system prompt carries the same warning on every turn
+(`internal/core/agent.go` — the line predates rc10; it is already
+present in rc9), and each MCP tool result carries its own
+per-result untrusted-data warning (`internal/mcp/tool.go`).
 
 Opt-out is per server and explicit: `"sandbox": false` in `mcp.json`
 runs that server fully trusted, like a hook — it can read the
 agent's config and home directory, and the daemon logs the opt-out.
-**Known limitation (Audit 6, F-A6-P2-14):** sandboxed MCP servers
-share the sandbox work dir (`<data_dir>/sandbox/work`, i.e. `/work`)
-with `shell_exec` — a server can read files a shell turn left there
-and plant files a later shell turn might run. Do not leave secrets
-in `/work`. `ScrubEnv` is name-based only: a secret-shaped *value*
-under an innocuous env name reaches a sandboxed server intact
-(F-A6-P2-20, defence-in-depth only — the daemon's env normally holds
-no secrets, config is file-based).
+**Per-server work dirs (Audit 6, F-A6-P2-14, fixed in rc11):** each
+sandboxed MCP server gets its own work dir
+(`<data_dir>/sandbox-mcp-<name>/work`, i.e. its own `/work`) instead
+of sharing `shell_exec`'s `<data_dir>/sandbox/work` — a server can
+only read files under its own `/work`, never files a shell turn or
+another server left behind. Do not leave secrets in a server's
+`/work`. `ScrubEnv` redacts by value shape as well as by name
+(Audit 6, F-A6-P2-20, fixed in rc11): a secret-shaped *value* —
+`sk-` / `sk-ant-` keys, `ghp_` / `github_pat_` tokens, `AKIA`
+keys, Telegram-token shape, JWTs, private-key blocks — is dropped
+whatever the variable is named (`internal/tools/shell.go`,
+`secretValuePatterns`), on top of the name-based rules. The
+daemon's env normally holds no secrets (config is file-based), so
+this is defence in depth.
 
 ## File-tool confinement
 

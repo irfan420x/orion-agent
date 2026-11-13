@@ -19,7 +19,6 @@ import (
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/messaging"
-	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/tools"
 )
 
@@ -33,7 +32,7 @@ import (
 // reproduces the LIVE shape end to end:
 //
 //   - real PollStream + real turn handler + real gate + real callback
-//     handler (handleApprovalCallback), against a fake Bot API that
+//     handler (messaging.HandleApprovalCallback), against a fake Bot API that
 //     mimics Telegram's long-poll: getUpdates BLOCKS until an update
 //     is enqueued or the requested timeout elapses, and honours the
 //     offset (only updates with update_id >= offset are returned);
@@ -219,17 +218,19 @@ func TestApprovalCallbackLiveShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ruleStore := permissions.NewRuleStore(filepath.Join(dir, "permissions.json"))
 	// The REAL daemon wiring (prompter + expiry hook + card
 	// tracker), not a copy of it.
-	gate, cards := buildApprovalGate(gw, ruleStore)
+	gate, cards, err := buildApprovalGate(a, gw, ownerID)
+	if err != nil {
+		t.Fatalf("buildApprovalGate: %v", err)
+	}
 	// Short window so a failure is fast to observe (live is 90s);
 	// the tap below still lands well inside it.
 	gate.SetTimeout(25 * time.Second)
 	a.SetPermissionGate(gate)
 	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
 		t.Logf("callback handler invoked: id=%s data=%q from=%v", q.ID, q.Data, q.From)
-		err := handleApprovalCallback(ctx, gw, gate, ownerID, q, cards)
+		err := messaging.HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, "oriond")
 		t.Logf("callback handler returned err=%v pending=%d", err, gate.PendingCount())
 		return err
 	})
@@ -396,13 +397,15 @@ func TestApprovalCallbackWhileTurnSlotsFull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ruleStore := permissions.NewRuleStore(filepath.Join(dir, "permissions.json"))
-	gate, cards := buildApprovalGate(gw, ruleStore)
+	gate, cards, err := buildApprovalGate(a, gw, ownerID)
+	if err != nil {
+		t.Fatalf("buildApprovalGate: %v", err)
+	}
 	gate.SetTimeout(25 * time.Second)
 	a.SetPermissionGate(gate)
 	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
 		t.Logf("callback handler invoked: id=%s data=%q from=%v", q.ID, q.Data, q.From)
-		err := handleApprovalCallback(ctx, gw, gate, ownerID, q, cards)
+		err := messaging.HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, "oriond")
 		t.Logf("callback handler returned err=%v pending=%d", err, gate.PendingCount())
 		return err
 	})
@@ -557,13 +560,15 @@ func TestApprovalCardExpiresOnTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ruleStore := permissions.NewRuleStore(filepath.Join(dir, "permissions.json"))
-	gate, cards := buildApprovalGate(gw, ruleStore)
+	gate, cards, err := buildApprovalGate(a, gw, ownerID)
+	if err != nil {
+		t.Fatalf("buildApprovalGate: %v", err)
+	}
 	// Short window (live is 90s) so the test runs in ~12s.
 	gate.SetTimeout(8 * time.Second)
 	a.SetPermissionGate(gate)
 	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
-		return handleApprovalCallback(ctx, gw, gate, ownerID, q, cards)
+		return messaging.HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, "oriond")
 	})
 
 	allowed := map[int64]bool{ownerID: true}

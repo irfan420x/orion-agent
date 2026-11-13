@@ -136,9 +136,16 @@ func TestAppTypedMemoryHelpers(t *testing.T) {
 func TestCompressWithSessionMemory(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()
+	// The script provider's summary preserves the seeded turns
+	// (project plan / build), so the /compress preservation
+	// check (F-A7-P2-4) passes; the stub provider's "ok" shares
+	// nothing with any history and is refused. The seeded turns
+	// are varied for the same reason — one repeated phrase has
+	// only two distinct content tokens to share.
+	a.Provider = &compressScriptProvider{usage: model.Usage{}}
 	// 12 messages so compression has something to drop (keep 10).
 	for i := 0; i < 12; i++ {
-		if err := a.Memory.AddMessage(model.Message{Role: "user", Content: "turn message"}); err != nil {
+		if err := a.Memory.AddMessage(model.Message{Role: "user", Content: compressFixtureMessages[i%len(compressFixtureMessages)]}); err != nil {
 			t.Fatalf("AddMessage: %v", err)
 		}
 	}
@@ -158,8 +165,9 @@ func TestCompressWithSessionMemory(t *testing.T) {
 	}
 	// Plain Compress (empty session memory) has no citation.
 	a2 := testApp(t)
+	a2.Provider = &compressScriptProvider{usage: model.Usage{}}
 	for i := 0; i < 12; i++ {
-		if err := a2.Memory.AddMessage(model.Message{Role: "user", Content: "turn message"}); err != nil {
+		if err := a2.Memory.AddMessage(model.Message{Role: "user", Content: compressFixtureMessages[i%len(compressFixtureMessages)]}); err != nil {
 			t.Fatalf("AddMessage: %v", err)
 		}
 	}

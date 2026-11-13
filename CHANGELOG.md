@@ -4,7 +4,50 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0-rc12] — 2026-11-13
+
+### Audit 7 fixes (v0.2.0-rc12) — see `AUDIT7_2026-11-13.md`
+
+Fixes the 2 P1s and the P2 batch from the fresh-eyes audit of rc11
+(0 P0, 2 P1, 8 P2). **Verdict: NOT production-ready** — the 24–72 h
+daemon soak (F-A3-4) is still open, and F-A3-2 (no pprof/debug
+endpoint) is still open. Verified by the release coordinator on the
+final commit: **1,126 tests pass, 0 fail, 4 skip (total 1,130),
+21/21 packages, race clean 21/21, no data race**; live DeepSeek proof
+`17*23+5=396` (rc11: 1,105 total: 1,101 pass, 0 fail, 4 skip).
+
+- **F-A7-1** — `/compress` pre-flight budget refusal (metered in
+  rc11, never refused at the daily limit).
+- **F-A7-2** — subagent token accounting: late usage from a
+  ctx-ignoring executor, and the sweep-window race that can
+  permanently lose a recorded task's tokens.
+- **F-A7-P2-1..P2-7** — fuzzy skill-marker validation; oriond onto
+  the shared gate constructor; callback batch-split (dispatch
+  callbacks before messages); manual `/compress`
+  summary-preservation check; `#### Tools` heading warning; docs
+  pass + `make release-check` (this entry).
+- **F-A7-P2-8** — slash commands documented as oriond-only (not
+  wired): `orion daemon` / `orion telegram poll` are turn-only —
+  slash commands go to the agent as plain text there, and
+  `/restart` owner-only holds vacuously (there is no `/restart`
+  command to refuse, only a text turn about restarting). `oriond`
+  is the only entrypoint with the full command framework (the
+  19-command `/` menu). Documented in README (quick start + CLI
+  table) and in code (`cmd/orion/main.go`: the `cmdTelegram`
+  comment and the `daemonTurnHandler` doc); wiring the registry
+  into these entrypoints would duplicate ~300 lines of per-turn
+  env, pause, footer, retry and restart plumbing with no shared
+  home for it.
+
+- **Known limitation (found during the F-A7-2 fix, follow-up for
+  rc13/Audit 8):** the subagent Manager evicts finished tasks past
+  `maxEntries=100`, so a chat spawning more than 100 subagent tasks
+  before a sweep can lose the oldest finished, unswept entries —
+  their tokens can never be swept. Fix candidates: raise the cap,
+  or sweep-before-evict (needs care — the Manager does not know
+  about budgets).
+
+## [0.2.0-rc11] — 2026-11-13
 
 ### Audit 6 fixes (v0.2.0-rc11) — see `AUDIT6_2026-11-13.md`
 
@@ -92,19 +135,26 @@ pass, 0 fail, 4 skip).
 
 #### Release checklist (before any push)
 
-- [ ] `make build && ./bin/orion version` reports the version matching
-  the tag (e.g. `0.2.0-rc11` for tag `v0.2.0-rc11`) — **the version
-  string must match the tag before any push**. If it does not, do not
-  push: check that `Version` is a `var` in `internal/version/
-  version.go`, that the Makefile / `install.sh` ldflags pass `-X
+- [ ] `make release-check` passes. It builds `orion`, asserts
+  `orion version` matches `git describe --tags --exact-match`,
+  asserts this file has a heading for the tag, and asserts the
+  README test counts match the suite (it runs the full suite
+  itself). **The version string must match the tag before any
+  push.** If the version check fails, do not push: check that
+  `Version` is a `var` in `internal/version/version.go`, that the
+  Makefile / `install.sh` ldflags pass `-X
   …version.Version=<tag without the leading v>`, and that the tag
   exists on the exact commit being built (`git describe --tags
   --exact-match`).
 - [ ] Full suite green (`go test ./...`, `go test -race ./...`,
   `gofmt -l`, `go vet ./...`) with the counts recorded in this
-  section; live DeepSeek proof (`17*23+5=396`) run.
+  section; live DeepSeek proof (`17*23+5=396`) run. (`make
+  release-check` already runs the plain suite; `-race`, `gofmt`,
+  `go vet`, and the live proof are still manual.)
 - [ ] Docs claims re-verified against the code (package count via
-  `go list ./...`, tool count, command count, version string).
+  `go list ./...`, tool count, command count). `make release-check`
+  covers the CHANGELOG tag heading and the README test counts;
+  the remaining numbers are checked by hand.
 
 ## [0.2.0-rc10] — 2026-11-13
 

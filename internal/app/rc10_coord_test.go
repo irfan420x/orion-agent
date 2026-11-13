@@ -24,7 +24,6 @@ func TestCoordSweepChargesOnlyOwningChat(t *testing.T) {
 		return "done", subagent.Usage{Tokens: 100}, nil
 	})
 	a.Subagents = mgr
-	turnStart := time.Now().Add(-time.Minute)
 	if _, err := mgr.SpawnForChat(111, "work for A", time.Minute); err != nil {
 		t.Fatalf("SpawnForChat A: %v", err)
 	}
@@ -58,15 +57,15 @@ func TestCoordSweepChargesOnlyOwningChat(t *testing.T) {
 		t.Fatalf("chatSessionFor 222: %v", err)
 	}
 	// Sweep B first: only B's task (100) may be charged.
-	if got := a.sweepFinishedSubagents(csB, 222, turnStart); got != 100 {
+	if got := a.sweepFinishedSubagents(csB, 222); got != 100 {
 		t.Errorf("sweep B = %d, want 100 (only B's task)", got)
 	}
 	// Sweep A: only A's task (100); B's task must not leak here.
-	if got := a.sweepFinishedSubagents(csA, 111, turnStart); got != 100 {
+	if got := a.sweepFinishedSubagents(csA, 111); got != 100 {
 		t.Errorf("sweep A = %d, want 100 (only A's task)", got)
 	}
 	// Second sweep charges nothing (already swept).
-	if got := a.sweepFinishedSubagents(csA, 111, turnStart); got != 0 {
+	if got := a.sweepFinishedSubagents(csA, 111); got != 0 {
 		t.Errorf("second sweep A = %d, want 0 (already charged)", got)
 	}
 }
@@ -81,7 +80,6 @@ func TestCoordUnattributedTaskIsNeverSwept(t *testing.T) {
 		return "done", subagent.Usage{Tokens: 100}, nil
 	})
 	a.Subagents = mgr
-	turnStart := time.Now().Add(-time.Minute)
 	if _, err := mgr.Spawn("unattributed work", time.Minute); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -105,7 +103,7 @@ func TestCoordUnattributedTaskIsNeverSwept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chatSessionFor 111: %v", err)
 	}
-	if got := a.sweepFinishedSubagents(cs, 111, turnStart); got != 0 {
+	if got := a.sweepFinishedSubagents(cs, 111); got != 0 {
 		t.Errorf("sweep = %d, want 0 (unattributed task must not be charged)", got)
 	}
 }

@@ -10,8 +10,13 @@
 // Cancellation and timeout are enforced by the Manager itself: the
 // executor runs in an inner goroutine and the Manager selects on the
 // task context, so a task is recorded as timed out / cancelled promptly
-// even if the executor ignores its context. A late executor result is
-// discarded (the result channel is buffered).
+// even if the executor ignores its context. A late executor result's
+// OUTPUT is discarded (the task is already terminal), but its USAGE
+// is not: when the executor eventually returns, a late-arrival
+// waiter records the reported usage on the entry (F-A7-2a), so a
+// later GetResult or sweep charges the tokens instead of losing
+// them. UsageSettled on the Result reports whether the usage is
+// final yet.
 package subagent
 
 import (
@@ -65,15 +70,26 @@ type Task struct {
 
 // Result is the outcome of a finished subagent task. Err is non-nil
 // for failed and timed-out tasks. Usage records what the executor
-// reported the task consumed; it is zero for tasks that never ran the
-// executor to completion (timeout, cancellation, panic).
+// reported the task consumed. UsageSettled reports whether Usage is
+// final: it is true once the executor's outcome has been consumed
+// (at record time on the normal path). For a task recorded as timed
+// out or cancelled while its executor was still running, Usage is
+// zero and UsageSettled is false until the executor eventually
+// returns, at which point the late-arrival waiter records its
+// reported usage and sets UsageSettled (F-A7-2a) — a caller that
+// charges a task must wait for UsageSettled before treating a zero
+// usage as final, or it will charge zero and lose the late tokens.
+// An executor that never returns leaves Usage zero and
+// UsageSettled false forever; its spend is unknowable, not invented.
 type Result struct {
-	TaskID     string
-	Output     string
-	Err        error
-	Usage      Usage
-	Duration   time.Duration
-	FinishedAt time.Time
+	TaskID string
+	Output string
+	Err    error
+	Usage  Usage
+	// UsageSettled reports whether Usage can no longer change.
+	UsageSettled bool
+	Duration     time.Duration
+	FinishedAt   time.Time
 }
 
 // Usage is the resource consumption one subagent task reported. Tokens
@@ -97,11 +113,22 @@ type TaskStatus struct {
 // Executor runs one brief and returns its output plus the usage it
 // consumed. Implementations must respect ctx cancellation/timeout
 // where possible; the Manager enforces the timeout regardless, so an
-// executor that ignores ctx is still recorded as timed out on schedule
-// (its late result — output and usage — is discarded).
+// executor that ignores ctx is still recorded as timed out on schedule.
+// Its late OUTPUT is discarded, but its late usage is recorded on
+// the task when it eventually returns (F-A7-2a), so the tokens are
+// charged by the next sweep or session close instead of being lost.
 // The real agent loop is plugged in by the caller via
 // NewManagerWithExecutor or SetExecutor.
 type Executor func(ctx context.Context, brief string) (output string, usage Usage, err error)
+
+// outcome is one executor return, carried on runTask's buffered
+// channel. Package-level so the late-arrival waiter (spawned by
+// runTask's timeout branch) can consume it after runTask returns.
+type outcome struct {
+	output string
+	usage  Usage
+	err    error
+}
 
 // taskEntry is the Manager's internal record for one task. done is
 // closed exactly once, when the task finishes and result is set.
@@ -291,11 +318,6 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 		defer cancel()
 	}
 
-	type outcome struct {
-		output string
-		usage  Usage
-		err    error
-	}
 	ch := make(chan outcome, 1)
 	go func() {
 		defer func() {
@@ -312,6 +334,10 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 	var usage Usage
 	var err error
 	var status Status
+	// lateUsage is set when the timeout/cancellation branch wins the
+	// race: the task is recorded with unsettled (zero) usage and a
+	// late-arrival waiter is spawned after the record.
+	lateUsage := false
 
 	select {
 	case o := <-ch:
@@ -334,8 +360,14 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 		}
 	case <-ctx.Done():
 		// Timeout or cancellation won the race. The executor may still
-		// be running; its late result is discarded via the buffered
-		// channel, so this task is recorded promptly.
+		// be running; the task is recorded promptly with zero usage
+		// (UsageSettled false), and a late-arrival waiter records the
+		// usage when the executor eventually returns (F-A7-2a) — the
+		// buffered channel means the waiter never blocks the executor,
+		// and the usage can only be written once (this branch is the
+		// only other writer, and it already ran), so a late usage can
+		// never be charged twice. The late OUTPUT is discarded: the
+		// task is already terminal, only its spend is recovered.
 		if ctx.Err() == context.DeadlineExceeded {
 			status = StatusTimeout
 			err = context.DeadlineExceeded
@@ -343,21 +375,48 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 			status = StatusFailed
 			err = context.Canceled
 		}
+		lateUsage = true
 	}
 
 	finishedAt := time.Now()
 	m.mu.Lock()
 	entry.status = status
 	entry.result = Result{
-		TaskID:     entry.task.ID,
-		Output:     output,
-		Err:        err,
-		Usage:      usage,
-		Duration:   finishedAt.Sub(start),
-		FinishedAt: finishedAt,
+		TaskID:       entry.task.ID,
+		Output:       output,
+		Err:          err,
+		Usage:        usage,
+		UsageSettled: !lateUsage,
+		Duration:     finishedAt.Sub(start),
+		FinishedAt:   finishedAt,
 	}
 	entry.finished = true
 	close(entry.done)
+	m.mu.Unlock()
+	if lateUsage {
+		go m.awaitLateOutcome(entry, ch)
+	}
+}
+
+// awaitLateOutcome waits for a timed-out or cancelled task's
+// executor to return and records its reported usage on the entry
+// (F-A7-2a), so GetResult and the per-chat sweep pick it up and the
+// next sweep (or session close) charges it. Only the usage is
+// recorded — the late output and error are discarded, the task
+// stays recorded with its timeout/cancellation status and error.
+// The wait ends as soon as the outcome arrives; an executor that
+// never returns leaves one goroutine parked on the buffered channel
+// for the Manager's lifetime. That is the same order of leak as the
+// executor goroutine itself (which is stuck inside user code and
+// cannot be interrupted in Go), so no extra bound is imposed: a
+// timer on this waiter would forfeit exactly the late usage it
+// exists to recover, and the entry is already terminal, so the
+// parked waiter holds no semaphore slot and no other resource.
+func (m *Manager) awaitLateOutcome(entry *taskEntry, ch <-chan outcome) {
+	o := <-ch
+	m.mu.Lock()
+	entry.result.Usage = o.usage
+	entry.result.UsageSettled = true
 	m.mu.Unlock()
 }
 

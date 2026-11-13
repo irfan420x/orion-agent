@@ -300,7 +300,7 @@ func TestApprovalCallbackRoundTrip(t *testing.T) {
 		Message: &messaging.TGMessage{MessageID: 9, Chat: messaging.TGChat{ID: 77}},
 		Data:    "perm:approve:" + req.ID,
 	}
-	if err := handleApprovalCallback(context.Background(), gw, gate, ownerID, q, nil); err != nil {
+	if err := messaging.HandleApprovalCallback(context.Background(), gw, gate, ownerID, q, nil, "oriond"); err != nil {
 		t.Fatalf("stranger tap: %v", err)
 	}
 	select {
@@ -311,7 +311,7 @@ func TestApprovalCallbackRoundTrip(t *testing.T) {
 	// The requester approves: Check returns true.
 	q.From = &messaging.TGUser{ID: 77}
 	q.ID = "cb-owner"
-	if err := handleApprovalCallback(context.Background(), gw, gate, ownerID, q, nil); err != nil {
+	if err := messaging.HandleApprovalCallback(context.Background(), gw, gate, ownerID, q, nil, "oriond"); err != nil {
 		t.Fatalf("requester tap: %v", err)
 	}
 	select {
@@ -356,7 +356,7 @@ func TestApprovalCallbackExpiredRequest(t *testing.T) {
 		Message: &messaging.TGMessage{MessageID: 9, Chat: messaging.TGChat{ID: 77}},
 		Data:    "perm:approve:0123456789abcdef",
 	}
-	if err := handleApprovalCallback(context.Background(), gw, gate, 7429947930, q, nil); err != nil {
+	if err := messaging.HandleApprovalCallback(context.Background(), gw, gate, 7429947930, q, nil, "oriond"); err != nil {
 		t.Fatalf("expired tap: %v", err)
 	}
 	fake.mu.Lock()

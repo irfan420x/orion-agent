@@ -3,13 +3,12 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc11.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc12.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,059 tests total — 1,055 pass, 0 fail, 4 skip —
+> built and tested (1,130 tests total — 1,126 pass, 0 fail, 4 skip —
 > Ollama live tests plus one MCP process test that needs a live server;
-> race clean; counts verified by Audit 6 on rc10, see
-> `AUDIT6_2026-11-13.md` — the rc11 suite count is confirmed by the
-> release coordinator before tagging). The model can now delegate to subagents (`subagent_spawn` /
+> race clean; counts verified by the rc12 release coordinator on the
+> final commit, see `AUDIT7_2026-11-13.md`). The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
 > history — fixed by a calibrated token estimator; same turn now costs
@@ -83,13 +82,23 @@ oriond                                  # standalone daemon binary
 #    at a self-hosted Bot API server (or a local fake for testing —
 #    see `oriond --help`).
 
+`orion telegram poll` and `orion daemon` are turn-only: they run the
+same gated, per-chat-isolated agent loop as `oriond`, but they have
+no slash-command framework — `/restart`, `/new`, `/model`, `/help`
+and the rest go to the agent as plain text, not as commands.
+`/restart` owner-only therefore holds vacuously there (there is no
+`/restart` command to refuse, only a text turn about restarting).
+`oriond` is the only entrypoint with the full command framework —
+the 19-command `/` menu below. Use `oriond` for a bot that answers
+`/commands`.
+
 While a turn runs, the bot streams a live "💻 terminal" card into
 the chat (one message, edited in place): each tool call appears as
 a block with its command, file writes as ✍️ lines, repeats collapse
 to (×N). Displayed commands are redacted, so secrets never leak
 into the chat. The final reply is a structured message in your
 language, with a runtime footer (model, tokens, steps, duration)
-you can toggle with `/footer`. The `/` menu offers 19 commands
+you can toggle with `/footer`. On `oriond`, the `/` menu offers 19 commands
 (`/help`, `/new`, `/sessions`, `/resume`, `/stop`, `/status`, `/model`,
 `/usage`, `/undo`, `/retry`, `/pause`, `/agents`, `/title`, `/compress`,
 `/save`, `/restart`, `/whoami`, `/footer`, `/memory`); per-chat
@@ -110,11 +119,11 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-21/21 packages, 1,059 tests total (1,055 passing, 0 failing, 4 skipped —
+21/21 packages, 1,130 tests total (1,126 passing, 0 failing, 4 skipped —
 the live Ollama tests, which need a running Ollama server, plus one MCP test
 that needs a live server process), race clean — `go test
--count=1 ./...`, verified by Audit 6 on rc10, 2026-11-13
-(`AUDIT6_2026-11-13.md`). Run the suite with `go test ./...` or `make test`.
+-count=1 ./...`, verified by the rc12 release coordinator, 2026-11-13
+(`AUDIT7_2026-11-13.md`). Run the suite with `go test ./...` or `make test`.
 
 ## Configuration
 
@@ -251,11 +260,13 @@ Consequences the operator must know:
   runs that server fully trusted, like a hook — it can read the
   agent's config and home directory. The daemon logs the opt-out on
   start.
-- Known limitation (Audit 6, F-A6-P2-14): sandboxed MCP servers share
-  the sandbox work dir (`<data_dir>/sandbox/work`, i.e. `/work`) with
-  `shell_exec`, so a server can read files a shell turn left in
-  `/work` and plant files a later shell turn might run. Do not leave
-  secrets in `/work`; see [SECURITY.md](SECURITY.md).
+- Per-server work dirs (Audit 6, F-A6-P2-14, fixed in rc11): each
+  sandboxed MCP server gets its own work dir
+  (`<data_dir>/sandbox-mcp-<name>/work`, i.e. its own `/work`) instead
+  of sharing `shell_exec`'s `<data_dir>/sandbox/work`, so a server can
+  no longer read files a shell turn left in `/work` or plant files a
+  later shell turn might run. Do not leave secrets in a server's
+  `/work`; see [SECURITY.md](SECURITY.md).
 
 ## Per-chat budget and USD cost
 
@@ -275,11 +286,13 @@ chat's daily total; yesterday's spend never counts against today.
 Side-channel provider calls (selector, extraction, auto-compact)
 and finished-but-unfetched subagent tasks are charged to the owning
 chat at turn end, so they count against the same budget. Metering of
-`/compress` itself is an rc11 fix (Audit 6, F-A6-1 — no production
+`/compress` itself landed in rc11 (Audit 6, F-A6-1 — no production
 caller passed the metering sink on the `/compress` path in rc10);
-the release coordinator verifies it landed before tagging. See
-[SECURITY.md](SECURITY.md) for the enforcement points and the known
-metering gaps still open in rc11.
+Audit 7 verified it live (the 218-token `/compress` summarisation
+recorded in `budget.json`). The remaining gap — `/compress` is
+metered but never refused at the daily limit (Audit 7, F-A7-1) —
+is rc12 scope. See [SECURITY.md](SECURITY.md) for the enforcement
+points and the known metering gaps.
 
 `/usage` shows the chat's day: tokens today with the
 prompt/completion/subagent split, the daily budget (limit,
@@ -328,8 +341,9 @@ is never deleted or modified by the migration.
 | `orion sessions` / `orion sessions list` | List CLI sessions (transcripts, newest first) |
 | `orion sessions resume <id\|prefix>` | Resume a CLI session: its transcript becomes the working history |
 | `orion sessions new` | Start a fresh CLI session (old transcript stays saved) |
-| `orion telegram test/poll` | Verify token / start gateway |
-| `orion daemon` / `oriond` | Telegram polling daemon |
+| `orion telegram test/poll` | Verify token / start gateway (turn-only — no slash commands; see above) |
+| `orion daemon` | Telegram polling daemon (turn-only — no slash commands; see above) |
+| `oriond` | Telegram polling daemon with the full slash-command framework (19-command `/` menu) |
 | `orion version` | Print version |
 
 ## Tools (all wired into the agent)

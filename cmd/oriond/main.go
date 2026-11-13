@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
@@ -184,26 +183,21 @@ func run(args []string) int {
 	} else {
 		fmt.Fprintln(os.Stderr, "oriond: no owner (empty allowlist with allow-all opt-in); /restart is refused for everyone")
 	}
-	// Permission gate (P1-O2): rules persist under the data dir
-	// (permissions.json, 0600). The prompter sends the Telegram
-	// inline-keyboard approval message; the callback handler
-	// resolves it. Local CLI runs never install a gate (see the
-	// permissions package doc) — the gate applies to
-	// Telegram-driven turns only.
-	ruleStore := permissions.NewRuleStore(filepath.Join(a.Config.DataDir, "permissions.json"))
-	if err := ruleStore.LoadError(); err != nil {
-		fmt.Fprintf(os.Stderr, "oriond: permissions file unusable, starting with no rules: %v\n", err)
+	// Permission gate (P1-O2) + approval cards: built through the
+	// shared constructor (app.NewPermissionGate, F-A7-P2-2) with
+	// the shared Telegram prompter/expiry hook from
+	// internal/messaging — the same wiring `orion daemon` and
+	// `orion telegram poll` get from wireGate, so the three
+	// Telegram loops cannot drift apart again. Rules persist
+	// under the data dir (permissions.json, 0600); a load error
+	// is logged by NewPermissionGate and the gate starts with no
+	// rules rather than refusing startup. See buildApprovalGate.
+	gate, cards, err := buildApprovalGate(a, gw, ownerID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
+		return 1
 	}
-	// Permission gate (P1-O2) + approval cards: the prompter sends
-	// the Telegram inline-keyboard approval message and the expiry
-	// hook edits the card in place when the window closes, so a
-	// dead card never keeps live-looking buttons (the rc8
-	// incident). See buildApprovalGate.
-	gate, cards := buildApprovalGate(gw, ruleStore)
-	a.SetPermissionGate(gate)
-	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
-		return handleApprovalCallback(ctx, gw, gate, ownerID, q, cards)
-	})
+	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, "oriond")
 
 	allowed := make(map[int64]bool, len(a.Config.TelegramAllowedChats))
 	for _, id := range a.Config.TelegramAllowedChats {
@@ -259,177 +253,24 @@ func run(args []string) int {
 	}
 }
 
-// approvalCards tracks live approval-card message IDs by pending
-// request ID. note records a card when the prompter sends it;
-// take removes and returns it when the request expires (so the
-// expiry edit runs once); forget removes it when the request is
-// answered (so a resolved card is never expired later). All methods
-// are nil-safe: a nil *approvalCards means "no tracking" (tests
-// that call handleApprovalCallback directly pass nil).
-type approvalCards struct {
-	mu sync.Mutex
-	m  map[string]int64
-}
-
-func newApprovalCards() *approvalCards { return &approvalCards{m: map[string]int64{}} }
-
-func (c *approvalCards) note(id string, msgID int64) {
-	if c == nil {
-		return
+// buildApprovalGate wires the permission gate for the daemon
+// through the shared constructor (app.NewPermissionGate, F-A7-P2-2)
+// with the shared Telegram prompter and expiry hook from
+// internal/messaging — the same wiring `orion daemon` and `orion
+// telegram poll` get from wireGate. It returns the gate and the
+// card tracker; the callback handler is installed by the caller
+// (run installs it right after; tests may install their own
+// logging wrapper instead). A nil gate is never returned on
+// success. Extracted from run() so the live-shape tests exercise
+// exactly the daemon's wiring, not a copy of it.
+func buildApprovalGate(a *app.App, gw *messaging.TelegramGateway, ownerID int64) (*permissions.Gate, *messaging.ApprovalCards, error) {
+	cards := messaging.NewApprovalCards()
+	gate, err := a.NewPermissionGate(messaging.ApprovalPrompter(gw, cards, "oriond"))
+	if err != nil {
+		return nil, nil, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.m == nil {
-		c.m = map[string]int64{}
-	}
-	c.m[id] = msgID
-}
-
-func (c *approvalCards) forget(id string) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.m, id)
-}
-
-func (c *approvalCards) take(id string) (int64, bool) {
-	if c == nil {
-		return 0, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	msgID, ok := c.m[id]
-	if ok {
-		delete(c.m, id)
-	}
-	return msgID, ok
-}
-
-// buildApprovalGate wires the permission gate for the daemon: the
-// prompter sends the Telegram approval card (recording its message
-// ID in cards) and the expiry hook edits the card in place when the
-// window closes. It returns the gate and the card tracker; the
-// callback handler takes the tracker so a resolved card is never
-// expired later. Extracted from run() so the live-shape tests
-// exercise exactly the daemon's wiring, not a copy of it.
-func buildApprovalGate(gw *messaging.TelegramGateway, ruleStore *permissions.RuleStore) (*permissions.Gate, *approvalCards) {
-	cards := newApprovalCards()
-	gate := permissions.NewGate(ruleStore, func(ctx context.Context, req permissions.ApprovalRequest) error {
-		text := fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool.", req.Summary(), req.ChatID, req.SenderID)
-		msgID, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, text, messaging.ApprovalKeyboard(req.ID))
-		if err == nil {
-			cards.note(req.ID, msgID)
-			fmt.Fprintf(os.Stderr, "oriond: approval prompt: tool %q request %s chat %d card %d\n", req.Tool, req.ID, req.ChatID, msgID)
-		}
-		return err
-	})
-	// When a request dies unanswered, expire its card in place:
-	// replace the text and REMOVE the keyboard, so nobody can tap
-	// a dead button. The edit runs in a goroutine (the hook must
-	// return promptly) with a background context — the turn's
-	// context may already be cancelled, which is exactly why the
-	// request expired. Best-effort: a failed edit never fails
-	// anything; the card simply stays until Telegram prunes it.
-	gate.SetOnExpire(func(req permissions.ApprovalRequest) {
-		msgID, ok := cards.take(req.ID)
-		if !ok {
-			return
-		}
-		fmt.Fprintf(os.Stderr, "oriond: approval expired: request %s chat %d card %d\n", req.ID, req.ChatID, msgID)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			// Log an edit failure (F-A5-P2-22): a failed expiry
-			// edit (e.g. message deleted) must leave a trace
-			// instead of being swallowed.
-			if err := gw.EditMessageTextMarkup(ctx, req.ChatID, msgID, "⚠️ Approval request: ⏰ Expired — no answer within the approval window. Send the request again to retry.", messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}}); err != nil {
-				fmt.Fprintf(os.Stderr, "oriond: approval expired: request %s card %d edit failed: %v\n", req.ID, msgID, err)
-			}
-		}()
-	})
-	return gate, cards
-}
-
-// handleApprovalCallback resolves one permission-gate approval
-// tap (P1-O2). The decision comes from the button's callback data
-// (perm:<decision>:<requestID>); the pending request is looked up
-// in the gate, and only the user whose turn requested the tool call
-// — or the owner — may answer it. A tap from anyone else (e.g.
-// another member of a group chat) is refused without touching the
-// pending request, so a stranger can neither approve nor deny
-// someone else's tool call. The approval message is edited in place
-// to show the outcome, and the query is answered to clear the
-// button spinner. A tap on an expired request is told so.
-//
-// Every tap is logged (decision, request ID, sender, outcome): the
-// rc8 incident was undiagnosable from the log precisely because the
-// success and expired paths logged nothing, so a tap that never
-// arrived and a tap on a dead card looked identical. With these
-// lines the next incident reads: prompt (id=X) → tap (id=Y) →
-// resolved/expired — and X≠Y names the stale card at once.
-func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, gate *permissions.Gate, ownerID int64, q messaging.TGCallbackQuery, cards *approvalCards) error {
-	decision, id, ok := messaging.ParsePermissionCallback(q.Data)
-	if !ok {
-		// Log the unparseable tap (F-A5-P2-22): without this a
-		// tap the handler cannot understand is silent, and a
-		// malformed button looks exactly like a dead one. The
-		// data is a short callback payload (perm:<decision>:<id>),
-		// never free user text, so logging it is safe.
-		fmt.Fprintf(os.Stderr, "oriond: approval tap: unparseable callback data %q (query %s)\n", q.Data, q.ID)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
-	}
-	senderID := int64(0)
-	if q.From != nil {
-		senderID = q.From.ID
-	}
-	fmt.Fprintf(os.Stderr, "oriond: approval tap: %s request %s from %d\n", decision, id, senderID)
-	req, found := gate.Pending(id)
-	if !found {
-		fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s expired (no longer pending)\n", id)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
-	}
-	if senderID != req.SenderID && senderID != ownerID {
-		fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s refused for sender %d (requester %d, owner %d)\n", id, senderID, req.SenderID, ownerID)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "Only the person who asked can approve this.")
-	}
-	var persist *permissions.Action
-	approved := false
-	outcome := ""
-	switch decision {
-	case "approve":
-		approved, outcome = true, "✅ Approved — running it now."
-	case "deny":
-		approved, outcome = false, "❌ Denied."
-	case "always":
-		allow := permissions.ActionAllow
-		persist, approved, outcome = &allow, true, "✅ Approved — I won't ask again for this tool."
-	case "never":
-		deny := permissions.ActionDeny
-		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool."
-	}
-	if !gate.Resolve(id, approved, persist) {
-		fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s expired during resolve\n", id)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
-	}
-	fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s resolved approved=%v\n", id, approved)
-	cards.forget(id)
-	// Edit the prompt in place so the chat shows the outcome. The
-	// edit carries the outcome only (no tool arguments): the
-	// prompt's summary is user/model-derived text and EditMessageText
-	// sends HTML, so echoing it back could break the markup.
-	// The edit uses EditMessageTextMarkup with an EMPTY keyboard
-	// (F-A5-P2-21): omitting reply_markup leaves the old keyboard
-	// in place, so a resolved card would keep live Approve/Deny
-	// buttons — the same defect the expiry path already fixes.
-	// An edit failure is logged, never swallowed (F-A5-P2-22).
-	if q.Message != nil {
-		if err := gw.EditMessageTextMarkup(ctx, q.Message.Chat.ID, q.Message.MessageID, "⚠️ Approval request: "+outcome, messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}}); err != nil {
-			fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s outcome edit failed: %v\n", id, err)
-		}
-	}
-	return gw.AnswerCallbackQuery(ctx, q.ID, outcome)
+	messaging.InstallApprovalExpiry(gate, gw, cards, "oriond")
+	return gate, cards, nil
 }
 
 // runTurn runs one real agent turn for a chat: it records the input

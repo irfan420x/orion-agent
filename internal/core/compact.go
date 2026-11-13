@@ -52,10 +52,11 @@
 //     is refused and the prefix is left untouched (Audit 5
 //     F-A5-2; Audit 6 F-A6-P2-1).
 //
-// The manual /compress path (App.compressWithOn) is untouched and
-// keeps working exactly as before; auto-compaction reuses its
-// summarisation shape (same prompt, same what-not-to-save gate)
-// but never calls into app, so there is no import cycle.
+// The manual /compress path (App.compressWithOn) shares the same
+// summarisation shape (same prompt, same what-not-to-save gate,
+// same preservation check via SummaryPreservesSource, F-A7-P2-4);
+// auto-compaction never calls into app, so there is no import
+// cycle.
 package core
 
 import (
@@ -760,6 +761,16 @@ func summaryPreservesSource(summary string, source []model.Message) bool {
 		floor = maxSummaryLengthFloor
 	}
 	return len([]rune(summary)) >= floor
+}
+
+// SummaryPreservesSource is the exported form of
+// summaryPreservesSource, shared with the manual /compress path
+// (internal/app compressWithOn, F-A7-P2-4): the same preservation
+// bar auto-compaction applies must hold for a manual compress —
+// a degenerate summary must never cost the history it claims to
+// replace, whichever path produced it.
+func SummaryPreservesSource(summary string, source []model.Message) bool {
+	return summaryPreservesSource(summary, source)
 }
 
 // noteCompactionFailure counts one failed compaction toward the

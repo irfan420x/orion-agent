@@ -492,7 +492,11 @@ func TestResultRecordsUsage(t *testing.T) {
 }
 
 // TestResultUsageZeroWhenExecutorNeverCompletes: a task that times out
-// (executor's late result discarded) records zero usage.
+// reports zero usage to the waiter — Wait returns promptly, before
+// the executor's late return. (F-A7-2a: the late usage IS recorded
+// on the entry afterwards, when the executor eventually returns;
+// see TestLateUsageFromIgnoringExecutorIsCharged. What stays zero
+// here is only the prompt timeout result, never a later GetResult.)
 func TestResultUsageZeroWhenExecutorNeverCompletes(t *testing.T) {
 	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
 		time.Sleep(500 * time.Millisecond)

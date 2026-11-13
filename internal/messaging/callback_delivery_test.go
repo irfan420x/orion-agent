@@ -54,7 +54,25 @@ type queueFake struct {
 	mu       sync.Mutex
 	queue    []Update
 	answered []string
+	sent     []queueSent // every sendMessage call, in order
+	edits    []queueEdit // every editMessageText call, in order
 	nextID   int64
+}
+
+// queueSent is one sendMessage call the fake recorded.
+type queueSent struct {
+	ChatID   int64  `json:"chat_id"`
+	Text     string `json:"text"`
+	Keyboard string // raw reply_markup JSON, "" when no keyboard
+	MsgID    int64
+}
+
+// queueEdit is one editMessageText call the fake recorded.
+type queueEdit struct {
+	ChatID  int64  `json:"chat_id"`
+	MsgID   int64  `json:"message_id"`
+	Text    string `json:"text"`
+	HasKeys bool   // the edit carried a reply_markup (empty keyboard)
 }
 
 func newQueueFake() *queueFake { return &queueFake{} }
@@ -109,8 +127,27 @@ func (f *queueFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/sendMessage"):
+		var msg queueSent
+		_ = json.Unmarshal(body, &msg)
+		var raw struct {
+			ReplyMarkup json.RawMessage `json:"reply_markup"`
+		}
+		_ = json.Unmarshal(body, &raw)
+		msg.Keyboard = string(raw.ReplyMarkup)
 		f.nextID++
+		msg.MsgID = f.nextID
+		f.sent = append(f.sent, msg)
 		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d}}`, f.nextID)
+	case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+		var e queueEdit
+		_ = json.Unmarshal(body, &e)
+		var raw struct {
+			ReplyMarkup json.RawMessage `json:"reply_markup"`
+		}
+		_ = json.Unmarshal(body, &raw)
+		e.HasKeys = len(raw.ReplyMarkup) > 0
+		f.edits = append(f.edits, e)
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	case strings.HasSuffix(r.URL.Path, "/sendChatAction"):
 		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	case strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
@@ -119,8 +156,6 @@ func (f *queueFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(body, &req)
 		f.answered = append(f.answered, req.CallbackQueryID)
-		fmt.Fprint(w, `{"ok":true,"result":true}`)
-	case strings.HasSuffix(r.URL.Path, "/editMessageText"):
 		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	case strings.HasSuffix(r.URL.Path, "/setMyCommands"):
 		fmt.Fprint(w, `{"ok":true,"result":true}`)

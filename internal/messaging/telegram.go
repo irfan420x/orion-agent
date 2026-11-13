@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
 )
 
@@ -157,12 +159,17 @@ type TelegramGateway struct {
 	client  *http.Client
 	offset  int64
 	mu      sync.Mutex
-	// fetchMu serialises GetUpdates calls. The offset alone is not
-	// enough: two concurrent GetUpdates calls could both read the
-	// same offset before either advanced it, and Telegram would
-	// return the same updates to both. One poller at a time also
-	// matches the Bot API's own rule (409 Conflict when a second
-	// getUpdates is in flight).
+	// fetchMu serialises getUpdates fetches. The offset alone is not
+	// enough: two concurrent fetches could both read the same
+	// offset before either advanced it, and Telegram would return
+	// the same updates to both. One poller at a time also matches
+	// the Bot API's own rule (409 Conflict when a second
+	// getUpdates is in flight). GetUpdates holds it across the
+	// fetch and the offset advance (one atomic step); PollStream
+	// holds it only for the fetch and confirms per dispatched
+	// update afterwards (F-A7-P2-3) — production runs a single
+	// poller, so no second fetcher can observe the un-advanced
+	// offset mid-batch.
 	fetchMu sync.Mutex
 	// allowedChats is nil when no allowlist is set (all chats pass).
 	allowedChats map[int64]bool
@@ -878,6 +885,216 @@ func ParsePermissionCallback(data string) (decision, requestID string, ok bool) 
 	}
 }
 
+// --- Shared permission-gate Telegram wiring (F-A7-P2-2) -------------
+//
+// Before rc12 the approval wiring existed twice — once in cmd/orion
+// (wireGate) and once in cmd/oriond (buildApprovalGate) — as two
+// near-identical copies of the prompter text, the expiry hook, the
+// card tracker and the tap resolver, plus two separate gate
+// constructions (oriond called permissions.NewGate directly while
+// cmd/orion called app.NewPermissionGate). The security property
+// held on both paths, but the copies could drift apart again, and
+// the wireGate comment claiming oriond used the shared constructor
+// was false. The wiring below is the single implementation both
+// binaries use: each binary still builds its gate through the
+// shared constructor (app.NewPermissionGate) and passes the
+// prompter from ApprovalPrompter, then installs the expiry hook
+// and the callback handler from here. The only per-binary
+// difference is the log prefix ("orion" vs "oriond"), passed in so
+// log lines keep naming the binary that emitted them. Gate
+// behaviour is unchanged: same prompt text, same expiry edit,
+// same requester-or-owner tap rule.
+
+// ApprovalCards tracks live approval-card message IDs by pending
+// request ID. Note records a card when the prompter sends it;
+// Take removes and returns it when the request expires (so the
+// expiry edit runs once); Forget removes it when the request is
+// answered (so a resolved card is never expired later). All
+// methods are nil-safe: a nil *ApprovalCards means "no tracking"
+// (tests that call HandleApprovalCallback directly pass nil).
+type ApprovalCards struct {
+	mu sync.Mutex
+	m  map[string]int64
+}
+
+// NewApprovalCards returns an empty card tracker.
+func NewApprovalCards() *ApprovalCards { return &ApprovalCards{m: map[string]int64{}} }
+
+// Note records msgID as the live card for pending request id.
+func (c *ApprovalCards) Note(id string, msgID int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]int64{}
+	}
+	c.m[id] = msgID
+}
+
+// Take removes and returns the card for id, reporting whether one
+// was tracked.
+func (c *ApprovalCards) Take(id string) (int64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msgID, ok := c.m[id]
+	if ok {
+		delete(c.m, id)
+	}
+	return msgID, ok
+}
+
+// Forget removes any tracked card for id without returning it.
+func (c *ApprovalCards) Forget(id string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, id)
+}
+
+// ApprovalPromptText renders the approval-card text for req: what
+// is being asked, which chat it is for, and who requested it, plus
+// the button instructions. Shared by both binaries so the card a
+// user sees never depends on which entrypoint is running.
+func ApprovalPromptText(req permissions.ApprovalRequest) string {
+	return fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool.", req.Summary(), req.ChatID, req.SenderID)
+}
+
+// ApprovalPrompter builds the gate prompter for gw: it sends the
+// Telegram inline-keyboard approval card (recording its message ID
+// in cards so the expiry hook can edit it in place) and logs the
+// prompt. A send failure is returned so the gate can treat the
+// prompt as undelivered.
+func ApprovalPrompter(gw *TelegramGateway, cards *ApprovalCards, logPrefix string) permissions.Prompter {
+	return func(ctx context.Context, req permissions.ApprovalRequest) error {
+		msgID, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, ApprovalPromptText(req), ApprovalKeyboard(req.ID))
+		if err == nil {
+			cards.Note(req.ID, msgID)
+			fmt.Fprintf(os.Stderr, "%s: approval prompt: tool %q request %s chat %d card %d\n", logPrefix, req.Tool, req.ID, req.ChatID, msgID)
+		}
+		return err
+	}
+}
+
+// InstallApprovalExpiry installs gate's expiry hook: when a
+// request dies unanswered, its card is edited in place — text
+// replaced and keyboard REMOVED, so nobody can tap a dead button.
+// The edit runs in a goroutine (the hook must return promptly)
+// with a background context — the turn's context may already be
+// cancelled, which is exactly why the request expired.
+// Best-effort: a failed edit is logged, never fatal.
+func InstallApprovalExpiry(gate *permissions.Gate, gw *TelegramGateway, cards *ApprovalCards, logPrefix string) {
+	gate.SetOnExpire(func(req permissions.ApprovalRequest) {
+		msgID, ok := cards.Take(req.ID)
+		if !ok {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "%s: approval expired: request %s chat %d card %d\n", logPrefix, req.ID, req.ChatID, msgID)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			// Log an edit failure: a failed expiry edit (e.g.
+			// message deleted) must leave a trace instead of
+			// being swallowed.
+			if err := gw.EditMessageTextMarkup(ctx, req.ChatID, msgID, "⚠️ Approval request: ⏰ Expired — no answer within the approval window. Send the request again to retry.", InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+				fmt.Fprintf(os.Stderr, "%s: approval expired: request %s card %d edit failed: %v\n", logPrefix, req.ID, msgID, err)
+			}
+		}()
+	})
+}
+
+// HandleApprovalCallback resolves one permission-gate approval tap
+// (P1-O2): the decision comes from the button's callback data
+// (perm:<decision>:<requestID>); the pending request is looked up
+// in the gate, and only the user whose turn requested the tool call
+// — or the owner — may answer it. A tap from anyone else is refused
+// without touching the pending request, so a stranger can neither
+// approve nor deny someone else's tool call. The approval message
+// is edited in place to show the outcome, and the query is answered
+// to clear the button spinner. A tap on an expired request is told
+// so. Every tap is logged (decision, request ID, sender, outcome):
+// a tap that never arrives and a tap on a dead card must be
+// distinguishable in the log.
+func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *permissions.Gate, ownerID int64, q TGCallbackQuery, cards *ApprovalCards, logPrefix string) error {
+	decision, id, ok := ParsePermissionCallback(q.Data)
+	if !ok {
+		// Log the unparseable tap: without this a tap the
+		// handler cannot understand is silent, and a malformed
+		// button looks exactly like a dead one. The data is a
+		// short callback payload (perm:<decision>:<id>), never
+		// free user text, so logging it is safe.
+		fmt.Fprintf(os.Stderr, "%s: approval tap: unparseable callback data %q (query %s)\n", logPrefix, q.Data, q.ID)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
+	}
+	senderID := int64(0)
+	if q.From != nil {
+		senderID = q.From.ID
+	}
+	fmt.Fprintf(os.Stderr, "%s: approval tap: %s request %s from %d\n", logPrefix, decision, id, senderID)
+	req, found := gate.Pending(id)
+	if !found {
+		fmt.Fprintf(os.Stderr, "%s: approval tap: request %s expired (no longer pending)\n", logPrefix, id)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+	}
+	if senderID != req.SenderID && senderID != ownerID {
+		fmt.Fprintf(os.Stderr, "%s: approval tap: request %s refused for sender %d (requester %d, owner %d)\n", logPrefix, id, senderID, req.SenderID, ownerID)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "Only the person who asked can approve this.")
+	}
+	var persist *permissions.Action
+	approved := false
+	outcome := ""
+	switch decision {
+	case "approve":
+		approved, outcome = true, "✅ Approved — running it now."
+	case "deny":
+		approved, outcome = false, "❌ Denied."
+	case "always":
+		allow := permissions.ActionAllow
+		persist, approved, outcome = &allow, true, "✅ Approved — I won't ask again for this tool."
+	case "never":
+		deny := permissions.ActionDeny
+		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool."
+	}
+	if !gate.Resolve(id, approved, persist) {
+		fmt.Fprintf(os.Stderr, "%s: approval tap: request %s expired during resolve\n", logPrefix, id)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+	}
+	fmt.Fprintf(os.Stderr, "%s: approval tap: request %s resolved approved=%v\n", logPrefix, id, approved)
+	cards.Forget(id)
+	// Edit the prompt in place so the chat shows the outcome. The
+	// edit carries the outcome only (no tool arguments): the
+	// prompt's summary is user/model-derived text and
+	// EditMessageText sends HTML, so echoing it back could break
+	// the markup. The edit uses EditMessageTextMarkup with an EMPTY
+	// keyboard: omitting reply_markup leaves the old keyboard in
+	// place, so a resolved card would keep live Approve/Deny
+	// buttons. An edit failure is logged, never swallowed.
+	if q.Message != nil {
+		if err := gw.EditMessageTextMarkup(ctx, q.Message.Chat.ID, q.Message.MessageID, "⚠️ Approval request: "+outcome, InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: approval tap: request %s outcome edit failed: %v\n", logPrefix, id, err)
+		}
+	}
+	return gw.AnswerCallbackQuery(ctx, q.ID, outcome)
+}
+
+// InstallApprovalCallbackHandler installs the gateway callback
+// handler that resolves approval taps through gate: only the
+// requester or the owner may answer (see
+// HandleApprovalCallback). Callers must install this (or an
+// equivalent) or approvals can never be answered — the gate
+// prompts, but no tap reaches it.
+func InstallApprovalCallbackHandler(gw *TelegramGateway, gate *permissions.Gate, ownerID int64, cards *ApprovalCards, logPrefix string) {
+	gw.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+		return HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, logPrefix)
+	})
+}
+
 // SendChatAction sends a chat action (e.g. "typing") to chatID, so the
 // user sees the bot working while a turn runs.
 func (g *TelegramGateway) SendChatAction(ctx context.Context, chatID int64, action string) error {
@@ -981,22 +1198,24 @@ func (g *TelegramGateway) SendMessage(ctx context.Context, chatID int64, text st
 	return nil
 }
 
-// GetUpdates long-polls for new updates (timeout=30s on the server side,
-// 35s client timeout). After a successful call the internal offset is
-// advanced to max(update_id) + 1, so the next call only returns newer
-// updates. It honours ctx cancellation.
-func (g *TelegramGateway) GetUpdates(ctx context.Context) ([]Update, error) {
+// fetchUpdatesLocked long-polls for new updates (timeout=30s on the
+// server side, 35s client timeout) and returns them WITHOUT
+// advancing the offset. The caller holds fetchMu and must advance
+// the offset for every update it has decided (dispatched, dropped,
+// or skipped) — see advanceOffsetTo and PollStream's contiguous
+// confirmation. It honours ctx cancellation.
+//
+// Splitting the fetch from the advance is what closes the
+// crash-window loss (F-A7-P2-3): GetUpdates used to advance the
+// offset the moment updates arrived, before any of them was
+// dispatched, so a daemon dying mid-batch confirmed
+// fetched-but-undispatched updates server-side and they were lost.
+// A caller that never advances re-fetches the same updates on the
+// next poll instead — at-least-once, never lost.
+func (g *TelegramGateway) fetchUpdatesLocked(ctx context.Context) ([]Update, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Serialise whole polls (see fetchMu): the offset read, the
-	// request, and the offset advance are one atomic step, so two
-	// concurrent callers can never fetch the same offset and deliver
-	// the same updates twice. A second caller waits here for the
-	// in-flight long poll (up to ~35s) instead of duplicating it.
-	g.fetchMu.Lock()
-	defer g.fetchMu.Unlock()
-
 	// Bound the long poll even if the caller supplied a client without a
 	// timeout. WithTimeout never extends a shorter caller deadline: the
 	// earliest deadline wins.
@@ -1019,22 +1238,68 @@ func (g *TelegramGateway) GetUpdates(ctx context.Context) ([]Update, error) {
 	if err := json.Unmarshal(result, &updates); err != nil {
 		return nil, fmt.Errorf("messaging: telegram getUpdates: decode result: %w", err)
 	}
-	if len(updates) > 0 {
-		var maxID int64 = updates[0].UpdateID
-		for _, u := range updates[1:] {
-			if u.UpdateID > maxID {
-				maxID = u.UpdateID
-			}
-		}
-		g.mu.Lock()
-		if maxID+1 > g.offset {
-			g.offset = maxID + 1
-		}
-		g.mu.Unlock()
-	}
 	if updates == nil {
 		updates = []Update{}
 	}
+	return updates, nil
+}
+
+// advanceOffsetTo moves the offset to next when next is ahead of it.
+// The offset only ever moves forward: a stale or duplicate advance
+// is a no-op. It is the single place the offset changes.
+func (g *TelegramGateway) advanceOffsetTo(next int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if next > g.offset {
+		g.offset = next
+	}
+}
+
+// advanceOffset moves the offset past every update in updates (to
+// max(update_id) + 1), so the next call only returns newer updates.
+// It is GetUpdates' whole-batch confirmation: every fetched update
+// is decided by the caller at once, so all of them are confirmed
+// together.
+func (g *TelegramGateway) advanceOffset(updates []Update) {
+	if len(updates) == 0 {
+		return
+	}
+	var maxID int64 = updates[0].UpdateID
+	for _, u := range updates[1:] {
+		if u.UpdateID > maxID {
+			maxID = u.UpdateID
+		}
+	}
+	g.advanceOffsetTo(maxID + 1)
+}
+
+// GetUpdates long-polls for new updates (timeout=30s on the server side,
+// 35s client timeout). After a successful call the internal offset is
+// advanced to max(update_id) + 1, so the next call only returns newer
+// updates. It honours ctx cancellation.
+//
+// Serialise whole polls (see fetchMu): the offset read, the
+// request, and the offset advance are one atomic step, so two
+// concurrent callers can never fetch the same offset and deliver
+// the same updates twice. A second caller waits here for the
+// in-flight long poll (up to ~35s) instead of duplicating it.
+// PollStream does NOT use this method: it fetches with
+// fetchUpdatesLocked and confirms per dispatched update instead,
+// so a crash mid-batch cannot confirm updates it never dispatched.
+func (g *TelegramGateway) GetUpdates(ctx context.Context) ([]Update, error) {
+	// Serialise whole polls (see fetchMu): the offset read, the
+	// request, and the offset advance are one atomic step, so two
+	// concurrent callers can never fetch the same offset and deliver
+	// the same updates twice. A second caller waits here for the
+	// in-flight long poll (up to ~35s) instead of duplicating it.
+	g.fetchMu.Lock()
+	defer g.fetchMu.Unlock()
+
+	updates, err := g.fetchUpdatesLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	g.advanceOffset(updates)
 	return updates, nil
 }
 
@@ -1087,6 +1352,14 @@ const typingResendInterval = 4 * time.Second
 // PollStream returns nil promptly; handlers already running are left
 // to finish (their reply sends use the cancelled ctx and fail
 // best-effort, as before).
+//
+// Each batch is dispatched in two passes (F-A7-P2-3): all callback
+// queries first, then messages. A message earlier in a batch must
+// never delay a tap later in that batch behind a turn slot.
+// The getUpdates offset advances only as updates are dispatched,
+// dropped, or skipped — and only past the longest contiguous run
+// of decided updates — so a crash mid-batch re-delivers the
+// undispatched suffix instead of confirming and losing it.
 func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) error {
 	if handler == nil {
 		return errors.New("messaging: telegram PollStream: handler must not be nil")
@@ -1301,7 +1574,20 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		default:
 		}
 
-		updates, err := g.GetUpdates(ctx)
+		// Fetch WITHOUT advancing the offset (F-A7-P2-3): the offset
+		// advances only as updates are dispatched below (see
+		// markDecided), so a crash mid-batch cannot confirm
+		// updates this loop never reached. fetchMu is held only
+		// for the fetch itself: the dispatch loop below can block
+		// on the turn semaphore, and holding the fetch lock across
+		// it would stall any concurrent GetUpdates caller for the
+		// same time. Production has a single poller, so no second
+		// fetcher can observe the un-advanced offset mid-batch;
+		// GetUpdates callers keep their own atomic
+		// fetch-and-advance (see GetUpdates).
+		g.fetchMu.Lock()
+		updates, err := g.fetchUpdatesLocked(ctx)
+		g.fetchMu.Unlock()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -1339,50 +1625,110 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		}
 		backoff = time.Second
 
+		// Every received update is logged first, in arrival order
+		// (id + kind + sender / chat ids only — never message text
+		// or callback data): the rc10 incident was undiagnosable
+		// precisely because nothing recorded whether getUpdates
+		// ever RETURNED the tap. With this line the next incident
+		// reads either "received update N callback_query" (the
+		// loss is downstream of the poll) or nothing at all (the
+		// loss is upstream: another poller confirmed it, or
+		// Telegram never delivered it).
 		for _, upd := range updates {
-			// Every received update is logged (id + kind + sender
-			// / chat ids only — never message text or callback
-			// data): the rc10 incident was undiagnosable precisely
-			// because nothing recorded whether getUpdates ever
-			// RETURNED the tap. With this line the next incident
-			// reads either "received update N callback_query" (the
-			// loss is downstream of the poll) or nothing at all
-			// (the loss is upstream: another poller confirmed it,
-			// or Telegram never delivered it).
 			g.logReceivedUpdate(upd)
-			// Callback queries (inline-keyboard taps) are handled
-			// on their own path, outside the per-chat lock (see
-			// handleCallback): a tap must be able to resolve a
-			// pending approval while the turn that requested it
-			// holds the chat's lock. The sender is checked the
-			// same way as for messages — a tap from a
-			// non-allowlisted user can never approve anything.
-			// The callback slot comes from cbSem, NOT the turn
-			// semaphore (see above): a tap is dispatched even
-			// when every turn slot is held.
-			if upd.CallbackQuery != nil {
-				q := upd.CallbackQuery
-				if !g.IsSenderAllowed(q.From) {
-					if q.From != nil {
-						g.logf("telegram poll: dropped callback query from non-allowlisted user %d", q.From.ID)
-					} else {
-						g.logf("telegram poll: dropped callback query with no sender")
-					}
-					continue
-				}
-				if ctx.Err() != nil {
-					return nil
-				}
-				select {
-				case cbSem <- struct{}{}:
-				case <-ctx.Done():
-					return nil
-				}
-				go handleCallback(*q)
-				continue
+		}
+
+		// markDecided confirms one update and advances the offset
+		// past the longest contiguous run of decided updates,
+		// starting at the offset this batch was fetched from
+		// (F-A7-P2-3, crash window). The offset is a single
+		// watermark, so it may only pass an update once every
+		// earlier update is decided too: a callback later in the
+		// batch is dispatched (and decided) while an earlier
+		// message is still waiting on a turn slot, but the
+		// watermark stays behind that message — a crash now
+		// re-delivers the suffix instead of losing it. A decided
+		// update is one this loop dispatched, dropped, or skipped
+		// on purpose; an undecided one is re-fetched on the next
+		// poll. That is at-least-once: a turn killed mid-flight
+		// by the crash runs again, which is the safe direction —
+		// the user gets a second reply rather than silence.
+		// Telegram delivers update_ids contiguously, so the run
+		// always reaches the batch end once every update is
+		// decided; defensively, if the batch starts above the
+		// watermark (a gap that cannot occur on the real API),
+		// the run starts at the first update instead of stalling
+		// forever below it.
+		nextConfirm := g.Offset()
+		if len(updates) > 0 && updates[0].UpdateID > nextConfirm {
+			nextConfirm = updates[0].UpdateID
+		}
+		decided := make(map[int64]bool, len(updates))
+		markDecided := func(id int64) {
+			decided[id] = true
+			for decided[nextConfirm] {
+				delete(decided, nextConfirm)
+				nextConfirm++
 			}
+			g.advanceOffsetTo(nextConfirm)
+		}
+
+		// Pass 1 — callbacks first (F-A7-P2-3, in-batch ordering).
+		// Callback queries (inline-keyboard taps) are handled on
+		// their own path, outside the per-chat lock (see
+		// handleCallback): a tap must be able to resolve a pending
+		// approval while the turn that requested it holds the
+		// chat's lock. The sender is checked the same way as for
+		// messages — a tap from a non-allowlisted user can never
+		// approve anything. The callback slot comes from cbSem,
+		// NOT the turn semaphore (see above): a tap is dispatched
+		// even when every turn slot is held.
+		//
+		// The passes exist because the loop used to iterate a
+		// batch sequentially: a message earlier in the same batch
+		// blocked the loop on sem before a callback later in that
+		// batch was reached, so a tap could still wait behind a
+		// message dispatch while all turn slots were held (up to
+		// the 90s approval window — a same-batch tap could still
+		// expire). Dispatching every callback before any message
+		// closes that ordering hole; the message pass below can
+		// block on sem without delaying a tap.
+		dispatchCallback := func(upd Update) bool {
+			q := upd.CallbackQuery
+			if !g.IsSenderAllowed(q.From) {
+				if q.From != nil {
+					g.logf("telegram poll: dropped callback query from non-allowlisted user %d", q.From.ID)
+				} else {
+					g.logf("telegram poll: dropped callback query with no sender")
+				}
+				markDecided(upd.UpdateID)
+				return true
+			}
+			if ctx.Err() != nil {
+				return false
+			}
+			select {
+			case cbSem <- struct{}{}:
+			case <-ctx.Done():
+				return false
+			}
+			go handleCallback(*q)
+			markDecided(upd.UpdateID)
+			return true
+		}
+
+		// Pass 2 — messages, in batch order. A message with no
+		// text is skipped (decided: there is nothing to deliver);
+		// anything else needs a turn slot, so this pass is the one
+		// that blocks when all slots are held. Blocking here is
+		// safe now: every callback in the batch is already
+		// dispatched, and the offset still sits behind any
+		// undispatched message (see markDecided), so a crash or a
+		// shutdown mid-pass re-delivers the rest.
+		dispatchMessage := func(upd Update) bool {
 			if upd.Message == nil || strings.TrimSpace(upd.Message.Text) == "" {
-				continue
+				markDecided(upd.UpdateID)
+				return true
 			}
 			// Sender authorisation: drop messages from chats outside
 			// the allowlist before the handler (and the agent, and
@@ -1393,7 +1739,8 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			// telegram_allowed_chats. The text is never logged.
 			if !g.IsChatAllowed(upd.Message.Chat.ID) {
 				g.logf("telegram poll: dropped message from non-allowlisted chat %d (add it to telegram_allowed_chats to allow it)", upd.Message.Chat.ID)
-				continue
+				markDecided(upd.UpdateID)
+				return true
 			}
 			// Sender check (P1-O4): the chat being allowlisted is
 			// not enough — the SENDER must be allowlisted too. In
@@ -1406,10 +1753,11 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				} else {
 					g.logf("telegram poll: dropped message with no sender in chat %d", upd.Message.Chat.ID)
 				}
-				continue
+				markDecided(upd.UpdateID)
+				return true
 			}
 			if ctx.Err() != nil {
-				return nil
+				return false
 			}
 			// Acquire a handler slot (or stop if cancelled) before
 			// dispatching, so the number of in-flight handlers is
@@ -1417,9 +1765,28 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				return nil
+				return false
 			}
 			go handle(upd)
+			markDecided(upd.UpdateID)
+			return true
+		}
+
+		for _, upd := range updates {
+			if upd.CallbackQuery == nil {
+				continue
+			}
+			if !dispatchCallback(upd) {
+				return nil
+			}
+		}
+		for _, upd := range updates {
+			if upd.CallbackQuery != nil {
+				continue
+			}
+			if !dispatchMessage(upd) {
+				return nil
+			}
 		}
 	}
 }
