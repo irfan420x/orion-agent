@@ -54,6 +54,13 @@ type Task struct {
 	Brief     string
 	Timeout   time.Duration
 	CreatedAt time.Time
+	// ChatID is the chat that spawned the task (0 when spawned
+	// without a chat context, e.g. the CLI). The per-chat
+	// subagent sweep (F-A5-7) charges a task only to its owning
+	// chat; without this the shared Manager lets one chat's
+	// finished tasks be charged to another chat whose sweep
+	// window they happen to fall in.
+	ChatID int64
 }
 
 // Result is the outcome of a finished subagent task. Err is non-nil
@@ -83,6 +90,8 @@ type TaskStatus struct {
 	Brief     string
 	Status    Status
 	StartedAt time.Time
+	// ChatID is the owning chat (0 when spawned without one).
+	ChatID int64
 }
 
 // Executor runs one brief and returns its output plus the usage it
@@ -162,7 +171,18 @@ func newTaskID() (string, error) {
 // Manager is already at maxConcurrent, Spawn returns an "at capacity"
 // error immediately instead of blocking. Spawn fails if no executor
 // is configured or the Manager has been shut down.
+// Spawn starts a task unattributed to any chat (chatID 0). Prefer
+// SpawnForChat on the model path so the per-chat sweep can charge
+// the task to its owner; unattributed tasks are never swept (the
+// fetch path still charges them to whoever fetches the result).
 func (m *Manager) Spawn(brief string, timeout time.Duration) (string, error) {
+	return m.SpawnForChat(0, brief, timeout)
+}
+
+// SpawnForChat is Spawn with the owning chat recorded on the task
+// (Audit 5 F-A5-7 attribution): the per-chat sweep charges a
+// finished task only to the chat that spawned it.
+func (m *Manager) SpawnForChat(chatID int64, brief string, timeout time.Duration) (string, error) {
 	if strings.TrimSpace(brief) == "" {
 		return "", errors.New("subagent: brief must not be empty")
 	}
@@ -196,7 +216,7 @@ func (m *Manager) Spawn(brief string, timeout time.Duration) (string, error) {
 	now := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	entry := &taskEntry{
-		task:      Task{ID: id, Brief: brief, Timeout: timeout, CreatedAt: now},
+		task:      Task{ID: id, Brief: brief, Timeout: timeout, CreatedAt: now, ChatID: chatID},
 		exec:      exec,
 		status:    StatusRunning,
 		startedAt: now,
@@ -434,6 +454,7 @@ func (m *Manager) List() []TaskStatus {
 			Brief:     e.task.Brief,
 			Status:    e.status,
 			StartedAt: e.startedAt,
+			ChatID:    e.task.ChatID,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

@@ -508,13 +508,21 @@ func (a *Agent) recallTypedFor(ctx context.Context, input string, recent []model
 // defaultMemorySelector is the provider-based side-query: it sends
 // the manifest headers plus the input to the agent's provider with a
 // tiny max_tokens and parses the returned JSON list of names. The
-// prompt instructs the model to select only clearly-relevant
-// memories, to exclude already-surfaced ones, and not to re-surface
-// usage docs for tools already in active use — but to surface
-// warnings/gotchas about them. Parse failures and provider errors
-// are returned so the caller can fall back to keyword scoring.
+// provider call's reported usage is metered into the turn's
+// side-channel total (F-A5-5): the selector runs on every turn with
+// typed memories, and its tokens must reach TurnFinished and the
+// budget instead of being discarded. The prompt instructs the model
+// to select only clearly-relevant memories, to exclude
+// already-surfaced ones, and not to re-surface usage docs for
+// tools already in active use — but to surface warnings/gotchas
+// about them. Parse failures and provider errors are returned so
+// the caller can fall back to keyword scoring.
 func (a *Agent) defaultMemorySelector(ctx context.Context, manifest []TypedMemory, input string, recentTools []string, surfaced []string) ([]string, error) {
-	return selectMemoriesWithProvider(ctx, a.provider, manifest, input, recentTools, surfaced)
+	names, usage, err := selectMemoriesWithProviderUsage(ctx, a.provider, manifest, input, recentTools, surfaced)
+	// Meter even on error: a provider call that returned
+	// unparseable text still spent the tokens it reported.
+	a.AddSideChannelUsage(usage)
+	return names, err
 }
 
 // selectMemoriesWithProvider runs one tiny provider call to pick
@@ -522,11 +530,22 @@ func (a *Agent) defaultMemorySelector(ctx context.Context, manifest []TypedMemor
 // can inject a fake. The response must be a JSON array of memory
 // names; anything else is an error (the caller falls back).
 func selectMemoriesWithProvider(ctx context.Context, provider model.Provider, manifest []TypedMemory, input string, recentTools []string, surfaced []string) ([]string, error) {
+	names, _, err := selectMemoriesWithProviderUsage(ctx, provider, manifest, input, recentTools, surfaced)
+	return names, err
+}
+
+// selectMemoriesWithProviderUsage is selectMemoriesWithProvider
+// with the provider call's reported usage returned as well, so the
+// caller can meter the side-query into the turn's usage (F-A5-5).
+// On a provider error or nil response the usage is zero; on a
+// parse error the usage is the reported spend of the unusable
+// response, so the caller meters it before falling back.
+func selectMemoriesWithProviderUsage(ctx context.Context, provider model.Provider, manifest []TypedMemory, input string, recentTools []string, surfaced []string) ([]string, model.Usage, error) {
 	if provider == nil {
-		return nil, fmt.Errorf("no provider available for memory selection")
+		return nil, model.Usage{}, fmt.Errorf("no provider available for memory selection")
 	}
 	if len(manifest) == 0 {
-		return nil, nil
+		return nil, model.Usage{}, nil
 	}
 	prompt := selectorPrompt(manifest, input, recentTools, surfaced)
 	temp := 0.0
@@ -539,12 +558,19 @@ func selectMemoriesWithProvider(ctx context.Context, provider model.Provider, ma
 		Temperature: &temp,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("memory selector provider call: %w", err)
+		return nil, model.Usage{}, fmt.Errorf("memory selector provider call: %w", err)
 	}
 	if resp == nil {
-		return nil, fmt.Errorf("memory selector provider returned nil response")
+		return nil, model.Usage{}, fmt.Errorf("memory selector provider returned nil response")
 	}
-	return parseSelectorResponse(resp.Message.Content, manifest)
+	names, err := parseSelectorResponse(resp.Message.Content, manifest)
+	if err != nil {
+		// The call still spent the tokens it reported, even
+		// though the response is unusable — return the usage
+		// so the caller meters it before falling back.
+		return nil, resp.Usage, err
+	}
+	return names, resp.Usage, nil
 }
 
 // selectorPrompt renders the manifest and the selection rules for

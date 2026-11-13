@@ -32,6 +32,9 @@
 // sentences, then most recent first. At most 3 items are injected,
 // each truncated to 200 characters, and a candidate whose content is
 // already visible in the recent window is never injected twice.
+// The conversation-summary fact is the exception: its latest
+// section is injected in its own extra slot, truncated to 2000
+// runes, so a compaction summary actually reaches the model.
 //
 // Recall never fails a run: if ListFacts or the full history cannot be
 // read, the loop logs and continues with whatever source survived
@@ -53,6 +56,18 @@ const maxRecallItems = 3
 
 // maxRecallItemRunes caps the length of a single injected item.
 const maxRecallItemRunes = 200
+
+// maxSummaryRecallRunes caps the injected conversation-summary
+// section (Audit 5 F-A5-2): the summary fact holds up to 8000
+// runes of distilled history, and the 200-rune item cap made all
+// but a fragment of it invisible to the model. The latest section
+// gets a much larger cap and its own slot, so a good summary
+// actually reaches the model instead of only the matching fragment.
+const maxSummaryRecallRunes = 2000
+
+// summaryFactKey is the fact key auto-compaction and /compress
+// write the conversation summary under.
+const summaryFactKey = "conversation-summary"
 
 // recallSectionHeader introduces the injected items in the system
 // message. It tells the model these are the user's own earlier words,
@@ -113,8 +128,19 @@ func recallItems(query string, facts []memory.Fact, older, recent []model.Messag
 
 	var cands []recallCandidate
 
+	// The conversation-summary fact is handled separately below
+	// (latest section, raised cap, its own slot): the generic
+	// fact path would truncate it to 200 runes and let it crowd
+	// out other facts.
+	var summaryFact *memory.Fact
+
 	// (a) Explicit facts: deliberate, so one shared token suffices.
 	for _, f := range facts {
+		if f.Key == summaryFactKey {
+			ff := f
+			summaryFact = &ff
+			continue
+		}
 		text := f.Key + ": " + f.Value
 		if alreadyVisible(f.Value, recent) || alreadyVisible(text, recent) {
 			continue
@@ -175,7 +201,34 @@ func recallItems(query string, facts []memory.Fact, older, recent []model.Messag
 	for i, c := range cands {
 		out[i] = c.text
 	}
+
+	// (a2) Latest conversation-summary section, in its own slot:
+	// it still needs a topical match (one shared content token),
+	// but when it matches the model gets the latest section at
+	// the raised cap instead of a 200-rune fragment — and it never
+	// displaces a precisely-matching fact or sentence. The latest
+	// section is the newest "## <timestamp>" section; a manual
+	// /compress summary (no header) is a single section.
+	if summaryFact != nil {
+		latest := latestSummarySection(summaryFact.Value)
+		if latest != "" && !alreadyVisible(latest, recent) {
+			if sharedTokenCount(queryTokens, contentTokens(latest)) >= 1 {
+				out = append(out, truncateRecallItemTo(latest, maxSummaryRecallRunes))
+			}
+		}
+	}
 	return out
+}
+
+// latestSummarySection returns the newest section of a
+// conversation-summary fact (the last "## <timestamp>" section, or
+// the whole value when it has no headers).
+func latestSummarySection(value string) string {
+	sections := splitSummarySections(value)
+	if len(sections) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(sections[len(sections)-1])
 }
 
 // recallFor gathers both recall sources for the current input and
@@ -302,9 +355,14 @@ func alreadyVisible(text string, recent []model.Message) bool {
 
 // truncateRecallItem cuts an item to maxRecallItemRunes runes.
 func truncateRecallItem(s string) string {
+	return truncateRecallItemTo(s, maxRecallItemRunes)
+}
+
+// truncateRecallItemTo cuts an item to at most n runes.
+func truncateRecallItemTo(s string, n int) string {
 	r := []rune(s)
-	if len(r) <= maxRecallItemRunes {
+	if len(r) <= n {
 		return s
 	}
-	return string(r[:maxRecallItemRunes])
+	return string(r[:n])
 }

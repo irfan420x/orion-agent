@@ -255,25 +255,51 @@ func TestAutoCompactCircuitBreaker(t *testing.T) {
 	}
 }
 
-func TestAutoCompactSkipsSeverelyOverBudgetHistory(t *testing.T) {
+func TestAutoCompactEmergencySummarisesOverBudgetHistory(t *testing.T) {
 	// A history many times the budget (legacy store, or a single
-	// giant tool result) must NOT burn a summarisation call on a
-	// prefix far over the context window: the request trim
-	// handles the turn, exactly as before auto-compaction.
+	// giant tool result) is no longer skipped entirely (Audit 5
+	// F-A5-1): the oldest turns are summarised in a BOUNDED slice
+	// (maxCompactionInputTokens), so the summariser never receives
+	// a prompt over the provider context, and the prefix is
+	// chipped away instead of left for the FIFO cap to drop
+	// silently. The request trim is no longer the only safety net.
+	// (This test replaces TestAutoCompactSkipsSeverelyOverBudgetHistory,
+	// which asserted the old skip.)
 	cfg := testConfig(5)
 	cfg.MaxHistoryTokens = 1024
 	store := newFakeStore()
 	seedHistory(t, store, 30, 500) // ~30 x 500 tokens: pressure ~15x
 	agent := newTestAgent(t, cfg, &fakeProvider{}, tools.NewRegistry(), store)
-	agent.SetCompactionSummariser(func(_ context.Context, _ []model.Message) (string, error) {
-		t.Error("summariser called on a severely over-budget history")
-		return "summary", nil
+	var summarised []model.Message
+	agent.SetCompactionSummariser(func(_ context.Context, old []model.Message) (string, error) {
+		summarised = old
+		return "Summary of the dropped turns: the user's favourite number is 17, discussed across many wordy turns.", nil
 	})
 	if _, err := agent.Run(context.Background(), "hello"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if st := agent.CompactionStatus(); st.Compactions != 0 || st.ConsecutiveFailures != 0 {
-		t.Errorf("CompactionStatus = %+v, want no compaction attempt at all", st)
+	if len(summarised) == 0 {
+		t.Fatal("summariser never called on a severely over-budget history: the prefix is left for the FIFO cap to drop silently")
+	}
+	// Bounded: the summarised slice must fit the input cap.
+	tokens := 0
+	for _, m := range summarised {
+		tokens += messageTokens(m)
+	}
+	if tokens > maxCompactionInputTokens {
+		t.Errorf("summariser got %d tokens, over the %d-token input cap", tokens, maxCompactionInputTokens)
+	}
+	// The seeded fact survived in the summary, and only the
+	// summarised slice (not the whole prefix) was dropped.
+	if fact, found, _ := store.GetFact("conversation-summary"); !found || !strings.Contains(fact.Value, "17") {
+		t.Errorf("summary fact = %+v, found=%v; want the favourite number preserved", fact, found)
+	}
+	st := agent.CompactionStatus()
+	if st.Compactions != 1 {
+		t.Errorf("CompactionStatus = %+v, want 1 emergency compaction", st)
+	}
+	if got := len(store.allMessages()); got != 30-len(summarised)+2 {
+		t.Errorf("history = %d, want %d (seed minus summarised slice plus the new turn)", got, 30-len(summarised)+2)
 	}
 }
 

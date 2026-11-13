@@ -110,11 +110,31 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 // the same tools, sandbox mode and trusted egress CIDRs as the
 // parent — but WITHOUT the subagent tools, which are only registered
 // on the parent registry. A child therefore cannot spawn subagents.
-func newChildRegistry(cfg *config.Config) (*tools.Registry, error) {
+//
+// The optional parentPlanning argument is the parent's planning
+// store (F-A5-P2-35): when given, the child's planning tools are
+// re-pointed at it, so a child's task_create lands in the chat's
+// files instead of a fresh in-memory store that is discarded when
+// the child exits. Sharing the store is safe — PlanningStore
+// serialises in-process (mutex) and across processes (flock) —
+// and the child still inherits the parent's chat id from the run
+// context, so it lands in the same chat's bucket. Omit it (or pass
+// nil) and the child keeps its own fresh in-memory store, the old
+// behaviour, which callers that never wired a data dir rely on.
+// The variadic form keeps the existing newChildRegistry(cfg) call
+// sites compiling while the executor wiring passes the store.
+func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore) (*tools.Registry, error) {
 	if cfg == nil {
 		cfg = config.Default()
 	}
-	return tools.DefaultRegistryWithSandboxAndTrustedEgress(cfg.Sandbox, cfg.TrustedEgressCIDRs)
+	reg, err := tools.DefaultRegistryWithSandboxAndTrustedEgress(cfg.Sandbox, cfg.TrustedEgressCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	if len(parentPlanning) > 0 && parentPlanning[0] != nil {
+		reg.SetPlanningStore(parentPlanning[0])
+	}
+	return reg, nil
 }
 
 // newSubagentExecutor returns a subagent.Executor that runs each brief
@@ -131,9 +151,14 @@ func newChildRegistry(cfg *config.Config) (*tools.Registry, error) {
 // children get a non-interactive gate.
 // The executor is safe to call concurrently — every spawn builds its
 // own agent, registry and store, sharing only the provider.
-func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger, hooksBus *hooks.Bus) subagent.Executor {
+// parentPlanning is the parent registry's planning store (Audit 5
+// F-A5-P2-35): the child re-points its planning tools at it, so a
+// child's task_create/todo_write lands in the chat's files instead
+// of an ephemeral per-child bucket that dies with the child. Nil
+// keeps the old isolated behaviour.
+func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger, hooksBus *hooks.Bus, parentPlanning *tools.PlanningStore) subagent.Executor {
 	return func(ctx context.Context, brief string) (string, subagent.Usage, error) {
-		childReg, err := newChildRegistry(cfg)
+		childReg, err := newChildRegistry(cfg, parentPlanning)
 		if err != nil {
 			return "", subagent.Usage{}, err
 		}

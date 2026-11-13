@@ -341,7 +341,12 @@ func buildApprovalGate(gw *messaging.TelegramGateway, ruleStore *permissions.Rul
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			_ = gw.EditMessageTextMarkup(ctx, req.ChatID, msgID, "⚠️ Approval request: ⏰ Expired — no answer within the approval window. Send the request again to retry.", messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}})
+			// Log an edit failure (F-A5-P2-22): a failed expiry
+			// edit (e.g. message deleted) must leave a trace
+			// instead of being swallowed.
+			if err := gw.EditMessageTextMarkup(ctx, req.ChatID, msgID, "⚠️ Approval request: ⏰ Expired — no answer within the approval window. Send the request again to retry.", messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}}); err != nil {
+				fmt.Fprintf(os.Stderr, "oriond: approval expired: request %s card %d edit failed: %v\n", req.ID, msgID, err)
+			}
 		}()
 	})
 	return gate, cards
@@ -367,6 +372,12 @@ func buildApprovalGate(gw *messaging.TelegramGateway, ruleStore *permissions.Rul
 func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, gate *permissions.Gate, ownerID int64, q messaging.TGCallbackQuery, cards *approvalCards) error {
 	decision, id, ok := messaging.ParsePermissionCallback(q.Data)
 	if !ok {
+		// Log the unparseable tap (F-A5-P2-22): without this a
+		// tap the handler cannot understand is silent, and a
+		// malformed button looks exactly like a dead one. The
+		// data is a short callback payload (perm:<decision>:<id>),
+		// never free user text, so logging it is safe.
+		fmt.Fprintf(os.Stderr, "oriond: approval tap: unparseable callback data %q (query %s)\n", q.Data, q.ID)
 		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
 	}
 	senderID := int64(0)
@@ -408,8 +419,15 @@ func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, 
 	// edit carries the outcome only (no tool arguments): the
 	// prompt's summary is user/model-derived text and EditMessageText
 	// sends HTML, so echoing it back could break the markup.
+	// The edit uses EditMessageTextMarkup with an EMPTY keyboard
+	// (F-A5-P2-21): omitting reply_markup leaves the old keyboard
+	// in place, so a resolved card would keep live Approve/Deny
+	// buttons — the same defect the expiry path already fixes.
+	// An edit failure is logged, never swallowed (F-A5-P2-22).
 	if q.Message != nil {
-		_ = gw.EditMessageText(ctx, q.Message.Chat.ID, q.Message.MessageID, "⚠️ Approval request: "+outcome)
+		if err := gw.EditMessageTextMarkup(ctx, q.Message.Chat.ID, q.Message.MessageID, "⚠️ Approval request: "+outcome, messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}}); err != nil {
+			fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s outcome edit failed: %v\n", id, err)
+		}
 	}
 	return gw.AnswerCallbackQuery(ctx, q.ID, outcome)
 }
@@ -675,6 +693,20 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 			}
 			store.Reset(chatID)
 			return id, n, nil
+		},
+		LastResumeReport: func(chatID int64) (messaging.ResumeReport, bool) {
+			rep, ok := a.LastResumeReportForChat(chatID)
+			if !ok {
+				return messaging.ResumeReport{}, false
+			}
+			return messaging.ResumeReport{
+				SessionID:          rep.SessionID,
+				TranscriptMessages: rep.TranscriptMessages,
+				LoadedMessages:     rep.LoadedMessages,
+				CorruptLines:       rep.CorruptLines,
+				SummariesLoaded:    rep.SummariesLoaded,
+				Capped:             rep.Capped,
+			}, true
 		},
 	}
 }

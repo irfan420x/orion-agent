@@ -46,6 +46,18 @@ const (
 	maxFileReadTimeout = 30 * time.Second
 )
 
+// errHardlinkRefused is returned by readFileBounded for a regular
+// file with more than one hard link (F-A5-P2-30): a hard link inside
+// an allowed root can point at a sensitive file outside it, and the
+// read path cannot distinguish the two names for one inode —
+// device/inode checks only prove the file is the one at the path,
+// not that no other name reaches it. Refusing nlink>1 is the
+// least-breaking safe option: ordinary files have nlink=1, and a
+// hardlinked file is refused with a clear error instead of read.
+// Callers that must distinguish it from other read errors use
+// errors.Is.
+var errHardlinkRefused = errors.New("file has more than one hard link; refusing to read (a hard link inside the allowed directories could point at a file outside them)")
+
 // readFileBounded safely opens path and reads up to maxFileRead+1
 // bytes from it. path is the caller's absolute path BEFORE symlink
 // resolution; confined is the confinePath result for the same path.
@@ -90,6 +102,16 @@ func readFileBounded(ctx context.Context, path, confined string) ([]byte, os.Fil
 		if info.IsDir() {
 			ch <- result{nil, nil, fmt.Errorf("path %q is a directory, not a file", path)}
 			return
+		}
+		// A hardlinked regular file is refused outright, before
+		// any byte is read (F-A5-P2-30; see errHardlinkRefused).
+		// Directories and special files are unaffected: only
+		// regular files can be a hard link to outside content.
+		if info.Mode().IsRegular() {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+				ch <- result{nil, nil, errHardlinkRefused}
+				return
+			}
 		}
 		if err := verifyFdPath(f, confined); err != nil {
 			ch <- result{nil, nil, err}
@@ -372,6 +394,17 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
+	}
+	// fsync the directory so the rename itself is durable across
+	// OS/power loss, not just a process crash (F-A5-P2-36): the
+	// file fsync above only orders the file's own bytes, and
+	// without a directory fsync a power cut can roll the rename
+	// back. Best-effort on purpose: the rename already committed,
+	// so a directory-sync failure must not misreport the write
+	// itself as failed.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

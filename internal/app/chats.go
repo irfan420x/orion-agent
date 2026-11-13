@@ -57,6 +57,7 @@ import (
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
 	"github.com/irfan/orion/internal/session"
+	"github.com/irfan/orion/internal/subagent"
 )
 
 // chatStore is a memory.Store that splits the two halves of memory
@@ -132,6 +133,14 @@ type chatSession struct {
 	override     string
 	providerName string
 	modelName    string
+	// sweptSubagents records subagent task IDs whose finished
+	// tokens the runChatTurn sweep already charged to this chat
+	// (F-A5-7), so a task is never charged twice across turns.
+	// lastSubagentSweep is when the sweep last ran: tasks that
+	// finished after it (including between turns) are sweep
+	// candidates. Both are guarded by chatsMu.
+	sweptSubagents    map[string]bool
+	lastSubagentSweep time.Time
 }
 
 // chatSessionFor returns the chat's session, creating its store (and
@@ -412,32 +421,52 @@ func (a *App) HandleForChat(ctx context.Context, chatID int64, input string) (st
 // (oriond's Telegram turns, `orion daemon`, /retry) goes through
 // here, so no path can silently skip the budget:
 //
-//   - pre-flight: when the chat is already over budget, the turn is
-//     refused BEFORE the provider is called, with the
-//     BudgetExceededError (the caller turns it into a plain reply
-//     for the user; the error names the usage, the limit and the
-//     UTC-midnight reset). Nothing is recorded for a refused turn.
+//   - pre-flight with projection (F-A5-6): the turn's input tokens
+//     are estimated up front (retained history + the new input)
+//     and Check refuses the turn when the chat cannot afford even
+//     the input. The old Check(chatID, 0) only refused a chat
+//     already over the limit, so one heavy turn could blow past it
+//     by a large multiple.
+//   - mid-turn abort (F-A5-6): after every provider response the
+//     agent asks the Budget whether the turn's cumulative usage is
+//     still within budget; an over-budget turn stops there instead
+//     of running to max steps. The spend that already happened is
+//     still recorded.
 //   - post-turn: the turn's reported usage is recorded with its
-//     prompt/completion/subagent split (RecordUsage), even when the
-//     turn errored — a failed turn still consumed tokens, and the
-//     next turn must see the spend. A Record error (the turn pushed
-//     the chat over the limit) is swallowed deliberately: the turn
-//     already ran, and the NEXT turn is the one that gets refused.
+//     prompt/completion/subagent split, per (provider, model)
+//     (RecordUsageForModel), even when the turn errored — a failed
+//     turn still consumed tokens, and the next turn must see the
+//     spend. A Record error (the turn pushed the chat over the
+//     limit) is logged, never swallowed silently: the turn already
+//     ran, and the NEXT turn is the one that gets refused.
 //     A nil Budget (hand-built Apps) means unbudgeted, exactly as
 //     before.
+//   - subagent sweep (F-A5-7): finished subagent tasks the parent
+//     never fetched are charged here, at turn end, so
+//     spawn-and-never-fetch spend is no longer invisible.
 //
 // The returned stats carry the chat's provider/model plus the
 // prompt/completion/subagent split, so the footer and /usage can
 // show the turn honestly.
 func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnStart := time.Now()
 	agent, err := a.AgentForChat(chatID)
 	if err != nil {
 		return "", nil, err
 	}
 	if a.Budget != nil {
-		if err := a.Budget.Check(chatID, 0); err != nil {
+		if err := a.Budget.Check(chatID, a.projectedTurnTokens(chatID, input)); err != nil {
 			return "", nil, err
 		}
+		// Mid-turn abort (F-A5-6): installed for this turn only
+		// and cleared afterwards. The agent is per-chat and its
+		// runs are serialised, so no other turn can observe the
+		// hook; the closure reads a.Budget on every call, so a
+		// budget replaced mid-turn is honoured at once.
+		agent.SetTurnUsageLimitCheck(func(u model.Usage) error {
+			return a.Budget.Check(chatID, u.TotalTokens)
+		})
+		defer agent.SetTurnUsageLimitCheck(nil)
 	}
 	providerName, modelName := a.chatProviderInfo(chatID)
 	var stats *core.TurnStats
@@ -460,20 +489,132 @@ func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit 
 		}
 	}
 	reply, err := agent.RunWithEventHandler(ctx, input, wrapped)
+	if stats != nil {
+		// Subagent sweep (F-A5-7): charge finished tasks the
+		// parent never fetched. Note the subagent tools' sink
+		// charges fetched results to the app's GLOBAL agent,
+		// never to this chat's agent — so the sweep is the first
+		// time this chat's stats see these tokens, fetched or
+		// not — and the per-chat swept set guarantees a task is
+		// never charged twice across turns. The sweep runs only
+		// when stats exist: a turn with no TurnFinished records
+		// nothing, so its swept tokens must stay unswept for a
+		// later turn instead of being marked and lost.
+		if cs, csErr := a.chatSessionFor(chatID); csErr == nil {
+			if swept := a.sweepFinishedSubagents(cs, chatID, turnStart); swept > 0 {
+				stats.Tokens += swept
+				stats.SubagentTokens += swept
+			}
+		}
+	}
 	if stats != nil && a.Budget != nil {
-		// Best effort: a failed record must never fail the turn
-		// that just completed (and an over-budget record is
-		// expected — the spend happened; the next turn refuses).
-		_ = a.Budget.RecordUsage(chatID, model.Usage{
+		// The spend is recorded even for failed turns, and an
+		// over-budget record is expected — but it is logged,
+		// not swallowed: a silent over-limit record is how the
+		// budget looked like a next-turn gate instead of a cap.
+		if recErr := a.Budget.RecordUsageForModel(chatID, providerName, modelName, model.Usage{
 			PromptTokens:     stats.PromptTokens,
 			CompletionTokens: stats.CompletionTokens,
 			TotalTokens:      stats.Tokens,
-		}, stats.SubagentTokens)
+		}, stats.SubagentTokens); recErr != nil && a.Logger != nil {
+			a.Logger.Printf("app: chat %d: turn recorded %d tokens, over daily budget: %v", chatID, stats.Tokens, recErr)
+		}
 	}
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
 	}
 	return reply, stats, err
+}
+
+// projectedTurnTokens estimates the input tokens the turn's first
+// provider call will carry: the retained history (content plus
+// tool-call names and arguments, the same units the agent's
+// request trim measures) plus the new user input. It is the
+// pre-flight projection for the budget (F-A5-6): the system prompt
+// and recall sections are NOT included — they are roughly constant
+// and the mid-turn abort covers them — while history and input are
+// the user-controlled parts that can jump by tens of thousands of
+// tokens in one turn (the rc6 RSS-feed case). model.CountTokens is
+// the calibrated estimator, deliberately conservative. A store read
+// failure degrades to the input alone, never to refusing the turn
+// on a missing estimate.
+func (a *App) projectedTurnTokens(chatID int64, input string) int {
+	n := model.CountTokens(input) + 4
+	cs, err := a.chatSessionFor(chatID)
+	if err != nil || cs == nil || cs.store == nil {
+		return n
+	}
+	all, err := cs.store.RecentMessages(0)
+	if err != nil {
+		return n
+	}
+	for _, m := range all {
+		n += model.CountTokens(m.Content) + 4
+		for _, tc := range m.ToolCalls {
+			n += model.CountTokens(tc.Name) + model.CountTokens(tc.Arguments) + 4
+		}
+	}
+	return n
+}
+
+// sweepFinishedSubagents charges this chat for subagent tasks that
+// finished but were never fetched (F-A5-7). It returns the tokens
+// charged. A task is charged once: tasks already in the chat's
+// swept set are skipped, and a task still running (or timed out,
+// which records zero usage) contributes nothing. The sweep window
+// starts at the last sweep — so a task that finished BETWEEN turns
+// is caught by the next turn — or at turnStart on the first sweep,
+// so a new chat never inherits another chat's finished tasks.
+// Attribution is by the task's owning chat (recorded at spawn):
+// a task another chat spawned is skipped here even if it finished
+// inside this chat's window, and is charged by its own chat's
+// sweep instead. Unattributed tasks (chatID 0, e.g. CLI spawns)
+// are never swept; the fetch path still charges them to whoever
+// fetches the result.
+func (a *App) sweepFinishedSubagents(cs *chatSession, chatID int64, turnStart time.Time) int {
+	if a == nil || a.Subagents == nil || cs == nil {
+		return 0
+	}
+	a.chatsMu.Lock()
+	if cs.sweptSubagents == nil {
+		cs.sweptSubagents = map[string]bool{}
+	}
+	swept := cs.sweptSubagents
+	lower := turnStart
+	if !cs.lastSubagentSweep.IsZero() {
+		lower = cs.lastSubagentSweep
+	}
+	a.chatsMu.Unlock()
+	total := 0
+	for _, ts := range a.Subagents.List() {
+		if ts.ChatID != chatID {
+			continue
+		}
+		res, finished := a.Subagents.GetResult(ts.ID)
+		if !finished {
+			continue
+		}
+		if ts.Status != subagent.StatusDone && ts.Status != subagent.StatusFailed {
+			continue
+		}
+		if res.FinishedAt.Before(lower) {
+			continue
+		}
+		a.chatsMu.Lock()
+		already := swept[ts.ID]
+		if !already {
+			swept[ts.ID] = true
+		}
+		a.chatsMu.Unlock()
+		if already {
+			continue
+		}
+		total += res.Usage.Tokens
+	}
+	a.chatsMu.Lock()
+	cs.lastSubagentSweep = time.Now()
+	a.chatsMu.Unlock()
+	return total
 }
 
 // HandleStreamForChat is HandleStream for one chat: the turn runs on
@@ -581,6 +722,7 @@ func (a *App) NewSessionForChat(chatID int64) error {
 		return nil
 	}
 	a.chatsMu.Lock()
+	oldTr := cs.transcript
 	cs.transcript = tr
 	cs.sessionID = id
 	agent := cs.agent
@@ -591,6 +733,13 @@ func (a *App) NewSessionForChat(chatID int64) error {
 		// history.
 		agent.SetTranscript(tr)
 		agent.ResetCompactionBreaker()
+	}
+	// The old transcript is no longer the live one: release its
+	// lock/fd (a later resume back to it reopens it). Without
+	// this, every rotation leaked one fd + flock (Audit 5 W1
+	// sync item 3).
+	if oldTr != nil && oldTr != tr {
+		_ = oldTr.Close()
 	}
 	return nil
 }
@@ -730,6 +879,9 @@ func (a *App) StatusLineForChat(chatID int64) string {
 			fmt.Fprintf(&b, "\nCompaction: approaching (history %.0f%% full; auto-compacts at 80%%)", st.Pressure*100)
 		case st.Compactions > 0:
 			fmt.Fprintf(&b, "\nCompaction: %d auto-compaction(s), history %.0f%% full", st.Compactions, st.Pressure*100)
+		}
+		if st.DroppedWithoutSummary > 0 {
+			fmt.Fprintf(&b, "\nCompaction: %d turn(s) dropped without summary; full turns are in the session transcript", st.DroppedWithoutSummary)
 		}
 	}
 	if !a.StartedAt.IsZero() {

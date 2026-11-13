@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/cost"
@@ -248,7 +249,7 @@ func (a *App) SwitchProvider(name string) error {
 		// agent on every call (see Build), so no re-pointing is
 		// needed here: tokens from consumed results accrue to
 		// this new agent automatically.
-		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger, a.Hooks))
+		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger, a.Hooks, a.Tools.PlanningStore()))
 	}
 	a.mu.Unlock()
 	// Chats without an override follow the new default; chats with
@@ -339,9 +340,18 @@ func (a *App) UsageLineForChat(chatID int64) string {
 	fmt.Fprintf(&b, "Tokens today (this chat): %s (%s prompt + %s completion, incl. %s subagent)\n",
 		formatThousands(du.Total), formatThousands(du.Prompt), formatThousands(du.Completion), formatThousands(du.Subagent))
 	tbl := cost.DefaultTable()
-	if usd, ok := tbl.EstimateTotals(providerName, modelName, du.Prompt, du.Completion, du.Subagent); ok {
+	// Per-model pricing (F-A5-P2-18): the budget keeps the day's
+	// split per (provider, model), and each model's tokens are
+	// priced at that model's own rate — a morning on
+	// deepseek-chat is never repriced at an afternoon switch to
+	// claude-opus-4. Records made without a model (the "" bucket)
+	// are priced at the chat's current model, as before. When
+	// any bucket has no price in the table the whole cost is
+	// unknown, never a partial $ figure.
+	byModel := a.Budget.DayUsageByModel(chatID)
+	if usd, label, ok := estimateDayCost(tbl, byModel, providerName, modelName); ok {
 		fmt.Fprintf(&b, "Est. cost today (this chat): %s (est., %s, price table v%s effective %s)\n",
-			cost.FormatUSD(usd), modelName, tbl.Version, tbl.Effective)
+			cost.FormatUSD(usd), label, tbl.Version, tbl.Effective)
 	} else {
 		fmt.Fprintf(&b, "Est. cost today (this chat): unknown (no price for %s/%s in price table v%s effective %s)\n",
 			providerName, modelName, tbl.Version, tbl.Effective)
@@ -353,6 +363,42 @@ func (a *App) UsageLineForChat(chatID int64) string {
 			formatThousands(limit), formatThousands(a.Budget.Remaining(chatID)), a.Budget.ResetAt().Format("2006-01-02 15:04 UTC"))
 	}
 	return b.String()
+}
+
+// estimateDayCost prices one chat's day split per (provider,
+// model) at each model's own rate (F-A5-P2-18). It returns the
+// summed USD estimate, the label for the cost line, and false when
+// any bucket has no price (the caller then reports "unknown").
+// The "" bucket (records made without a model) is priced at the
+// chat's current provider/model. With a single bucket the label is
+// that bucket's model, matching the old single-model line; with
+// several it says "priced per model". An empty split prices $0 at
+// the current model.
+func estimateDayCost(tbl *cost.Table, byModel map[budget.ModelKey]budget.DayUsage, providerName, modelName string) (float64, string, bool) {
+	if len(byModel) == 0 {
+		usd, ok := tbl.EstimateTotals(providerName, modelName, 0, 0, 0)
+		return usd, modelName, ok
+	}
+	total := 0.0
+	label := ""
+	for key, du := range byModel {
+		prov, mod := key.Provider, key.Model
+		if prov == "" && mod == "" {
+			prov, mod = providerName, modelName
+		}
+		usd, ok := tbl.EstimateTotalsWithTotal(prov, mod, du.Prompt, du.Completion, du.Subagent, du.Total)
+		if !ok {
+			return 0, "", false
+		}
+		total += usd
+		if len(byModel) == 1 {
+			label = mod
+		}
+	}
+	if len(byModel) > 1 {
+		label = "priced per model"
+	}
+	return total, label, true
 }
 
 // formatThousands renders n with "," thousands separators ("1240" ->
@@ -510,12 +556,20 @@ func (a *App) NewSession() error {
 		}
 		return nil
 	}
+	oldTr := a.globalTranscript
 	a.globalTranscript = tr
 	a.globalSessionID = id
 	if ag := a.agent(); ag != nil {
 		// A new session starts with a clean compaction slate.
 		ag.SetTranscript(tr)
 		ag.ResetCompactionBreaker()
+	}
+	// The old transcript is no longer the live one: release its
+	// lock/fd (a later resume back to it reopens it). Without
+	// this, every rotation leaked one fd + flock (Audit 5 W1
+	// sync item 3).
+	if oldTr != nil && oldTr != tr {
+		_ = oldTr.Close()
 	}
 	return nil
 }
@@ -638,7 +692,15 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 // old enough (history fits the window) it returns before == after
 // with summaryLen == 0 and no error. A provider failure leaves
 // history untouched.
-func compressWithOn(ctx context.Context, store memory.Store, provider model.Provider, keepRecent int, sessionMemory string) (before, after, summaryLen int, summary string, err error) {
+//
+// Metering (F-A5-5): the summarisation call's reported usage is
+// handed to each recordUsage sink (nil sinks are skipped), so the
+// caller can charge it to the chat's budget — /compress runs
+// outside any turn, so its tokens never pass through TurnFinished
+// and must be recorded directly. The per-chat caller passes a sink
+// that records to the chat's Budget; the CLI caller passes none
+// (local runs are unbudgeted).
+func compressWithOn(ctx context.Context, store memory.Store, provider model.Provider, keepRecent int, sessionMemory string, recordUsage ...func(model.Usage)) (before, after, summaryLen int, summary string, err error) {
 	if keepRecent < 1 {
 		keepRecent = compressRecentWindow
 	}
@@ -656,7 +718,7 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 		return before, before, 0, "", errors.New("app: compress: no provider configured")
 	}
 	var b strings.Builder
-	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers and anything the user asked to remember. Do not invent anything not in the messages.\n\n")
+	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers, pending items and open questions, and anything the user asked to remember, including user instructions and preferences. Do not invent anything not in the messages.\n\n")
 	if strings.TrimSpace(sessionMemory) != "" {
 		// Session memory is model-derived text: gate it like
 		// extraction output (derivable content dropped) and
@@ -681,6 +743,19 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 	})
 	if err != nil {
 		return before, before, 0, "", fmt.Errorf("app: compress: summarisation call: %w", err)
+	}
+	// Meter the summarisation call (F-A5-5): report its usage to
+	// the caller's sink before any early return below can skip
+	// it. A nil response has no usage to report.
+	if resp != nil {
+		for _, record := range recordUsage {
+			if record != nil {
+				record(resp.Usage)
+			}
+		}
+	}
+	if resp == nil {
+		return before, before, 0, "", errors.New("app: compress: provider returned a nil response")
 	}
 	summary = strings.TrimSpace(resp.Message.Content)
 	if summary == "" {

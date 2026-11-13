@@ -221,10 +221,23 @@ func TestRunContinuesAfterMultiMBToolResult(t *testing.T) {
 	}
 	args, _ := json.Marshal(map[string]any{"path": path})
 	prov := &fakeProvider{chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
-		if call == 1 {
-			return toolCallResponse("call-1", "file_read", string(args)), nil
+		// The seeded history is ~13x the budget, so the turn
+		// starts with a bounded emergency compaction (Audit 5
+		// F-A5-1): answer the summarisation call with a real
+		// summary — it must preserve the seeded turns' tokens —
+		// not with the file_read tool call.
+		if len(req.Messages) > 0 && req.Messages[0].Content == "You summarise conversations into compact memories." {
+			return textResponse("Summary of the old filler turns: old filler turn and old filler answer repeated."), nil
 		}
-		return textResponse("done"), nil
+		// The turn's own requests: the first asks to read the
+		// file; any request already carrying the tool result is
+		// done.
+		for _, m := range req.Messages {
+			if m.Role == "tool" {
+				return textResponse("done"), nil
+			}
+		}
+		return toolCallResponse("call-1", "file_read", string(args)), nil
 	}}
 	cfg := testConfig(5)
 	cfg.MaxHistoryTokens = 1500

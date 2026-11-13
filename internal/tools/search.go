@@ -15,6 +15,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -52,6 +53,23 @@ const (
 	// file can hold a megabyte on a single line, and one such line
 	// must not eat the whole result cap.
 	maxGrepLineRunes = 1000
+	// maxGrepTotalBytes caps the total bytes one grep call reads
+	// across all files (F-A5-P2-31): the file-count cap alone
+	// allows 10k files x 1 MB each, ~10 GB, bounded only by the
+	// tool context. 32 MB keeps a no-match scan bounded while
+	// still covering a large tree.
+	maxGrepTotalBytes = 32 * 1024 * 1024
+	// maxGrepRenderedLines caps the total lines one grep call
+	// renders, matches and context together (F-A5-P2-32): 500
+	// matches x (1 + 2x10 context lines) x 1000 runes/line is
+	// ~10 MB in memory before the registry cap. 2000 lines is
+	// ~2 MB worst case and still far more than a useful answer.
+	maxGrepRenderedLines = 2000
+	// maxGlobPatternRunes / maxGlobSegments bound a glob pattern
+	// (F-A5-9): the matcher is linear once consecutive "**" is
+	// collapsed, but an unbounded pattern is still absurd input.
+	maxGlobPatternRunes = 512
+	maxGlobSegments     = 64
 )
 
 // ---------------------------------------------------------------- helpers
@@ -230,6 +248,21 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	// A single file is searched directly (no walk): grep over a
 	// file path must behave like grep over a directory holding it.
 	if info, err := os.Lstat(root); err == nil && !info.IsDir() {
+		// Fail fast on symlinks and non-regular files
+		// (fifo/socket/device): the safe read below would block
+		// on a writer-less fifo until the read timeout
+		// (F-A5-P2-36) — the same pre-check file_edit uses.
+		// This is only a fast path: the read itself still goes
+		// through the O_NOFOLLOW open + fd verification, so a
+		// swap between this check and the read cannot redirect
+		// it; and a missing file (Lstat error) falls through to
+		// the walk, which reports it.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a symlink; symlinked files are refused", root)}
+		}
+		if !info.Mode().IsRegular() {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is not a regular file", root)}
+		}
 		return t.grepFiles(ctx, []string{root}, match, contextLines, maxMatches, root), nil
 	}
 
@@ -256,12 +289,12 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 			return filepath.SkipAll
 		}
 		if d.IsDir() {
-			if d.Type()&fs.ModeSymlink != 0 {
-				// Never descend into a symlinked directory:
-				// its target may be outside the roots.
-				skippedSymlink++
-				return filepath.SkipDir
-			}
+			// A symlinked directory never arrives here:
+			// WalkDir Lstat-reports it with IsDir()==false, so
+			// it is handled by the symlink branch below (which
+			// resolves the target and checks confinement). The
+			// symlink check that used to live here was dead code
+			// (F-A5-P2-36) and is gone.
 			if d.Name() == ".git" && p != root {
 				return filepath.SkipDir
 			}
@@ -270,13 +303,29 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		// Files only from here on.
 		if d.Type()&fs.ModeSymlink != 0 {
 			// A symlinked file is followed only when its target
-			// stays inside the walk root and outside every
-			// sensitive directory; anything else is skipped and
-			// counted, never read.
+			// stays inside the walk root, outside every
+			// sensitive directory, and outside any .git
+			// directory; anything else is skipped and counted,
+			// never read. The .git check closes the bypass where
+			// a link to a file inside .git was read even though
+			// the walk skips .git dirs (F-A5-P2-29).
 			target, rerr := filepath.EvalSymlinks(p)
-			if rerr != nil || !within(target, root) || inSensitiveDir(target) {
+			if rerr != nil || !within(target, root) || inSensitiveDir(target) || underGitDir(target) {
 				skippedSymlink++
 				return nil
+			}
+			// Include/exclude apply to the link name, exactly
+			// as for regular files below: a symlinked file must
+			// not dodge the filter (F-A5-P2-28).
+			if a.Include != "" {
+				if ok, _ := grepGlobMatch(a.Include, d.Name()); !ok {
+					return nil
+				}
+			}
+			if a.Exclude != "" {
+				if ok, _ := grepGlobMatch(a.Exclude, d.Name()); ok {
+					return nil
+				}
 			}
 			files = append(files, target)
 			return nil
@@ -328,6 +377,20 @@ func inSensitiveDir(path string) bool {
 	return false
 }
 
+// underGitDir reports whether path sits under a .git directory:
+// any path component equal to ".git". Grep skips .git contents
+// (the walk skips .git dirs), and a symlink into .git must not
+// smuggle those files back in (F-A5-P2-29). The same guard is
+// applied to glob's symlink targets.
+func underGitDir(path string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+		if seg == ".git" {
+			return true
+		}
+	}
+	return false
+}
+
 // grepFiles searches each file in paths (already confined, sorted)
 // and renders the matches with context.
 func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatcher, contextLines, maxMatches int, root string) string {
@@ -337,13 +400,28 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 	filesWithMatches := 0
 	binarySkipped := 0
 	truncatedFiles := 0
+	hardlinkSkipped := 0
+	totalBytes := 0
 	capped := false
+	bytesCapped := false
+	renderCapped := false
 	for _, p := range paths {
 		if matchCount >= maxMatches {
 			capped = true
 			break
 		}
+		if renderCapped {
+			break
+		}
 		if err := ctx.Err(); err != nil {
+			break
+		}
+		// Total-bytes cap (F-A5-P2-31): stop starting new files
+		// once the call has read maxGrepTotalBytes; the file
+		// that crosses the cap is still searched in full, so
+		// the total overshoots by at most one file.
+		if totalBytes >= maxGrepTotalBytes {
+			bytesCapped = true
 			break
 		}
 		// readFileBounded opens with O_NOFOLLOW and verifies the
@@ -353,11 +431,18 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 		data, info, err := readFileBounded(ctx, p, p)
 		if err != nil {
 			// One unreadable file must not fail the search.
+			// A hardlink refusal is counted separately so the
+			// footer can say why the file was not searched
+			// (F-A5-P2-30).
+			if errors.Is(err, errHardlinkRefused) {
+				hardlinkSkipped++
+			}
 			continue
 		}
 		if info.IsDir() || !info.Mode().IsRegular() {
 			continue
 		}
+		totalBytes += len(data)
 		if len(data) > maxFileRead {
 			truncatedFiles++
 		}
@@ -410,8 +495,17 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 		for _, m := range matched {
 			matchedSet[m] = true
 		}
+		// Render cap (F-A5-P2-32): stop appending rendered lines
+		// at maxGrepRenderedLines, matches and context together.
+		// The footer says so; the outer loop then stops scanning
+		// further files, since more matches could not be shown.
+	render:
 		for _, w := range windows {
 			for i := w.from; i <= w.to; i++ {
+				if len(hits) >= maxGrepRenderedLines {
+					renderCapped = true
+					break render
+				}
 				hits = append(hits, grepHit{
 					path:    p,
 					lineNo:  i + 1,
@@ -422,6 +516,19 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 		}
 	}
 	if matchCount == 0 {
+		// A scan that found nothing still reports why it
+		// stopped early, when it did: otherwise a capped scan
+		// looks identical to an empty tree.
+		var notes []string
+		if bytesCapped {
+			notes = append(notes, fmt.Sprintf("stopped after scanning %d bytes (cap %d MB)", totalBytes, maxGrepTotalBytes/(1024*1024)))
+		}
+		if hardlinkSkipped > 0 {
+			notes = append(notes, fmt.Sprintf("skipped %d file(s) with multiple hard links; refusing to read", hardlinkSkipped))
+		}
+		if len(notes) > 0 {
+			return "(no matches)\n[" + strings.Join(notes, "; ") + "]"
+		}
 		return "(no matches)"
 	}
 	var sb strings.Builder
@@ -435,6 +542,15 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 	fmt.Fprintf(&sb, "[%d matching line(s) in %d file(s)", matchCount, filesWithMatches)
 	if capped {
 		fmt.Fprintf(&sb, "; capped at %d matches", maxMatches)
+	}
+	if bytesCapped {
+		fmt.Fprintf(&sb, "; stopped after scanning %d bytes (cap %d MB)", totalBytes, maxGrepTotalBytes/(1024*1024))
+	}
+	if renderCapped {
+		fmt.Fprintf(&sb, "; output truncated to %d rendered lines", maxGrepRenderedLines)
+	}
+	if hardlinkSkipped > 0 {
+		fmt.Fprintf(&sb, "; skipped %d file(s) with multiple hard links", hardlinkSkipped)
 	}
 	if binarySkipped > 0 {
 		fmt.Fprintf(&sb, "; skipped %d binary file(s)", binarySkipped)
@@ -484,6 +600,14 @@ type globArgs struct {
 // paths, no "." or ".." segments (they would escape the base), no
 // empty segments, and every non-"**" segment must be a valid
 // path.Match pattern. It returns the cleaned segments.
+//
+// The pattern is bounded (F-A5-9): at most maxGlobPatternRunes
+// runes and maxGlobSegments segments, and consecutive "**"
+// segments collapse to one — "**/**" matches exactly what "**"
+// does, but the old recursive matcher re-tried every split for
+// each "**", so 20 "**" segments took 42s for a single match on a
+// 12-deep tree. The matcher itself is linear-time now (see
+// matchGlobSegments), and the collapse keeps patterns small.
 func validateGlobPattern(pattern string) ([]string, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return nil, fmt.Errorf("pattern must not be empty")
@@ -495,47 +619,71 @@ func validateGlobPattern(pattern string) ([]string, error) {
 	if strings.Contains(pattern, "\x00") {
 		return nil, fmt.Errorf("pattern must not contain NUL")
 	}
+	if utf8.RuneCountInString(pattern) > maxGlobPatternRunes {
+		return nil, fmt.Errorf("pattern is over %d characters", maxGlobPatternRunes)
+	}
 	parts := strings.Split(pattern, "/")
+	if len(parts) > maxGlobSegments {
+		return nil, fmt.Errorf("pattern has %d segments, over the %d-segment limit", len(parts), maxGlobSegments)
+	}
+	collapsed := make([]string, 0, len(parts))
 	for _, seg := range parts {
 		switch seg {
 		case "", ".", "..":
 			return nil, fmt.Errorf("pattern %q has an empty, \".\" or \"..\" segment; patterns stay inside the search directory", pattern)
 		case "**":
+			// Consecutive "**" is semantically one "**".
+			if len(collapsed) > 0 && collapsed[len(collapsed)-1] == "**" {
+				continue
+			}
+			collapsed = append(collapsed, seg)
 		default:
 			if _, err := path.Match(seg, ""); err != nil {
 				return nil, fmt.Errorf("invalid glob segment %q in pattern %q: %w", seg, pattern, err)
 			}
+			collapsed = append(collapsed, seg)
 		}
 	}
-	return parts, nil
+	return collapsed, nil
 }
 
 // matchGlobSegments reports whether the path segments name match
 // the pattern segments pat. "**" matches zero or more segments;
 // any other segment must match exactly one segment via path.Match.
+//
+// Dynamic programming over (pattern, name) prefixes: O(len(pat) x
+// len(name)) time, no recursion, no exponential blowup on "**"
+// (F-A5-9). The walk already bounds name depth by the filesystem,
+// and validateGlobPattern bounds pat, so one match call is cheap
+// and the walk's periodic ctx check is enough to interrupt a call.
 func matchGlobSegments(pat, name []string) bool {
-	if len(pat) == 0 {
-		return len(name) == 0
-	}
-	if pat[0] == "**" {
-		// "**" eats zero segments, or one-or-more (recurse).
-		if matchGlobSegments(pat[1:], name) {
-			return true
-		}
-		for i := 1; i <= len(name); i++ {
-			if matchGlobSegments(pat[1:], name[i:]) {
-				return true
+	// dp[j] = pat[:i] matches name[:j] for the current i.
+	dp := make([]bool, len(name)+1)
+	dp[0] = true
+	for i := 0; i < len(pat); i++ {
+		ndp := make([]bool, len(name)+1)
+		if pat[i] == "**" {
+			// "**" eats zero segments (dp[j]) or one more
+			// segment on top of what it already ate (ndp[j-1]).
+			for j := 0; j <= len(name); j++ {
+				if dp[j] {
+					ndp[j] = true
+				} else if j > 0 && ndp[j-1] {
+					ndp[j] = true
+				}
+			}
+		} else {
+			for j := 1; j <= len(name); j++ {
+				if dp[j-1] {
+					if ok, _ := path.Match(pat[i], name[j-1]); ok {
+						ndp[j] = true
+					}
+				}
 			}
 		}
-		return false
+		dp = ndp
 	}
-	if len(name) == 0 {
-		return false
-	}
-	if ok, _ := path.Match(pat[0], name[0]); !ok {
-		return false
-	}
-	return matchGlobSegments(pat[1:], name[1:])
+	return dp[len(name)]
 }
 
 func (t *globTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -600,18 +748,22 @@ func (t *globTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 			return nil
 		}
 		if d.IsDir() {
-			if d.Type()&fs.ModeSymlink != 0 {
-				skippedSymlink++
-				return filepath.SkipDir
-			}
+			// A symlinked directory never arrives here:
+			// WalkDir Lstat-reports it with IsDir()==false, so
+			// it is handled by the symlink branch below. The
+			// symlink check that used to live here was dead code
+			// (F-A5-P2-36) and is gone.
 			if d.Name() == ".git" {
 				return filepath.SkipDir
 			}
 		} else if d.Type()&fs.ModeSymlink != 0 {
 			// Symlinked files match only when their target stays
-			// inside the walk root and outside sensitive dirs.
+			// inside the walk root, outside sensitive dirs, and
+			// outside any .git directory (same guard as grep:
+			// a link into .git must not smuggle its files back
+			// in, F-A5-P2-29).
 			target, rerr := filepath.EvalSymlinks(p)
-			if rerr != nil || !within(target, root) || inSensitiveDir(target) {
+			if rerr != nil || !within(target, root) || inSensitiveDir(target) || underGitDir(target) {
 				skippedSymlink++
 				return nil
 			}

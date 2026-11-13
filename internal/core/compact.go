@@ -28,9 +28,25 @@
 //     consecutive failures the compactor trips: it stops retrying
 //     (no provider call, no history change) and surfaces the
 //     tripped state via CompactionStatus until a successful manual
-//     /compress (App resets the breaker) or an explicit reset.
-//     Tripping never fails a turn — the request trim still keeps
-//     the turn inside budget, and the transcript still records it.
+//     /compress (App resets the breaker), an explicit reset, or
+//     the cooldown elapses (defaultBreakerCooldown, after which
+//     it re-arms itself and retries — a transient provider outage
+//     must not disable compaction for the session). Tripping never
+//     fails a turn — the request trim still keeps the turn inside
+//     budget, and the transcript still records it. While tripped
+//     (or while pressure is far over budget and the bounded
+//     emergency compaction cannot keep up), turns the FIFO cap
+//     drops are NOT silent any more: recordMessage detects the
+//     drop, logs it with the count, counts it in
+//     CompactionStatus.DroppedWithoutSummary, and spills the dropped
+//     turn to the transcript as an explicit "dropped,
+//     unsummarised" record (Audit 5 F-A5-1).
+//   - Summary verification: a summary is accepted only if it
+//     preserves something from the summarised turns (at least one
+//     shared content token, and not below a length floor relative
+//     to the input) — a provider returning filler such as
+//     "Nothing durable was discussed." is refused and the prefix is
+//     left untouched (Audit 5 F-A5-2).
 //
 // The manual /compress path (App.compressWithOn) is untouched and
 // keeps working exactly as before; auto-compaction reuses its
@@ -69,18 +85,34 @@ const (
 	// this many consecutive failed compactions stop further
 	// attempts until reset.
 	maxAutoCompactFailures = 3
-	// maxAutoCompactPressure is the ceiling above which a turn
-	// does NOT auto-compact: summarising a prefix many times the
-	// budget would itself need a provider call far over the
-	// context window (and burn more tokens than the turn), so the
-	// bounded request trim — the existing safety net — handles
-	// the turn instead. A session growing normally never reaches
-	// it: compaction fires at 80% on the way up, so pressure can
-	// only jump past the ceiling in one turn via a single giant
-	// tool result, or arrive there from a legacy store. The
-	// transcript still records every turn, and manual /compress
-	// remains available for that state.
-	maxAutoCompactPressure = 2.0
+	// maxCompactionInputTokens bounds one summarisation call's
+	// input (estimated tokens of the oldest turns): the summariser
+	// never receives a prompt over the provider context, and a
+	// prefix far over budget is chipped away a bounded slice per
+	// turn instead of skipped or sent whole (F-A5-1, F-A5-P2-7).
+	// 16k tokens is well inside a 64k-context provider with room
+	// for the 800-token summary.
+	maxCompactionInputTokens = 16000
+	// defaultBreakerCooldown is how long a tripped circuit breaker
+	// stays down before it re-arms itself and retries: a transient
+	// provider outage must not disable auto-compaction for the
+	// rest of the session (F-A5-P2-7). A successful manual
+	// /compress (ResetCompactionBreaker) still re-arms immediately.
+	defaultBreakerCooldown = 5 * time.Minute
+	// minSummaryRunes and maxSummaryLengthFloor bound the
+	// preservation check's length floor: a summary shorter than
+	// inputRunes/summaryLengthDivisor runes (clamped to this range)
+	// is rejected as degenerate, alongside the token-overlap check
+	// (F-A5-2). The floor is deliberately lenient for filler-heavy
+	// input — a long prefix whose only durable content is one fact
+	// legitimately summarises short; the overlap check is what
+	// catches content-free filler.
+	minSummaryRunes       = 20
+	maxSummaryLengthFloor = 100
+	summaryLengthDivisor  = 2000
+	// maxDroppedTurnContentRunes truncates one spilled turn's
+	// content in the "dropped, unsummarised" transcript record.
+	maxDroppedTurnContentRunes = 500
 	// maxSummaryFactRunes caps the appended conversation-summary
 	// fact: each compaction appends a dated section, and past the
 	// cap the oldest sections are dropped so the fact stays
@@ -108,6 +140,16 @@ type CompactionStatus struct {
 	LastCompactAt time.Time
 	// Compactions counts successful auto-compactions on this agent.
 	Compactions int
+	// DroppedWithoutSummary counts turns the store's FIFO cap dropped
+	// without a summary since the last breaker reset (Audit 5
+	// F-A5-1): the count is visible here, in /status and on the
+	// card, and each dropped turn is spilled to the transcript as
+	// an explicit "dropped, unsummarised" record. The durable
+	// record survives a reset; this counter does not.
+	DroppedWithoutSummary int
+	// LastDroppedAt is when the most recent unsummarised drop
+	// happened, zero when none has.
+	LastDroppedAt time.Time
 }
 
 // HistoryPressure measures how full the retained history is: the
@@ -150,17 +192,21 @@ type transcriptSink interface {
 // fields are guarded by mu; it is safe for concurrent use, though
 // in practice only the serialised agent loop touches it.
 type compactor struct {
-	mu                  sync.Mutex
-	summariser          compactionSummariser
-	threshold           float64
-	warningThreshold    float64
-	keepRecent          int
-	consecutiveFailures int
-	tripped             bool
-	lastErr             string
-	lastCompactAt       time.Time
-	compactions         int
-	pressure            float64
+	mu                    sync.Mutex
+	summariser            compactionSummariser
+	threshold             float64
+	warningThreshold      float64
+	keepRecent            int
+	consecutiveFailures   int
+	tripped               bool
+	trippedAt             time.Time
+	breakerCooldown       time.Duration // 0 = defaultBreakerCooldown
+	lastErr               string
+	lastCompactAt         time.Time
+	compactions           int
+	pressure              float64
+	droppedWithoutSummary int
+	lastDroppedAt         time.Time
 }
 
 func newCompactor() *compactor {
@@ -197,21 +243,26 @@ func (a *Agent) CompactionStatus() CompactionStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return CompactionStatus{
-		Pressure:            c.pressure,
-		Warning:             c.pressure >= c.warningThreshold && c.pressure < c.threshold,
-		NeedsCompact:        c.pressure >= c.threshold,
-		Tripped:             c.tripped,
-		ConsecutiveFailures: c.consecutiveFailures,
-		LastError:           c.lastErr,
-		LastCompactAt:       c.lastCompactAt,
-		Compactions:         c.compactions,
+		Pressure:              c.pressure,
+		Warning:               c.pressure >= c.warningThreshold && c.pressure < c.threshold,
+		NeedsCompact:          c.pressure >= c.threshold,
+		Tripped:               c.tripped,
+		ConsecutiveFailures:   c.consecutiveFailures,
+		LastError:             c.lastErr,
+		LastCompactAt:         c.lastCompactAt,
+		Compactions:           c.compactions,
+		DroppedWithoutSummary: c.droppedWithoutSummary,
+		LastDroppedAt:         c.lastDroppedAt,
 	}
 }
 
 // ResetCompactionBreaker clears the circuit breaker after a
 // successful manual /compress (or an explicit operator reset), so
 // auto-compaction can try again. It does not reset the success
-// counters.
+// counters — but it does reset the dropped-without-summary count:
+// the count is "since the last reset", and a reset marks the
+// operator having taken action (the durable record of the drops
+// themselves lives in the transcript's spill records and the log).
 func (a *Agent) ResetCompactionBreaker() {
 	a.compactorMu.Lock()
 	c := a.compactor
@@ -222,8 +273,11 @@ func (a *Agent) ResetCompactionBreaker() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.tripped = false
+	c.trippedAt = time.Time{}
 	c.consecutiveFailures = 0
 	c.lastErr = ""
+	c.droppedWithoutSummary = 0
+	c.lastDroppedAt = time.Time{}
 }
 
 // SetTranscript wires the per-session transcript the agent
@@ -242,10 +296,39 @@ func (a *Agent) SetTranscript(s transcriptSink) {
 // is logged and never fails the turn: memory is the working store,
 // the transcript is the record, and a failed record must not lose
 // the turn itself.
+//
+// FIFO-drop spill (Audit 5 F-A5-1): the store caps retained history
+// at memory.MaxMessages, dropping the oldest turns first. When this
+// add pushes the store to its cap, the oldest turn(s) are dropped —
+// and a drop with no summary must not be silent. Before adding,
+// the current oldest turn is snapshotted; after adding, a store
+// still pinned at the cap proves the drop happened, and the dropped
+// turn is spilled (counted, logged, written to the transcript as an
+// explicit "dropped, unsummarised" record). A store without a cap
+// (a test fake, or one that grew past it) never pins at the cap, so
+// no spill is recorded for it.
 func (a *Agent) recordMessage(msg model.Message) {
+	var before []model.Message
+	if all, err := a.memory.RecentMessages(0); err == nil && len(all) >= memory.MaxMessages {
+		before = all
+	}
 	if err := a.memory.AddMessage(msg); err != nil {
 		a.logf("memory AddMessage (%s) failed: %v", msg.Role, err)
 		return
+	}
+	if len(before) > 0 {
+		if after, err := a.memory.RecentMessages(0); err == nil && len(after) == memory.MaxMessages {
+			// The store was at (or over) its cap and is still
+			// pinned at it after the add: the oldest
+			// len(before)+1-MaxMessages turns were dropped.
+			n := len(before) + 1 - memory.MaxMessages
+			if n > len(before) {
+				n = len(before)
+			}
+			if n > 0 {
+				a.spillDroppedTurns(before[:n])
+			}
+		}
 	}
 	a.transcriptMu.RLock()
 	sink := a.transcript
@@ -258,19 +341,93 @@ func (a *Agent) recordMessage(msg model.Message) {
 	}
 }
 
+// dropSink is the optional transcript leg for FIFO-spill records: a
+// sink that records turns the cap dropped without a summary. The
+// real session.Transcript implements it; a test fake need not — the
+// spill then still counts and logs, it just has nowhere durable to
+// go in that test.
+type dropSink interface {
+	AppendDropped(text string) error
+}
+
+// spillDroppedTurns records turns the FIFO cap dropped without a
+// summary: count them in CompactionStatus, log them with the count,
+// and spill each one to the transcript as an explicit "dropped,
+// unsummarised" record. A transcript failure is logged and never
+// fails the turn — the count and the log already record the loss.
+func (a *Agent) spillDroppedTurns(dropped []model.Message) {
+	if len(dropped) == 0 {
+		return
+	}
+	c := a.compactorOrDefault()
+	c.mu.Lock()
+	c.droppedWithoutSummary += len(dropped)
+	c.lastDroppedAt = time.Now()
+	total := c.droppedWithoutSummary
+	c.mu.Unlock()
+	first := dropped[0]
+	a.logf("FIFO cap dropped %d turn(s) without summary (%d total since last reset; oldest was %s: %q)", len(dropped), total, first.Role, truncateRunesForLog(first.Content, 80))
+	a.transcriptMu.RLock()
+	sink := a.transcript
+	a.transcriptMu.RUnlock()
+	ds, ok := sink.(dropSink)
+	if !ok {
+		return
+	}
+	for _, m := range dropped {
+		if err := ds.AppendDropped(formatDroppedTurn(m)); err != nil {
+			a.logf("transcript AppendDropped failed (drop already counted): %v", err)
+		}
+	}
+}
+
+// formatDroppedTurn renders one dropped turn for the spill record:
+// its role and truncated content, so the record says what was lost
+// without keeping a whole giant tool result. An assistant message
+// with no content names its tool calls instead.
+func formatDroppedTurn(m model.Message) string {
+	content := strings.TrimSpace(m.Content)
+	if content == "" && len(m.ToolCalls) > 0 {
+		names := make([]string, len(m.ToolCalls))
+		for i, tc := range m.ToolCalls {
+			names[i] = tc.Name
+		}
+		content = "tool calls: " + strings.Join(names, ", ")
+	}
+	if r := []rune(content); len(r) > maxDroppedTurnContentRunes {
+		content = string(r[:maxDroppedTurnContentRunes]) + "..."
+	}
+	return "Dropped without summary (auto-compaction unavailable): " + m.Role + ": " + content
+}
+
+// truncateRunesForLog shortens s to at most n runes for a log line,
+// appending "..." when it truncates.
+func truncateRunesForLog(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
+}
+
 // recordSummary appends a compaction summary to the wired
-// transcript, if any. Failures are logged, never fatal: the
-// summary already lives in the conversation-summary fact.
-func (a *Agent) recordSummary(summary string) {
+// transcript, if any. It returns the transcript error: a failed
+// summary persist aborts the compaction before anything is dropped
+// (Audit 5 F-A5-P2-1) — the transcript is the unbounded backstop,
+// and dropping the prefix while the summary never landed there
+// would silently lose it. With no transcript wired there is
+// nothing to persist and the call succeeds.
+func (a *Agent) recordSummary(summary string) error {
 	a.transcriptMu.RLock()
 	sink := a.transcript
 	a.transcriptMu.RUnlock()
 	if sink == nil {
-		return
+		return nil
 	}
 	if err := sink.AppendSummary(summary); err != nil {
-		a.logf("transcript AppendSummary failed (summary kept as fact): %v", err)
+		return fmt.Errorf("core: transcript AppendSummary: %w", err)
 	}
+	return nil
 }
 
 // maybeAutoCompact measures the retained history's pressure and,
@@ -280,15 +437,29 @@ func (a *Agent) recordSummary(summary string) {
 // the turn: a compaction failure is counted toward the circuit
 // breaker, logged, and the turn proceeds on the uncompacted
 // history (the request trim still keeps it inside budget).
+//
+// Bounded input (F-A5-P2-7): only a bounded slice of the oldest
+// turns is ever summarised (maxCompactionInputTokens), so a prefix
+// far over budget is chipped away a slice per turn instead of
+// skipped entirely (F-A5-1) or sent whole to the provider. Only
+// the slice actually summarised is dropped; the rest stays for
+// the next turn's compaction.
 func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool {
 	c := a.compactorOrDefault()
 	pressure := HistoryPressure(all, a.maxHistoryTokens())
 	c.mu.Lock()
+	prevPressure := c.pressure
 	c.pressure = pressure
 	tripped := c.tripped
+	trippedAt := c.trippedAt
+	cooldown := c.breakerCooldown
+	if cooldown <= 0 {
+		cooldown = defaultBreakerCooldown
+	}
 	threshold := c.threshold
 	warningThreshold := c.warningThreshold
 	keepRecent := c.keepRecent
+	dropped := c.droppedWithoutSummary
 	c.mu.Unlock()
 
 	if pressure >= warningThreshold && pressure < threshold {
@@ -299,32 +470,51 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 	if pressure < threshold {
 		return false
 	}
-	if pressure > maxAutoCompactPressure {
-		// Severely over budget: do not burn a summarisation
-		// call on a prefix many times the budget — the
-		// request trim handles this turn, as before.
-		a.logf("history pressure %.0f%% is far over budget; skipping auto-compaction (request trim handles this turn)", pressure*100)
-		return false
+	// Jump warning (F-A5-P2-7): a single giant turn can leap over
+	// the warning band without ever being inside it — the user
+	// still gets the advance notice, and compaction proceeds.
+	if prevPressure < warningThreshold {
+		a.emit(ProgressEvent{Kind: EventCompactionWarning, Step: 0})
+		a.logf("history pressure jumped from %.0f%% to %.0f%%, skipping the warning band (auto-compacts at %.0f%%)", prevPressure*100, pressure*100, threshold*100)
 	}
 	if tripped {
-		// Circuit breaker: do not retry, do not call the
-		// provider, do not touch history. Surface it every
-		// time the trigger is hit so the tripped state cannot
-		// go unnoticed while turns keep running.
-		a.emit(ProgressEvent{Kind: EventCompactionWarning, Step: 0, Err: errors.New("core: auto-compaction circuit breaker tripped after repeated failures; run /compress")})
-		a.logf("history pressure %.0f%% but auto-compaction circuit breaker is tripped; run /compress", pressure*100)
-		return false
+		// Circuit breaker: re-arm after the cooldown (a transient
+		// provider outage must not disable compaction for the
+		// rest of the session), otherwise do not retry, do not
+		// call the provider, do not touch history. Surface it
+		// every time the trigger is hit so the tripped state
+		// cannot go unnoticed while turns keep running — and name
+		// any turns already dropped without summary.
+		if !trippedAt.IsZero() && time.Since(trippedAt) >= cooldown {
+			c.mu.Lock()
+			c.tripped = false
+			c.trippedAt = time.Time{}
+			c.consecutiveFailures = 0
+			c.lastErr = ""
+			c.mu.Unlock()
+			a.logf("auto-compaction circuit breaker re-armed after %s cooldown; retrying", cooldown)
+		} else {
+			errText := "core: auto-compaction circuit breaker tripped after repeated failures; run /compress"
+			if dropped > 0 {
+				errText = fmt.Sprintf("core: auto-compaction circuit breaker tripped after repeated failures; %d turn(s) dropped without summary; run /compress", dropped)
+			}
+			a.emit(ProgressEvent{Kind: EventCompactionWarning, Step: 0, Err: errors.New(errText)})
+			a.logf("history pressure %.0f%% but auto-compaction circuit breaker is tripped; run /compress", pressure*100)
+			return false
+		}
 	}
 	if len(all) <= keepRecent {
 		return false
 	}
 	old := append([]model.Message(nil), all[:len(all)-keepRecent]...)
 	recent := append([]model.Message(nil), all[len(all)-keepRecent:]...)
+	toSummarise := boundedOldPrefix(old, maxCompactionInputTokens)
+	kept := append(append([]model.Message(nil), old[len(toSummarise):]...), recent...)
 
 	summariser := c.summariserFor(a)
 	summaryCtx, cancel := context.WithTimeout(ctx, a.timeout())
 	defer cancel()
-	summary, err := summariser(summaryCtx, old)
+	summary, err := summariser(summaryCtx, toSummarise)
 	if err != nil {
 		a.noteCompactionFailure(fmt.Errorf("summarisation: %w", err))
 		return false
@@ -339,10 +529,21 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 	// Derivable content is dropped; if nothing worth keeping
 	// remains, the compaction is refused and history is left
 	// untouched.
-	if kept, ok := memory.FilterExplicitSave(summary); ok {
-		summary = kept
+	if keptSummary, ok := memory.FilterExplicitSave(summary); ok {
+		summary = keptSummary
 	} else {
 		a.noteCompactionFailure(errors.New("summary contained nothing worth saving (gate dropped it all)"))
+		return false
+	}
+	// Preservation check (F-A5-2): the summary must preserve
+	// something from the turns it replaces — at least one shared
+	// content token, and not below a length floor relative to the
+	// input. A provider returning filler ("Nothing durable was
+	// discussed.") passes the gate above but preserves nothing,
+	// and dropping the prefix on its word would lose the history
+	// for a sentence that says nothing.
+	if !summaryPreservesSource(summary, toSummarise) {
+		a.noteCompactionFailure(errors.New("summary preserved nothing from the summarised turns (no shared content tokens, or below the length floor)"))
 		return false
 	}
 	// Summary-before-drop: persist the summary FIRST (fact +
@@ -353,8 +554,11 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 		a.noteCompactionFailure(fmt.Errorf("store summary: %w", err))
 		return false
 	}
-	a.recordSummary(summary)
-	if err := a.memory.ReplaceMessages(recent); err != nil {
+	if err := a.recordSummary(summary); err != nil {
+		a.noteCompactionFailure(err)
+		return false
+	}
+	if err := a.memory.ReplaceMessages(kept); err != nil {
 		a.noteCompactionFailure(fmt.Errorf("drop summarised messages: %w", err))
 		return false
 	}
@@ -363,10 +567,69 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 	c.lastErr = ""
 	c.lastCompactAt = time.Now()
 	c.compactions++
+	// Pressure is measured on the history that is actually kept
+	// now — /status and the footer must not keep reporting the
+	// pre-compaction pressure (F-A5-P2-2).
+	c.pressure = HistoryPressure(kept, a.maxHistoryTokens())
 	c.mu.Unlock()
 	a.emit(ProgressEvent{Kind: EventAutoCompacted, Step: 0})
-	a.logf("auto-compacted: %d messages summarised, %d kept", len(old), len(recent))
+	a.logf("auto-compacted: %d messages summarised, %d kept", len(toSummarise), len(kept))
 	return true
+}
+
+// boundedOldPrefix takes the oldest messages of old whose estimated
+// tokens fit within maxTokens, so the summariser never receives a
+// prompt over the provider context. At least one message is always
+// taken, even if it alone exceeds the cap — a single giant turn
+// still gets summarised rather than skipped.
+func boundedOldPrefix(old []model.Message, maxTokens int) []model.Message {
+	total := 0
+	n := 0
+	for i, m := range old {
+		t := messageTokens(m)
+		if n > 0 && total+t > maxTokens {
+			break
+		}
+		total += t
+		n = i + 1
+	}
+	if n == 0 && len(old) > 0 {
+		n = 1
+	}
+	return old[:n]
+}
+
+// summaryPreservesSource reports whether summary preserves anything
+// from source: at least one shared content token with the source
+// turns, and not below a length floor relative to the input size.
+// A source with no content tokens at all cannot verify any summary,
+// so every summary of it is refused.
+func summaryPreservesSource(summary string, source []model.Message) bool {
+	var sb strings.Builder
+	for _, m := range source {
+		sb.WriteString(m.Content)
+		sb.WriteString("\n")
+	}
+	src := sb.String()
+	summary = strings.TrimSpace(summary)
+	srcTokens := contentTokens(src)
+	if len(srcTokens) == 0 {
+		// Nothing in the source to preserve — and nothing to
+		// verify a summary against. A summary of content-free
+		// turns is refused rather than trusted.
+		return false
+	}
+	if sharedTokenCount(contentTokens(summary), srcTokens) == 0 {
+		return false
+	}
+	floor := len([]rune(src)) / summaryLengthDivisor
+	if floor < minSummaryRunes {
+		floor = minSummaryRunes
+	}
+	if floor > maxSummaryLengthFloor {
+		floor = maxSummaryLengthFloor
+	}
+	return len([]rune(summary)) >= floor
 }
 
 // noteCompactionFailure counts one failed compaction toward the
@@ -381,6 +644,7 @@ func (a *Agent) noteCompactionFailure(err error) {
 	tripped := failures >= maxAutoCompactFailures
 	if tripped {
 		c.tripped = true
+		c.trippedAt = time.Now()
 	}
 	c.mu.Unlock()
 	if tripped {
@@ -422,7 +686,12 @@ func (a *Agent) defaultCompactionSummariser(ctx context.Context, old []model.Mes
 		return "", errors.New("no provider available for auto-compaction")
 	}
 	var b strings.Builder
-	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers and anything the user asked to remember. Do not invent anything not in the messages.\n\n")
+	// Name what must survive, explicitly: pending items, open
+	// questions and user instructions/preferences used to depend
+	// on the model volunteering them (Audit 5 F-A5-2). NOTE: the
+	// same prompt is copied in internal/app/commands.go
+	// (compressWithOn) — keep the two in sync.
+	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers, pending items and open questions, and anything the user asked to remember, including user instructions and preferences. Do not invent anything not in the messages.\n\n")
 	for _, m := range old {
 		fmt.Fprintf(&b, "%s: %s\n", m.Role, m.Content)
 	}
@@ -441,6 +710,12 @@ func (a *Agent) defaultCompactionSummariser(ctx context.Context, old []model.Mes
 	if resp == nil {
 		return "", errors.New("auto-compaction provider returned nil response")
 	}
+	// Meter the summarisation call (F-A5-5): auto-compaction runs
+	// outside the main loop, so without this its tokens never
+	// reach TurnFinished or the budget. A failed call reports no
+	// usage (resp is nil on error); a successful call's reported
+	// usage is folded into this turn's usage by finishTurn.
+	a.AddSideChannelUsage(resp.Usage)
 	return strings.TrimSpace(resp.Message.Content), nil
 }
 

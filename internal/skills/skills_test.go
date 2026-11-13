@@ -352,3 +352,107 @@ func TestRegisterAndGetDoNotAliasTools(t *testing.T) {
 		t.Errorf("after mutating List() result, registry tool = %q, want %q", got3.Tools[0], "exec")
 	}
 }
+
+func TestParseToolsHeadingVariants(t *testing.T) {
+	// Audit 5 F-A5-P2-25: "## Tools:", "## Allowed Tools", and
+	// "## Available Tools" used to parse to Tools=nil — and nil
+	// means unrestricted — so a skill author intending a
+	// restriction silently got none. All variants must now parse
+	// to the same restriction as the exact heading.
+	cases := []struct {
+		heading string
+	}{
+		{"## Tools"},
+		{"## Tools:"},
+		{"## tools"},
+		{"## Allowed Tools"},
+		{"## Allowed Tools:"},
+		{"## Available Tools"},
+		{"## available tools:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.heading, func(t *testing.T) {
+			content := "# Variant\n\nDoes things.\n\n" + tc.heading + "\n\n- echo\n"
+			s, warnings := parseSkill("variant.md", content)
+			if len(warnings) != 0 {
+				t.Errorf("heading %q produced warnings %v, want none", tc.heading, warnings)
+			}
+			if len(s.Tools) != 1 || s.Tools[0] != "echo" {
+				t.Errorf("heading %q: tools = %v, want [echo]", tc.heading, s.Tools)
+			}
+		})
+	}
+}
+
+func TestParseToolsLikeHeadingWarns(t *testing.T) {
+	// A heading that looks like a Tools section but is not a
+	// recognised variant must not silently fail open: it parses
+	// to no restriction AND produces a warning, so the author
+	// finds out instead of running unrestricted.
+	for _, heading := range []string{"## Tool", "## Tools and Setup", "## My Tools"} {
+		content := "# Variant\n\nDoes things.\n\n" + heading + "\n\n- echo\n"
+		s, warnings := parseSkill("variant.md", content)
+		if len(s.Tools) != 0 {
+			t.Errorf("heading %q: tools = %v, want none (unrecognised heading)", heading, s.Tools)
+		}
+		if len(warnings) == 0 {
+			t.Errorf("heading %q: no warning produced, want one", heading)
+		} else if !strings.Contains(warnings[0], "no tool restriction") {
+			t.Errorf("heading %q: warning = %q, want it to say no tool restriction applies", heading, warnings[0])
+		}
+	}
+
+	// A heading with no "tool" word at all is not Tools-like:
+	// no warning, no restriction.
+	s, warnings := parseSkill("plain.md", "# Plain\n\nDoes things.\n\n## Notes\n\n- echo\n")
+	if len(s.Tools) != 0 || len(warnings) != 0 {
+		t.Errorf("non-Tools heading: tools = %v, warnings = %v, want both empty", s.Tools, warnings)
+	}
+}
+
+func TestLoadDirRefusesSymlinks(t *testing.T) {
+	// Audit 5 F-A5-P2-26: a .md symlink inside the skills dir
+	// pointing anywhere on disk must not load as a skill.
+	dir := t.TempDir()
+	outside := t.TempDir()
+	writeFixture(t, outside, "outside.md", "# Smuggled\n\nSmuggled body.\n")
+	if err := os.Symlink(filepath.Join(outside, "outside.md"), filepath.Join(dir, "evil.md")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	writeFixture(t, dir, "good.md", shellSkill)
+
+	r := NewRegistry()
+	n, err := r.LoadDir(dir)
+	if n != 1 {
+		t.Fatalf("LoadDir loaded %d skills, want 1 (only the regular file)", n)
+	}
+	if err == nil {
+		t.Fatal("LoadDir: expected an error refusing the symlink, got nil")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("LoadDir error = %v, want it to mention the symlink", err)
+	}
+	if _, ok := r.Get("Smuggled"); ok {
+		t.Error("symlinked skill \"Smuggled\" loaded — it must not be")
+	}
+	if _, ok := r.Get("Shell"); !ok {
+		t.Error("regular skill \"Shell\" did not load alongside the refused symlink")
+	}
+}
+
+func TestLoadFileRefusesSymlink(t *testing.T) {
+	// Same guarantee on the single-file path.
+	dir := t.TempDir()
+	outside := t.TempDir()
+	target := writeFixture(t, outside, "outside.md", "# Smuggled\n\nSmuggled body.\n")
+	link := filepath.Join(dir, "evil.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	r := NewRegistry()
+	if _, err := r.LoadFile(link); err == nil {
+		t.Error("LoadFile(symlink): expected error, got nil")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("LoadFile(symlink) error = %v, want it to mention the symlink", err)
+	}
+}

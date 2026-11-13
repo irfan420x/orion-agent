@@ -236,9 +236,9 @@ func TestCallbackQueryReachesHandler(t *testing.T) {
 	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		mu.Lock()
 		got = append(got, q)
-		mu.Unlock()
 		id, _ := SenderIDFromContext(ctx)
 		gotSender = id
+		mu.Unlock()
 		// A real handler answers the query (clearing the button
 		// spinner); the gateway does not answer for it.
 		return g.AnswerCallbackQuery(ctx, q.ID, "Approved")
@@ -252,11 +252,14 @@ func TestCallbackQueryReachesHandler(t *testing.T) {
 		defer mu.Unlock()
 		return len(got) == 1
 	})
-	if got[0].Data != "perm:approve:0123456789abcdef" {
-		t.Errorf("callback data = %q, want the approval payload", got[0].Data)
+	mu.Lock()
+	gotData, gotSenderID := got[0].Data, gotSender
+	mu.Unlock()
+	if gotData != "perm:approve:0123456789abcdef" {
+		t.Errorf("callback data = %q, want the approval payload", gotData)
 	}
-	if gotSender != 77 {
-		t.Errorf("callback sender in ctx = %d, want 77", gotSender)
+	if gotSenderID != 77 {
+		t.Errorf("callback sender in ctx = %d, want 77", gotSenderID)
 	}
 	waitFor(t, "callback answer", func() bool {
 		fake.mu.Lock()

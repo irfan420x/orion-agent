@@ -207,7 +207,11 @@ func (a *Agent) sessionExtractorFor() sessionExtractorFunc {
 // defaultSessionExtractor asks the agent's provider for a compact
 // summary of decisions and facts from the recent turns. An empty
 // summary (or "nothing worth saving") is returned as "" so nothing
-// is appended.
+// is appended. The call's reported usage is metered into the
+// agent's side-channel total (F-A5-5): extraction runs in a
+// background goroutine after its turn finished, so its tokens are
+// folded into the NEXT turn's usage rather than dropped — the
+// budget still sees them, one turn late.
 func (a *Agent) defaultSessionExtractor(ctx context.Context, turns []model.Message) (string, error) {
 	if a.provider == nil {
 		return "", fmt.Errorf("no provider available for session extraction")
@@ -227,6 +231,7 @@ func (a *Agent) defaultSessionExtractor(ctx context.Context, turns []model.Messa
 	if resp == nil {
 		return "", fmt.Errorf("session extraction provider returned nil response")
 	}
+	a.AddSideChannelUsage(resp.Usage)
 	return strings.TrimSpace(resp.Message.Content), nil
 }
 

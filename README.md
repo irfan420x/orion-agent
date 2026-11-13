@@ -3,9 +3,9 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc9.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc10.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (972 tests pass, 0 fail, 4 skip — Ollama live tests
+> built and tested (1055 tests pass, 0 fail, 4 skip — Ollama live tests
 > plus one MCP process test that needs a live server; race clean). The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -101,7 +101,7 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-21/21 packages, 972 tests passing, 0 failing, 4 skipped (the live
+21/21 packages, 1055 tests passing, 0 failing, 4 skipped (the live
 Ollama tests, which need a running Ollama server, plus one MCP test
 that needs a live server process), race clean — `go test
 -count=1 ./...`, verified 2026-11-13. Run the suite with `go test ./...` or `make test`.
@@ -126,7 +126,7 @@ that needs a live server process), race clean — `go test
   "timeout_seconds": 120,
   "max_tool_result_bytes": 262144,
   "max_history_tokens": 32768,
-  "sandbox": { "enabled": false, "root": "~/.orion/sandbox", "allow_network": false, "allow_without_seccomp": false }
+  "sandbox": { "enabled": true, "root": "~/.orion/sandbox", "allow_network": false, "allow_without_seccomp": false }
 }
 ```
 
@@ -192,6 +192,44 @@ RAM: `ollama pull hermes3:8b`, then set the model in config. See
 [docs/E2E_LIVE_OLLAMA.md](docs/E2E_LIVE_OLLAMA.md) for the measured
 evidence (this VM has ~700 MiB free, so no Hermes model runs here).
 
+## Sandbox (shell_exec)
+
+`shell_exec` runs confined by default: Linux namespaces + chroot
+(see [SECURITY.md](SECURITY.md)), with a seccomp filter when the
+`orion-seccomp` launcher is installed. The sandbox is **on by
+default** — a fresh install confines `shell_exec`, and a config
+file that omits the `sandbox` section still confines it. Turning
+it off is an explicit operator opt-out: set
+`sandbox.enabled=false` in `~/.orion/config.json`, or export
+`ORION_SANDBOX=off`. An opted-out run is logged every time
+(`shell_exec: sandbox disabled; running command without sandbox
+isolation`), so the loss of confinement is visible per command,
+not once per process. When the sandbox is on but cannot be
+established on the host, `shell_exec` refuses the command
+(fail-closed) instead of running it unsandboxed, unless
+`sandbox.allow_unsandboxed_fallback=true` is set explicitly; a
+missing seccomp filter is likewise refused unless
+`sandbox.allow_without_seccomp=true` is set.
+
+## Sessions
+
+Every conversation is kept as an append-only per-session JSONL
+transcript — one file per session, never rewritten:
+
+- Telegram: `<data_dir>/chats/<chatID>/sessions/<session-id>.jsonl`
+- CLI: `<data_dir>/sessions/<session-id>.jsonl`
+
+The live session id is recorded in `sessions/current.json` under
+the same root. `/new` starts a fresh session (the old transcript
+stays on disk); `/sessions` lists sessions and `/resume <id or
+unique prefix>` resumes one, reloading its messages into the
+working history. The CLI has the same operations:
+`orion sessions` (list), `orion sessions resume <id>`,
+`orion sessions new`. A chat created before transcripts existed
+has its turns from the legacy `memory.json` imported once into
+the transcript the first time it is opened — the JSON file itself
+is never deleted or modified by the migration.
+
 ## CLI
 
 | Command | What it does |
@@ -231,8 +269,8 @@ see "Size caps" under [Configuration](#configuration).
 
 See [SECURITY.md](SECURITY.md). The short version: one canonical
 token-based denylist (`internal/security.IsBlockedCommand`), secret
-scanning/redaction, a SHA-256 hash-chained audit log, and an opt-in
-sandbox for `shell_exec` (Linux namespaces + chroot) that confines
+scanning/redaction, a SHA-256 hash-chained audit log, and a sandbox
+for `shell_exec`, on by default (Linux namespaces + chroot), that confines
 commands to a sandbox root even when the denylist cannot see what
 interpreter code or a script file will do. Tests never execute
 destructive commands — denylist tests call

@@ -103,24 +103,118 @@ func TestPreToolUseExitZeroJSONBlockHonoured(t *testing.T) {
 	}
 }
 
-func TestPreToolUseOtherExitContinuesWithWarning(t *testing.T) {
+// TestPreToolUseDecisionlessJSONLineSkipped (Audit 5, F-A5-P2-10):
+// a JSON stdout line with no decision field must not swallow the
+// real decision on a later line.
+func TestPreToolUseDecisionlessJSONLineSkipped(t *testing.T) {
+	dir := t.TempDir()
+	writeHook(t, dir, EventPreToolUse, "noisy.sh", `echo '{"status":"ok"}'; echo '{"decision":"block","reason":"no"}'; exit 0`)
+	b := NewBus(dir)
+	out := b.PreToolUse(context.Background(), "calculator", json.RawMessage(`{}`))
+	if !out.Blocked {
+		t.Fatalf("hook printing {\"status\":\"ok\"} then a block decision did not block: %+v", out)
+	}
+	if out.Reason != "no" {
+		t.Errorf("block reason = %q, want %q", out.Reason, "no")
+	}
+}
+
+// TestPreToolUseDecisionCaseInsensitive (Audit 5, F-A5-P2-10): the
+// decision is matched case-insensitively — "Block" blocks.
+func TestPreToolUseDecisionCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	writeHook(t, dir, EventPreToolUse, "loud.sh", `echo '{"decision":"Block","reason":"loud no"}'; exit 0`)
+	b := NewBus(dir)
+	out := b.PreToolUse(context.Background(), "calculator", json.RawMessage(`{}`))
+	if !out.Blocked || out.Reason != "loud no" {
+		t.Errorf("decision \"Block\": %+v, want blocked with reason 'loud no'", out)
+	}
+}
+
+// TestPreToolUseArgsAreRedacted (Audit 5, F-A5-P2-14): a secret
+// the model pasted into a tool argument must not reach the hook's
+// stdin unredacted.
+func TestPreToolUseArgsAreRedacted(t *testing.T) {
+	dir := t.TempDir()
+	seen := filepath.Join(dir, "payload.json")
+	writeHook(t, dir, EventPreToolUse, "see.sh", "cat > "+seen)
+	b := NewBus(dir)
+	token := "sk-0123456789abcdef0123456789abcdef0123456789abcdef"
+	args := json.RawMessage(`{"command":"curl https://example.com -H 'Authorization: Bearer ` + token + `' --data plain-text"}`)
+	b.PreToolUse(context.Background(), "shell_exec", args)
+	data, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatalf("hook did not receive stdin: %v", err)
+	}
+	if strings.Contains(string(data), token) {
+		t.Errorf("hook stdin leaked the secret-shaped token: %s", data)
+	}
+	if !strings.Contains(string(data), "[REDACTED]") {
+		t.Errorf("hook stdin has no [REDACTED] marker: %s", data)
+	}
+	// The non-secret parts of the arguments still arrive intact.
+	if !strings.Contains(string(data), "plain-text") || !strings.Contains(string(data), "curl https://example.com") {
+		t.Errorf("hook stdin lost non-secret argument text: %s", data)
+	}
+}
+
+// TestPostToolUseArgsAreRedacted is the PostToolUse half of
+// F-A5-P2-14: the same redaction applies to the arguments handed
+// to a post-tool hook.
+func TestPostToolUseArgsAreRedacted(t *testing.T) {
+	dir := t.TempDir()
+	seen := filepath.Join(dir, "payload.json")
+	writeHook(t, dir, EventPostToolUse, "see.sh", "cat > "+seen)
+	b := NewBus(dir)
+	token := "sk-0123456789abcdef0123456789abcdef0123456789abcdef"
+	args := json.RawMessage(`{"command":"echo ` + token + `"}`)
+	b.PostToolUse(context.Background(), "shell_exec", args, "ok")
+	data, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatalf("hook did not receive stdin: %v", err)
+	}
+	if strings.Contains(string(data), token) {
+		t.Errorf("post hook stdin leaked the secret-shaped token: %s", data)
+	}
+	if !strings.Contains(string(data), "[REDACTED]") {
+		t.Errorf("post hook stdin has no [REDACTED] marker: %s", data)
+	}
+}
+
+func TestPreToolUseOtherExitFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	writeHook(t, dir, EventPreToolUse, "warn.sh", `echo "something odd" >&2; exit 3`)
 	b := NewBus(dir)
 	out := b.PreToolUse(context.Background(), "calculator", json.RawMessage(`{}`))
-	if out.Blocked {
-		t.Error("exit-3 hook blocked, want continue-with-warning")
+	// Any clean non-zero exit fails CLOSED (Audit 5, F-A5-P2-11):
+	// a buggy hook must not silently stop enforcing policy while
+	// tool calls proceed.
+	if !out.Blocked {
+		t.Error("exit-3 hook did not block; want fail-closed")
 	}
-	if !strings.Contains(out.Warning, "warn.sh") || !strings.Contains(out.Warning, "3") {
-		t.Errorf("warning = %q, want hook name and exit code", out.Warning)
+	if !strings.Contains(out.Reason, "warn.sh") || !strings.Contains(out.Reason, "3") || !strings.Contains(out.Reason, "failing closed") {
+		t.Errorf("block reason = %q, want hook name, exit code and 'failing closed'", out.Reason)
+	}
+}
+
+// TestPreToolUseExitOneFailsClosed is the exit-1 case of the same
+// rule (Audit 5, F-A5-P2-11): a `set -e` script failing on a
+// missing dependency must block, not warn-and-continue.
+func TestPreToolUseExitOneFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	writeHook(t, dir, EventPreToolUse, "buggy.sh", "exit 1")
+	b := NewBus(dir)
+	out := b.PreToolUse(context.Background(), "calculator", json.RawMessage(`{}`))
+	if !out.Blocked {
+		t.Error("exit-1 hook did not block; want fail-closed")
 	}
 }
 
 func TestPreToolUseCrashFailsClosed(t *testing.T) {
 	dir := t.TempDir()
-	// Exit 1 is a clean exit (warning path); a real crash — killed
-	// by a signal — must fail closed. `kill -9 $$` dies by signal
-	// (SIGKILL) with no exit code.
+	// A real crash — killed by a signal — must fail closed, like
+	// any clean non-zero exit now does (Audit 5, F-A5-P2-11).
+	// `kill -9 $$` dies by signal (SIGKILL) with no exit code.
 	writeHook(t, dir, EventPreToolUse, "crash.sh", "kill -9 $$")
 	b := NewBus(dir)
 	out := b.PreToolUse(context.Background(), "calculator", json.RawMessage(`{}`))

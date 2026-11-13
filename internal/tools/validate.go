@@ -4,13 +4,18 @@
 // Definition before the tool runs: required parameters must be
 // present, and every supplied parameter must match its declared JSON
 // type (string, integer, number, boolean, object, array) and, when
-// the schema declares one, its enum. A validation failure is a clean
-// invalid_args ToolError — never a panic, never a half-executed tool —
-// and validation runs inside Execute, after the agent's permission
-// gate has already decided the call (the gate runs in core before
-// Execute is reached) and before any tool code, denylist check, or
-// side effect. A call that fails validation therefore cannot bypass
-// the gate or the denylist: it never reaches the tool at all.
+// the schema declares one, its enum and its numeric/string bounds
+// (minimum, maximum, minLength, maxLength, pattern). Validation
+// recurses into nested object properties/required and array items,
+// so a nested schema (e.g. todo_write's todos[].content/status) is
+// enforced here, not only at the top level. A validation failure is
+// a clean invalid_args ToolError — never a panic, never a
+// half-executed tool — and validation runs inside Execute, after the
+// agent's permission gate has already decided the call (the gate runs
+// in core before Execute is reached) and before any tool code,
+// denylist check, or side effect. A call that fails validation
+// therefore cannot bypass the gate or the denylist: it never reaches
+// the tool at all.
 //
 // Schemas are the definitions tools already publish to the model
 // (model.ToolDefinition.Parameters, OpenAI-style JSON Schema), so
@@ -24,6 +29,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/irfan/orion/internal/model"
@@ -68,23 +74,39 @@ func validateArgs(def model.ToolDefinition, args json.RawMessage) error {
 	if len(def.Parameters) == 0 {
 		return nil
 	}
-	props, _ := def.Parameters["properties"].(map[string]any)
-	required := toStringSlice(def.Parameters["required"])
+	return validateObject(tool, "", obj, def.Parameters)
+}
 
-	for _, name := range required {
-		if name == "" {
+// validateObject checks obj against an object schema: required
+// parameters must be present, and every supplied property matching a
+// declared property schema is validated (recursively, via
+// validateValue). name is the dotted path of obj in the arguments
+// ("" at the top level) used to name nested parameters in errors:
+// a missing field inside todos[0] is reported as
+// "todos[0].content", not as a bare "content". A schema with no
+// usable "properties"/"required" imposes no constraint: a malformed
+// schema must never turn a valid call into an error.
+func validateObject(tool, name string, obj map[string]any, schema map[string]any) error {
+	invalid := func(format string, a ...any) error {
+		return &ToolError{Tool: tool, Kind: "invalid_args", Err: fmt.Errorf(format, a...)}
+	}
+	props, _ := schema["properties"].(map[string]any)
+	required := toStringSlice(schema["required"])
+
+	for _, req := range required {
+		if req == "" {
 			continue
 		}
-		if _, ok := obj[name]; !ok {
-			return invalid("missing required parameter %q", name)
+		if _, ok := obj[req]; !ok {
+			return invalid("missing required parameter %q", joinName(name, req))
 		}
 	}
 	requiredSet := make(map[string]bool, len(required))
-	for _, name := range required {
-		requiredSet[name] = true
+	for _, req := range required {
+		requiredSet[req] = true
 	}
-	for name, val := range obj {
-		if val == nil && !requiredSet[name] {
+	for propName, val := range obj {
+		if val == nil && !requiredSet[propName] {
 			// JSON null for an OPTIONAL parameter means
 			// "absent": providers send null for fields they
 			// do not fill, and rejecting that would break
@@ -93,29 +115,44 @@ func validateArgs(def model.ToolDefinition, args json.RawMessage) error {
 			// check below (validateValue).
 			continue
 		}
-		prop, ok := props[name]
+		prop, ok := props[propName]
 		if !ok {
 			// Unknown parameters are ignored: providers add
 			// extra fields, and rejecting them would break
 			// calls that are otherwise valid.
 			continue
 		}
-		schema, ok := prop.(map[string]any)
+		propSchema, ok := prop.(map[string]any)
 		if !ok {
 			continue // malformed property schema: never fail the call
 		}
-		if err := validateValue(tool, name, val, schema); err != nil {
+		if err := validateValue(tool, joinName(name, propName), val, propSchema); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// joinName appends a property name to a dotted parameter path (""
+// at the top level yields the bare name).
+func joinName(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "." + name
+}
+
 // validateValue checks one supplied parameter against its property
-// schema (type and enum). A JSON null is treated as "absent" for an
-// optional parameter — providers send null for fields they do not
+// schema (type, enum, numeric/string bounds, and nested
+// properties/required/items). A JSON null is treated as "absent" for
+// an optional parameter — providers send null for fields they do not
 // fill — but a required parameter that is present-but-null still
-// fails its type check unless the schema allows "null".
+// fails its type check unless the schema allows "null". Nested
+// schemas are enforced recursively: an object value is checked
+// against the schema's own properties/required, and each array
+// element against the schema's items (Audit 5 F-A5-P2-27 — the old
+// code validated only the top level, so e.g. todo_write's
+// todos[].content/status were never checked here).
 func validateValue(tool, name string, val any, schema map[string]any) error {
 	invalid := func(format string, a ...any) error {
 		return &ToolError{Tool: tool, Kind: "invalid_args", Err: fmt.Errorf(format, a...)}
@@ -139,15 +176,164 @@ func validateValue(tool, name string, val any, schema map[string]any) error {
 			return invalid("parameter %q must be %s, got %s", name, describeTypes(types), jsonTypeName(val))
 		}
 	}
-	if enum, ok := schema["enum"].([]any); ok && len(enum) > 0 {
+	if enum := enumList(schema["enum"]); len(enum) > 0 {
 		for _, allowed := range enum {
-			if reflect.DeepEqual(val, allowed) {
+			if enumEqual(val, allowed) {
 				return nil
 			}
 		}
 		return invalid("parameter %q must be one of %v, got %v", name, enum, val)
 	}
+	// Numeric bounds (minimum/maximum): only numbers are checked;
+	// a bound on a non-number is a schema error, not a call error.
+	// Bounds arrive as float64 from JSON or as int/float64 from a
+	// Go-built definition; either form is read.
+	if f, ok := val.(float64); ok {
+		if min, ok := numericBound(schema["minimum"]); ok && f < min {
+			return invalid("parameter %q must be >= %v, got %v", name, schema["minimum"], val)
+		}
+		if max, ok := numericBound(schema["maximum"]); ok && f > max {
+			return invalid("parameter %q must be <= %v, got %v", name, schema["maximum"], val)
+		}
+	}
+	// String bounds (minLength/maxLength/pattern): lengths count
+	// Unicode code points, as JSON Schema does. A malformed
+	// pattern is a schema error, never a call error: it is
+	// ignored rather than failing the call.
+	if s, ok := val.(string); ok {
+		n := len([]rune(s))
+		if min, ok := intBound(schema["minLength"]); ok && n < min {
+			return invalid("parameter %q must be at least %d characters, got %d", name, min, n)
+		}
+		if max, ok := intBound(schema["maxLength"]); ok && n > max {
+			return invalid("parameter %q must be at most %d characters, got %d", name, max, n)
+		}
+		if pat, ok := schema["pattern"].(string); ok && pat != "" {
+			if re, err := regexp.Compile(pat); err == nil && !re.MatchString(s) {
+				return invalid("parameter %q must match pattern %q, got %q", name, pat, s)
+			}
+		}
+	}
+	// Nested object schemas: recurse into properties/required.
+	if obj, ok := val.(map[string]any); ok {
+		if err := validateObject(tool, name, obj, schema); err != nil {
+			return err
+		}
+	}
+	// Nested array schemas: each element against items.
+	if arr, ok := val.([]any); ok {
+		if items, ok := schema["items"].(map[string]any); ok {
+			for i, elem := range arr {
+				if err := validateValue(tool, fmt.Sprintf("%s[%d]", name, i), elem, items); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
+}
+
+// enumList reads a schema's "enum" value. Tools publish enums as
+// []any (JSON-decoded definitions) or []string / []int / []float64
+// (Go-built definitions); the old code accepted only []any, so a
+// Go-built []string enum silently imposed no constraint at all
+// (Audit 5 F-A5-P2-27). Anything else yields no enum rather than an
+// error: a malformed schema must not fail calls.
+func enumList(v any) []any {
+	switch e := v.(type) {
+	case []any:
+		return e
+	case []string:
+		out := make([]any, len(e))
+		for i, s := range e {
+			out[i] = s
+		}
+		return out
+	case []int:
+		out := make([]any, len(e))
+		for i, n := range e {
+			out[i] = n
+		}
+		return out
+	case []float64:
+		out := make([]any, len(e))
+		for i, n := range e {
+			out[i] = n
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// enumEqual reports whether a decoded argument value equals an enum
+// entry. Plain DeepEqual is wrong for numbers: JSON decodes argument
+// values as float64, while a Go-built enum may hold int, so
+// DeepEqual(float64(1), int(1)) is false and a valid value would be
+// rejected. Numbers are therefore compared by value; everything
+// else uses DeepEqual.
+func enumEqual(val, allowed any) bool {
+	if vf, ok := toFloat(val); ok {
+		if af, ok := toFloat(allowed); ok {
+			return vf == af
+		}
+		return false
+	}
+	return reflect.DeepEqual(val, allowed)
+}
+
+// toFloat converts a numeric value of any Go numeric kind to
+// float64. JSON-decoded numbers are float64; Go-built schemas use
+// int, int64, or float64. Non-numbers report false.
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// numericBound reads a minimum/maximum schema value as a float64.
+// A missing or non-numeric bound imposes no constraint.
+func numericBound(v any) (float64, bool) {
+	return toFloat(v)
+}
+
+// intBound reads a minLength/maxLength schema value as an int. A
+// JSON-decoded bound is float64; a Go-built one is usually int. A
+// missing, non-numeric, or non-integral bound imposes no constraint.
+func intBound(v any) (int, bool) {
+	f, ok := toFloat(v)
+	if !ok || math.Trunc(f) != f {
+		return 0, false
+	}
+	return int(f), true
 }
 
 // valueMatchesType reports whether the decoded JSON value v has the

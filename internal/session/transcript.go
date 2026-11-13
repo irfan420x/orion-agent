@@ -35,19 +35,23 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/security"
 )
 
 // RecordKind distinguishes transcript records.
@@ -61,6 +65,11 @@ const (
 	// text that was saved before older turns were dropped from
 	// the working history.
 	KindSummary RecordKind = "summary"
+	// KindDropped is a turn the store's FIFO cap dropped without
+	// a summary (auto-compaction unavailable): the turn's role
+	// and truncated content, so the loss is explicit in the
+	// transcript instead of silent (Audit 5 F-A5-1).
+	KindDropped RecordKind = "dropped"
 )
 
 // Record is one JSONL line in a session transcript.
@@ -81,6 +90,7 @@ type Info struct {
 	UpdatedAt time.Time
 	Messages  int
 	Summaries int
+	Dropped   int // turns dropped without a summary (KindDropped)
 	Bytes     int64
 	Title     string // first user message, truncated
 }
@@ -191,13 +201,44 @@ func WriteCurrent(root, id string) error {
 	return nil
 }
 
+// maxTranscriptLineBytes caps one JSONL line: a longer line is
+// treated as one corrupt line and skipped, never fatal — a single
+// overlong line must not make the whole session unloadable
+// (Audit 5 F-A5-P2-3). 16 MiB is far above any legitimate record
+// (tool results are capped at 256 KiB) and far below an OOM.
+const maxTranscriptLineBytes = 16 * 1024 * 1024
+
+// openTranscripts tracks transcripts open in this process, keyed
+// by absolute path. Open returns the existing handle for a path
+// that is already open here — one file, one sequence counter — so
+// two handles can never assign the same seq (Audit 5 F-A5-P2-6).
+// Across processes the flock on the held fd enforces the same
+// single-owner discipline: a second process's Open fails instead
+// of interleaving records with duplicate seqs.
+var openTranscriptsMu sync.Mutex
+var openTranscripts = map[string]*Transcript{}
+
 // Transcript is one session's append-only JSONL file. It is safe
 // for concurrent use.
+//
+// The file is held open for the handle's life (O_APPEND) under an
+// exclusive flock, taken on Open and released on Close: the lock
+// serialises writers across processes, and the held fd means the
+// in-memory seq/count can never drift from the file. Close when a
+// handle is no longer needed (session rotation/resume); a handle
+// that is never closed keeps its lock until the process exits.
+// Open returns the already-open in-process handle for the same
+// path (reference-counted), so reopening a live session in this
+// process — a daemon restart in-process, a CLI sharing the App —
+// never conflicts with itself.
 type Transcript struct {
 	mu      sync.Mutex
 	dir     string
 	id      string
 	path    string
+	f       *os.File // held O_APPEND fd, flocked LOCK_EX
+	refs    int      // in-process Open references; 0 releases lock + fd
+	closed  bool
 	seq     int
 	count   int
 	corrupt int
@@ -211,7 +252,12 @@ type Transcript struct {
 // Existing records are counted and the sequence resumes after the
 // highest seen seq, so reopening after a restart never reuses a
 // sequence number. A corrupt line is skipped and counted (see
-// CorruptLines), never fatal.
+// CorruptLines), never fatal. Opening a transcript another process
+// already holds is an error: one owner per file.
+//
+// An already-open path in this process returns the existing
+// handle (with its reference count raised); call Close once per
+// Open when the handle is no longer needed.
 func Open(root, id string) (*Transcript, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("session: root directory must not be empty")
@@ -223,16 +269,70 @@ func Open(root, id string) (*Transcript, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("session: create sessions dir %q: %w", dir, err)
 	}
-	t := &Transcript{dir: dir, id: id, path: filepath.Join(dir, id+".jsonl")}
-	if f, err := os.OpenFile(t.path, os.O_CREATE|os.O_WRONLY, 0o600); err != nil {
-		return nil, fmt.Errorf("session: create transcript %q: %w", t.path, err)
-	} else if err := f.Close(); err != nil {
-		return nil, fmt.Errorf("session: create transcript %q: %w", t.path, err)
+	path := filepath.Join(dir, id+".jsonl")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
 	}
+	openTranscriptsMu.Lock()
+	defer openTranscriptsMu.Unlock()
+	if tr, ok := openTranscripts[abs]; ok {
+		tr.mu.Lock()
+		tr.refs++
+		tr.mu.Unlock()
+		return tr, nil
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("session: open transcript %q: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("session: transcript %q is already open in another process: %w", path, err)
+	}
+	t := &Transcript{dir: dir, id: id, path: path, f: f, refs: 1}
 	if err := t.scanLocked(); err != nil {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
 		return nil, err
 	}
+	openTranscripts[abs] = t
 	return t, nil
+}
+
+// Close releases one Open reference to the transcript. When the
+// last reference closes, the flock is released and the held fd
+// closed; the file itself is untouched. Appends after the last
+// close fail; reads still work (they re-read the file). Close is
+// idempotent and safe to call on a nil transcript.
+func (t *Transcript) Close() error {
+	if t == nil {
+		return nil
+	}
+	abs, err := filepath.Abs(t.path)
+	if err != nil {
+		abs = t.path
+	}
+	openTranscriptsMu.Lock()
+	defer openTranscriptsMu.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil
+	}
+	t.refs--
+	if t.refs > 0 {
+		return nil
+	}
+	t.closed = true
+	delete(openTranscripts, abs)
+	if t.f != nil {
+		syscall.Flock(int(t.f.Fd()), syscall.LOCK_UN)
+		err := t.f.Close()
+		t.f = nil
+		return err
+	}
+	return nil
 }
 
 // ID returns the session id.
@@ -257,6 +357,63 @@ func (t *Transcript) CorruptLines() int {
 	return t.corrupt
 }
 
+// scanLines reads f line by line, calling fn for each line
+// (without its trailing newline). A line longer than
+// maxTranscriptLineBytes is reported once with overlong=true and
+// empty bytes — the rest of the line is consumed so scanning
+// resumes at the next line, and the line is one corrupt line, not
+// a fatal error. The final line need not end with a newline. The
+// read is bounded: an overlong line never accumulates in memory.
+func scanLines(f *os.File, fn func(line []byte, overlong bool) error) error {
+	r := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, overlong, done, err := readLine(r)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if err := fn(line, overlong); err != nil {
+			return err
+		}
+	}
+}
+
+// readLine reads one line from r. done is true when the file is
+// exhausted with no line left. Overlong lines are consumed in
+// fragments and reported with overlong=true and no bytes.
+func readLine(r *bufio.Reader) (line []byte, overlong bool, done bool, err error) {
+	for {
+		frag, rerr := r.ReadSlice('\n')
+		if len(frag) > 0 && !overlong {
+			if len(line)+len(frag) > maxTranscriptLineBytes {
+				overlong = true
+				line = nil
+			} else {
+				line = append(line, frag...)
+			}
+		}
+		switch rerr {
+		case nil:
+			// Complete line: strip the trailing newline.
+			if n := len(line); n > 0 && line[n-1] == '\n' {
+				line = line[:n-1]
+			}
+			return line, overlong, false, nil
+		case bufio.ErrBufferFull:
+			continue
+		case io.EOF:
+			if len(line) == 0 && !overlong {
+				return nil, false, true, nil
+			}
+			return line, overlong, false, nil
+		default:
+			return nil, false, false, rerr
+		}
+	}
+}
+
 // scanLocked recounts the file: highest seq, record count, corrupt
 // lines. Callers must hold t.mu.
 func (t *Transcript) scanLocked() error {
@@ -269,60 +426,125 @@ func (t *Transcript) scanLocked() error {
 		return fmt.Errorf("session: open transcript %q: %w", t.path, err)
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	err = scanLines(f, func(line []byte, overlong bool) error {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			return nil
+		}
+		if overlong {
+			t.corrupt++
+			return nil
 		}
 		var r Record
-		if err := json.Unmarshal([]byte(line), &r); err != nil {
+		if err := json.Unmarshal(line, &r); err != nil {
 			t.corrupt++
-			continue
+			return nil
 		}
 		t.count++
 		if r.Seq > t.seq {
 			t.seq = r.Seq
 		}
-	}
-	if err := sc.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return fmt.Errorf("session: scan transcript %q: %w", t.path, err)
 	}
 	return nil
 }
 
-// appendLocked writes one record (seq assigned here, timestamp
-// already set by the caller) as a single JSON line, fsynced.
+// rescanLocked re-derives seq/count/corrupt from the file after a
+// failed append: the bytes may have landed despite the error, so
+// the in-memory counters must reflect the file, never a guess.
+// A scan failure leaves the counters as they were (a gap in seq is
+// safe; a reuse is not).
+func (t *Transcript) rescanLocked() {
+	_ = t.scanLocked()
+}
+
+// recordsLocked reads every parseable record in order. Corrupt
+// lines are skipped and counted; only a read error fails the call.
 // Callers must hold t.mu.
+func (t *Transcript) recordsLocked() ([]Record, int, error) {
+	f, err := os.Open(t.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, 0, nil
+		}
+		return nil, 0, fmt.Errorf("session: open transcript %q: %w", t.path, err)
+	}
+	defer f.Close()
+	var out []Record
+	corrupt := 0
+	err = scanLines(f, func(line []byte, overlong bool) error {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			return nil
+		}
+		if overlong {
+			corrupt++
+			return nil
+		}
+		var r Record
+		if err := json.Unmarshal(line, &r); err != nil {
+			corrupt++
+			return nil
+		}
+		out = append(out, r)
+		return nil
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("session: scan transcript %q: %w", t.path, err)
+	}
+	return out, corrupt, nil
+}
+
+// scrubRecord redacts secrets from a record before it is
+// persisted (Audit 5 F-A5-P2-8): the transcript is append-only and
+// keeps every turn forever, so a pasted key or token must never
+// land in it verbatim. Message content and tool-call arguments are
+// scrubbed; roles, tool names and ids are not secret-bearing.
+func scrubRecord(r *Record) {
+	switch r.Kind {
+	case KindMessage:
+		if r.Message != nil {
+			r.Message.Content = security.RedactSecrets(r.Message.Content)
+			for i := range r.Message.ToolCalls {
+				r.Message.ToolCalls[i].Arguments = security.RedactSecrets(r.Message.ToolCalls[i].Arguments)
+			}
+		}
+	case KindSummary, KindDropped:
+		r.Text = security.RedactSecrets(r.Text)
+	}
+}
+
+// appendLocked writes one record (seq assigned here, timestamp
+// already set by the caller) as a single JSON line, fsynced, on
+// the held fd. Callers must hold t.mu.
+//
+// A write/sync failure never decrements seq: the bytes may already
+// be on disk, and reusing the seq would duplicate it. Instead the
+// file is re-scanned so seq/count reflect what is actually stored.
 func (t *Transcript) appendLocked(r Record) error {
+	if t.closed || t.f == nil {
+		return errors.New("session: transcript is closed")
+	}
 	t.seq++
 	r.Seq = t.seq
 	r.SessionID = t.id
+	scrubRecord(&r)
 	data, err := json.Marshal(r)
 	if err != nil {
 		t.seq--
 		return fmt.Errorf("session: encode transcript record: %w", err)
 	}
 	data = append(data, '\n')
-	f, err := os.OpenFile(t.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.seq--
-		return fmt.Errorf("session: open transcript %q: %w", t.path, err)
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		t.seq--
+	if _, err := t.f.Write(data); err != nil {
+		t.rescanLocked()
 		return fmt.Errorf("session: append to transcript %q: %w", t.path, err)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		t.seq--
+	if err := t.f.Sync(); err != nil {
+		t.rescanLocked()
 		return fmt.Errorf("session: sync transcript %q: %w", t.path, err)
-	}
-	if err := f.Close(); err != nil {
-		t.seq--
-		return fmt.Errorf("session: close transcript %q: %w", t.path, err)
 	}
 	t.count++
 	return nil
@@ -374,35 +596,34 @@ func (t *Transcript) Records() ([]Record, error) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	f, err := os.Open(t.path)
+	recs, corrupt, err := t.recordsLocked()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("session: open transcript %q: %w", t.path, err)
-	}
-	defer f.Close()
-	var out []Record
-	corrupt := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		var r Record
-		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			corrupt++
-			continue
-		}
-		out = append(out, r)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("session: scan transcript %q: %w", t.path, err)
+		return nil, err
 	}
 	t.corrupt = corrupt
-	return out, nil
+	return recs, nil
+}
+
+// AppendDropped appends a record for a turn the store's FIFO cap
+// dropped without a summary (Audit 5 F-A5-1): the text names the
+// dropped turn, so the loss is explicit in the transcript instead
+// of silent. An empty text is an error — a dropped record must say
+// what was lost.
+func (t *Transcript) AppendDropped(text string) error {
+	if t == nil {
+		return errors.New("session: transcript is nil")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return errors.New("session: dropped record must not be empty")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.appendLocked(Record{
+		Timestamp: time.Now().UTC(),
+		Kind:      KindDropped,
+		Text:      text,
+	})
 }
 
 // Messages returns the transcript's conversation messages in
@@ -438,13 +659,26 @@ func (t *Transcript) Summaries() ([]string, error) {
 	return out, nil
 }
 
-// MigrateFrom imports msgs into an empty transcript, once: when
-// the transcript already holds records it returns 0, nil —
-// re-importing would duplicate every turn. Imported records are
-// stamped with importedAt (the source file's modification time, so
-// the timestamps say "when this history was written", not "when it
+// MigrateFrom imports msgs into the transcript, once — with
+// resume: when the transcript already holds records it imports
+// only the remainder. Imported records are stamped with
+// importedAt (the source file's modification time, so the
+// timestamps say "when this history was written", not "when it
 // was imported") and marked Migrated. It never deletes or modifies
 // the source history; the caller keeps memory.json as-is.
+//
+// Resumability (Audit 5 F-A5-P2-4): a migration that failed
+// mid-way used to be unrecoverable — the already-appended messages
+// made the "import once" guard block every retry. Now a transcript
+// holding only Migrated message records imports the store turns
+// not already present (matched as a multiset on role+content, in
+// order — a partial import is always a prefix of the store's
+// sequence, so the remainder is exactly the turns after it). Once
+// any live (non-migrated) record exists, the session has run
+// turns of its own and migration never runs again, so nothing is
+// imported twice. On a mid-way error it returns the count
+// appended so far alongside the error, and the next open resumes
+// the remainder.
 func (t *Transcript) MigrateFrom(msgs []model.Message, importedAt time.Time) (int, error) {
 	if t == nil {
 		return 0, errors.New("session: transcript is nil")
@@ -457,10 +691,29 @@ func (t *Transcript) MigrateFrom(msgs []model.Message, importedAt time.Time) (in
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.count > 0 {
-		return 0, nil
+	recs, _, err := t.recordsLocked()
+	if err != nil {
+		return 0, err
 	}
+	for _, r := range recs {
+		if r.Kind != KindMessage || !r.Migrated {
+			return 0, nil
+		}
+	}
+	// Turns already imported, as a multiset: a turn already in the
+	// transcript is skipped, so a retry imports the remainder.
+	have := make(map[string]int, len(recs))
+	for _, r := range recs {
+		if r.Message != nil {
+			have[migrateKey(*r.Message)]++
+		}
+	}
+	appended := 0
 	for _, m := range msgs {
+		if k := migrateKey(m); have[k] > 0 {
+			have[k]--
+			continue
+		}
 		mm := m
 		if err := t.appendLocked(Record{
 			Timestamp: importedAt,
@@ -468,10 +721,18 @@ func (t *Transcript) MigrateFrom(msgs []model.Message, importedAt time.Time) (in
 			Message:   &mm,
 			Migrated:  true,
 		}); err != nil {
-			return 0, err
+			return appended, err
 		}
+		appended++
 	}
-	return len(msgs), nil
+	return appended, nil
+}
+
+// migrateKey identifies a turn for the import-once multiset: role
+// plus content. Tool calls are part of the content for these
+// purposes — two turns with the same text are the same turn.
+func migrateKey(m model.Message) string {
+	return m.Role + "\x00" + m.Content
 }
 
 // List returns every session under root, newest first, with
@@ -521,16 +782,17 @@ func statTranscript(path, id string) (Info, error) {
 		return info, err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	err = scanLines(f, func(line []byte, overlong bool) error {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			return nil
+		}
+		if overlong {
+			return nil
 		}
 		var r Record
-		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			continue
+		if err := json.Unmarshal(line, &r); err != nil {
+			return nil
 		}
 		if info.CreatedAt.IsZero() {
 			info.CreatedAt = r.Timestamp
@@ -544,9 +806,12 @@ func statTranscript(path, id string) (Info, error) {
 			}
 		case KindSummary:
 			info.Summaries++
+		case KindDropped:
+			info.Dropped++
 		}
-	}
-	if err := sc.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return info, err
 	}
 	if info.CreatedAt.IsZero() {

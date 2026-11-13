@@ -44,6 +44,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -258,10 +260,15 @@ func summaryArg(tool string, raw map[string]json.RawMessage) string {
 }
 
 // pendingRequest is a registered approval wait: the request plus the
-// channel Resolve delivers on.
+// channel Resolve delivers on. resolved records the outcome Resolve
+// delivered (set under the gate mutex before the channel send), so a
+// timer/cancel branch that fires in the same instant as a tap can
+// prefer the delivered result instead of denying a call the user
+// just approved (F-A5-P2-20).
 type pendingRequest struct {
-	req ApprovalRequest
-	ch  chan pendingResult
+	req      ApprovalRequest
+	ch       chan pendingResult
+	resolved *pendingResult
 }
 
 // pendingResult is what Resolve delivers: whether the user approved,
@@ -312,6 +319,11 @@ type Gate struct {
 	// (a network call) — because Check calls it before returning
 	// the denial.
 	onExpire func(ApprovalRequest)
+	// logger receives gate diagnostics (prompter failures and
+	// other silent paths — F-A5-P2-22). It defaults to stderr;
+	// SetLogger replaces it. loggerMu guards it.
+	logger   *log.Logger
+	loggerMu sync.RWMutex
 }
 
 // NewGate builds a gate over rules (may be nil: no standing rules)
@@ -323,6 +335,32 @@ func NewGate(rules *RuleStore, prompter Prompter) *Gate {
 		prompter: prompter,
 		timeout:  DefaultTimeout,
 		pending:  map[string]*pendingRequest{},
+		logger:   log.New(os.Stderr, "orion/permissions: ", log.LstdFlags),
+	}
+}
+
+// SetLogger replaces the gate's diagnostic logger. A nil logger is
+// ignored. It never blocks on a waiting Check.
+func (g *Gate) SetLogger(l *log.Logger) {
+	if g == nil || l == nil {
+		return
+	}
+	g.loggerMu.Lock()
+	defer g.loggerMu.Unlock()
+	g.logger = l
+}
+
+// logf writes a formatted diagnostic line, never panicking on a nil
+// logger.
+func (g *Gate) logf(format string, args ...any) {
+	if g == nil {
+		return
+	}
+	g.loggerMu.RLock()
+	l := g.logger
+	g.loggerMu.RUnlock()
+	if l != nil {
+		l.Printf(format, args...)
 	}
 }
 
@@ -443,42 +481,89 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 
 	if err := g.prompter(ctx, req); err != nil {
 		g.removePending(req.ID)
+		// Log the failure (F-A5-P2-22): a failed card send is
+		// otherwise silent and indistinguishable from "the user
+		// never answered". The request ID names the prompt that
+		// never reached the user.
+		g.logf("approval request %s: prompter failed for tool %q (chat %d): %v", req.ID, tool, req.ChatID, err)
 		return false, fmt.Sprintf("denied: could not ask for approval: %v", err)
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case res := <-pr.ch:
-		if res.persist != nil && g.rules != nil {
-			// Persisting "always allow" for a denylisted
-			// command must be impossible: the check above
-			// already refused the call, so this line is only
-			// reachable for non-denylisted calls — but
-			// re-check here anyway, so a future refactor
-			// that reorders Check cannot create an approval
-			// bypass through a persisted rule.
-			if *res.persist == ActionAllow && tool == "shell_exec" && isDenylistedCommand(args) {
-				return false, "denied: command is blocked by the shell denylist and cannot be approved"
-			}
-			_ = g.rules.Set(tool, *res.persist)
-		}
-		if res.approved {
-			return true, ""
-		}
-		return false, fmt.Sprintf("denied: the user declined the %s tool call %q", Classify(tool), tool)
+		return g.applyResult(tool, args, res)
 	case <-timer.C:
+		// Resolve-vs-expiry race (F-A5-P2-20): a tap landing
+		// in the same instant as the deadline must not be
+		// "approved" to the user while the tool is denied.
+		// Resolve records its outcome on the pending request
+		// under the gate mutex before sending, so re-check
+		// here: a delivered result wins over the timer, the
+		// expiry hook does NOT fire, and the card is never
+		// left saying Expired after an approval.
+		if res, ok := g.resolvedOutcome(pr); ok {
+			return g.applyResult(tool, args, res)
+		}
 		g.removePending(req.ID)
 		if hook := g.onExpireHook(); hook != nil {
 			hook(req)
 		}
 		return false, "denied: approval timed out (no answer within the approval window)"
 	case <-ctx.Done():
+		// Same race as the timer branch: a tap landing as the
+		// turn is cancelled wins over the cancellation when
+		// Resolve already recorded it.
+		if res, ok := g.resolvedOutcome(pr); ok {
+			return g.applyResult(tool, args, res)
+		}
 		g.removePending(req.ID)
 		if hook := g.onExpireHook(); hook != nil {
 			hook(req)
 		}
 		return false, "denied: approval cancelled (the turn ended before an answer arrived)"
 	}
+}
+
+// resolvedOutcome returns the outcome Resolve recorded on pr, if
+// any. Resolve sets it under the gate mutex before delivering to
+// the channel, so this read is ordered against it: a non-nil
+// result means the user answered before the timer/cancel branch
+// ran, even if the select picked the timer case first.
+func (g *Gate) resolvedOutcome(pr *pendingRequest) (pendingResult, bool) {
+	if g == nil || pr == nil {
+		return pendingResult{}, false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if pr.resolved == nil {
+		return pendingResult{}, false
+	}
+	return *pr.resolved, true
+}
+
+// applyResult applies a delivered approval outcome: it persists an
+// "always allow" / "never allow" rule when one was requested (a
+// denylisted command can never be persisted as allowed — see the
+// re-check below) and reports whether the call may run.
+func (g *Gate) applyResult(tool, args string, res pendingResult) (bool, string) {
+	if res.persist != nil && g.rules != nil {
+		// Persisting "always allow" for a denylisted
+		// command must be impossible: the check above
+		// already refused the call, so this line is only
+		// reachable for non-denylisted calls — but
+		// re-check here anyway, so a future refactor
+		// that reorders Check cannot create an approval
+		// bypass through a persisted rule.
+		if *res.persist == ActionAllow && tool == "shell_exec" && isDenylistedCommand(args) {
+			return false, "denied: command is blocked by the shell denylist and cannot be approved"
+		}
+		_ = g.rules.Set(tool, *res.persist)
+	}
+	if res.approved {
+		return true, ""
+	}
+	return false, fmt.Sprintf("denied: the user declined the %s tool call %q", Classify(tool), tool)
 }
 
 // Pending returns the pending request with id, for the callback
@@ -526,9 +611,15 @@ func (g *Gate) Resolve(id string, approved bool, persist *Action) bool {
 		return false
 	}
 	delete(g.pending, id)
+	// Record the outcome under the mutex BEFORE delivering it:
+	// a timer/cancel branch racing this Resolve re-checks the
+	// recorded outcome (see resolvedOutcome) and honours the
+	// user's answer instead of expiring the request (F-A5-P2-20).
+	res := pendingResult{approved: approved, persist: persist}
+	pr.resolved = &res
 	g.mu.Unlock()
 	select {
-	case pr.ch <- pendingResult{approved: approved, persist: persist}:
+	case pr.ch <- res:
 	default:
 	}
 	return true

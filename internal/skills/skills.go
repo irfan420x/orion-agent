@@ -5,12 +5,24 @@
 // optional "## Tools" section lists the tools the skill may use. The
 // registry loads skills from a directory of *.md files (or a single file),
 // keeps them in memory, and supports lookup, listing, and search.
+//
+// TRUST MODEL (Audit 5 F-A5-8): a skill file is untrusted data, not
+// Orion instructions. The "## Tools" list is an anti-drift aid for the
+// model — it keeps a skill on its intended tools — not a security
+// boundary against skill content: a skill body can always ask the
+// model to end the skill or switch skills, and the agent loop lets
+// the model do that on its own initiative. Do not install
+// third-party skills you have not read. Discovery loads only regular
+// files from the skills directory: symlinks are refused, so a synced
+// or checked-out directory cannot smuggle in a skill that lives
+// outside it.
 package skills
 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,7 +47,9 @@ type Skill struct {
 	Content string
 	// Tools lists the tool names from the "## Tools" section, if any.
 	// Both bulleted ("- exec", "* exec") and numbered ("1. exec",
-	// "1) exec") items are recognised.
+	// "1) exec") items are recognised. The list is an anti-drift aid,
+	// not a security boundary against skill content (see the package
+	// doc): nil means the skill declares no restriction.
 	Tools []string
 }
 
@@ -142,6 +156,10 @@ func (r *Registry) Search(query string) []Skill {
 // LoadDir reads every *.md file in dir (non-recursive) and registers the
 // skills it can parse. It returns the number of skills loaded.
 //
+// Symlinks are refused (see the per-file check below): a skills dir
+// populated by a sync or checkout that preserves symlinks must not
+// load a skill that lives outside the dir.
+//
 // Files that fail to parse (for example an empty file) are skipped; each
 // failure is collected and the collected errors are returned as one joined
 // error at the end, while the skills that parsed successfully are still
@@ -169,6 +187,22 @@ func (r *Registry) LoadDir(dir string) (int, error) {
 		}
 		sawMD = true
 		path := filepath.Join(dir, entry.Name())
+		// Symlinks are refused, not followed: a symlink inside
+		// the skills dir pointing anywhere on disk would
+		// otherwise load as a skill (Audit 5 F-A5-P2-26), which
+		// defeats the documented "loads only from the data dir"
+		// guarantee — e.g. for a skills dir populated by a sync
+		// or checkout that preserves symlinks. Lstat (not Stat)
+		// sees the link itself. The refusal is recorded like
+		// any other per-file failure: the remaining skills still
+		// load, and the caller logs the joined error.
+		if info, err := os.Lstat(path); err != nil {
+			errs = append(errs, fmt.Errorf("skills: cannot stat %q: %w", path, err))
+			continue
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			errs = append(errs, fmt.Errorf("skills: refusing symlink %q: skill files must be regular files inside %q", path, dir))
+			continue
+		}
 		skill, err := parseFile(path)
 		if err != nil {
 			errs = append(errs, err)
@@ -197,9 +231,16 @@ func (r *Registry) LoadFile(path string) (Skill, error) {
 }
 
 // parseFile reads one skill file (capped at maxFileSize) and parses it.
+// Symlinks are refused here too, so the single-file LoadFile path has
+// the same guarantee as LoadDir (Audit 5 F-A5-P2-26).
 func parseFile(path string) (Skill, error) {
 	if strings.TrimSpace(path) == "" {
 		return Skill{}, errors.New("skills: empty file path")
+	}
+	if info, err := os.Lstat(path); err != nil {
+		return Skill{}, fmt.Errorf("skills: cannot stat %q: %w", path, err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		return Skill{}, fmt.Errorf("skills: refusing symlink %q: skill files must be regular files", path)
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -219,7 +260,10 @@ func parseFile(path string) (Skill, error) {
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return Skill{}, fmt.Errorf("skills: file %q is empty", path)
 	}
-	skill := parseSkill(path, string(data))
+	skill, warnings := parseSkill(path, string(data))
+	for _, w := range warnings {
+		log.Printf("orion: skills: %s: %s", path, w)
+	}
 	if strings.TrimSpace(skill.Name) == "" {
 		// Reachable when the filename itself yields no name (e.g. a
 		// file literally called ".md") and the file has no "# " heading:
@@ -235,12 +279,19 @@ func parseFile(path string) (Skill, error) {
 // (without .md) as the skill name, and missing description or tools
 // sections simply leave those fields empty. Callers must reject empty
 // files before calling this.
-func parseSkill(path, content string) Skill {
+//
+// The second result is warnings about headings that look like a Tools
+// section but were not recognised as one (see normalizeToolsHeading):
+// the file's restriction is then silently absent, and the caller logs
+// the warning so the author finds out instead of running unrestricted.
+func parseSkill(path, content string) (Skill, []string) {
 	skill := Skill{
 		Path:    path,
 		Content: content,
 		Name:    strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
 	}
+	var warnings []string
+	warnedHeadings := map[string]bool{}
 
 	lines := strings.Split(content, "\n")
 
@@ -296,6 +347,11 @@ func parseSkill(path, content string) Skill {
 	// section unless it is a new "## " section header: a "### "
 	// sub-heading inside Tools used to leave the section open, so
 	// bullets under a "### Notes" subsection were parsed as tools.
+	// The heading is normalised (see normalizeToolsHeading): a
+	// trailing colon and the "Allowed/Available Tools" variants
+	// count, because a skill author who writes one of those
+	// intends a restriction, and the old exact-match-only parse
+	// silently gave them none (Audit 5 F-A5-P2-25).
 	inTools := false
 	seenTools := map[string]bool{}
 	for _, line := range lines {
@@ -303,7 +359,12 @@ func parseSkill(path, content string) Skill {
 		if lvl := headingLevel(trimmed); lvl > 0 {
 			if lvl == 2 {
 				title := strings.TrimSpace(strings.TrimPrefix(trimmed, "## "))
-				inTools = strings.EqualFold(title, "Tools")
+				isTools, toolsLike := normalizeToolsHeading(title)
+				inTools = isTools
+				if toolsLike && !warnedHeadings[title] {
+					warnedHeadings[title] = true
+					warnings = append(warnings, fmt.Sprintf("unrecognised Tools-like heading %q — no tool restriction applied; use \"## Tools\", \"## Allowed Tools\", or \"## Available Tools\"", title))
+				}
 			} else {
 				inTools = false
 			}
@@ -346,7 +407,31 @@ func parseSkill(path, content string) Skill {
 		skill.Tools = append(skill.Tools, item)
 	}
 
-	return skill
+	return skill, warnings
+}
+
+// normalizeToolsHeading reports whether a level-2 heading title is a
+// Tools section, and whether it merely looks like one.
+//
+// Recognised (case-insensitive, trailing colon ignored): "Tools",
+// "Allowed Tools", "Available Tools". A title that is not recognised
+// but contains "tool" or "tools" as a word ("Tool", "Tools and
+// Setup", "My Tools") is Tools-like: the author probably meant a
+// restriction, so the caller should warn rather than silently run
+// the skill unrestricted (Audit 5 F-A5-P2-25).
+func normalizeToolsHeading(title string) (isTools, toolsLike bool) {
+	t := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(title), ":"))
+	switch strings.ToLower(t) {
+	case "tools", "allowed tools", "available tools":
+		return true, false
+	}
+	for _, w := range strings.Fields(strings.ToLower(t)) {
+		w = strings.Trim(w, ".,;:()[]\"'`")
+		if w == "tool" || w == "tools" {
+			return false, true
+		}
+	}
+	return false, false
 }
 
 // headingLevel returns the ATX heading level (1-6) of line, or 0 when

@@ -160,6 +160,12 @@ type CommandEnv struct {
 	// working history. Nil until the daemon wires it; /resume
 	// then replies that sessions are unavailable.
 	ResumeSession func(chatID int64, idOrPrefix string) (string, int, error)
+	// LastResumeReport returns what the last /resume actually
+	// restored for this chat (corrupt lines skipped, cap applied,
+	// summaries merged). Optional: when nil the /resume reply
+	// stays in its short form. The daemon wires it to the app's
+	// LastResumeReportForChat.
+	LastResumeReport func(chatID int64) (ResumeReport, bool)
 	// CompressWithSessionMemory is the /compress variant that
 	// takes the session-memory text so the saved summary preserves
 	// decisions/facts from session memory (not just the raw
@@ -189,6 +195,19 @@ type SessionInfo struct {
 	Summaries int
 	Bytes     int64
 	Title     string // first user message, truncated
+}
+
+// ResumeReport describes what a /resume actually restored, so the
+// reply can say so instead of silently dropping it (Audit 5
+// F-A5-P2-5). Mirrors internal/app.ResumeReport; the daemon converts
+// between the two (messaging must not import app).
+type ResumeReport struct {
+	SessionID          string
+	TranscriptMessages int  // messages in the transcript (pre-cap)
+	LoadedMessages     int  // messages now in working history (capped)
+	CorruptLines       int  // unparseable transcript lines skipped
+	SummariesLoaded    int  // transcript summaries merged into memory
+	Capped             bool // transcript held more than the store cap
 }
 
 // memoryTypeOrder is the display order for /memory groups; types
@@ -487,7 +506,25 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			if err != nil {
 				return fmt.Sprintf("❌ Could not resume session: %v", err), nil
 			}
-			return fmt.Sprintf("✅ Resumed session %s (%d message(s) in history). Facts and memories are shared, so nothing else changed.", id, count), nil
+			reply := fmt.Sprintf("✅ Resumed session %s (%d message(s) in history). Facts and memories are shared, so nothing else changed.", id, count)
+			if env.LastResumeReport != nil {
+				if rep, ok := env.LastResumeReport(env.ChatID); ok {
+					var notes []string
+					if rep.Capped {
+						notes = append(notes, fmt.Sprintf("the transcript held %d messages; working history is capped at %d", rep.TranscriptMessages, rep.LoadedMessages))
+					}
+					if rep.CorruptLines > 0 {
+						notes = append(notes, fmt.Sprintf("%d corrupt line(s) were skipped", rep.CorruptLines))
+					}
+					if rep.SummariesLoaded > 0 {
+						notes = append(notes, fmt.Sprintf("%d summaries were merged into memory", rep.SummariesLoaded))
+					}
+					if len(notes) > 0 {
+						reply += " Note: " + strings.Join(notes, "; ") + "."
+					}
+				}
+			}
+			return reply, nil
 		},
 	})
 

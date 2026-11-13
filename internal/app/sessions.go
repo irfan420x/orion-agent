@@ -29,6 +29,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/irfan/orion/internal/memory"
@@ -57,14 +59,23 @@ func openOrCreateTranscript(root string, store memory.Store, legacyFile string, 
 	if err != nil {
 		return nil, "", fmt.Errorf("app: open session transcript: %w", err)
 	}
-	if tr.Count() == 0 && store != nil {
+	// Migration is resumable (Audit 5 F-A5-P2-4): attempt it
+	// whenever the store holds turns, not only on an empty
+	// transcript — a transcript holding only Migrated records
+	// imports the remainder, and a live transcript imports
+	// nothing. A failed import no longer costs the whole
+	// transcript: the transcript is live from here on, and the
+	// next open resumes the remainder.
+	if store != nil {
 		if msgs, err := store.RecentMessages(0); err == nil && len(msgs) > 0 {
 			importedAt := time.Now().UTC()
 			if st, err := os.Stat(legacyFile); err == nil {
 				importedAt = st.ModTime().UTC()
 			}
 			if n, err := tr.MigrateFrom(msgs, importedAt); err != nil {
-				return nil, "", fmt.Errorf("app: migrate history into transcript: %w", err)
+				if log != nil {
+					log.Printf("app: migration into session %s incomplete (%d imported): %v; remainder will resume on next open", id, n, err)
+				}
 			} else if n > 0 {
 				// Migration is worth one log line: it is the
 				// only time old history moves anywhere.
@@ -121,6 +132,185 @@ func (a *App) CurrentSessionIDForChat(chatID int64) (string, error) {
 	return cs.sessionID, nil
 }
 
+// ResumeReport describes what a /resume actually restored, so
+// the caller can report it instead of silently dropping it
+// (Audit 5 F-A5-P2-5): corrupt lines in the transcript, a
+// transcript longer than the store's cap, and summaries loaded
+// into the shared fact. The last report per chat (or global) is
+// kept for LastResumeReportForChat / LastResumeReport — the
+// /resume reply text is rendered by the messaging layer, which
+// reads the report from there.
+type ResumeReport struct {
+	SessionID          string
+	TranscriptMessages int  // messages in the transcript (pre-cap)
+	LoadedMessages     int  // messages now in working history (capped)
+	CorruptLines       int  // unparseable transcript lines skipped
+	SummariesLoaded    int  // transcript summaries merged into the fact
+	Capped             bool // transcript held more than MaxMessages
+}
+
+var resumeReportsMu sync.Mutex
+var resumeReports = map[string]ResumeReport{}
+
+func recordResumeReport(key string, r ResumeReport) {
+	resumeReportsMu.Lock()
+	defer resumeReportsMu.Unlock()
+	resumeReports[key] = r
+}
+
+func lastResumeReport(key string) (ResumeReport, bool) {
+	resumeReportsMu.Lock()
+	defer resumeReportsMu.Unlock()
+	r, ok := resumeReports[key]
+	return r, ok
+}
+
+// LastResumeReportForChat returns the last resume outcome for one
+// chat, if any resume has run for it.
+func (a *App) LastResumeReportForChat(chatID int64) (ResumeReport, bool) {
+	return lastResumeReport(fmt.Sprintf("chat:%d", chatID))
+}
+
+// LastResumeReport returns the last resume outcome for the
+// CLI/global session, if any resume has run for it.
+func (a *App) LastResumeReport() (ResumeReport, bool) {
+	return lastResumeReport("global")
+}
+
+// maxResumeSummaryFactRunes caps the shared conversation-summary
+// fact after merging resumed summaries, mirroring core's cap.
+const maxResumeSummaryFactRunes = 8000
+
+// LoadResumedSession loads a transcript's messages into store and
+// its summaries into the shared conversation-summary fact, and
+// reports the outcome. The transcript keeps every turn; the
+// working history is bounded by the store's MaxMessages cap, and
+// the report says so instead of silently dropping the excess.
+// Summaries that exist only in the transcript are merged into the
+// fact (deduplicated — a summary already there is not added
+// twice), so they reach the model through fact recall instead of
+// being invisible after resume. Corrupt lines are counted, not
+// fatal.
+func LoadResumedSession(store memory.Store, tr *session.Transcript, sessionID string, logger *log.Logger) (ResumeReport, error) {
+	rep := ResumeReport{SessionID: sessionID}
+	msgs, err := tr.Messages()
+	if err != nil {
+		return rep, fmt.Errorf("app: resume: read transcript: %w", err)
+	}
+	rep.TranscriptMessages = len(msgs)
+	rep.CorruptLines = tr.CorruptLines()
+	rep.Capped = len(msgs) > memory.MaxMessages
+	if rep.Capped && logger != nil {
+		logger.Printf("app: resume: transcript %s holds %d messages; working history capped at %d, oldest %d turn(s) stay in the transcript only", sessionID, len(msgs), memory.MaxMessages, len(msgs)-memory.MaxMessages)
+	}
+	if rep.CorruptLines > 0 && logger != nil {
+		logger.Printf("app: resume: transcript %s has %d corrupt line(s) skipped", sessionID, rep.CorruptLines)
+	}
+	if err := store.ReplaceMessages(msgs); err != nil {
+		return rep, fmt.Errorf("app: resume: load history: %w", err)
+	}
+	if loaded, err := store.RecentMessages(0); err == nil {
+		rep.LoadedMessages = len(loaded)
+	} else {
+		rep.LoadedMessages = len(msgs)
+		if rep.LoadedMessages > memory.MaxMessages {
+			rep.LoadedMessages = memory.MaxMessages
+		}
+	}
+	if sums, err := tr.Summaries(); err == nil && len(sums) > 0 {
+		n, err := mergeResumedSummaries(store, sessionID, sums)
+		if err != nil {
+			if logger != nil {
+				logger.Printf("app: resume: transcript summaries for %s could not be merged into the fact: %v", sessionID, err)
+			}
+		} else {
+			rep.SummariesLoaded = n
+		}
+	}
+	return rep, nil
+}
+
+// mergeResumedSummaries merges a resumed session's transcript
+// summaries into the shared conversation-summary fact, one dated
+// section per summary, skipping summaries already present. The
+// fact is shared across a chat's sessions, so a resumed section
+// is headed with its session id; the fact is trimmed to the cap
+// by dropping the oldest sections first.
+func mergeResumedSummaries(store memory.Store, sessionID string, summaries []string) (int, error) {
+	if len(summaries) == 0 {
+		return 0, nil
+	}
+	existing, found, err := store.GetFact("conversation-summary")
+	if err != nil {
+		return 0, err
+	}
+	combined := ""
+	if found {
+		combined = strings.TrimSpace(existing.Value)
+	}
+	added := 0
+	stamp := time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
+	for _, s := range summaries {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.Contains(combined, s) {
+			continue
+		}
+		section := "## Resumed " + sessionID + " " + stamp + "\n" + s
+		if combined == "" {
+			combined = section
+		} else {
+			combined += "\n\n" + section
+		}
+		added++
+	}
+	if added == 0 {
+		return 0, nil
+	}
+	combined = trimResumeSummaryFact(combined, maxResumeSummaryFactRunes)
+	return added, store.AddFact("conversation-summary", combined)
+}
+
+// trimResumeSummaryFact drops the oldest "## <...>" sections until
+// the fact fits within maxRunes, newest kept. It mirrors
+// core.trimSummaryFact: text before the first header is its own
+// oldest section.
+func trimResumeSummaryFact(combined string, maxRunes int) string {
+	if len([]rune(combined)) <= maxRunes {
+		return combined
+	}
+	var sections []string
+	var cur strings.Builder
+	for _, line := range strings.SplitAfter(combined, "\n") {
+		if strings.HasPrefix(line, "## ") && cur.Len() > 0 {
+			sections = append(sections, strings.TrimRight(cur.String(), "\n"))
+			cur.Reset()
+		}
+		cur.WriteString(line)
+	}
+	if cur.Len() > 0 {
+		sections = append(sections, strings.TrimRight(cur.String(), "\n"))
+	}
+	if len(sections) == 0 {
+		return combined
+	}
+	for len(sections) > 1 {
+		total := 0
+		for _, s := range sections {
+			total += len([]rune(s)) + 2
+		}
+		if total <= maxRunes {
+			break
+		}
+		sections = sections[1:]
+	}
+	if len(sections) == 1 {
+		if r := []rune(sections[0]); len(r) > maxRunes {
+			return string(r[len(r)-maxRunes:])
+		}
+	}
+	return strings.Join(sections, "\n\n")
+}
+
 // ResumeSessionForChat resumes one chat's named session: the id
 // may be a full id or a unique leading prefix. The transcript's
 // messages replace the working history (bounded by the store's
@@ -129,7 +319,9 @@ func (a *App) CurrentSessionIDForChat(chatID int64) (string, error) {
 // into it. It returns the resolved id and the message count now
 // in working history. Resuming the live session is a no-op that
 // reports its message count. Facts and typed memories are shared
-// and untouched by a resume.
+// and untouched by a resume. The resume outcome (corrupt lines,
+// capping, summaries loaded) is recorded for
+// LastResumeReportForChat.
 func (a *App) ResumeSessionForChat(chatID int64, idOrPrefix string) (string, int, error) {
 	cs, err := a.chatSessionFor(chatID)
 	if err != nil {
@@ -153,17 +345,15 @@ func (a *App) ResumeSessionForChat(chatID int64, idOrPrefix string) (string, int
 	if err != nil {
 		return "", 0, fmt.Errorf("app: resume: open transcript: %w", err)
 	}
-	msgs, err := tr.Messages()
+	rep, err := LoadResumedSession(cs.store, tr, full, a.Logger)
 	if err != nil {
-		return "", 0, fmt.Errorf("app: resume: read transcript: %w", err)
-	}
-	if err := cs.store.ReplaceMessages(msgs); err != nil {
-		return "", 0, fmt.Errorf("app: resume: load history: %w", err)
+		return "", 0, err
 	}
 	if err := session.WriteCurrent(cs.dir, full); err != nil {
 		return "", 0, fmt.Errorf("app: resume: record current session: %w", err)
 	}
 	a.chatsMu.Lock()
+	oldTr := cs.transcript
 	cs.transcript = tr
 	cs.sessionID = full
 	agent := cs.agent
@@ -175,7 +365,13 @@ func (a *App) ResumeSessionForChat(chatID int64, idOrPrefix string) (string, int
 		agent.SetTranscript(tr)
 		agent.ResetCompactionBreaker()
 	}
-	return full, len(msgs), nil
+	// The old transcript is no longer the live one: release its
+	// lock/fd (a later resume back to it reopens it).
+	if oldTr != nil && oldTr != tr {
+		_ = oldTr.Close()
+	}
+	recordResumeReport(fmt.Sprintf("chat:%d", chatID), rep)
+	return full, rep.LoadedMessages, nil
 }
 
 // CompactionStatusForChat returns one chat's agent's
@@ -194,24 +390,28 @@ func (a *App) CompactionStatusForChat(chatID int64) (compactionStatus, error) {
 	}
 	st := agent.CompactionStatus()
 	return compactionStatus{
-		Pressure:            st.Pressure,
-		Warning:             st.Warning,
-		Tripped:             st.Tripped,
-		ConsecutiveFailures: st.ConsecutiveFailures,
-		LastError:           st.LastError,
-		Compactions:         st.Compactions,
+		Pressure:              st.Pressure,
+		Warning:               st.Warning,
+		Tripped:               st.Tripped,
+		ConsecutiveFailures:   st.ConsecutiveFailures,
+		LastError:             st.LastError,
+		Compactions:           st.Compactions,
+		DroppedWithoutSummary: st.DroppedWithoutSummary,
+		LastDroppedAt:         st.LastDroppedAt,
 	}, nil
 }
 
 // compactionStatus is the app-level view of core.CompactionStatus
 // (messaging renders it; it carries no core import in its shape).
 type compactionStatus struct {
-	Pressure            float64
-	Warning             bool
-	Tripped             bool
-	ConsecutiveFailures int
-	LastError           string
-	Compactions         int
+	Pressure              float64
+	Warning               bool
+	Tripped               bool
+	ConsecutiveFailures   int
+	LastError             string
+	Compactions           int
+	DroppedWithoutSummary int
+	LastDroppedAt         time.Time
 }
 
 // wireGlobalTranscript opens the CLI/global session's transcript
@@ -275,23 +475,25 @@ func (a *App) ResumeSession(idOrPrefix string) (string, int, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("app: resume: open transcript: %w", err)
 	}
-	msgs, err := tr.Messages()
+	rep, err := LoadResumedSession(a.Memory, tr, full, a.Logger)
 	if err != nil {
-		return "", 0, fmt.Errorf("app: resume: read transcript: %w", err)
-	}
-	if err := a.Memory.ReplaceMessages(msgs); err != nil {
-		return "", 0, fmt.Errorf("app: resume: load history: %w", err)
+		return "", 0, err
 	}
 	if err := session.WriteCurrent(a.Config.DataDir, full); err != nil {
 		return "", 0, fmt.Errorf("app: resume: record current session: %w", err)
 	}
+	oldTr := a.globalTranscript
 	a.globalTranscript = tr
 	a.globalSessionID = full
 	if a.Agent != nil {
 		a.Agent.SetTranscript(tr)
 		a.Agent.ResetCompactionBreaker()
 	}
-	return full, len(msgs), nil
+	if oldTr != nil && oldTr != tr {
+		_ = oldTr.Close()
+	}
+	recordResumeReport("global", rep)
+	return full, rep.LoadedMessages, nil
 }
 
 // CurrentSessionID returns the CLI/global live session id.

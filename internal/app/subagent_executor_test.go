@@ -84,7 +84,7 @@ func TestSubagentExecutorRealChildLoop(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, nil)
 	out, usage, err := exec(context.Background(), "do the thing")
 	if err != nil {
 		t.Fatalf("executor: %v", err)
@@ -118,7 +118,7 @@ func TestSubagentExecutorPropagatesMaxStepsError(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(2), nil, nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(2), nil, nil, nil, nil)
 	out, _, err := exec(context.Background(), "loop forever")
 	if out != "" {
 		t.Fatalf("output = %q, want empty when the child errors", out)
@@ -214,7 +214,7 @@ func TestSubagentManagerEndToEndUsageAndIsolation(t *testing.T) {
 			}, nil
 		},
 	}
-	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(childProv, cfg, nil, nil, nil))
+	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(childProv, cfg, nil, nil, nil, nil))
 	defer mgr.Shutdown()
 
 	parentProv := &scriptedProvider{
@@ -395,7 +395,7 @@ func TestRC9ChildAgentGetsHooks(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, bus)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, bus, nil)
 	out, _, err := exec(context.Background(), "compute 1+1")
 	if err != nil {
 		t.Fatalf("executor: %v", err)
@@ -415,5 +415,91 @@ func TestRC9ChildAgentGetsHooks(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "1+1 = 2") {
 		t.Errorf("second request contains calculator output %q: the hook did not block the child's tool call", "1+1 = 2")
+	}
+}
+
+// TestSubagentExecutorChildSharesParentPlanningStore proves Audit 5
+// F-A5-P2-35 end to end: the executor wires the parent's planning
+// store into the child registry, so a child's task_create lands in
+// the parent's store and the parent's task_list sees it. (W5's seam
+// test covers newChildRegistry directly; this one covers the
+// executor call sites in Build / SwitchProviderForChat.)
+func TestSubagentExecutorChildSharesParentPlanningStore(t *testing.T) {
+	parentReg, err := tools.DefaultRegistry()
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	parentStore := parentReg.PlanningStore()
+	if parentStore == nil {
+		t.Fatal("parent registry has no planning store")
+	}
+	childProv := &scriptedProvider{
+		name: "child",
+		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
+			if call == 1 {
+				return &model.ChatResponse{
+					Message: model.Message{
+						Role:      "assistant",
+						ToolCalls: []model.ToolCall{{ID: "c1", Name: "task_create", Arguments: `{"title":"child task"}`}},
+					},
+					FinishReason: "tool_calls",
+				}, nil
+			}
+			return &model.ChatResponse{
+				Message:      model.Message{Role: "assistant", Content: "planned"},
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, parentStore)
+	if _, _, err := exec(context.Background(), "plan this"); err != nil {
+		t.Fatalf("executor: %v", err)
+	}
+	out, err := parentReg.Execute(context.Background(), "task_list", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("parent task_list: %v", err)
+	}
+	if !strings.Contains(out, "child task") {
+		t.Errorf("parent task_list does not show the child's task:\n%s", out)
+	}
+}
+
+// TestSubagentExecutorWithoutParentPlanningStoreIsIsolated: passing
+// a nil parent store keeps the old behaviour — the child's
+// task_create lands in its own ephemeral bucket and the parent
+// never sees it.
+func TestSubagentExecutorWithoutParentPlanningStoreIsIsolated(t *testing.T) {
+	parentReg, err := tools.DefaultRegistry()
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	childProv := &scriptedProvider{
+		name: "child",
+		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
+			if call == 1 {
+				return &model.ChatResponse{
+					Message: model.Message{
+						Role:      "assistant",
+						ToolCalls: []model.ToolCall{{ID: "c1", Name: "task_create", Arguments: `{"title":"child task"}`}},
+					},
+					FinishReason: "tool_calls",
+				}, nil
+			}
+			return &model.ChatResponse{
+				Message:      model.Message{Role: "assistant", Content: "planned"},
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, nil)
+	if _, _, err := exec(context.Background(), "plan this"); err != nil {
+		t.Fatalf("executor: %v", err)
+	}
+	out, err := parentReg.Execute(context.Background(), "task_list", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("parent task_list: %v", err)
+	}
+	if strings.Contains(out, "child task") {
+		t.Errorf("parent task_list shows the child's task without a shared store:\n%s", out)
 	}
 }

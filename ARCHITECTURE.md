@@ -1,4 +1,4 @@
-# Orion Architecture (v0.2.0-rc9)
+# Orion Architecture (v0.2.0-rc10)
 
 ```
 cmd/orion      CLI: run, chat, config, status, tools, memory, skills,
@@ -24,7 +24,7 @@ internal/tools   Registry + 22 tools (shell, files, web, calculator,
 internal/memory  FileStore: JSON file, atomic writes, facts + 200-msg
                conversation history, case-insensitive fact search.
 internal/sandbox  Namespace + pivot_root sandbox for shell_exec
-               (opt-in via config; user/mount/net namespaces,
+               (on by default; user/mount/net namespaces,
                read-only /usr, minimal /etc copy, writable /work),
                with a seccomp syscall filter (orion-seccomp helper)
                when the helper is installed. Refuses the command

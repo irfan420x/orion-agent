@@ -44,11 +44,17 @@ non-negotiable.
 
 ## Sandbox mode (shell_exec)
 
-Opt-in confinement for `shell_exec`, on top of the denylist — it
+Confinement for `shell_exec`, on by default, on top of the denylist — it
 exists because the denylist cannot see what aliased/dynamic
 interpreter code, a bare interpreter, a script file, or stdin will
 do. The sandbox can; the denylist still runs first, so a blocked
-command is refused before anything is spawned.
+command is refused before anything is spawned. The sandbox is
+**on by default**: a fresh install confines `shell_exec`, and a
+config file that omits the `sandbox` section still confines it.
+Turning it off is an explicit operator opt-out
+(`sandbox.enabled=false` in config, or `ORION_SANDBOX=off`); an
+opted-out run is logged every time, so the loss of confinement is
+visible per command.
 
 ### Mechanism (surveyed on this VM, 2026-11-13)
 
@@ -187,9 +193,11 @@ sandbox unavailable.
 ```
 
 Env overrides: `ORION_SANDBOX=on`, `ORION_SANDBOX_ROOT=<path>`.
-Default root is `<data_dir>/sandbox`; default is **off** — when
-off, `shell_exec` behaves exactly as before. `root` must be an
-absolute path, never `/` or inside a system tree (`/etc`, `/usr`,
+Default root is `<data_dir>/sandbox`; the sandbox is **on by
+default** — when it is explicitly turned off (`sandbox.enabled=false`
+in config, or `ORION_SANDBOX=off`), `shell_exec` runs unsandboxed,
+protected only by the denylist, and every such run is logged.
+`root` must be an absolute path, never `/` or inside a system tree (`/etc`, `/usr`,
 `/proc`, …). Commands run with cwd `/work` (the root's `work/`
 subdir on the host), so files the agent writes persist there
 between runs; `/tmp` does not.

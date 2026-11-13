@@ -331,6 +331,12 @@ func TestApprovalCallbackRoundTrip(t *testing.T) {
 	if len(fake.edits) != 1 {
 		t.Errorf("prompt edits = %d, want 1 (the approval outcome)", len(fake.edits))
 	}
+	// F-A5-P2-21: the resolved card must not keep live buttons — the
+	// outcome edit carries an empty inline keyboard, exactly like
+	// the expiry path, so a second tap cannot look live.
+	if len(fake.edits) == 1 && !strings.Contains(fake.edits[0], `"inline_keyboard":[]`) {
+		t.Errorf("outcome edit body = %s, want it to carry an empty inline_keyboard", fake.edits[0])
+	}
 }
 
 func TestApprovalCallbackExpiredRequest(t *testing.T) {

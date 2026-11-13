@@ -124,9 +124,14 @@ func TestHandleStreamForChatStatsCarrySubagentSplit(t *testing.T) {
 }
 
 // TestHandleStreamForChatBudgetRefusal proves the budget gate on
-// the per-chat turn path: the first turn runs and records its
-// spend (even though it pushed the chat over the limit), and the
-// second turn is refused BEFORE the provider is called.
+// the per-chat turn path under the F-A5-6 projection semantics: a
+// turn whose projected input cost exceeds the remaining budget is
+// refused pre-flight, BEFORE the provider is called, and records
+// nothing — the old pre-flight-only Check(chatID, 0) let such a
+// turn run and blow past the limit. A turn that starts affordable
+// but overspends mid-turn is aborted after the over-budget
+// response (the spend that already happened is still recorded),
+// and the next turn is refused pre-flight.
 func TestHandleStreamForChatBudgetRefusal(t *testing.T) {
 	a := testApp(t)
 	defer a.Close()
@@ -135,50 +140,78 @@ func TestHandleStreamForChatBudgetRefusal(t *testing.T) {
 		return finalUsageResponse("ok", model.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}), nil
 	}}
 	a.Provider = prov
-	if _, _, err := a.HandleStreamForChat(context.Background(), 111, "first", nil); err != nil {
-		t.Fatalf("first HandleStreamForChat: %v", err)
+	// Chat 111 has 99/100 used: even the smallest turn's
+	// projected input (~5 tokens for "first") no longer fits, so
+	// the turn is refused pre-flight and never reaches the
+	// provider.
+	if err := a.Budget.RecordUsage(111, model.Usage{TotalTokens: 99}, 0); err != nil {
+		t.Fatalf("RecordUsage: %v", err)
 	}
-	if got := a.Budget.Usage(111); got != 150 {
-		t.Fatalf("budget Usage after first turn = %d, want 150 (over-budget spend is recorded)", got)
+	if _, _, err := a.HandleStreamForChat(context.Background(), 111, "first", nil); !errors.Is(err, budget.ErrBudgetExceeded) {
+		t.Fatalf("HandleStreamForChat over projected budget err = %v, want ErrBudgetExceeded", err)
 	}
-	if _, _, err := a.HandleStreamForChat(context.Background(), 111, "second", nil); !errors.Is(err, budget.ErrBudgetExceeded) {
+	if got := prov.Calls(); got != 0 {
+		t.Errorf("provider calls = %d, want 0 (the refused turn must never reach the provider)", got)
+	}
+	// A refused turn records nothing.
+	if got := a.Budget.Usage(111); got != 99 {
+		t.Errorf("budget Usage after refused turn = %d, want 99", got)
+	}
+	// Chat 112 starts at 0, so its turn runs — but the provider
+	// reports 150 tokens for a 100-token budget, so the mid-turn
+	// abort stops the turn after that response. The spend that
+	// already happened is still recorded.
+	if _, _, err := a.HandleStreamForChat(context.Background(), 112, "first", nil); !errors.Is(err, budget.ErrBudgetExceeded) {
+		t.Fatalf("overspending HandleStreamForChat err = %v, want ErrBudgetExceeded", err)
+	}
+	if got := a.Budget.Usage(112); got != 150 {
+		t.Fatalf("budget Usage after overspending turn = %d, want 150 (over-budget spend is recorded)", got)
+	}
+	if _, _, err := a.HandleStreamForChat(context.Background(), 112, "second", nil); !errors.Is(err, budget.ErrBudgetExceeded) {
 		t.Fatalf("second HandleStreamForChat err = %v, want ErrBudgetExceeded", err)
 	}
 	if got := prov.Calls(); got != 1 {
-		t.Errorf("provider calls = %d, want 1 (the refused turn must never reach the provider)", got)
+		t.Errorf("provider calls = %d, want 1 (only the overspending turn reached the provider)", got)
 	}
 	// A refused turn records nothing.
-	if got := a.Budget.Usage(111); got != 150 {
+	if got := a.Budget.Usage(112); got != 150 {
 		t.Errorf("budget Usage after refused turn = %d, want 150", got)
 	}
 }
 
 // TestHandleForChatBudgetEnforced proves the non-streaming per-chat
-// path (used by `orion daemon`) enforces the same budget: a chat
-// already over budget is refused without a provider call.
+// path (used by `orion daemon`) enforces the same budget under the
+// F-A5-6 projection semantics: a chat whose remaining budget cannot
+// cover the turn's projected input is refused pre-flight without a
+// provider call, while other chats are unaffected.
 func TestHandleForChatBudgetEnforced(t *testing.T) {
 	a := testApp(t)
 	defer a.Close()
 	a.Budget = budget.New(100)
 	prov := &usageScriptProvider{chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
-		return finalUsageResponse("ok", model.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}), nil
+		return finalUsageResponse("ok", model.Usage{PromptTokens: 6, CompletionTokens: 4, TotalTokens: 10}), nil
 	}}
 	a.Provider = prov
-	if _, err := a.HandleForChat(context.Background(), 111, "first"); err != nil {
-		t.Fatalf("first HandleForChat: %v", err)
+	// Chat 111 has 99/100 used: the next turn's projected input
+	// does not fit, so it is refused pre-flight.
+	if err := a.Budget.RecordUsage(111, model.Usage{TotalTokens: 99}, 0); err != nil {
+		t.Fatalf("RecordUsage: %v", err)
 	}
-	if _, err := a.HandleForChat(context.Background(), 111, "second"); !errors.Is(err, budget.ErrBudgetExceeded) {
-		t.Fatalf("second HandleForChat err = %v, want ErrBudgetExceeded", err)
+	if _, err := a.HandleForChat(context.Background(), 111, "first"); !errors.Is(err, budget.ErrBudgetExceeded) {
+		t.Fatalf("first HandleForChat err = %v, want ErrBudgetExceeded", err)
 	}
-	if got := prov.Calls(); got != 1 {
-		t.Errorf("provider calls = %d, want 1", got)
+	if got := prov.Calls(); got != 0 {
+		t.Errorf("provider calls = %d, want 0 (the refused turn must never reach the provider)", got)
+	}
+	if got := a.Budget.Usage(111); got != 99 {
+		t.Errorf("budget Usage after refused turn = %d, want 99", got)
 	}
 	// Other chats are unaffected by this chat's budget.
 	if _, err := a.HandleForChat(context.Background(), 222, "other chat"); err != nil {
 		t.Fatalf("HandleForChat for another chat: %v, want it to run", err)
 	}
-	if got := prov.Calls(); got != 2 {
-		t.Errorf("provider calls after other chat = %d, want 2", got)
+	if got := prov.Calls(); got != 1 {
+		t.Errorf("provider calls after other chat = %d, want 1", got)
 	}
 }
 

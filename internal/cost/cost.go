@@ -146,8 +146,12 @@ func (t *Table) PriceFor(provider, modelName string) (Price, bool) {
 // Estimate prices usage at the (provider, model) rate card: prompt
 // tokens at the input rate, completion tokens at the output rate,
 // and subagentTokens (whose split is unknown — see the package doc)
-// at the output rate. It returns false when the price is unknown or
-// any count is negative; the caller must then report "unknown",
+// at the output rate. Tokens the provider reported in TotalTokens
+// above prompt + completion + subagent — the remainder, e.g. cached
+// tokens a provider counts in its total but not in the split — are
+// also priced, at the output rate, so no reported token is silently
+// unpriced (F-A5-P2-23). It returns false when the price is unknown
+// or any count is negative; the caller must then report "unknown",
 // never $0. A zero-token usage on a known model estimates $0 and
 // returns true.
 func (t *Table) Estimate(provider, modelName string, u model.Usage, subagentTokens int) (float64, bool) {
@@ -162,17 +166,39 @@ func (t *Table) Estimate(provider, modelName string, u model.Usage, subagentToke
 	usd := float64(u.PromptTokens)*pr.InputPerMillion/perMillion +
 		float64(u.CompletionTokens)*pr.OutputPerMillion/perMillion +
 		float64(subagentTokens)*pr.OutputPerMillion/perMillion
+	// The remainder is the provider-reported total minus every
+	// token already priced above. It is normally zero (providers
+	// report Total = Prompt + Completion, subagent tokens already
+	// inside Total); a positive remainder is real spend outside
+	// the split, priced at the output rate — the conservative
+	// side — rather than dropped. A negative remainder (a
+	// provider whose split exceeds its total, or a caller that
+	// double-counted subagent tokens) prices as zero extra, never
+	// negative.
+	if remainder := u.TotalTokens - u.PromptTokens - u.CompletionTokens - subagentTokens; remainder > 0 {
+		usd += float64(remainder) * pr.OutputPerMillion / perMillion
+	}
 	return usd, true
 }
 
 // EstimateTotals is Estimate over raw counts, for callers that
 // track prompt/completion/subagent separately (e.g. the per-chat
-// daily budget) instead of carrying a model.Usage.
+// daily budget) instead of carrying a model.Usage. The total is
+// prompt + completion + subagent, so the remainder is zero; use
+// EstimateTotalsWithTotal when the provider-reported total exceeds
+// the split.
 func (t *Table) EstimateTotals(provider, modelName string, prompt, completion, subagent int) (float64, bool) {
+	return t.EstimateTotalsWithTotal(provider, modelName, prompt, completion, subagent, prompt+completion+subagent)
+}
+
+// EstimateTotalsWithTotal is EstimateTotals with an explicit
+// provider-reported total: any remainder (total minus the split)
+// is priced at the output rate, like Estimate does.
+func (t *Table) EstimateTotalsWithTotal(provider, modelName string, prompt, completion, subagent, total int) (float64, bool) {
 	return t.Estimate(provider, modelName, model.Usage{
 		PromptTokens:     prompt,
 		CompletionTokens: completion,
-		TotalTokens:      prompt + completion + subagent,
+		TotalTokens:      total,
 	}, subagent)
 }
 

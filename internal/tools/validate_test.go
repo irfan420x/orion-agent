@@ -192,3 +192,201 @@ func TestValidateNoSchemaMeansNoConstraint(t *testing.T) {
 		t.Fatalf("Execute(schemaless): expected success, got %v", err)
 	}
 }
+
+// schemaStubTool is a tool with an arbitrary caller-supplied schema,
+// for exercising validation of schema shapes the built-in stub does
+// not cover (Go-built enums, nested schemas, bounds).
+type schemaStubTool struct {
+	name   string
+	params map[string]any
+	ran    *int
+}
+
+func (t *schemaStubTool) Name() string { return t.name }
+
+func (t *schemaStubTool) Description() string { return "Schema stub." }
+
+func (t *schemaStubTool) Definition() model.ToolDefinition {
+	return model.ToolDefinition{
+		Name:        t.name,
+		Description: t.Description(),
+		Parameters:  t.params,
+	}
+}
+
+func (t *schemaStubTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
+	*t.ran++
+	return "ran", nil
+}
+
+func newSchemaStubRegistry(t *testing.T, name string, params map[string]any) (*Registry, *int) {
+	t.Helper()
+	r := NewRegistry()
+	ran := 0
+	if err := r.Register(&schemaStubTool{name: name, params: params, ran: &ran}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	return r, &ran
+}
+
+func TestValidateEnumStringSlice(t *testing.T) {
+	// Audit 5 F-A5-P2-27: the old code checked the enum only if it
+	// was []any, so a Go-built definition using []string silently
+	// imposed no enum at all.
+	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"mode": map[string]any{"type": "string", "enum": []string{"a", "b"}},
+		},
+	})
+	ctx := context.Background()
+
+	_, err := r.Execute(ctx, "stub", json.RawMessage(`{"mode":"c"}`))
+	assertInvalidArgs(t, err, `parameter "mode" must be one of`)
+	if *ran != 0 {
+		t.Fatalf("tool ran despite []string enum violation")
+	}
+	if _, err := r.Execute(ctx, "stub", json.RawMessage(`{"mode":"a"}`)); err != nil {
+		t.Fatalf("Execute(mode=a): expected success, got %v", err)
+	}
+	if *ran != 1 {
+		t.Fatalf("tool ran %d time(s), want 1", *ran)
+	}
+}
+
+func TestValidateEnumNumericNormalisation(t *testing.T) {
+	// reflect.DeepEqual(float64, int) is false, so a JSON-decoded
+	// value 1 (float64) never matched a Go-built int enum entry.
+	// Numbers must be compared by value.
+	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"level": map[string]any{"type": "integer", "enum": []any{1, 2}},
+			"score": map[string]any{"type": "integer", "enum": []int{10, 20}},
+			"ratio": map[string]any{"type": "number", "enum": []float64{0.5, 1.5}},
+		},
+	})
+	ctx := context.Background()
+
+	for _, args := range []string{
+		`{"level":1}`,
+		`{"score":20}`,
+		`{"ratio":1.5}`,
+	} {
+		if _, err := r.Execute(ctx, "stub", json.RawMessage(args)); err != nil {
+			t.Fatalf("Execute(%s): expected success, got %v", args, err)
+		}
+	}
+	for _, tc := range []struct {
+		args string
+		want string
+	}{
+		{`{"level":3}`, `parameter "level" must be one of`},
+		{`{"score":15}`, `parameter "score" must be one of`},
+		{`{"ratio":2.5}`, `parameter "ratio" must be one of`},
+	} {
+		_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+		assertInvalidArgs(t, err, tc.want)
+	}
+	if *ran != 3 {
+		t.Fatalf("tool ran %d time(s), want 3 (only the valid calls)", *ran)
+	}
+}
+
+func TestValidateNestedSchemas(t *testing.T) {
+	// Audit 5 F-A5-P2-27: validation used to check only top-level
+	// properties/required, so nested required fields (e.g.
+	// todo_write's todos[].content/status) were ignored entirely.
+	// The schema below mirrors todo_write's todos shape.
+	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"todos": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"content": map[string]any{"type": "string", "minLength": 1},
+						"status":  map[string]any{"type": "string", "enum": []string{"pending", "done"}},
+					},
+					"required": []string{"content", "status"},
+				},
+			},
+		},
+	})
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		args string
+		want string
+	}{
+		{"both required fields missing", `{"todos":[{"wrong":1},{}]}`, `missing required parameter "todos[0].content"`},
+		{"status missing", `{"todos":[{"content":"x"}]}`, `missing required parameter "todos[0].status"`},
+		{"second item missing content", `{"todos":[{"content":"x","status":"done"},{}]}`, `missing required parameter "todos[1].content"`},
+		{"nested enum violated", `{"todos":[{"content":"x","status":"bogus"}]}`, `parameter "todos[0].status" must be one of`},
+		{"nested minLength violated", `{"todos":[{"content":"","status":"done"}]}`, `parameter "todos[0].content" must be at least 1 characters`},
+		{"nested wrong type", `{"todos":[{"content":7,"status":"done"}]}`, `parameter "todos[0].content" must be string, got integer`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+			assertInvalidArgs(t, err, tc.want)
+		})
+	}
+	if *ran != 0 {
+		t.Fatalf("tool ran %d time(s) despite nested violations", *ran)
+	}
+
+	// A fully valid nested call runs.
+	if _, err := r.Execute(ctx, "stub", json.RawMessage(`{"todos":[{"content":"x","status":"done"},{"content":"y","status":"pending"}]}`)); err != nil {
+		t.Fatalf("Execute(valid nested): expected success, got %v", err)
+	}
+	if *ran != 1 {
+		t.Fatalf("tool ran %d time(s), want 1", *ran)
+	}
+}
+
+func TestValidateNumericAndStringBounds(t *testing.T) {
+	// Audit 5 F-A5-P2-27: minimum/maximum/pattern/minLength were
+	// never read, though schemas declare them (e.g. shell timeout
+	// 1–120). Bounds use Go ints here, as Go-built definitions do.
+	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"timeout": map[string]any{"type": "number", "minimum": 1, "maximum": 120},
+			"code":    map[string]any{"type": "string", "pattern": "^[a-z]+$", "minLength": 3, "maxLength": 5},
+		},
+	})
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		args string
+		want string
+	}{
+		{"below minimum", `{"timeout":0}`, `parameter "timeout" must be >= 1`},
+		{"above maximum", `{"timeout":121}`, `parameter "timeout" must be <= 120`},
+		{"too short", `{"code":"ab"}`, `parameter "code" must be at least 3 characters`},
+		{"too long", `{"code":"abcdef"}`, `parameter "code" must be at most 5 characters`},
+		{"pattern mismatch", `{"code":"ABC"}`, `parameter "code" must match pattern`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+			assertInvalidArgs(t, err, tc.want)
+		})
+	}
+	if *ran != 0 {
+		t.Fatalf("tool ran %d time(s) despite bound violations", *ran)
+	}
+
+	for _, args := range []string{`{"timeout":60}`, `{"timeout":1}`, `{"timeout":120}`, `{"code":"abc"}`} {
+		if _, err := r.Execute(ctx, "stub", json.RawMessage(args)); err != nil {
+			t.Fatalf("Execute(%s): expected success, got %v", args, err)
+		}
+	}
+	if *ran != 4 {
+		t.Fatalf("tool ran %d time(s), want 4", *ran)
+	}
+}

@@ -28,6 +28,14 @@
 //	PostToolUse: {"event":"PostToolUse","tool_name":"<tool>","arguments":{...},"result":"<tool result text, truncated>"}
 //	Stop:        {"event":"Stop","reason":"completed"|"max_steps"|"error: ..."}
 //
+// The arguments handed to a hook are secret-redacted first (Audit
+// 5, F-A5-P2-14): a secret the model pasted into an argument (a
+// token in a shell_exec command) must not reach the hook's stdin
+// unredacted, where a verbose hook could log it to a file — the
+// same redaction block reasons already get. The result handed to
+// a PostToolUse hook is the text the model sees, already redacted
+// by the registry.
+//
 // Exit-code protocol (the exit code is authoritative; the optional
 // JSON on stdout supplies the human-readable reason):
 //
@@ -36,6 +44,10 @@
 //	   JSON is honoured even with exit 0, so a hook that decides in
 //	   code does not have to arrange its exit code too. Non-JSON
 //	   stdout on exit 0 is ignored (hooks may print diagnostics).
+//	   Only a stdout line that actually carries a decision counts:
+//	   a JSON line with no decision field (e.g. {"status":"ok"})
+//	   is skipped, not treated as the decision — and the decision
+//	   is matched case-insensitively ("Block" blocks).
 //	2: block. PreToolUse: the tool call DOES NOT execute — the agent
 //	   feeds "Error: tool ... blocked by hook: <reason>" back to the
 //	   model instead, exactly as if the permission gate had denied
@@ -47,9 +59,14 @@
 //	   going" loop re-entry, and silently re-entering the loop from
 //	   a hook would be a correctness hazard. A Stop hook that exits
 //	   2 is logged loudly so the operator notices the deviation.
-//	other (1, 3, ...): continue-with-warning. The warning is logged
-//	   and returned to the caller; the turn proceeds. A hook that
-//	   crashes must not take the agent down with it.
+//	other (1, 3, ...): FAIL CLOSED for PreToolUse (Audit 5,
+//	   F-A5-P2-11): any clean non-zero exit blocks the call, like a
+//	   crash, a timeout, or a start failure — a buggy hook (a
+//	   `set -e` script failing on a missing dependency, exit 1)
+//	   must not silently stop enforcing policy while tool calls
+//	   proceed. For PostToolUse / Stop a non-zero exit is only a
+//	   warning: there is nothing left to block, and the turn
+//	   proceeds.
 //
 // Fail-safe rule: a hook that cannot be started, times out, or is
 // killed (any failure that is NOT a clean process exit) fails CLOSED
@@ -396,7 +413,9 @@ type PreOutcome struct {
 // The first hook that blocks short-circuits the rest. A nil bus or
 // a bus with no PreToolUse hooks continues with a zero outcome. See
 // the package doc for the exit-code contract and the fail-safe rule:
-// a hook that cannot run at all BLOCKS the call.
+// a hook that cannot run at all BLOCKS the call, and so does any
+// clean non-zero exit (Audit 5, F-A5-P2-11) — only exit 0 (or a
+// JSON "continue" decision on exit 0) lets the call proceed.
 func (b *Bus) PreToolUse(ctx context.Context, tool string, args json.RawMessage) PreOutcome {
 	if b == nil || b.Count(EventPreToolUse) == 0 {
 		return PreOutcome{}
@@ -404,7 +423,7 @@ func (b *Bus) PreToolUse(ctx context.Context, tool string, args json.RawMessage)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	payload, err := json.Marshal(preToolUsePayload{Event: string(EventPreToolUse), ToolName: tool, Arguments: args})
+	payload, err := json.Marshal(preToolUsePayload{Event: string(EventPreToolUse), ToolName: tool, Arguments: redactJSONArgs(args)})
 	if err != nil {
 		// Arguments came from the agent as validated JSON; a
 		// marshal failure here is near-impossible. Fail closed
@@ -437,7 +456,15 @@ func (b *Bus) PreToolUse(ctx context.Context, tool string, args json.RawMessage)
 				warnings = append(warnings, fmt.Sprintf("hook %q exited 0 with unknown decision %q", h.Name, res.decision))
 			}
 		default:
-			warnings = append(warnings, fmt.Sprintf("hook %q exited with code %d (%s); continuing with warning", h.Name, res.code, res.reason()))
+			// Any other clean non-zero exit fails CLOSED
+			// (Audit 5, F-A5-P2-11): a buggy hook must not
+			// silently stop enforcing policy while tool
+			// calls proceed.
+			return PreOutcome{
+				Blocked: true,
+				Reason:  fmt.Sprintf("hook %q exited with code %d (%s); failing closed", h.Name, res.code, res.reason()),
+				Warning: strings.Join(warnings, "; "),
+			}
 		}
 	}
 	return PreOutcome{Warning: strings.Join(warnings, "; ")}
@@ -456,7 +483,7 @@ func (b *Bus) PostToolUse(ctx context.Context, tool string, args json.RawMessage
 		ctx = context.Background()
 	}
 	payload, err := json.Marshal(postToolUsePayload{
-		Event: string(EventPostToolUse), ToolName: tool, Arguments: args,
+		Event: string(EventPostToolUse), ToolName: tool, Arguments: redactJSONArgs(args),
 		Result: tools.TruncateToolResult(result, maxHookResultBytes),
 	})
 	if err != nil {
@@ -657,9 +684,12 @@ func (b *Bus) runHook(ctx context.Context, h *Hook, payload []byte, tool string)
 		}
 	}
 	// Parse the stdout JSON decision. Only the FIRST line that
-	// parses as a hookOutput counts: a hook may print diagnostics
-	// before its decision, and a trailing garbage line must not
-	// override it. Non-JSON stdout is not an error.
+	// carries a decision counts (Audit 5, F-A5-P2-10): a hook may
+	// print diagnostics before its decision, and a JSON line with
+	// no decision field at all ({"status":"ok"}) must not swallow
+	// the real decision on a later line. The decision is matched
+	// case-insensitively ("Block" blocks). Non-JSON stdout is not
+	// an error.
 	for _, line := range strings.Split(stdout.String(), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -669,7 +699,11 @@ func (b *Bus) runHook(ctx context.Context, h *Hook, payload []byte, tool string)
 		if err := json.Unmarshal([]byte(line), &out); err != nil {
 			continue
 		}
-		res.decision = strings.TrimSpace(out.Decision)
+		decision := strings.ToLower(strings.TrimSpace(out.Decision))
+		if decision == "" {
+			continue // JSON, but no decision: keep looking
+		}
+		res.decision = decision
 		if out.Reason != "" {
 			res.stdoutReason = redactAndCap(out.Reason)
 		}
@@ -722,6 +756,52 @@ func (w *cappedBuffer) String() string { return w.buf.String() }
 // not at the call site.
 func cleanHookText(s string) string {
 	return redactAndCap(s)
+}
+
+// redactJSONArgs returns args with secret-shaped string values
+// redacted (Audit 5, F-A5-P2-14), so a secret the model pasted
+// into a tool argument never reaches a hook's stdin unredacted.
+// It walks the decoded JSON and redacts each string value with
+// security.RedactSecrets — the same redaction block reasons get —
+// while keys and structure are preserved. Numbers decode with
+// UseNumber so their literal text survives the round-trip
+// exactly. On any failure (invalid JSON, unmarshalable value)
+// it returns args unchanged: the caller then fails closed on
+// invalid JSON, exactly as before.
+func redactJSONArgs(args json.RawMessage) json.RawMessage {
+	if len(args) == 0 {
+		return args
+	}
+	dec := json.NewDecoder(bytes.NewReader(args))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return args
+	}
+	redactJSONValue(&v)
+	out, err := json.Marshal(v)
+	if err != nil {
+		return args
+	}
+	return out
+}
+
+// redactJSONValue redacts secret-shaped strings in place, walking
+// objects and arrays. Non-string values are left alone.
+func redactJSONValue(v *any) {
+	switch t := (*v).(type) {
+	case string:
+		*v = security.RedactSecrets(t)
+	case map[string]any:
+		for k, val := range t {
+			redactJSONValue(&val)
+			t[k] = val
+		}
+	case []any:
+		for i := range t {
+			redactJSONValue(&t[i])
+		}
+	}
 }
 
 // redactAndCap redacts detected secrets, then caps to

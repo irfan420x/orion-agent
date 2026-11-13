@@ -6,6 +6,112 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Audit 5 fixes (v0.2.0-rc10) — see `AUDIT5_2026-11-13.md`
+
+Fixes all 9 P1s and **all 38 P2s** from the fresh-eyes audit of
+rc9; nothing deferred. **Verdict: NOT production-ready** — the
+24–72 h daemon soak (F-A3-4) is still open, and F-A3-2 (no
+pprof/debug endpoint) is still open. 1055 tests pass, 0 fail, 4
+skip (3 Ollama live tests + 1 MCP process test), race clean,
+21/21 packages. Live proof: glob with a 20×`**` pattern finds a
+12-deep file and 17×23+5=396 in a 4.7 s DeepSeek turn (the glob
+alone took 42.6 s before the fix).
+
+- **F-A5-1 FIFO cap silent history loss** (`internal/core/compact.go`,
+  `internal/core/recall.go`, `internal/session/transcript.go`):
+  bounded emergency summarisation (16k token cap) when the
+  breaker trips or pressure >2×, spill to KindDropped records,
+  surfaced in CompactionStatus + `/status` + the terminal card.
+- **F-A5-2 summary content verified** (`internal/core/compact.go`):
+  summaries are rejected when they share zero tokens with the
+  source (or fall below the length floor); the latest summary is
+  injected at 2000 runes in its own recall slot.
+- **F-A5-3 MCP newline-less flood** (`internal/mcp/client.go`):
+  ReadSlice loop kills a server past the 16 MiB cap — a 96 MiB
+  flood dies in ~0.1 s with heap <64 MiB.
+- **F-A5-4 MCP servers confined** (`internal/mcp/sandbox.go`):
+  MCP servers run sandboxed (fail-closed, default-on; proven
+  live with a real probe server: config unreadable, HOME=/work,
+  cwd=/work), 64 tools/server + 64 KiB schema cap.
+- **F-A5-5 unmetered side-channel calls** (`internal/core/agent.go`,
+  `recall_v2.go`, `extraction.go`, `compact.go`, `internal/app/commands.go`):
+  selector, extraction, `/compress` and auto-compact provider
+  calls all fold into the turn's usage via `AddSideChannelUsage`.
+- **F-A5-6 budget pre-flight-only** (`internal/app/chats.go`):
+  projection check refuses a turn whose projected input exceeds
+  the remaining budget before the provider is called, plus a
+  mid-turn abort (`SetTurnUsageLimitCheck`) after every provider
+  response.
+- **F-A5-7 unfetched subagent tokens** (`internal/app/chats.go`,
+  `internal/subagent/subagent.go`, `internal/tools/subagent.go`):
+  turn-end sweep charges finished-but-unfetched tasks exactly
+  once — and tasks are now attributed to their owning chat at
+  spawn, so one chat's sweep can never charge another chat's
+  tasks (unattributed/CLI tasks are never swept).
+- **F-A5-8 skill bodies escaping `## Tools`** (`internal/core/skills.go`,
+  `internal/tools/skill.go`): skill bodies are delimited with
+  BEGIN/END SKILL markers and a hierarchy instruction in the
+  system prompt; `## Tools` is documented as anti-drift, not a
+  security boundary.
+- **F-A5-9 Glob `**` exponential blowup** (`internal/tools/search.go`):
+  pattern caps (512 runes, 64 segments) + consecutive `**`
+  collapsed + linear-time DP matcher — 20×`**` on a 12-deep
+  tree went 42.6 s → 0.00 s.
+- **P2-1…P2-8 compact/transcripts**: summary-append failure
+  aborts the compaction instead of dropping silently; pressure
+  recomputed after a drop; transcript reads via a `bufio.Reader`
+  loop (overlong line = one corrupt line, not an unloadable
+  session); resumable migration; resume loads summaries and
+  reports corrupt lines + the 200 cap; transcript flock +
+  shared-handle registry; breaker re-arms after a 5-min
+  cooldown with a jump warning; `RedactSecrets` on transcript
+  append.
+- **P2-9…P2-17 hooks/MCP**: 64 tools/server + 64 KiB schema
+  cap; decisionless JSON lines skipped, case-insensitive
+  decision match; fail-closed on any non-zero PreToolUse exit;
+  dead servers reaped and deregistered; concurrent startup with
+  a 30 s total budget; hook args redacted; `Alive()` requires a
+  started client; MCP results delimited + a system-prompt
+  warning; atomic `Start` check-and-set.
+- **P2-18…P2-23 cost/budget/approval**: per-(provider,model)
+  day buckets + per-model pricing in `/usage`; budget persisted
+  to `budget.json` under the data dir (wired in `Build`, so a
+  daemon restart no longer resets every chat's spend); Resolve
+  records the outcome under the mutex before delivery (timer
+  race closed); the resolved card's buttons are cleared; the
+  three silent approval log paths now log; the remainder is
+  priced at the output rate.
+- **P2-24…P2-27 skills/validation**: skill descriptions
+  sanitised and quoted in the system prompt; `## Tools` heading
+  variants normalised with a warning on unrecognised Tools-like
+  headings; `LoadDir`/`LoadFile` refuse symlinks; the validator
+  accepts `[]any`/`[]string`/`[]int`/`[]float64` enums, normalises
+  numerics, recurses into nested schemas, and enforces
+  minimum/maximum/minLength/maxLength/pattern.
+- **P2-28…P2-36 search/planning**: grep include/exclude
+  applied to symlinked files; symlink targets under `.git`
+  skipped; hardlink refusal via `readFileBounded`; grep 32 MB
+  total-bytes cap; grep 2000 rendered-lines cap + `task_list`
+  pagination; planning flock around load-modify-save; O_NOFOLLOW
+  + Lstat refuses symlinked state files and symlinked
+  `chats/<id>` dirs; the subagent child's planning store is
+  wired to the parent's (spawn → child `task_create` → parent
+  `task_list` sees it); dir fsync after rename, `loadTodos`
+  validates statuses, state files capped at 32 MB, grep
+  single-file FIFO pre-check, dead symlinked-dir branches
+  removed.
+- **P2-37 flaky test-only data race**: `TestCallbackQueryReachesHandler`
+  writes `gotSender` inside the mutex and reads it under the
+  mutex; `-race -count=3` passes.
+- **P2-38 docs staleness**: README/SECURITY.md/ARCHITECTURE.md
+  no longer call the sandbox "opt-in"/"default off"; README
+  gains Sandbox and Sessions (JSONL transcripts) sections; the
+  stale rc7 `./orion` binary at the repo root is removed.
+- **Coordinator integration**: `/resume` reports the cap,
+  corrupt lines and summaries merged (daemon path wired);
+  session rotation now closes the old transcript instead of
+  leaking one fd + flock per rotation (chat + global paths).
+
 ### Feature gaps (v0.2.0-rc9) — see `orion-muse-sync/audit.md` §12/§8
 
 Builds the capability features the external audit identified as

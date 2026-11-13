@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/subagent"
 )
 
@@ -32,8 +33,10 @@ import (
 // Usage accounting rule (see subagentResultTool.Execute): tokens are
 // counted in the parent turn when the parent consumes the result —
 // i.e. on the first subagent_result fetch of a finished (DONE or
-// FAILED) task. A result that is never fetched is never counted, and
-// fetching the same result twice counts it once.
+// FAILED) task. A result that is never fetched is charged instead by
+// the per-chat turn-end sweep (app.runChatTurn, F-A5-7), so
+// spawn-and-never-fetch spend is no longer invisible; fetching the
+// same result twice counts it once in either path.
 type SubagentUsageSink interface {
 	AddSubagentUsage(tokens int)
 }
@@ -184,7 +187,12 @@ func (t *subagentSpawnTool) Execute(ctx context.Context, args json.RawMessage) (
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
-	id, err := t.set.mgr.Spawn(brief, time.Duration(timeoutSeconds)*time.Second)
+	// Attribute the task to its owning chat (Audit 5 F-A5-7):
+	// the per-chat sweep charges a finished task only to the
+	// chat that spawned it. No approval context (CLI-driven
+	// use) means chatID 0 — unattributed, never swept.
+	chatID, _, _ := permissions.ApprovalContextFrom(ctx)
+	id, err := t.set.mgr.SpawnForChat(chatID, brief, time.Duration(timeoutSeconds)*time.Second)
 	if err != nil {
 		return "", mapManagerError(t.Name(), err)
 	}
@@ -330,8 +338,9 @@ func (t *subagentResultTool) Execute(ctx context.Context, args json.RawMessage) 
 
 	// Finished: charge the usage exactly once, for DONE and FAILED
 	// tasks — tokens are counted in the parent turn when the parent
-	// consumes the result; a result never fetched is never counted,
-	// and a second fetch of the same result must not double-count.
+	// consumes the result; a second fetch of the same result must
+	// not double-count. A result never fetched is charged instead
+	// by the per-chat turn-end sweep (app.runChatTurn, F-A5-7).
 	// Failed tasks count too: their tokens were genuinely spent
 	// (the executor did work before failing) and the parent is told
 	// about them, so hiding them would undercount the turn.

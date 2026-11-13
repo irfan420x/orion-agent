@@ -19,22 +19,34 @@
 // Record never errors.
 //
 // The day is the UTC calendar date; usage resets at UTC midnight.
-// Usage is in-memory only: a daemon restart resets the counters.
-// That is deliberate — the budget is a rate control, not billing —
-// and it is documented here so nobody mistakes it for durable
-// accounting.
+//
+// Usage is persisted when a file is set with SetFile (F-A5-P2-19):
+// every record auto-saves atomically (temp file + rename + dir
+// fsync, like the session store) and a new Budget on the same file
+// reloads today's totals, so a daemon restart no longer resets
+// every chat's daily spend. Without a file the budget stays
+// in-memory only. A stale file (a previous UTC day) loads as
+// empty: yesterday's spend never counts against today.
 //
 // RecordUsage additionally keeps the prompt/completion/subagent
 // split for the day, so the USD estimate (internal/cost) can price
 // the day's spend: prompt at the input rate, completion and
-// subagent tokens at the output rate. The split is accounting only;
-// the budget meter is always the total, and Record (total only)
-// stays the simple path for callers without a split.
+// subagent tokens at the output rate. RecordUsageForModel keeps the
+// same split per (provider, model) (F-A5-P2-18), so /usage prices
+// each model's tokens at that model's own rate instead of repricing
+// the whole day at the chat's current model. The split is
+// accounting only; the budget meter is always the total, and Record
+// (total only) stays the simple path for callers without a split.
 package budget
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +74,34 @@ func (e *BudgetExceededError) Error() string {
 // Unwrap lets errors.Is(err, ErrBudgetExceeded) match.
 func (e *BudgetExceededError) Unwrap() error { return ErrBudgetExceeded }
 
+// modelDay is one (provider, model) slice of a chatDay: the same
+// split as chatDay, so /usage can price each model's tokens at that
+// model's own rate (F-A5-P2-18). The "" provider / "" model bucket
+// holds records made without a model (RecordUsage); it is priced at
+// the chat's current model by the caller.
+type modelDay struct {
+	used       int
+	prompt     int
+	completion int
+	subagent   int
+}
+
+// modelKey identifies one (provider, model) bucket. Provider and
+// Model are normalised (lowercase, trimmed) at record time, so
+// "DeepSeek" and "deepseek" never split a bucket.
+type modelKey struct {
+	Provider string
+	Model    string
+}
+
+// normalizeModelKey lowercases and trims a (provider, model) pair.
+func normalizeModelKey(provider, modelName string) modelKey {
+	return modelKey{
+		Provider: strings.ToLower(strings.TrimSpace(provider)),
+		Model:    strings.ToLower(strings.TrimSpace(modelName)),
+	}
+}
+
 // chatDay is one chat's usage for one UTC day. prompt/completion
 // are the provider-reported split for the day's turns; subagent is
 // the subagent tokens consumed by those turns (already included in
@@ -69,12 +109,15 @@ func (e *BudgetExceededError) Unwrap() error { return ErrBudgetExceeded }
 // separately only so the USD estimate can price them at the output
 // rate, since their own split is unknown). used is the budget
 // meter: the sum of TotalTokens as reported, subagent included.
+// byModel is the same split per (provider, model); it always sums
+// to the day totals.
 type chatDay struct {
 	day        string // "2006-01-02" in UTC
 	used       int
 	prompt     int
 	completion int
 	subagent   int
+	byModel    map[modelKey]*modelDay
 }
 
 // DayUsage is one chat's token usage for today, with the split the
@@ -96,6 +139,11 @@ type Budget struct {
 	limit int
 	now   func() time.Time
 	usage map[int64]*chatDay
+	// file is the persistence path set with SetFile ("" means
+	// in-memory only); loadedChats counts the chats restored by
+	// the last SetFile load, so the caller can log the reload.
+	file        string
+	loadedChats int
 }
 
 // New returns a Budget with the given per-chat daily token limit. A
@@ -143,7 +191,7 @@ func (b *Budget) entryLocked(chatID int64) *chatDay {
 	today := b.today()
 	e, ok := b.usage[chatID]
 	if !ok {
-		e = &chatDay{day: today}
+		e = &chatDay{day: today, byModel: map[modelKey]*modelDay{}}
 		b.usage[chatID] = e
 		return e
 	}
@@ -153,6 +201,10 @@ func (b *Budget) entryLocked(chatID int64) *chatDay {
 		e.prompt = 0
 		e.completion = 0
 		e.subagent = 0
+		e.byModel = map[modelKey]*modelDay{}
+	}
+	if e.byModel == nil {
+		e.byModel = map[modelKey]*modelDay{}
 	}
 	return e
 }
@@ -199,6 +251,17 @@ func (b *Budget) Record(chatID int64, tokens int) error {
 // and the next Check must see it. A negative count in any field is
 // a caller error and records nothing.
 func (b *Budget) RecordUsage(chatID int64, u model.Usage, subagentTokens int) error {
+	return b.RecordUsageForModel(chatID, "", "", u, subagentTokens)
+}
+
+// RecordUsageForModel is RecordUsage with the (provider, model)
+// the tokens were spent on, so the day's USD estimate can price
+// each model's tokens at that model's own rate (F-A5-P2-18). The
+// per-model buckets always sum to the day totals; the budget meter
+// is unchanged. An empty provider/model records into the "" bucket,
+// priced by the caller at the chat's current model. The same
+// negative-count and over-limit rules as RecordUsage apply.
+func (b *Budget) RecordUsageForModel(chatID int64, provider, modelName string, u model.Usage, subagentTokens int) error {
 	if u.PromptTokens < 0 || u.CompletionTokens < 0 || u.TotalTokens < 0 || subagentTokens < 0 {
 		return fmt.Errorf("budget: token counts must not be negative, got prompt=%d completion=%d total=%d subagent=%d", u.PromptTokens, u.CompletionTokens, u.TotalTokens, subagentTokens)
 	}
@@ -209,6 +272,22 @@ func (b *Budget) RecordUsage(chatID int64, u model.Usage, subagentTokens int) er
 	e.prompt += u.PromptTokens
 	e.completion += u.CompletionTokens
 	e.subagent += subagentTokens
+	key := normalizeModelKey(provider, modelName)
+	md := e.byModel[key]
+	if md == nil {
+		md = &modelDay{}
+		e.byModel[key] = md
+	}
+	md.used += u.TotalTokens
+	md.prompt += u.PromptTokens
+	md.completion += u.CompletionTokens
+	md.subagent += subagentTokens
+	// Best-effort auto-save: a failed persist must never lose the
+	// in-memory accounting or fail the turn that just completed —
+	// the spend is recorded either way, and Save() surfaces the
+	// error to a caller that checks. The save runs while mu is
+	// held so a concurrent record cannot interleave a torn write.
+	b.saveLocked()
 	if b.limit > 0 && e.used > b.limit {
 		return &BudgetExceededError{ChatID: chatID, Used: e.used - u.TotalTokens, Requested: u.TotalTokens, Limit: b.limit}
 	}
@@ -224,6 +303,28 @@ func (b *Budget) DayUsage(chatID int64) DayUsage {
 	e := b.entryLocked(chatID)
 	return DayUsage{Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent, Total: e.used}
 }
+
+// DayUsageByModel returns chatID's token usage for today split by
+// (provider, model), so the caller can price each model's tokens at
+// that model's own rate. It is empty for a chat with no usage; the
+// buckets always sum to DayUsage. The "" provider / "" model bucket
+// holds records made without a model (RecordUsage); the caller
+// prices that bucket at the chat's current model.
+func (b *Budget) DayUsageByModel(chatID int64) map[modelKey]DayUsage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e := b.entryLocked(chatID)
+	out := make(map[modelKey]DayUsage, len(e.byModel))
+	for k, md := range e.byModel {
+		out[k] = DayUsage{Prompt: md.prompt, Completion: md.completion, Subagent: md.subagent, Total: md.used}
+	}
+	return out
+}
+
+// ModelKey is the exported form of the (provider, model) bucket key
+// returned by DayUsageByModel. Provider and Model are normalised
+// (lowercase, trimmed).
+type ModelKey = modelKey
 
 // Usage returns the tokens chatID has consumed today. It is 0 for a
 // chat with no usage, and it resets at UTC midnight.
@@ -253,4 +354,212 @@ func (b *Budget) Remaining(chatID int64) int {
 func (b *Budget) ResetAt() time.Time {
 	now := b.now().UTC()
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+// --- Persistence (F-A5-P2-19) -------------------------------------------
+//
+// The budget is a rate control, but an in-memory-only counter is a
+// bypass: any daemon restart (crash, /restart, VM reboot) reset
+// every chat to zero spend. With a file set, every record
+// auto-saves atomically and a fresh Budget reloads today's totals
+// on SetFile, so spend survives restarts. The file holds one UTC
+// day only; a file from a previous day loads as empty.
+//
+// Wiring (coordinator: app.Build): after budget.New,
+// if cfg.DataDir != "" {
+//     if n, err := b.SetFile(filepath.Join(cfg.DataDir, "budget.json")); err != nil {
+//         logger.Printf("budget: persist disabled (%v); usage is in-memory only", err)
+//     } else if n > 0 {
+//         logger.Printf("budget: restored today's usage for %d chat(s) from %s", n, filepath.Join(cfg.DataDir, "budget.json"))
+//     }
+// }
+// No shutdown save is needed: records auto-save.
+
+// budgetFile is the on-disk shape: one UTC day, per-chat totals
+// plus the per-model split. The limit is config, never persisted.
+type budgetFile struct {
+	Version int                       `json:"version"`
+	Day     string                    `json:"day"`
+	Chats   map[string]budgetFileChat `json:"chats"`
+}
+
+type budgetFileChat struct {
+	Used       int               `json:"used"`
+	Prompt     int               `json:"prompt"`
+	Completion int               `json:"completion"`
+	Subagent   int               `json:"subagent"`
+	Models     []budgetFileModel `json:"models,omitempty"`
+}
+
+type budgetFileModel struct {
+	Provider   string `json:"provider"`
+	Model      string `json:"model"`
+	Used       int    `json:"used"`
+	Prompt     int    `json:"prompt"`
+	Completion int    `json:"completion"`
+	Subagent   int    `json:"subagent"`
+}
+
+// SetFile enables persistence at path: it loads today's usage from
+// the file when present (a missing file means "nothing recorded
+// yet", not an error; a file from a previous UTC day loads as
+// empty) and auto-saves on every later record. It returns how many
+// chats were restored, so the caller can log the reload. A corrupt
+// file is an error and persistence stays disabled — the in-memory
+// counters keep working, and the corrupt file is left alone for
+// the operator (fix or delete it and restart; it is never
+// overwritten while SetFile has failed).
+func (b *Budget) SetFile(path string) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.file = ""
+	b.loadedChats = 0
+	if strings.TrimSpace(path) == "" {
+		return 0, fmt.Errorf("budget: persistence path must not be empty")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			b.file = path
+			return 0, nil
+		}
+		return 0, fmt.Errorf("budget: read persistence file %q: %w", path, err)
+	}
+	var f budgetFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return 0, fmt.Errorf("budget: parse persistence file %q: %w", path, err)
+	}
+	if f.Version != 1 {
+		return 0, fmt.Errorf("budget: persistence file %q has unsupported version %d (want 1)", path, f.Version)
+	}
+	today := b.today()
+	if f.Day != today {
+		// Yesterday's spend never counts against today.
+		b.file = path
+		return 0, nil
+	}
+	restored := 0
+	for idStr, fc := range f.Chats {
+		chatID, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		if fc.Used < 0 || fc.Prompt < 0 || fc.Completion < 0 || fc.Subagent < 0 {
+			continue
+		}
+		e := &chatDay{
+			day:        today,
+			used:       fc.Used,
+			prompt:     fc.Prompt,
+			completion: fc.Completion,
+			subagent:   fc.Subagent,
+			byModel:    map[modelKey]*modelDay{},
+		}
+		for _, fm := range fc.Models {
+			if fm.Used < 0 || fm.Prompt < 0 || fm.Completion < 0 || fm.Subagent < 0 {
+				continue
+			}
+			e.byModel[normalizeModelKey(fm.Provider, fm.Model)] = &modelDay{
+				used: fm.Used, prompt: fm.Prompt, completion: fm.Completion, subagent: fm.Subagent,
+			}
+		}
+		// A chat with no per-model rows (written by an older
+		// build, or RecordUsage without a model) keeps its
+		// totals; the "" bucket is rebuilt so the split still
+		// sums to the totals.
+		if len(e.byModel) == 0 && (fc.Used > 0 || fc.Prompt > 0 || fc.Completion > 0 || fc.Subagent > 0) {
+			e.byModel[modelKey{}] = &modelDay{used: fc.Used, prompt: fc.Prompt, completion: fc.Completion, subagent: fc.Subagent}
+		}
+		b.usage[chatID] = e
+		restored++
+	}
+	b.file = path
+	b.loadedChats = restored
+	return restored, nil
+}
+
+// PersistPath returns the persistence file set with SetFile, or ""
+// when the budget is in-memory only.
+func (b *Budget) PersistPath() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.file
+}
+
+// LoadedChats returns how many chats the last SetFile load restored.
+func (b *Budget) LoadedChats() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.loadedChats
+}
+
+// Save persists today's usage atomically (temp file 0600 in the
+// same directory + fsync + rename + dir fsync, like the session
+// store). It is a no-op when no file is set. Records already
+// auto-save; Save exists for callers that want an explicit,
+// checked persist (e.g. shutdown).
+func (b *Budget) Save() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.saveLocked()
+}
+
+// saveLocked writes the file; caller must hold b.mu. It returns
+// nil when no file is set, and never mutates in-memory state.
+func (b *Budget) saveLocked() error {
+	if b.file == "" {
+		return nil
+	}
+	f := budgetFile{Version: 1, Day: b.today(), Chats: map[string]budgetFileChat{}}
+	for chatID, e := range b.usage {
+		if e.day != f.Day {
+			continue
+		}
+		fc := budgetFileChat{Used: e.used, Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent}
+		for k, md := range e.byModel {
+			fc.Models = append(fc.Models, budgetFileModel{
+				Provider: k.Provider, Model: k.Model,
+				Used: md.used, Prompt: md.prompt, Completion: md.completion, Subagent: md.subagent,
+			})
+		}
+		f.Chats[fmt.Sprintf("%d", chatID)] = fc
+	}
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return fmt.Errorf("budget: encode usage: %w", err)
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(b.file)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("budget: create persistence dir %q: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, ".budget-*.tmp")
+	if err != nil {
+		return fmt.Errorf("budget: create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("budget: chmod temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("budget: write temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("budget: sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("budget: close temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, b.file); err != nil {
+		return fmt.Errorf("budget: rename temp file: %w", err)
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

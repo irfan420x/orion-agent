@@ -25,6 +25,20 @@
 // directory (which might be a repo). The server child runs with its
 // working directory set to the data dir, never the repo cwd.
 //
+// # Confinement (Audit 5, F-A5-4)
+//
+// A server runs confined to the Orion sandbox by default (the same
+// namespace/chroot + seccomp confinement shell_exec uses — see
+// internal/mcp/sandbox.go): it sees /usr read-only and the sandbox
+// work dir, and can never read the agent's config, keys, or home
+// directory. The server binary must therefore live under /usr (or
+// resolve there). A server that needs host access opts out
+// explicitly with "sandbox": false in mcp.json, and an opted-out
+// server is FULLY TRUSTED code, equivalent to a hook: it runs as
+// the daemon uid with full filesystem access. Confinement is
+// fail-closed: when it is on but cannot be established, the server
+// is refused, never silently run unsandboxed.
+//
 // # Environment
 //
 // A server child NEVER inherits the agent's secrets: its environment
@@ -96,6 +110,16 @@ const (
 	// the model: a server's description is untrusted text in the
 	// provider request, and it must stay short.
 	maxDescriptionRunes = 2000
+	// maxToolsPerServer caps how many tools one server may
+	// advertise (Audit 5, F-A5-P2-9): a server advertising
+	// thousands of tools would flood every provider request with
+	// definitions. Extras are skipped and logged.
+	maxToolsPerServer = 64
+	// maxSchemaBytes caps the serialised JSON Schema of one tool
+	// (Audit 5, F-A5-P2-9): a multi-MB schema would flood the
+	// provider request the same way. An oversize schema is
+	// replaced with an empty object schema and logged.
+	maxSchemaBytes = 64 * 1024
 	// closeGrace is how long Close waits after SIGTERM before
 	// SIGKILL: enough for a well-behaved server to exit cleanly.
 	closeGrace = 2 * time.Second
@@ -151,12 +175,32 @@ type Client struct {
 	dataDir string
 	logger  *log.Logger
 
-	mu      sync.Mutex // guards started/closed/cmd
+	mu      sync.Mutex // guards started/starting/closed/cmd/onDead
 	started bool
-	closed  bool
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stderr  *cappedBuffer
+	// starting is true between the check in Start and the moment
+	// Start records the outcome: two concurrent Start calls must
+	// never both launch the server (Audit 5, F-A5-P2-17). The
+	// check-and-set of started/starting is atomic under mu; the
+	// flag is cleared when Start returns, so a failed Start can
+	// be retried.
+	starting bool
+	closed   bool
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	stderr   *cappedBuffer
+	// onDead, when set (by the Manager), is called exactly once
+	// when the server dies, so the Manager can deregister the
+	// server's tools (Audit 5, F-A5-P2-12).
+	onDead       func(*Client)
+	deadHookOnce sync.Once
+
+	// waitCh is closed once cmd.Wait has reaped the server
+	// process; waitOnce guards the single Wait (Audit 5,
+	// F-A5-P2-12: a dead server must not be left a zombie).
+	// waitCh is created in NewClient so Close can always select
+	// on it once a process exists.
+	waitCh   chan struct{}
+	waitOnce sync.Once
 
 	writeMu sync.Mutex // serialises all writes (calls + server-request replies)
 
@@ -181,6 +225,7 @@ func NewClient(name string, cfg ServerConfig, dataDir string) *Client {
 		logger:  log.New(os.Stderr, "orion/mcp: ", log.LstdFlags),
 		pending: map[int64]chan rpcResponse{},
 		done:    make(chan struct{}),
+		waitCh:  make(chan struct{}),
 	}
 }
 
@@ -208,16 +253,23 @@ func (c *Client) Name() string { return c.name }
 
 // Alive reports whether the server process is up (started and the
 // reader has not observed its death). It is a snapshot: a server
-// can die immediately after.
+// can die immediately after. A client that was never started is
+// NOT alive (Audit 5, F-A5-P2-15): the old check returned true
+// before Start ever ran.
 func (c *Client) Alive() bool {
+	c.mu.Lock()
+	started := c.started
+	c.mu.Unlock()
 	c.deadMu.Lock()
 	defer c.deadMu.Unlock()
-	return c.deadErr == nil
+	return started && c.deadErr == nil
 }
 
 // markDead records the server's death and wakes every waiter: the
 // reader calls it on EOF/error, Close calls it after killing the
-// process. The first error wins; later ones are dropped.
+// process. The first error wins; later ones are dropped. The
+// onDead hook (when set) fires exactly once, so the Manager can
+// deregister the server's tools.
 func (c *Client) markDead(err error) {
 	c.deadMu.Lock()
 	if c.deadErr == nil {
@@ -229,6 +281,14 @@ func (c *Client) markDead(err error) {
 	c.deadMu.Unlock()
 	c.doneOnce.Do(func() { close(c.done) })
 	c.failPending(err)
+	c.deadHookOnce.Do(func() {
+		c.mu.Lock()
+		hook := c.onDead
+		c.mu.Unlock()
+		if hook != nil {
+			hook(c)
+		}
+	})
 }
 
 // deadError returns the recorded death error, or nil.
@@ -320,8 +380,14 @@ func (c *Client) serverEnv() []string {
 // past that. On failure the process is killed and Start reports
 // the error; the client must not be reused afterwards.
 func (c *Client) Start(ctx context.Context) error {
+	// The check-and-set of started/starting is atomic under mu:
+	// two concurrent Start calls must never both launch the
+	// server (Audit 5, F-A5-P2-17). The flag is cleared when
+	// Start returns, so a failed Start can be retried; a
+	// successful Start leaves started set, and starting is
+	// cleared by the same defer.
 	c.mu.Lock()
-	if c.started {
+	if c.started || c.starting {
 		c.mu.Unlock()
 		return errors.New("mcp: client already started")
 	}
@@ -329,7 +395,13 @@ func (c *Client) Start(ctx context.Context) error {
 		c.mu.Unlock()
 		return errors.New("mcp: client is closed")
 	}
+	c.starting = true
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.starting = false
+		c.mu.Unlock()
+	}()
 
 	if !namePattern.MatchString(c.name) {
 		return fmt.Errorf("mcp: invalid server name %q (want letters, digits, _ or -)", c.name)
@@ -343,6 +415,9 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !c.cfg.sandboxEnabled() {
+		c.logf("server %q runs UNSANDBOXED (\"sandbox\": false in mcp.json): it is fully trusted code, like a hook, and can read the agent's config and home directory", c.name)
 	}
 
 	cmd := exec.Command(path, c.cfg.Args...)
@@ -363,6 +438,20 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	c.stderr = &cappedBuffer{limit: 16 * 1024}
 	cmd.Stderr = c.stderr
+	// Confinement (Audit 5, F-A5-4): by default the server runs
+	// under the Orion sandbox (namespace/chroot + seccomp, the
+	// same confinement as shell_exec) — see
+	// prepareSandboxed. It rewrites cmd to run the sandbox
+	// wrapper; the pipes above survive it (Prepare does not
+	// touch Stdin/Stdout), so the MCP session still speaks over
+	// them. Fail-closed: a sandbox that cannot be established
+	// refuses the server, it never silently runs unsandboxed.
+	if c.cfg.sandboxEnabled() {
+		if err := c.prepareSandboxed(cmd, path); err != nil {
+			_ = stdin.Close()
+			return err
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		return fmt.Errorf("mcp: server %q: start: %w", c.name, err)
@@ -405,16 +494,44 @@ func (c *Client) Start(ctx context.Context) error {
 // server until EOF/error, routing responses to their callers and
 // answering server requests. It never blocks on a caller: a
 // response with no waiter is dropped, and a request reply is a
-// best-effort write. On exit it marks the client dead.
+// best-effort write. On exit it marks the client dead and reaps
+// the server process (Audit 5, F-A5-P2-12: a dead server must not
+// be left a zombie).
+//
+// The line cap is enforced INCREMENTALLY (Audit 5, F-A5-3): the
+// old code used ReadBytes('\n') and only checked the length after
+// it returned, so a server streaming without a newline grew memory
+// unboundedly (bufio's collectFragments accumulates 64 KiB buffers
+// with no limit) and the cap never fired. This loop reads with
+// ReadSlice, which returns at most one 64 KiB buffer at a time,
+// and kills the server the moment the accumulated line exceeds
+// maxLineBytes — memory stays bounded by the cap plus one buffer,
+// and a newline-less flood dies promptly instead of OOMing the
+// daemon.
 func (c *Client) readLoop(r *bufio.Reader) {
+	defer func() { go c.reap() }()
+	var line []byte
 	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > maxLineBytes {
-			c.markDead(fmt.Errorf("mcp: server %q sent a line over %d bytes; killing it", c.name, maxLineBytes))
-			c.killProcess()
-			return
+		frag, err := r.ReadSlice('\n')
+		if len(frag) > 0 {
+			// Copy: the fragment aliases the reader's buffer
+			// and is overwritten by the next ReadSlice.
+			line = append(line, frag...)
+			if len(line) > maxLineBytes {
+				c.markDead(fmt.Errorf("mcp: server %q sent a line over %d bytes; killing it", c.name, maxLineBytes))
+				c.killProcess()
+				return
+			}
 		}
-		if err != nil && len(line) == 0 {
+		if err == bufio.ErrBufferFull {
+			continue // more fragments of the same line coming
+		}
+		if err != nil {
+			if len(line) > 0 {
+				// A final line without a trailing newline
+				// is still a message: process it, then exit.
+				c.handleLine(bytes.TrimSpace(line))
+			}
 			if err == io.EOF {
 				c.markDead(fmt.Errorf("mcp: server %q exited (stderr: %s)", c.name, strings.TrimSpace(c.stderrString())))
 			} else {
@@ -422,14 +539,9 @@ func (c *Client) readLoop(r *bufio.Reader) {
 			}
 			return
 		}
-		// A final line without a trailing newline is still a
-		// message (err == io.EOF with len > 0): process it, then
-		// loop and exit on the next read.
+		// A complete newline-terminated line.
 		c.handleLine(bytes.TrimSpace(line))
-		if err != nil {
-			c.markDead(fmt.Errorf("mcp: server %q exited (stderr: %s)", c.name, strings.TrimSpace(c.stderrString())))
-			return
-		}
+		line = nil
 	}
 }
 
@@ -616,7 +728,12 @@ type listToolsResult struct {
 // are skipped (and logged); the rest are normalised (description
 // capped, input schema defaulted to an empty object schema when
 // missing or malformed) so a sloppy server can never hand the model
-// a broken tool definition.
+// a broken tool definition. Two floods are capped (Audit 5,
+// F-A5-P2-9): at most maxToolsPerServer tools are kept (extras are
+// skipped and logged), and a tool whose serialised schema exceeds
+// maxSchemaBytes gets an empty object schema instead — a server
+// must not be able to inject thousands of definitions, or one
+// multi-MB schema, into every provider request.
 func (c *Client) ListTools(ctx context.Context) ([]ToolInfo, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -629,14 +746,23 @@ func (c *Client) ListTools(ctx context.Context) ([]ToolInfo, error) {
 	}
 	out := make([]ToolInfo, 0, len(res.Tools))
 	for _, t := range res.Tools {
+		if len(out) >= maxToolsPerServer {
+			c.logf("server %q advertised %d tools; keeping the first %d and skipping the rest", c.name, len(res.Tools), maxToolsPerServer)
+			break
+		}
 		if !namePattern.MatchString(t.Name) {
 			c.logf("server %q advertised tool with invalid name %q; skipping", c.name, t.Name)
 			continue
 		}
+		schema := normalizeInputSchema(t.InputSchema)
+		if b, err := json.Marshal(schema); err != nil || len(b) > maxSchemaBytes {
+			c.logf("server %q tool %q has an oversize schema (%d bytes); replacing with an empty object schema", c.name, t.Name, len(b))
+			schema = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
 		out = append(out, ToolInfo{
 			Name:        t.Name,
 			Description: truncateRunes(strings.TrimSpace(t.Description), maxDescriptionRunes),
-			InputSchema: normalizeInputSchema(t.InputSchema),
+			InputSchema: schema,
 		})
 	}
 	return out, nil
@@ -712,6 +838,26 @@ func (c *Client) killProcess() {
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 }
 
+// reap waits for the server process to be reaped, exactly once:
+// cmd.Wait may run only once, so waitOnce guards it, and waitCh
+// closes when the wait has finished. Callers (readLoop on death,
+// Close on shutdown) may all call reap; only one of them actually
+// waits, the rest return once the wait is done. A server that dies
+// mid-turn is reaped here, not left a zombie until daemon
+// shutdown (Audit 5, F-A5-P2-12).
+func (c *Client) reap() {
+	c.mu.Lock()
+	cmd := c.cmd
+	c.mu.Unlock()
+	if cmd == nil {
+		return
+	}
+	c.waitOnce.Do(func() {
+		_ = cmd.Wait()
+		close(c.waitCh)
+	})
+}
+
 // Close terminates the server: close stdin (a polite EOF), SIGTERM
 // the process group, wait up to closeGrace, then SIGKILL. It waits
 // for the process to be reaped so no zombie is left, and marks the
@@ -735,18 +881,20 @@ func (c *Client) Close() error {
 	if stdin != nil {
 		_ = stdin.Close()
 	}
-	// SIGTERM the group, then reap with a grace deadline.
+	// SIGTERM the group, then reap with a grace deadline. The
+	// reap is shared with readLoop (same waitOnce/waitCh): if
+	// the server already died, its reader is reaping it and
+	// this select just waits for that reap to land.
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go c.reap()
 	select {
-	case <-done:
+	case <-c.waitCh:
 		return nil
 	case <-time.After(closeGrace):
 		c.killProcess()
-		<-done
+		<-c.waitCh
 		return nil
 	}
 }

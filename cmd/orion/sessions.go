@@ -14,10 +14,12 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/irfan/orion/internal/app"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/session"
 )
@@ -111,17 +113,28 @@ func cmdSessionsResume(idOrPrefix string) error {
 	if err != nil {
 		return fmt.Errorf("sessions resume: open transcript: %w", err)
 	}
-	msgs, err := tr.Messages()
+	// LoadResumedSession (Audit 5 F-A5-P2-5) loads the messages and
+	// merges the transcript's summaries into the shared fact,
+	// instead of silently dropping the summaries and the cap /
+	// corrupt-line outcomes.
+	logger := log.New(os.Stderr, "orion: ", log.LstdFlags)
+	rep, err := app.LoadResumedSession(local.Memory, tr, full, logger)
 	if err != nil {
-		return fmt.Errorf("sessions resume: read transcript: %w", err)
-	}
-	if err := local.Memory.ReplaceMessages(msgs); err != nil {
 		return fmt.Errorf("sessions resume: load history: %w", err)
 	}
 	if err := session.WriteCurrent(cfg.DataDir, full); err != nil {
 		return fmt.Errorf("sessions resume: record current session: %w", err)
 	}
-	fmt.Printf("Resumed session %s (%d message(s) in history).\n", full, len(msgs))
+	fmt.Printf("Resumed session %s (%d message(s) in history).\n", full, rep.LoadedMessages)
+	if rep.Capped {
+		fmt.Printf("Note: the transcript held %d messages; working history is capped at %d.\n", rep.TranscriptMessages, rep.LoadedMessages)
+	}
+	if rep.CorruptLines > 0 {
+		fmt.Printf("Note: %d corrupt line(s) were skipped.\n", rep.CorruptLines)
+	}
+	if rep.SummariesLoaded > 0 {
+		fmt.Printf("Note: %d summaries were merged into memory.\n", rep.SummariesLoaded)
+	}
 	return nil
 }
 

@@ -29,6 +29,26 @@ type ServerConfig struct {
 	// They are the operator's explicit choice (see the package
 	// doc) and overlay the scrubbed process environment.
 	Env map[string]string `json:"env"`
+	// Sandbox confines the server to the Orion sandbox (the same
+	// namespace/chroot + seccomp confinement shell_exec uses):
+	// the server can only see /usr (read-only) and the sandbox
+	// work dir, and can never read the agent's config, keys, or
+	// home directory. It defaults to ON (nil means sandboxed):
+	// a server that needs host access — a filesystem server over
+	// the operator's real directories, a binary installed
+	// outside /usr — must opt out explicitly with
+	// "sandbox": false, and an opted-out server is FULLY TRUSTED
+	// code, equivalent to a hook: it runs as the daemon uid with
+	// full filesystem access and can read the agent's config.
+	// Opting out is logged loudly at startup.
+	Sandbox *bool `json:"sandbox,omitempty"`
+}
+
+// sandboxEnabled reports whether this server runs confined. The
+// default is confined (a nil Sandbox pointer means "sandboxed");
+// only an explicit "sandbox": false opts out.
+func (s ServerConfig) sandboxEnabled() bool {
+	return s.Sandbox == nil || *s.Sandbox
 }
 
 // maxConfigBytes caps mcp.json: a config file is small, and an

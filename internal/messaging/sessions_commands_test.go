@@ -146,3 +146,41 @@ func TestResumeCommandUnwired(t *testing.T) {
 		t.Errorf("unwired reply should say unavailable: %q", reply)
 	}
 }
+
+// TestResumeCommandReportsCorruptAndCap (Audit 5 F-A5-P2-5): when
+// the last-resume report says the transcript was capped, had
+// corrupt lines, and merged summaries, the /resume reply must say
+// so instead of silently dropping it.
+func TestResumeCommandReportsCorruptAndCap(t *testing.T) {
+	s := newStubSessionEnv()
+	s.env.LastResumeReport = func(chatID int64) (ResumeReport, bool) {
+		return ResumeReport{
+			SessionID:          s.resumeID,
+			TranscriptMessages: 250,
+			LoadedMessages:     200,
+			CorruptLines:       1,
+			SummariesLoaded:    2,
+			Capped:             true,
+		}, true
+	}
+	reply := dispatchSession(t, s, "/resume 20261113-150405-aa")
+	for _, want := range []string{
+		"the transcript held 250 messages; working history is capped at 200",
+		"1 corrupt line(s) were skipped",
+		"2 summaries were merged into memory",
+	} {
+		if !strings.Contains(reply, want) {
+			t.Errorf("reply missing %q:\n%s", want, reply)
+		}
+	}
+}
+
+// TestResumeCommandWithoutReportStaysShort: with no report wired,
+// the reply keeps its short form (no dangling "Note:").
+func TestResumeCommandWithoutReportStaysShort(t *testing.T) {
+	s := newStubSessionEnv()
+	reply := dispatchSession(t, s, "/resume 20261113-150405-aa")
+	if strings.Contains(reply, "Note:") {
+		t.Errorf("reply without a report should not carry a note:\n%s", reply)
+	}
+}

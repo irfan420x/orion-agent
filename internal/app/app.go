@@ -186,7 +186,7 @@ func Build(path string) (*App, error) {
 	// parent turn) and pollutes the parent's history. The child
 	// shares only the provider (concurrent-safe) and the typed
 	// memories (read-only view).
-	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus))
+	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, registry.PlanningStore()))
 
 	// Model-visible subagent tools, registered on the PARENT
 	// registry only (children get a registry without them, so no
@@ -246,6 +246,15 @@ func Build(path string) (*App, error) {
 		MCP:        mcpMgr,
 		StartedAt:  time.Now(),
 		typedStore: typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
+	}
+	// Budget persistence (Audit 5 F-A5-P2-19): without a file, a
+	// daemon restart resets every chat's daily spend to zero. The
+	// file holds today's per-chat totals (atomic write-temp+rename
+	// in budget.SetFile); a stale day loads as empty.
+	if n, err := app.Budget.SetFile(filepath.Join(cfg.DataDir, "budget.json")); err != nil {
+		logger.Printf("budget: persist disabled (%v); usage is in-memory only", err)
+	} else if n > 0 {
+		logger.Printf("budget: restored today's usage for %d chat(s) from %s", n, filepath.Join(cfg.DataDir, "budget.json"))
 	}
 	// Per-session transcript (audit P0 #4): the CLI/global agent
 	// records every stored turn into the live session transcript
