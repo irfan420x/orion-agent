@@ -120,6 +120,19 @@ const (
 	// provider request the same way. An oversize schema is
 	// replaced with an empty object schema and logged.
 	maxSchemaBytes = 64 * 1024
+	// nearCapLineBytes is the size at which an invalid-JSON line
+	// counts as "near-cap" (Audit 6, F-A6-P2-21): half the line
+	// cap. A server streaming such lines is burning CPU in
+	// readLoop/handleLine even though memory stays bounded.
+	nearCapLineBytes = maxLineBytes / 2
+	// maxConsecutiveNearCapInvalidLines bounds how many near-cap
+	// invalid lines a server may send in a row (Audit 6,
+	// F-A6-P2-21): past this many, the server is killed instead
+	// of being allowed to keep the reader busy indefinitely. A
+	// valid line — or an invalid line below the near-cap size —
+	// resets the streak, so an occasionally confused server is
+	// not punished for one bad burst.
+	maxConsecutiveNearCapInvalidLines = 5
 	// closeGrace is how long Close waits after SIGTERM before
 	// SIGKILL: enough for a well-behaved server to exit cleanly.
 	closeGrace = 2 * time.Second
@@ -185,9 +198,15 @@ type Client struct {
 	// be retried.
 	starting bool
 	closed   bool
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stderr   *cappedBuffer
+	// closePending is set by Close when it lands while Start is
+	// still preparing (starting==true, cmd==nil): there is no
+	// process to kill yet, so Start must kill the process it is
+	// about to launch instead of letting it run (Audit 6,
+	// F-A6-P2-13). Guarded by mu, like starting/closed/cmd.
+	closePending bool
+	cmd          *exec.Cmd
+	stdin        io.WriteCloser
+	stderr       *cappedBuffer
 	// onDead, when set (by the Manager), is called exactly once
 	// when the server dies, so the Manager can deregister the
 	// server's tools (Audit 5, F-A5-P2-12).
@@ -461,6 +480,24 @@ func (c *Client) Start(ctx context.Context) error {
 	c.stdin = stdin
 	c.started = true
 	c.mu.Unlock()
+	// F-A6-P2-13: Close may have landed while Start was still
+	// preparing (starting==true, cmd==nil — the window spans the
+	// whole prepareSandboxed for a sandboxed server). Close
+	// recorded the request in closePending because there was no
+	// process to kill yet; honour it here, now that the process
+	// exists, instead of handshaking with a client that is
+	// already closed. Close kills even when closed is already
+	// set (see Close), so this also covers a Close that landed
+	// after cmd was assigned but before the reader started. The
+	// client was never usable, so started is cleared again.
+	if c.closeRequested() {
+		c.mu.Lock()
+		c.started = false
+		c.closePending = false
+		c.mu.Unlock()
+		_ = c.Close()
+		return errors.New("mcp: client closed during start")
+	}
 	go c.readLoop(bufio.NewReaderSize(stdout, 64*1024))
 
 	// Handshake under its own timeout: a server that starts but
@@ -490,6 +527,17 @@ func (c *Client) Start(ctx context.Context) error {
 	return nil
 }
 
+// closeRequested reports whether Close has been called (either
+// before Start launched the process, recorded as closePending,
+// or at any later time). Start checks it right after cmd.Start
+// so a Close that landed during preparation still kills the
+// server (Audit 6, F-A6-P2-13).
+func (c *Client) closeRequested() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed || c.closePending
+}
+
 // readLoop is the reader goroutine: it reads NDJSON lines from the
 // server until EOF/error, routing responses to their callers and
 // answering server requests. It never blocks on a caller: a
@@ -508,9 +556,33 @@ func (c *Client) Start(ctx context.Context) error {
 // maxLineBytes — memory stays bounded by the cap plus one buffer,
 // and a newline-less flood dies promptly instead of OOMing the
 // daemon.
+//
+// Near-cap invalid lines are rate-limited too (Audit 6,
+// F-A6-P2-21): a server streaming 15 MiB lines of invalid JSON
+// forever stays under the memory cap but keeps readLoop and
+// handleLine busy indefinitely. After
+// maxConsecutiveNearCapInvalidLines such lines in a row the server
+// is killed, exactly like a line over the cap.
 func (c *Client) readLoop(r *bufio.Reader) {
 	defer func() { go c.reap() }()
 	var line []byte
+	nearCapInvalid := 0
+	// checkLine routes one complete line and reports whether the
+	// loop must stop: true only when the near-cap invalid-line
+	// limit fired and the server was killed.
+	checkLine := func(trimmed []byte) bool {
+		if c.handleLine(trimmed) && len(trimmed) >= nearCapLineBytes {
+			nearCapInvalid++
+			if nearCapInvalid >= maxConsecutiveNearCapInvalidLines {
+				c.markDead(fmt.Errorf("mcp: server %q sent %d consecutive near-cap invalid lines (%d bytes or more each); killing it", c.name, maxConsecutiveNearCapInvalidLines, nearCapLineBytes))
+				c.killProcess()
+				return true
+			}
+			return false
+		}
+		nearCapInvalid = 0
+		return false
+	}
 	for {
 		frag, err := r.ReadSlice('\n')
 		if len(frag) > 0 {
@@ -530,7 +602,7 @@ func (c *Client) readLoop(r *bufio.Reader) {
 			if len(line) > 0 {
 				// A final line without a trailing newline
 				// is still a message: process it, then exit.
-				c.handleLine(bytes.TrimSpace(line))
+				_ = checkLine(bytes.TrimSpace(line))
 			}
 			if err == io.EOF {
 				c.markDead(fmt.Errorf("mcp: server %q exited (stderr: %s)", c.name, strings.TrimSpace(c.stderrString())))
@@ -540,7 +612,9 @@ func (c *Client) readLoop(r *bufio.Reader) {
 			return
 		}
 		// A complete newline-terminated line.
-		c.handleLine(bytes.TrimSpace(line))
+		if checkLine(bytes.TrimSpace(line)) {
+			return
+		}
 		line = nil
 	}
 }
@@ -556,32 +630,35 @@ func (c *Client) stderrString() string {
 // handleLine routes one NDJSON line: a server request gets an
 // answer, a notification is dropped, a response goes to its
 // caller, and anything unparseable is logged and dropped (a
-// confused server must not wedge the client).
-func (c *Client) handleLine(line []byte) {
+// confused server must not wedge the client). It reports whether
+// the line was unparsable, so readLoop can rate-limit repeated
+// near-cap invalid lines (Audit 6, F-A6-P2-21). Only readLoop
+// calls it, so it runs on the reader goroutine.
+func (c *Client) handleLine(line []byte) bool {
 	if len(line) == 0 {
-		return
+		return false
 	}
 	var env envelope
 	if err := json.Unmarshal(line, &env); err != nil {
 		c.logf("server %q sent unparsable output, dropping %d bytes", c.name, len(line))
-		return
+		return true
 	}
 	if env.Method != "" {
 		if env.ID == nil {
-			return // notification from the server: nothing to answer
+			return false // notification from the server: nothing to answer
 		}
 		c.answerServerRequest(env)
-		return
+		return false
 	}
 	if env.ID == nil {
 		c.logf("server %q sent a response with no id, dropping", c.name)
-		return
+		return false
 	}
 	var id int64
 	if err := json.Unmarshal(*env.ID, &id); err != nil {
 		// Our requests always carry numeric IDs; a response
 		// with a non-numeric ID cannot be ours.
-		return
+		return false
 	}
 	c.pendingMu.Lock()
 	ch, ok := c.pending[id]
@@ -590,12 +667,13 @@ func (c *Client) handleLine(line []byte) {
 	}
 	c.pendingMu.Unlock()
 	if !ok {
-		return // late response to a timed-out call: drop it
+		return false // late response to a timed-out call: drop it
 	}
 	select {
 	case ch <- rpcResponse{Result: env.Result, Error: env.Error}:
 	default:
 	}
+	return false
 }
 
 // answerServerRequest replies to a request the server sent us.
@@ -863,10 +941,34 @@ func (c *Client) reap() {
 // for the process to be reaped so no zombie is left, and marks the
 // client dead so in-flight calls fail instead of hanging. It is
 // safe to call more than once, and on a client that never started.
+//
+// Close during Start (Audit 6, F-A6-P2-13): if Start is still
+// preparing (starting==true, cmd==nil — the window spans the whole
+// prepareSandboxed for a sandboxed server) there is no process to
+// kill yet, so Close records the request as closePending and
+// returns immediately instead of waiting: Start honours it right
+// after cmd.Start() and kills the server there. Close NEVER waits
+// for Start to finish — a Close on a Start blocked in the
+// initialize handshake must return promptly and kill the server,
+// not wait out the handshake timeout.
+//
+// A second Close still kills when a process exists: the old code
+// returned early on closed==true before looking at cmd, so
+// Start's failure path calling Close() again after an earlier
+// Close was a silent no-op and the server leaked. Re-killing is
+// best-effort (SIGTERM/SIGKILL on a dead group are ignored) and
+// the reap is shared through waitOnce/waitCh, so a repeated Close
+// returns as soon as the process is reaped.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	if c.closed {
+	if c.starting && c.cmd == nil {
+		// Start is in flight but has not launched the process
+		// yet: record a pending kill for Start to honour, and
+		// return without waiting (see above).
+		c.closed = true
+		c.closePending = true
 		c.mu.Unlock()
+		c.markDead(errors.New("mcp: client closed"))
 		return nil
 	}
 	c.closed = true

@@ -1,5 +1,8 @@
 # Orion Security
 
+Orion is MIT-licensed (see [LICENSE](LICENSE)); the repository is
+public at https://github.com/irfan420x/orion-agent.
+
 ## Denylist — the rule that matters most
 
 On 2026-11-13 a denylist test ran a live `rm -rf /` and destroyed
@@ -421,6 +424,127 @@ key file is an error, never silently replaced).
   request URL (which contains the token), so errors are wrapped in
   a redacting error type (`[redacted]` in `Error()`; `Unwrap()` is
   preserved for `errors.Is`/`errors.As`).
+
+## Telegram controls: permission gate, per-chat isolation, owner tier, daily budget
+
+### Permission gate (`internal/permissions`, `internal/app`)
+
+Destructive and network tools never run on Telegram without approval
+when a gate is installed. Tools are classified (`permissions.Classify`):
+**destructive** — `shell_exec`, `file_write`, `file_edit`,
+`subagent_spawn`; **network** — `web_fetch`, `web_search`, and every
+`mcp__<server>__<tool>` (an MCP server is an external process with
+unknown capabilities); everything else is **safe** and runs without
+prompting. When the model calls a gated tool, the daemon sends a
+Telegram card with Approve / Deny / Always / Never buttons and blocks
+the turn for up to **90 s** (`permissions.DefaultTimeout`). Approve
+runs the call once; Always/Deny persist a per-tool rule in
+`permissions.json` (0600) under the data dir; on timeout or cancel
+the gate edits the card in place (text → "⏰ Expired…", keyboard
+removed) so a dead card never looks live. Every prompt, tap, and
+outcome is logged with the request ID. The shell denylist stays
+absolute: a denylisted command can never be approved, gate or no gate.
+
+Wiring (verified in rc10): the gate is installed by `oriond`
+(`cmd/oriond/main.go`, `SetPermissionGate`) and applied per chat
+(`internal/app/chats.go`). **Known gap (Audit 6, F-A6-3, an rc11
+fix):** `orion daemon` and `orion telegram poll` (`cmd/orion/main.go`)
+did not call `SetPermissionGate` in rc10, and `orion telegram poll`
+used the global handler instead of the per-chat one — so those two
+entrypoints ran Telegram turns ungated and unisolated. The live
+daemon is `oriond`, so there was no live exposure, but do not treat
+`orion daemon` / `orion telegram poll` as gated until the rc11 fix
+is verified in the tree. CLI runs (`orion run`, `orion chat`) stay
+ungated by design (denylist only).
+
+### Per-chat isolation (`internal/app`, `internal/messaging`)
+
+Each Telegram chat gets its own agent, history, provider/model
+override, session memory, usage, and pause flag, under
+`<data_dir>/chats/<chatID>/`; transcripts live under
+`chats/<chatID>/sessions/<session-id>.jsonl`. `/new`, `/model`,
+`/pause`, `/undo`, `/compress`, `/save`, `/status`, `/memory` act on
+the caller's chat only. Long-term facts and typed memories stay
+shared — they are the user's knowledge base, not per-chat state.
+Per-chat command-framework state (title, footer preference, pause
+flag, usage totals) persists in `<data_dir>/sessions.json` (0600).
+Subagent tasks are attributed to their owning chat at spawn, so one
+chat's turn-end sweep can never charge another chat's tasks.
+
+### Owner tier and sender check (`internal/messaging`)
+
+The gateway checks the **sender**, not just the chat:
+`IsSenderAllowed` is enforced for messages and for approval-button
+callbacks, and a message from a non-allowlisted sender is dropped
+before the handler (and the agent, and its tools) ever sees it; the
+dropped chat's ID is logged so the operator can find it. The **owner**
+is the first entry of `telegram_allowed_chats` (no separate config
+field); daemon-wide operations are owner-only — `/restart` refuses
+non-owners — and approval taps are accepted only from the requesting
+sender or the owner. If the allowlist is empty there is no owner and
+owner-only operations are refused for everyone. `allow_all_telegram_chats`
+is a first-time-setup opt-in only: it auto-disables 10 minutes after
+daemon start, with a loud startup warning, and must never be left on
+in a running deployment.
+
+### Per-chat daily budget (`internal/budget`, `internal/app`, `internal/cost`)
+
+Each chat gets its own token budget per UTC day — default **100,000
+tokens** (`per_chat_daily_token_budget` in config, 0 = unlimited,
+1,000–10,000,000). Enforcement lives in `runChatTurn`: a pre-flight
+check refuses a turn whose projected input would exceed the remaining
+budget, a mid-turn check aborts after a provider response that
+crosses it, and the turn's spend is recorded even for failed turns
+(an over-budget record is logged; the *next* turn is refused).
+Usage persists to `<data_dir>/budget.json` (auto-save on every
+record, atomic temp-file + rename), so a daemon restart does not
+reset any chat's daily total. `/usage` shows the chat's day —
+tokens with the prompt/completion/subagent split, the budget limit
+and remaining, and an estimated USD cost from the versioned price
+table (`internal/cost`, v2026-11-13) — an estimate, never the bill,
+and "unknown" for a model with no price, never $0.
+
+Known metering gaps (Audit 6, rc11 fixes — verify they landed
+before tagging): **F-A6-1** — `/compress` spent provider tokens no
+production caller metered in rc10; **F-A6-P2-6** — the mid-turn
+check reads the main agent's usage and is blind to subagent spend
+during the turn (charged at turn end by the sweep instead);
+**F-A6-P2-7** — timed-out subagent tasks, and tasks finishing after
+the last turn, were never charged in rc10.
+
+## MCP confinement (`internal/mcp`)
+
+MCP servers configured in `<data_dir>/mcp.json` run **confined by
+default** under the same sandbox `shell_exec` uses: new mount/PID/IPC/
+UTS namespaces, a pivot_root into a chroot holding only `/usr`
+(read-only) and the sandbox work dir, and the `orion-seccomp` filter.
+A sandboxed server cannot read `~/.orion/config.json` (the DeepSeek
+key, the Telegram token), `~/.ssh`, or the home directory; `HOME` is
+`/work`, `TMPDIR` is `/tmp`, and its environment is scrubbed (no
+`ORION_*`, `*_API_KEY`, `*_TOKEN`, `*_SECRET*`, `*_PASSWORD*`, or
+credential-bearing proxy vars). Confinement is fail-closed: an
+unavailable sandbox, a server binary not visible inside the chroot
+(it must live under `/usr`), or a missing seccomp launcher refuses
+the server at start — it never silently runs unsandboxed. Servers
+keep the host network namespace (they are network-class by design;
+every `mcp__` tool needs approval — see the permission gate above),
+and the line reader kills a server past the 16 MiB cap, so a
+newline-less flood cannot OOM the daemon. MCP results are delimited
+in the prompt; treat MCP-originated text as untrusted third-party
+data (Audit 6, F-A6-P2-19 — there is no system-prompt warning for it
+yet in rc10).
+
+Opt-out is per server and explicit: `"sandbox": false` in `mcp.json`
+runs that server fully trusted, like a hook — it can read the
+agent's config and home directory, and the daemon logs the opt-out.
+**Known limitation (Audit 6, F-A6-P2-14):** sandboxed MCP servers
+share the sandbox work dir (`<data_dir>/sandbox/work`, i.e. `/work`)
+with `shell_exec` — a server can read files a shell turn left there
+and plant files a later shell turn might run. Do not leave secrets
+in `/work`. `ScrubEnv` is name-based only: a secret-shaped *value*
+under an innocuous env name reaches a sandboxed server intact
+(F-A6-P2-20, defence-in-depth only — the daemon's env normally holds
+no secrets, config is file-based).
 
 ## File-tool confinement
 

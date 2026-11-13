@@ -6,7 +6,112 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Audit 6 fixes (v0.2.0-rc11) — see `AUDIT6_2026-11-13.md`
+
+Fixes the 3 P1s and the P2 batch from the fresh-eyes audit of rc10
+(0 P0, 3 P1, 21 P2), plus the reproduced live approval-button
+failure (callback never delivered — see below). **Verdict: NOT
+production-ready** — the 24–72 h daemon soak (F-A3-4) is still open,
+and F-A3-2 (no pprof/debug endpoint) is still open. Verified by the
+release coordinator on the final commit: **1,101 tests pass, 0 fail,
+4 skip (total 1,105), 21/21 packages, race clean 21/21, no data
+race**; live DeepSeek proof `17*23+5=396` (rc10: 1,059 total: 1,055
+pass, 0 fail, 4 skip).
+
+- **F-A6-1 `/compress` unmetered** (`internal/app/chats.go`,
+  `commands.go`): the metering sink is threaded into `handleCompress`
+  and the `/compress` dispatch, so a chat at its daily limit can no
+  longer run `/compress` repeatedly for free; regression test asserts
+  `Budget.Usage` increments after a real `/compress`.
+- **F-A6-2 skill END-marker injection** (`internal/skills/
+  skills.go`): a skill body containing a line that parses as a
+  `BEGIN SKILL` / `END SKILL` marker is rejected (or neutralised) at
+  load time, so a body can no longer close its own delimiter early
+  and inject a fake footer plus fresh instructions; regression test
+  with the exact marker line in the body. Belt-and-braces:
+  `formatSkillBody` also neutralises marker lines at render time,
+  so a programmatically-constructed skill cannot blur the boundary
+  either.
+- **F-A6-3 `orion daemon` / `orion telegram poll` ungated and
+  unisolated** (`cmd/orion/main.go`, `internal/app`): the permission
+  gate is now wired into both entrypoints via the shared
+  `app.NewPermissionGate` / `wireGate` helper, and `orion telegram
+  poll` uses the per-chat handler; `oriond` keeps its own
+  pre-existing gate wiring (verified in Audit 6 §1.4 — the security
+  property, a gate on all three paths, now holds everywhere).
+  Test asserts every command path that starts a Telegram loop has a
+  non-nil gate.
+- **Approval-button callback never delivered (live, rc10)**:
+  callback queries were dispatched only after acquiring a slot on
+  the turn-handler semaphore (8 slots), acquired in the poll loop
+  before `go handleCallback` — with all 8 slots held by long turns
+  (including 90 s approval waits) the poll loop blocked and the tap
+  was never dispatched: two consecutive live cards expired with
+  zero tap lines. Fixed with a dedicated callback semaphore plus
+  per-update poll logging (`telegram poll: received update N
+  callback_query …`), so the next incident is diagnosable in one
+  line. Regression tests fail on rc10 code and pass with the fix.
+- **P2 batch**: enum short-circuit in schema validation (F-A6-P2-11);
+  `Close()` during MCP `Start()` leaking the server process
+  (F-A6-P2-13); per-server MCP work dir instead of the shared
+  `/work` (F-A6-P2-14); transcript corrupt counting for overlong
+  lines and resumable migration (F-A6-P2-4/5); summary verification
+  hardening (≥3 distinct shared tokens, whole-input cap) plus
+  summariser redaction (F-A6-P2-1/2/3); subagent spend attribution
+  for the mid-turn check and timed-out / late-finishing tasks
+  (F-A6-P2-6/7); permission-gate `Resolve`/timer race closed with a
+  single state transition (F-A6-P2-8); `### Tools` heading warning
+  (F-A6-P2-9); skill hardlink refusal and open-then-fstat
+  (F-A6-P2-10); symlinked `DataDir` resolved before the planning
+  refusal (F-A6-P2-12); MCP system-prompt warning that MCP results
+  are untrusted (F-A6-P2-19); value-shape redaction in `ScrubEnv`
+  (F-A6-P2-20); rate limit on repeated near-cap MCP lines
+  (F-A6-P2-21).
+- **Flaky tests made deterministic** (F-A6-P2-17/18):
+  `TestAdversarialNamespaceDeathKillsAll` polls for readiness (pids
+  file + pgrep, bounded timeouts) instead of fixed sleeps;
+  `TestSubagentManagerEndToEndUsageAndIsolation` gets a deterministic
+  step budget (the flake is a test-design race: the parent's tight
+  poll loop burns the 10-step budget before the child goroutine runs
+  on a single CPU). The `TestW3BResolveTimerConsistency` stress test
+  added in this release was itself scheduling-dependent (timer side
+  never won under `-race`); it now alternates raced and
+  timer-wins-by-construction iterations.
+- **Docs + version (F-A6-P2-15/16)**: README no longer calls the repo
+  private (it is public under MIT), 19 Telegram commands, `orion
+  sessions` in the CLI table, MIT License mentions, MCP-confinement
+  and per-chat budget/USD-cost sections; ARCHITECTURE tree and
+  package list match `go list ./...` (21 packages); SECURITY.md
+  covers MCP confinement, the permission gate, per-chat isolation,
+  the owner tier, and the daily budget; `Version` is a `var` set from
+  `git describe --tags --exact-match` in the Makefile and
+  `install.sh`, with the source default as the untagged-build
+  fallback (never "dev", never a stale tag) — the rc10 binary
+  reported rc9 because `Version` was a `const` ldflags could not
+  override.
+
+#### Release checklist (before any push)
+
+- [ ] `make build && ./bin/orion version` reports the version matching
+  the tag (e.g. `0.2.0-rc11` for tag `v0.2.0-rc11`) — **the version
+  string must match the tag before any push**. If it does not, do not
+  push: check that `Version` is a `var` in `internal/version/
+  version.go`, that the Makefile / `install.sh` ldflags pass `-X
+  …version.Version=<tag without the leading v>`, and that the tag
+  exists on the exact commit being built (`git describe --tags
+  --exact-match`).
+- [ ] Full suite green (`go test ./...`, `go test -race ./...`,
+  `gofmt -l`, `go vet ./...`) with the counts recorded in this
+  section; live DeepSeek proof (`17*23+5=396`) run.
+- [ ] Docs claims re-verified against the code (package count via
+  `go list ./...`, tool count, command count, version string).
+
+## [0.2.0-rc10] — 2026-11-13
+
 ### Audit 5 fixes (v0.2.0-rc10) — see `AUDIT5_2026-11-13.md`
+
+**License: MIT** — `LICENSE` added (commit `d2e6b67`); the repository
+is public under the MIT License.
 
 Fixes all 9 P1s and **all 38 P2s** from the fresh-eyes audit of
 rc9; nothing deferred. **Verdict: NOT production-ready** — the

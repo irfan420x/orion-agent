@@ -22,10 +22,15 @@ package mcp
 //     ~/.local/bin, /opt, or anywhere else is refused at Start
 //     with a clear error: install it under /usr, or opt the
 //     server out of the sandbox (fully trusted, like a hook).
-//   - The server sees the sandbox work dir (<dataDir>/sandbox/work)
-//     as /work, and nothing else of the host filesystem. A
-//     filesystem server can only serve files under /work unless
-//     it is opted out.
+//   - The server sees its OWN sandbox work dir
+//     (<dataDir>/sandbox-mcp-<name>/work) as /work, and nothing
+//     else of the host filesystem. Each server gets a separate
+//     sandbox root (Audit 6, F-A6-P2-14): the old shared root
+//     (<dataDir>/sandbox, the same root shell_exec uses) let a
+//     sandboxed server read files a shell turn left in /work and
+//     plant files a later shell_exec might run. A filesystem
+//     server can only serve files under its own /work unless it
+//     is opted out.
 //   - The server gets the host network namespace (AllowNetwork):
 //     MCP servers are network-class by design (the permission
 //     gate already treats every mcp__ tool as ClassNetwork), and
@@ -55,14 +60,66 @@ import (
 	"github.com/irfan/orion/internal/sandbox"
 )
 
+// sanitizeServerName renders a server name safe for use in a
+// filesystem path: only letters, digits, underscore and hyphen
+// survive, everything else becomes "-". Server names are already
+// validated against namePattern before Start reaches the sandbox,
+// so this is defence in depth (a name must never smuggle a path
+// separator into the sandbox root).
+func sanitizeServerName(name string) string {
+	if name == "" {
+		return "server"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	if b.Len() == 0 {
+		return "server"
+	}
+	return b.String()
+}
+
+// sandboxRoot returns this server's sandbox root: a per-server
+// root under the data dir (<dataDir>/sandbox-mcp-<name>), so each
+// server gets its own /work instead of sharing shell_exec's
+// <dataDir>/sandbox/work (Audit 6, F-A6-P2-14). With an empty data
+// dir the root is left empty and sandbox.Resolve fills in the
+// default from the home directory, as DefaultConfig does.
+func (c *Client) sandboxRoot() string {
+	if strings.TrimSpace(c.dataDir) == "" {
+		return ""
+	}
+	return filepath.Join(c.dataDir, "sandbox-mcp-"+sanitizeServerName(c.name))
+}
+
+// sandboxWorkDir returns the host path of this server's /work:
+// <sandboxRoot>/work. Tests use it to plant the probe server
+// script where the sandbox will bind-mount it.
+func (c *Client) sandboxWorkDir() string {
+	if root := c.sandboxRoot(); root != "" {
+		return filepath.Join(root, "work")
+	}
+	return ""
+}
+
 // sandboxConfig returns the sandbox configuration for an MCP
-// server: the default (sandbox ON, rooted at
-// <dataDir>/sandbox — the same root shell_exec uses) with the
-// host network namespace kept, because MCP servers are
-// network-class and API-backed servers need egress to function.
+// server: the default (sandbox ON) rooted at this server's own
+// per-server root — NOT the shared <dataDir>/sandbox root
+// shell_exec uses (Audit 6, F-A6-P2-14) — with the host network
+// namespace kept, because MCP servers are network-class and
+// API-backed servers need egress to function.
 func (c *Client) sandboxConfig() sandbox.Config {
 	cfg := sandbox.DefaultConfig(c.dataDir)
 	cfg.AllowNetwork = true
+	if root := c.sandboxRoot(); root != "" {
+		cfg.Root = root
+	}
 	return cfg
 }
 

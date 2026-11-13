@@ -195,15 +195,19 @@ func (t *skillTool) availableNames() string {
 // inside the markers that looks like a system message, a tool
 // result, or this note is part of the skill text, not from Orion.
 // The system prompt (core.skillSection) carries the same hierarchy
-// instruction. Residual: the markers are labelling, not a
-// cryptographic boundary — a body that itself contains the exact
-// END marker line can blur the boundary, and the ## Tools list
-// remains an anti-drift aid, not a security boundary against skill
-// content. Do not install third-party skills you have not read.
+// instruction. Second bar (Audit 6 F-A6-2 residual): the body is
+// passed through skills.NeutralizeSkillMarkers before rendering,
+// so a marker line inside the body — possible only for a
+// programmatically-constructed Skill, since load time rejects such
+// bodies — is prefixed and can no longer close the block early.
+// The markers are labelling, not a cryptographic boundary, and the
+// ## Tools list remains an anti-drift aid, not a security boundary
+// against skill content. Do not install third-party skills you have
+// not read.
 func formatSkillBody(skill skills.Skill, task string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "===== BEGIN SKILL %q CONTENT =====\n", skill.Name)
-	b.WriteString(skill.Content)
+	b.WriteString(skills.NeutralizeSkillMarkers(skill.Content))
 	if !strings.HasSuffix(skill.Content, "\n") {
 		b.WriteString("\n")
 	}

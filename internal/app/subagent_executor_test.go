@@ -6,8 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
@@ -190,7 +193,64 @@ func TestReadOnlyTypedSource(t *testing.T) {
 //     user-role messages are the seeded one and the Run input —
 //     the child's own user message (its brief, as a turn) never
 //     appears there.
+//
+// The step budget is 100, not 10 (F-A6-P2-18): the parent polls
+// the non-blocking subagent_result tool in a tight loop — one
+// provider call per step, no sleep/yield between steps
+// (internal/core/agent.go) — so with the instant scripted
+// provider it burns its whole budget in <2 ms, while the child
+// task (a separate goroutine) needs 1.6–2.9 ms to finish. At 10
+// steps the parent hit "max steps exceeded" whenever the child
+// was not scheduled in time (GOMAXPROCS=1: 30/30 fails; under
+// load: 3/10). At 100 the parent polls until the child is done
+// (34–61 polls on one CPU) with margin to spare, and the test is
+// deterministic. This is a test-design race, not a product bug:
+// the production loop is unchanged.
 func TestSubagentManagerEndToEndUsageAndIsolation(t *testing.T) {
+	runSubagentManagerEndToEnd(t, 100, 0)
+}
+
+// TestSubagentManagerEndToEndSingleCPU (F-A6-P2-18 regression):
+// the starvation path only bites when the parent outruns the
+// child, which is guaranteed on a single CPU — the parent's
+// tight poll loop never yields, so the child goroutine is not
+// scheduled until the parent blocks or exhausts its budget.
+//
+// The child is GATED, not merely slow: it does not answer until
+// the parent has made 20 provider calls (minChildPolls=20 in
+// the helper). A plain "child is slow" gate is not enough — the
+// poll count before the child finishes varies with scheduler
+// luck (7–39 calls measured across 10 single-CPU runs, so a
+// bare `calls > 10` assertion failed 1 run in 10 even with the
+// fix in place). The gate makes the lower bound deterministic:
+// the run MUST need more than the old 10-step budget, so if it
+// ever passes with <=10 calls, the starvation path was not
+// exercised and this test is not proving the fix.
+func TestSubagentManagerEndToEndSingleCPU(t *testing.T) {
+	old := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(old)
+	calls := runSubagentManagerEndToEnd(t, 100, 20)
+	t.Logf("parent provider calls = %d on a single CPU (old 10-step budget; child gated to 20 polls)", calls)
+	if calls <= 10 {
+		t.Fatalf("parent provider calls = %d, want > 10: the single-CPU run did not exercise the starvation path, so this test is not proving the fix", calls)
+	}
+}
+
+// runSubagentManagerEndToEnd runs the end-to-end chain above with
+// the given parent step budget and returns the parent provider's
+// call count. minChildPolls gates the child's answer: when > 0,
+// the child's provider blocks until the parent has made at
+// least that many provider calls — the deterministic form of
+// "the child is slower than the parent's poll loop" (see
+// TestSubagentManagerEndToEndSingleCPU). 0 means ungated: the
+// child answers on its first call. minChildPolls must be below
+// maxSteps, or the parent could never see the child finish.
+func runSubagentManagerEndToEnd(t *testing.T, maxSteps, minChildPolls int) int {
+	t.Helper()
+	if minChildPolls >= maxSteps {
+		t.Fatalf("test bug: minChildPolls %d must be below maxSteps %d, or the parent can never see the child finish", minChildPolls, maxSteps)
+	}
+	var parentCalls atomic.Int32
 	dir := t.TempDir()
 	parentMem, err := memory.NewFileStore(dir)
 	if err != nil {
@@ -202,11 +262,26 @@ func TestSubagentManagerEndToEndUsageAndIsolation(t *testing.T) {
 	if err := parentMem.AddMessage(model.Message{Role: "assistant", Content: "noted"}); err != nil {
 		t.Fatalf("seed assistant: %v", err)
 	}
-	cfg := testSubagentConfig(10)
+	cfg := testSubagentConfig(maxSteps)
 
 	childProv := &scriptedProvider{
 		name: "child",
 		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
+			if minChildPolls > 0 {
+				// Wait until the parent has polled at least
+				// minChildPolls times: the child must not
+				// finish before the parent has burned that
+				// many steps. Bounded (10s) so a stuck
+				// parent fails the test instead of hanging
+				// the child until its 60s spawn timeout.
+				deadline := time.Now().Add(10 * time.Second)
+				for parentCalls.Load() < int32(minChildPolls) {
+					if time.Now().After(deadline) {
+						return nil, errors.New("child gate never opened: parent did not reach the gated poll count")
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}
 			return &model.ChatResponse{
 				Message:      model.Message{Role: "assistant", Content: "child-result-6x7-42"},
 				FinishReason: "stop",
@@ -220,6 +295,12 @@ func TestSubagentManagerEndToEndUsageAndIsolation(t *testing.T) {
 	parentProv := &scriptedProvider{
 		name: "parent",
 		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
+			// Counted atomically (not just parentProv.calls):
+			// the gated child reads this from its own
+			// goroutine, so the read must not race the
+			// parent's increment — -race would flag a plain
+			// int shared across the two goroutines.
+			parentCalls.Add(1)
 			usage := model.Usage{PromptTokens: 6, CompletionTokens: 4, TotalTokens: 10}
 			switch {
 			case call == 1:
@@ -357,6 +438,7 @@ func TestSubagentManagerEndToEndUsageAndIsolation(t *testing.T) {
 	if !strings.Contains(summary, "child-result-6x7-42") {
 		t.Fatalf("AgentsSummary missing result summary:\n%s", summary)
 	}
+	return parentProv.calls
 }
 
 // TestRC9ChildAgentGetsHooks: a subagent child must get the parent's

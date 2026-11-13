@@ -898,13 +898,36 @@ print('SPUN', x)"`)
 // SIGKILLed. A sandboxed command that backgrounds sleeps and is
 // then killed (context timeout, as the agent does on shell_exec
 // timeout) must leave no stray sleep on the host.
+//
+// Determinism (F-A6-P2-17): this test used to fail ~2/3 of runs.
+// Two fixed sleeps caused it: the 3s command context covered
+// Prepare as well as the run, so under load the context was
+// already expired when Start was called ("start: context deadline
+// exceeded"), and the fixed 1.5s wait for the sleeps to spawn was
+// too short when the launcher was slow, so the pids file was
+// missing. The test now waits for what it needs instead of
+// sleeping for what it hopes: the context is 30s (Prepare's cost
+// is covered), the pids file is POLLED until both marker sleeps
+// have recorded their PIDs (bounded 15s), and the host is POLLED
+// until the strays are gone (bounded 10s). The security
+// assertion is unchanged — both sleeps must exist, and none may
+// survive namespace death — only the waiting is now
+// event-driven. The wrapper output is read only after Wait, so
+// the strings.Builder is never read while the copy goroutine
+// writes it (see the spin test above).
 func TestAdversarialNamespaceDeathKillsAll(t *testing.T) {
 	requireSandbox(t)
 	if _, err := exec.LookPath("pgrep"); err != nil {
 		t.Skip("pgrep not available; cannot verify host-side cleanup")
 	}
 	root := filepath.Join(t.TempDir(), "root")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// 30s, not 3s: the context covers Prepare (namespace setup,
+	// bind mounts, /etc copies) as well as the run, and Prepare
+	// alone can take seconds under load. The test still bounds
+	// itself: the pids poll below fails after 15s and the kill
+	// is issued explicitly, so a hung launcher cannot hang the
+	// suite for the full 30s.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "true")
 	cmd.Env = os.Environ()
@@ -918,36 +941,84 @@ func TestAdversarialNamespaceDeathKillsAll(t *testing.T) {
 	var buf strings.Builder
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	// Start, let the sleeps spawn, then kill the wrapper (PID 1
-	// of the namespace) by cancelling the context — the same
-	// mechanism as a shell_exec timeout.
+	// Start, wait until both sleeps have spawned (their PIDs in
+	// the marker file), then kill the wrapper (PID 1 of the
+	// namespace) by cancelling the context — the same mechanism
+	// as a shell_exec timeout.
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	time.Sleep(1500 * time.Millisecond)
+	pidsPath := filepath.Join(root, "work", "pids.txt")
+	pids, ok := waitForMarkerPIDs(t, pidsPath, 15*time.Second)
+	if !ok {
+		// The sleeps never spawned: kill the wrapper and read
+		// its output only once Wait has returned, so the read
+		// cannot race the stdout-copy goroutine.
+		cancel()
+		_ = cmd.Wait()
+		t.Fatalf("marker pids file %q never held 2 small namespace PIDs within 15s (the sleeps never spawned):\nwrapper output:\n%s", pidsPath, buf.String())
+	}
 	cancel()
 	_ = cmd.Wait()
-	// The two sleeps must have existed (small namespace PIDs in
-	// the marker file) and must now be gone from the host.
-	data, err := os.ReadFile(filepath.Join(root, "work", "pids.txt"))
-	if err != nil {
-		t.Fatalf("marker pids file missing (the sleeps never spawned): %v\nwrapper output:\n%s", err, buf.String())
+	// The two sleeps must now be gone from the host. The kernel
+	// kill on namespace death is asynchronous, so poll for
+	// their disappearance instead of assuming a fixed 500ms
+	// is enough under load.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		// Anchored, for the same reason as the fork test: an
+		// unanchored pattern would match an unrelated "sleep 1770".
+		stray, err := exec.Command("pgrep", "-f", "^sleep 177$").CombinedOutput()
+		if err != nil || len(strings.TrimSpace(string(stray))) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("stray marker sleeps survived namespace death on the host: %q", strings.TrimSpace(string(stray)))
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	pids := []int{}
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+	_ = pids // the PIDs were validated (small namespace PIDs) by waitForMarkerPIDs
+}
+
+// waitForMarkerPIDs polls path until it holds exactly two lines,
+// each a small namespace PID (1..1000), or the timeout expires.
+// A torn read while the sandboxed shell is still appending (a
+// half-written line, a file with one line so far) is "not ready
+// yet", not a failure — only the deadline turns it into one, and
+// the caller then reports the file's final content.
+func waitForMarkerPIDs(t *testing.T, path string, timeout time.Duration) ([]int, bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if data, err := os.ReadFile(path); err == nil {
+			if pids, ok := parseMarkerPIDs(data); ok {
+				return pids, true
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// parseMarkerPIDs parses the marker file: exactly two lines, each
+// a small namespace PID. Anything else (missing file content,
+// one line so far, a torn line, a non-numeric line, a host-sized
+// PID) is not a valid marker file.
+func parseMarkerPIDs(data []byte) ([]int, bool) {
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		return nil, false
+	}
+	pids := make([]int, 0, 2)
+	for _, line := range lines {
 		n, err := strconv.Atoi(strings.TrimSpace(line))
 		if err != nil || n < 1 || n > 1000 {
-			t.Fatalf("marker pid %q is not a small namespace PID: %q", line, data)
+			return nil, false
 		}
 		pids = append(pids, n)
 	}
-	if len(pids) != 2 {
-		t.Fatalf("want 2 marker sleeps, got %d (%q)", len(pids), data)
-	}
-	time.Sleep(500 * time.Millisecond)
-	// Anchored, for the same reason as the fork test: an
-	// unanchored pattern would match an unrelated "sleep 1770".
-	if stray, err := exec.Command("pgrep", "-f", "^sleep 177$").CombinedOutput(); err == nil && len(strings.TrimSpace(string(stray))) > 0 {
-		t.Errorf("stray marker sleeps survived namespace death on the host: %q", strings.TrimSpace(string(stray)))
-	}
+	return pids, true
 }

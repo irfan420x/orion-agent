@@ -314,9 +314,31 @@ func readStateFile(path string) ([]byte, error) {
 // lexically under dataDir — a dirFunc override may legitimately
 // point elsewhere, and the host that supplied it is trusted — but
 // a dir that claims to be under the data dir yet resolves outside
-// it (a symlinked parent) is refused. Callers must hold s.mu:
-// dataDir is read without taking it.
+// it (a symlinked parent) is refused.
+//
+// A legitimately symlinked data dir itself is NOT a refusal
+// (F-A6-P2-12): the data dir is resolved (longest existing
+// ancestor, so a not-yet-created data dir under a symlinked
+// parent resolves too) before the containment check, and the
+// resolved dir is compared against the RESOLVED data dir. Only a
+// dir that resolves outside the resolved data dir — e.g. a
+// planted symlinked chats/<id> — is refused. Callers must hold
+// s.mu: dataDir is read without taking it.
 func ensurePlanningDir(dir, dataDir string) error {
+	// Resolve the data dir first (F-A6-P2-12): without this, a
+	// symlinked data dir makes every resolved planning dir look
+	// "outside" the (unresolved) data dir and every write is
+	// falsely refused. resolveSymlinks follows the longest
+	// existing ancestor, so it works even before the data dir
+	// itself exists. If resolution fails (an unreadable
+	// ancestor), fall back to the unresolved spelling — the
+	// pre-existing behaviour — rather than failing the write.
+	resolvedDataDir := dataDir
+	if dataDir != "" {
+		if resolved, err := resolveSymlinks(dataDir); err == nil {
+			resolvedDataDir = resolved
+		}
+	}
 	if info, err := os.Lstat(dir); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("planning dir %q is a symlink; refusing", dir)
@@ -340,7 +362,7 @@ func ensurePlanningDir(dir, dataDir string) error {
 	if info, err := os.Lstat(resolved); err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("planning dir %q is not a real directory", dir)
 	}
-	if dataDir != "" && within(dir, dataDir) && !within(resolved, dataDir) {
+	if dataDir != "" && within(dir, dataDir) && !within(resolved, resolvedDataDir) {
 		return fmt.Errorf("planning dir %q resolves outside the data dir", dir)
 	}
 	return nil

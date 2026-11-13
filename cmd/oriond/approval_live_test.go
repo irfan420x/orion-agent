@@ -86,6 +86,7 @@ func (f *longPollFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 		f.mu.Lock()
 		var out []messaging.Update
+	poll:
 		for {
 			out = nil
 			for _, u := range f.queue {
@@ -99,9 +100,19 @@ func (f *longPollFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Wait until an update arrives or the deadline passes.
 			// sync.Cond has no timed wait, so poll the condition
 			// on a short ticker (50ms) — cheap, and the wait is
-			// still a real block from the caller's view.
+			// still a real block from the caller's view. The wait
+			// also aborts when the client goes away (test
+			// teardown cancels the poll): without this,
+			// httptest.Server.Close blocks until the 30s deadline
+			// and every live-shape test pays ~30s on exit.
 			f.mu.Unlock()
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-r.Context().Done():
+				f.mu.Lock()
+				out = nil
+				break poll
+			case <-time.After(50 * time.Millisecond):
+			}
 			f.mu.Lock()
 			if time.Now().After(deadline) {
 				break
@@ -332,8 +343,180 @@ func TestApprovalCallbackLiveShape(t *testing.T) {
 	}
 }
 
-// TestApprovalCardExpiresOnTimeout: the other half of the live rc8
-// incident. When nobody taps (the request times out), the approval
+// TestApprovalCallbackWhileTurnSlotsFull is the rc11 W7 live-shape
+// repro of the rc10 incident (2026-11-13 18:30 SGT): Irfan tapped
+// Approve on card 253 in-window and the gate timed out with zero tap
+// lines. TestApprovalCallbackLiveShape above passes because it never
+// fills the turn semaphore — one turn, one slot. The live daemon can
+// have all 8 turn slots held (long-running turns, queued turns behind
+// the per-chat lock), and on the old code the poll loop acquired the
+// callback's slot from that same semaphore, so the tap was never
+// dispatched: silent, no log line, gate times out.
+//
+// This test floods the semaphore with 8 scripted approval turns
+// (turn 1 runs and blocks on its gate; turns 2-8 queue behind the
+// chat lock, each holding a slot) and then taps turn 1's Approve
+// button. It FAILS on the old code (no "done" reply within the wait:
+// the tap never reaches Resolve) and PASSES once callbacks use their
+// own semaphore.
+func TestApprovalCallbackWhileTurnSlotsFull(t *testing.T) {
+	dir := t.TempDir()
+	fake := newLongPollFake()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.DataDir = dir
+	cfg.MaxSteps = 5
+	cfg.TimeoutSeconds = 30
+	mem, err := memory.NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := tools.DefaultRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := &rc8ScriptedProvider{}
+	agent, err := core.NewAgent(cfg, prov, reg, mem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &app.App{Config: cfg, Provider: prov, Tools: reg, Memory: mem, Agent: agent}
+	defer a.Close()
+	store := messaging.NewSessionStore(filepath.Join(dir, "sessions.json"), true)
+
+	ownerID := int64(7429947930)
+	gw, err := messaging.NewTelegramGateway("123456:AAAAAAAAAAAAAAAAAAAA",
+		messaging.WithBaseURL(srv.URL),
+		messaging.WithAllowedChats(ownerID),
+		messaging.WithLogger(func(format string, args ...any) {
+			t.Logf("gateway: "+format, args...)
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleStore := permissions.NewRuleStore(filepath.Join(dir, "permissions.json"))
+	gate, cards := buildApprovalGate(gw, ruleStore)
+	gate.SetTimeout(25 * time.Second)
+	a.SetPermissionGate(gate)
+	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
+		t.Logf("callback handler invoked: id=%s data=%q from=%v", q.ID, q.Data, q.From)
+		err := handleApprovalCallback(ctx, gw, gate, ownerID, q, cards)
+		t.Logf("callback handler returned err=%v pending=%d", err, gate.PendingCount())
+		return err
+	})
+
+	allowed := map[int64]bool{ownerID: true}
+	restart := func() {}
+	retry := func(ctx context.Context, chatID int64) (string, *core.TurnStats, error) {
+		return "", nil, fmt.Errorf("nothing to retry")
+	}
+	env := buildCommandEnv(a, store, "orion_proof_bot", allowed, ownerID, restart, retry)
+	registry := messaging.DefaultRegistry(env)
+	turnFn := buildTurnHandler(a, store, registry, env, ownerID, "orion_proof_bot")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pollErr := make(chan error, 1)
+	go func() { pollErr <- gw.PollStream(ctx, turnFn) }()
+
+	waitFor := func(desc string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			fake.mu.Lock()
+			ok := cond()
+			fake.mu.Unlock()
+			if ok {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", desc)
+	}
+
+	// Flood the turn semaphore: 8 messages for the same chat. Turn 1
+	// runs and blocks on its approval gate; turns 2-8 queue behind
+	// the per-chat lock, each holding one of the 8 turn slots.
+	for i := int64(1); i <= 8; i++ {
+		fake.enqueue(messaging.Update{UpdateID: i, Message: &messaging.TGMessage{
+			MessageID: i, Chat: messaging.TGChat{ID: ownerID}, Text: "run the shell",
+			From: &messaging.TGUser{ID: ownerID},
+		}})
+	}
+
+	// Wait for turn 1's approval card, then give the poll loop a
+	// moment to dispatch the other 7 messages (microseconds of work,
+	// 2s of margin) so all 8 turn slots are held before the tap.
+	var requestID string
+	waitFor("approval prompt", func() bool {
+		for _, s := range fake.sent {
+			if s.ChatID != ownerID || s.Keyboard == "" {
+				continue
+			}
+			var kb messaging.InlineKeyboardMarkup
+			if err := json.Unmarshal([]byte(s.Keyboard), &kb); err != nil {
+				continue
+			}
+			for _, row := range kb.InlineKeyboard {
+				for _, b := range row {
+					if dec, id, ok := messaging.ParsePermissionCallback(b.CallbackData); ok && dec == "approve" {
+						requestID = id
+						return true
+					}
+				}
+			}
+		}
+		return false
+	})
+	t.Logf("approval card seen, requestID=%s; all 8 turn slots should now be held; tapping Approve...", requestID)
+	time.Sleep(2 * time.Second)
+	fake.enqueue(messaging.Update{UpdateID: 9, CallbackQuery: &messaging.TGCallbackQuery{
+		ID:      "cb-approve-" + requestID,
+		From:    &messaging.TGUser{ID: ownerID},
+		Message: &messaging.TGMessage{MessageID: 2, Chat: messaging.TGChat{ID: ownerID}},
+		Data:    "perm:approve:" + requestID,
+	}})
+	t.Logf("callback update enqueued at %s", time.Now().Format("15:04:05.000"))
+
+	// The tap must resolve turn 1's approval and the turn must
+	// complete with "done" well before the 25s gate window ends —
+	// even though every turn slot is held.
+	replied := false
+	waitFor("approved reply", func() bool {
+		for _, s := range fake.sent {
+			if s.ChatID == ownerID && s.Keyboard == "" && strings.HasPrefix(s.Text, "done") {
+				replied = true
+				return true
+			}
+		}
+		return false
+	})
+	if !replied {
+		t.Fatal("turn did not complete approved while turn slots were full")
+	}
+	t.Logf("turn completed approved with all turn slots held; gateway offset=%d", gw.Offset())
+
+	cancel()
+	select {
+	case err := <-pollErr:
+		if err != nil {
+			t.Fatalf("PollStream after cancel: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("PollStream did not return after cancel")
+	}
+
+	fake.mu.Lock()
+	answered := append([]string(nil), fake.answered...)
+	fake.mu.Unlock()
+	t.Logf("callback answers: %v", answered)
+	if len(answered) != 1 || !strings.Contains(answered[0], "cb-approve-") {
+		t.Errorf("callback queries answered = %v, want exactly the approve tap answered", answered)
+	}
+}
+
 // card must be edited in place to say it expired AND lose its
 // keyboard — a dead card with live buttons looks exactly like a
 // broken button, and a tap on it (answered only with a transient

@@ -176,13 +176,24 @@ func validateValue(tool, name string, val any, schema map[string]any) error {
 			return invalid("parameter %q must be %s, got %s", name, describeTypes(types), jsonTypeName(val))
 		}
 	}
+	// Enum membership is one constraint among others, not a pass:
+	// a value that matches the enum must still satisfy the type,
+	// bounds, pattern, and nested checks below. The old code
+	// returned success the moment a value matched an enum entry,
+	// so a schema with enum ["a","b"] + pattern "^[0-9]+$"
+	// accepted "a" (Audit 6 F-A6-P2-11) and an enum on a number
+	// skipped its minimum/maximum entirely.
 	if enum := enumList(schema["enum"]); len(enum) > 0 {
+		matched := false
 		for _, allowed := range enum {
 			if enumEqual(val, allowed) {
-				return nil
+				matched = true
+				break
 			}
 		}
-		return invalid("parameter %q must be one of %v, got %v", name, enum, val)
+		if !matched {
+			return invalid("parameter %q must be one of %v, got %v", name, enum, val)
+		}
 	}
 	// Numeric bounds (minimum/maximum): only numbers are checked;
 	// a bound on a non-number is a schema error, not a call error.

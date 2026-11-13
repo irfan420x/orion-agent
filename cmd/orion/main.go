@@ -12,12 +12,15 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/irfan/orion/internal/app"
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/messaging"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/version"
 )
 
@@ -720,20 +723,7 @@ func cmdTelegram(ctx context.Context, args []string) error {
 	if w := a.Config.AllowAllTelegramWarning(); w != "" {
 		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
 	}
-	gwOpts := []messaging.GatewayOption{
-		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
-		// Polling-health notes and dropped-chat IDs go to stderr,
-		// where the rest of the CLI's lifecycle logging goes.
-		messaging.WithLogger(func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, "orion: "+format+"\n", args...)
-		}),
-	}
-	if a.Config.AllowAllTelegramChats {
-		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
-		// every chat once the window (from daemon start) elapses.
-		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
-	}
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
+	gw, err := newTelegramGateway(a)
 	if err != nil {
 		return err
 	}
@@ -745,10 +735,18 @@ func cmdTelegram(ctx context.Context, args []string) error {
 		if err := messaging.CheckTelegramAllowlist(a.Config.TelegramAllowedChats, a.Config.AllowAllTelegramChats); err != nil {
 			return err
 		}
+		// F-A6-3: the gate is wired before polling starts, and
+		// the turn runs on the per-chat handler (the same one
+		// `orion daemon` uses) — not the global a.Handle,
+		// which bypassed per-chat isolation (P1-O3) and the
+		// per-chat budget. `orion telegram poll` is now the
+		// same gated, isolated loop as `orion daemon`, minus
+		// oriond's slash-command framework.
+		if _, _, err := wireGate(a, gw); err != nil {
+			return err
+		}
 		fmt.Println("telegram: polling for messages (Ctrl+C to stop)...")
-		return gw.Poll(ctx, func(c context.Context, chatID int64, text string) (string, error) {
-			return a.Handle(c, text)
-		})
+		return gw.Poll(ctx, daemonTurnHandler(a))
 	}
 	return nil
 }
@@ -777,20 +775,7 @@ Run Telegram polling until interrupted. Takes no arguments.
 	if w := a.Config.AllowAllTelegramWarning(); w != "" {
 		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
 	}
-	gwOpts := []messaging.GatewayOption{
-		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
-		// Polling-health notes and dropped-chat IDs go to stderr,
-		// where the rest of the CLI's lifecycle logging goes.
-		messaging.WithLogger(func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, "orion: "+format+"\n", args...)
-		}),
-	}
-	if a.Config.AllowAllTelegramChats {
-		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
-		// every chat once the window (from daemon start) elapses.
-		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
-	}
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
+	gw, err := newTelegramGateway(a)
 	if err != nil {
 		return err
 	}
@@ -798,6 +783,13 @@ Run Telegram polling until interrupted. Takes no arguments.
 	// messaging.CheckTelegramAllowlist): polling with no allowlist
 	// would let any Telegram chat drive the agent.
 	if err := messaging.CheckTelegramAllowlist(a.Config.TelegramAllowedChats, a.Config.AllowAllTelegramChats); err != nil {
+		return err
+	}
+	// F-A6-3: the permission gate is wired before polling
+	// starts — before rc11 this path never called
+	// SetPermissionGate, so destructive/network tools ran
+	// without approval here while oriond gated them.
+	if _, _, err := wireGate(a, gw); err != nil {
 		return err
 	}
 	username, err := gw.GetMe(ctx)
@@ -813,16 +805,24 @@ Run Telegram polling until interrupted. Takes no arguments.
 	return gw.Poll(ctx, daemonTurnHandler(a))
 }
 
-// daemonTurnHandler is the `orion daemon` turn function: each chat
-// runs on its own per-chat agent through App.HandleForChat, so a
-// chat's history, provider and usage are isolated from every other
-// chat (P1-O3) — and the per-chat daily token budget is enforced
-// (rc9 follow-up 2): the budget gate lives in app.runChatTurn,
-// shared with oriond's Telegram turns, so this path refuses an
-// over-budget chat exactly the way oriond does. Before rc9 this
-// handler called the GLOBAL App.Handle, which had no chat context
-// and no budget check at all: any allowlisted chat could spend
-// without limit on this path while oriond enforced the budget.
+// daemonTurnHandler is the turn function for `orion daemon` AND
+// `orion telegram poll` (F-A6-3): each chat runs on its own
+// per-chat agent through App.HandleForChat, so a chat's history,
+// provider and usage are isolated from every other chat (P1-O3) —
+// and the per-chat daily token budget is enforced (rc9 follow-up
+// 2): the budget gate lives in app.runChatTurn, shared with
+// oriond's Telegram turns, so this path refuses an over-budget
+// chat exactly the way oriond does. Before rc9 this handler called
+// the GLOBAL App.Handle, which had no chat context and no budget
+// check at all: any allowlisted chat could spend without limit on
+// this path while oriond enforced the budget.
+//
+// The turn context carries the approval context (P1-O2/P1-O4):
+// the chat the prompt goes to and the sender who may answer it.
+// Without it the permission gate would address its approval card
+// to chat 0 and accept any approver, and spawned subagents would
+// be unattributed (chatID 0, never swept). The sender comes from
+// the polling layer (PollStream sets it via WithSenderID).
 //
 // A budget refusal is returned as a plain reply, not an error:
 // the turn was refused on purpose, and the message names the usage,
@@ -830,10 +830,207 @@ Run Telegram polling until interrupted. Takes no arguments.
 // (the gateway reports them as "Sorry, I hit an error: ...").
 func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string, error) {
 	return func(c context.Context, chatID int64, text string) (string, error) {
+		senderID, _ := messaging.SenderIDFromContext(c)
+		c = permissions.WithApprovalContext(c, chatID, senderID)
 		reply, err := a.HandleForChat(c, chatID, text)
 		if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
 			return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil
 		}
 		return reply, err
 	}
+}
+
+// newTelegramGateway builds the Telegram gateway for the CLI's
+// Telegram paths (`orion daemon`, `orion telegram poll`) from the
+// app's config: allowlist, polling-health logger on stderr, and
+// the time-boxed allow-all opt-in (P2-O5). It is the single
+// construction site for both paths, so they cannot drift apart
+// again (before rc11 each built its own identical gwOpts block).
+func newTelegramGateway(a *app.App) (*messaging.TelegramGateway, error) {
+	gwOpts := []messaging.GatewayOption{
+		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
+		// Polling-health notes and dropped-chat IDs go to stderr,
+		// where the rest of the CLI's lifecycle logging goes.
+		messaging.WithLogger(func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "orion: "+format+"\n", args...)
+		}),
+	}
+	if a.Config.AllowAllTelegramChats {
+		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
+		// every chat once the window (from daemon start) elapses.
+		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
+	}
+	return messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
+}
+
+// approvalCards tracks live approval-card message IDs by pending
+// request ID. note records a card when the prompter sends it;
+// take removes and returns it when the request expires (so the
+// expiry edit runs once); forget removes it when the request is
+// answered (so a resolved card is never expired later). It mirrors
+// cmd/oriond's tracker: the two CLIs cannot share the type (each
+// is its own main package), but the behaviour is identical — a
+// dead card never keeps live-looking buttons, and a resolved card
+// is never expired afterwards.
+type approvalCards struct {
+	mu sync.Mutex
+	m  map[string]int64
+}
+
+func newApprovalCards() *approvalCards { return &approvalCards{m: map[string]int64{}} }
+
+func (c *approvalCards) note(id string, msgID int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[id] = msgID
+}
+
+func (c *approvalCards) take(id string) (int64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msgID, ok := c.m[id]
+	if ok {
+		delete(c.m, id)
+	}
+	return msgID, ok
+}
+
+func (c *approvalCards) forget(id string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, id)
+}
+
+// wireGate is the shared permission-gate wiring for every
+// Telegram loop in this binary (F-A6-3): `orion daemon` and
+// `orion telegram poll` both call it before polling starts, and
+// oriond calls the same shared constructor (app.NewPermissionGate)
+// with its own prompter — the gate is built exactly once per
+// entrypoint, never copied per command. It builds the gate
+// (rules under the data dir), installs it on the app, wires the
+// prompter (Telegram inline-keyboard approval card, tracked so
+// expiry can edit it in place) and the expiry hook, and installs
+// the callback handler that resolves taps. It returns the gate
+// and the card tracker; a nil gate is never returned on success,
+// so callers can assert the loop is gated. The owner is the
+// first allowlisted chat (see messaging.OwnerIDFromAllowlist):
+// daemon-wide decisions are owner-only in oriond, and here the
+// owner is the only approver besides the requester.
+func wireGate(a *app.App, gw *messaging.TelegramGateway) (*permissions.Gate, *approvalCards, error) {
+	cards := newApprovalCards()
+	ownerID := messaging.OwnerIDFromAllowlist(a.Config.TelegramAllowedChats)
+	gate, err := a.NewPermissionGate(func(ctx context.Context, req permissions.ApprovalRequest) error {
+		text := fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool.", req.Summary(), req.ChatID, req.SenderID)
+		msgID, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, text, messaging.ApprovalKeyboard(req.ID))
+		if err == nil {
+			cards.note(req.ID, msgID)
+			fmt.Fprintf(os.Stderr, "orion: approval prompt: tool %q request %s chat %d card %d\n", req.Tool, req.ID, req.ChatID, msgID)
+		}
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	// When a request dies unanswered, expire its card in place:
+	// replace the text and REMOVE the keyboard, so nobody can tap
+	// a dead button. The edit runs in a goroutine (the hook must
+	// return promptly) with a background context — the turn's
+	// context may already be cancelled, which is exactly why the
+	// request expired. Best-effort: a failed edit never fails
+	// anything.
+	gate.SetOnExpire(func(req permissions.ApprovalRequest) {
+		msgID, ok := cards.take(req.ID)
+		if !ok {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "orion: approval expired: request %s chat %d card %d\n", req.ID, req.ChatID, msgID)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := gw.EditMessageTextMarkup(ctx, req.ChatID, msgID, "⚠️ Approval request: ⏰ Expired — no answer within the approval window. Send the request again to retry.", messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}}); err != nil {
+				fmt.Fprintf(os.Stderr, "orion: approval expired: request %s card %d edit failed: %v\n", req.ID, msgID, err)
+			}
+		}()
+	})
+	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
+		return handleApprovalCallback(ctx, gw, gate, ownerID, q, cards)
+	})
+	if ownerID != 0 {
+		fmt.Fprintf(os.Stderr, "orion: owner chat %d (first telegram_allowed_chats entry)\n", ownerID)
+	}
+	return gate, cards, nil
+}
+
+// handleApprovalCallback resolves one permission-gate approval
+// tap (P1-O2): the decision comes from the button's callback data
+// (perm:<decision>:<requestID>); the pending request is looked up
+// in the gate, and only the user whose turn requested the tool call
+// — or the owner — may answer it. A tap from anyone else is refused
+// without touching the pending request, so a stranger can neither
+// approve nor deny someone else's tool call. The approval message
+// is edited in place to show the outcome, and the query is answered
+// to clear the button spinner. A tap on an expired request is told
+// so. Every tap is logged (decision, request ID, sender, outcome):
+// a tap that never arrives and a tap on a dead card must be
+// distinguishable in the log. This mirrors cmd/oriond's handler
+// (same contract, same log lines); the callback delivery path
+// itself (PollStream/getUpdates dispatch) lives in
+// internal/messaging and is owned by the W7 investigation —
+// this handler only resolves what that path delivers.
+func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, gate *permissions.Gate, ownerID int64, q messaging.TGCallbackQuery, cards *approvalCards) error {
+	decision, id, ok := messaging.ParsePermissionCallback(q.Data)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "orion: approval tap: unparseable callback data %q (query %s)\n", q.Data, q.ID)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
+	}
+	senderID := int64(0)
+	if q.From != nil {
+		senderID = q.From.ID
+	}
+	fmt.Fprintf(os.Stderr, "orion: approval tap: %s request %s from %d\n", decision, id, senderID)
+	req, found := gate.Pending(id)
+	if !found {
+		fmt.Fprintf(os.Stderr, "orion: approval tap: request %s expired (no longer pending)\n", id)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+	}
+	if senderID != req.SenderID && senderID != ownerID {
+		fmt.Fprintf(os.Stderr, "orion: approval tap: request %s refused for sender %d (requester %d, owner %d)\n", id, senderID, req.SenderID, ownerID)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "Only the person who asked can approve this.")
+	}
+	var persist *permissions.Action
+	approved := false
+	outcome := ""
+	switch decision {
+	case "approve":
+		approved, outcome = true, "✅ Approved — running it now."
+	case "deny":
+		approved, outcome = false, "❌ Denied."
+	case "always":
+		allow := permissions.ActionAllow
+		persist, approved, outcome = &allow, true, "✅ Approved — I won't ask again for this tool."
+	case "never":
+		deny := permissions.ActionDeny
+		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool."
+	}
+	if !gate.Resolve(id, approved, persist) {
+		fmt.Fprintf(os.Stderr, "orion: approval tap: request %s expired during resolve\n", id)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+	}
+	fmt.Fprintf(os.Stderr, "orion: approval tap: request %s resolved approved=%v\n", id, approved)
+	cards.forget(id)
+	if q.Message != nil {
+		if err := gw.EditMessageTextMarkup(ctx, q.Message.Chat.ID, q.Message.MessageID, "⚠️ Approval request: "+outcome, messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}}); err != nil {
+			fmt.Fprintf(os.Stderr, "orion: approval tap: request %s outcome edit failed: %v\n", id, err)
+		}
+	}
+	return gw.AnswerCallbackQuery(ctx, q.ID, outcome)
 }

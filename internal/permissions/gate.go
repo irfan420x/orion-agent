@@ -265,10 +265,33 @@ func summaryArg(tool string, raw map[string]json.RawMessage) string {
 // timer/cancel branch that fires in the same instant as a tap can
 // prefer the delivered result instead of denying a call the user
 // just approved (F-A5-P2-20).
+//
+// settled + timer close the race by construction (F-A6-P2-8): the
+// timer branch, the cancellation branch and Resolve all settle the
+// request through one mutex-guarded transition (see settle), so
+// exactly one of them wins. The loser observes the winner's
+// outcome: a Resolve that loses to the timer returns false (the
+// callback handler then reports the request expired, instead of
+// telling the user "Approved" for a call the gate denied), and a
+// timer branch that loses to Resolve honours the approval. Before
+// this, Resolve never stopped the timer and the timer branch only
+// re-checked the recorded outcome — a tap landing after that
+// re-check but before the expiry hook still produced "approved"
+// on the card and "denied" in the loop.
 type pendingRequest struct {
 	req      ApprovalRequest
 	ch       chan pendingResult
 	resolved *pendingResult
+	// timer is the approval-window timer Check armed for this
+	// request (nil until Check creates it); Resolve stops it
+	// under the gate mutex as part of settling, so a stopped
+	// timer can never fire after the request is answered.
+	timer *time.Timer
+	// settled is true once exactly one of Resolve, the timer
+	// branch or the cancellation branch has claimed the
+	// request. It is read and written only under the gate
+	// mutex, and settle is the only transition that sets it.
+	settled bool
 }
 
 // pendingResult is what Resolve delivers: whether the user approved,
@@ -490,36 +513,45 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	g.mu.Lock()
+	pr.timer = timer
+	g.mu.Unlock()
 	select {
 	case res := <-pr.ch:
 		return g.applyResult(tool, args, res)
 	case <-timer.C:
-		// Resolve-vs-expiry race (F-A5-P2-20): a tap landing
-		// in the same instant as the deadline must not be
-		// "approved" to the user while the tool is denied.
-		// Resolve records its outcome on the pending request
-		// under the gate mutex before sending, so re-check
-		// here: a delivered result wins over the timer, the
-		// expiry hook does NOT fire, and the card is never
-		// left saying Expired after an approval.
+		// Timer vs Resolve, decided by construction
+		// (F-A6-P2-8): settle claims the request under the
+		// gate mutex, so exactly one of this branch and
+		// Resolve wins. If this branch wins, Resolve already
+		// returned (or will return) false and the expiry hook
+		// fires exactly once. If Resolve won, its outcome is
+		// recorded and honoured here instead of expiring the
+		// request. (A loss with no recorded outcome means
+		// the cancellation branch won instead — the turn is
+		// over either way, so the denial below is correct.)
+		if g.settle(pr, nil) {
+			if hook := g.onExpireHook(); hook != nil {
+				hook(req)
+			}
+			return false, "denied: approval timed out (no answer within the approval window)"
+		}
 		if res, ok := g.resolvedOutcome(pr); ok {
 			return g.applyResult(tool, args, res)
-		}
-		g.removePending(req.ID)
-		if hook := g.onExpireHook(); hook != nil {
-			hook(req)
 		}
 		return false, "denied: approval timed out (no answer within the approval window)"
 	case <-ctx.Done():
-		// Same race as the timer branch: a tap landing as the
-		// turn is cancelled wins over the cancellation when
-		// Resolve already recorded it.
+		// Same single-winner settlement as the timer branch:
+		// a tap landing as the turn is cancelled wins over
+		// the cancellation when Resolve already settled it.
+		if g.settle(pr, nil) {
+			if hook := g.onExpireHook(); hook != nil {
+				hook(req)
+			}
+			return false, "denied: approval cancelled (the turn ended before an answer arrived)"
+		}
 		if res, ok := g.resolvedOutcome(pr); ok {
 			return g.applyResult(tool, args, res)
-		}
-		g.removePending(req.ID)
-		if hook := g.onExpireHook(); hook != nil {
-			hook(req)
 		}
 		return false, "denied: approval cancelled (the turn ended before an answer arrived)"
 	}
@@ -593,31 +625,80 @@ func (g *Gate) PendingCount() int {
 	return len(g.pending)
 }
 
+// settle is the single state transition for a pending request
+// (F-A6-P2-8): Resolve, the timer branch and the cancellation
+// branch all settle through here, under the gate mutex, so
+// exactly one of them wins. It reports whether this call won:
+// the winner owns the outcome (a recorded res, or the expiry
+// for a nil res), and every loser must observe the winner's
+// outcome instead of acting. Settling removes the request from
+// pending, stops its timer (so a timer stopped in time never
+// fires after an answer), and — for a Resolve — records the
+// outcome before the caller delivers it on the channel.
+func (g *Gate) settle(pr *pendingRequest, res *pendingResult) bool {
+	if g == nil || pr == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.settleLocked(pr, res)
+}
+
+// settleLocked is settle with the gate mutex already held.
+func (g *Gate) settleLocked(pr *pendingRequest, res *pendingResult) bool {
+	if pr.settled {
+		return false
+	}
+	pr.settled = true
+	if res != nil {
+		pr.resolved = res
+	}
+	if pr.timer != nil {
+		pr.timer.Stop()
+	}
+	delete(g.pending, pr.req.ID)
+	return true
+}
+
 // Resolve answers the pending request with id. approved is the
 // user's answer; persist, when non-nil, is a standing rule to store
 // ("always allow" / "never allow"). It reports whether a request
 // was waiting: false means the id is unknown, already answered, or
 // expired, and the caller should tell the user the request is gone
 // instead of acting on the tap. Resolve never blocks: if Check
-// already left (timeout/cancel), the answer is dropped.
+// already left (timeout/cancel), the answer is dropped. Exactly
+// one of Resolve and the timer/cancel branch wins the settle
+// (F-A6-P2-8): a Resolve that returns true is guaranteed to be
+// honoured by Check, and one that returns false lost to an expiry
+// Check already reported (or is reporting) as a denial.
 func (g *Gate) Resolve(id string, approved bool, persist *Action) bool {
 	if g == nil {
 		return false
 	}
+	// The lookup and the settle happen under one lock hold:
+	// a prompter-failure removal landing between them must not
+	// let Resolve report success for a request Check already
+	// abandoned.
 	g.mu.Lock()
 	pr, ok := g.pending[id]
 	if !ok {
 		g.mu.Unlock()
 		return false
 	}
-	delete(g.pending, id)
 	// Record the outcome under the mutex BEFORE delivering it:
 	// a timer/cancel branch racing this Resolve re-checks the
 	// recorded outcome (see resolvedOutcome) and honours the
 	// user's answer instead of expiring the request (F-A5-P2-20).
+	// settleLocked makes the win atomic: if the timer branch
+	// already settled the request, this Resolve loses and
+	// returns false instead of recording an approval Check
+	// will deny.
 	res := pendingResult{approved: approved, persist: persist}
-	pr.resolved = &res
+	won := g.settleLocked(pr, &res)
 	g.mu.Unlock()
+	if !won {
+		return false
+	}
 	select {
 	case pr.ch <- res:
 	default:

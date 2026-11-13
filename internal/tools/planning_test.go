@@ -450,6 +450,94 @@ func TestPlanningStoreSetDataDir(t *testing.T) {
 	}
 }
 
+// TestPlanningSymlinkedDataDirIsAccepted (F-A6-P2-12): a data dir
+// that is itself a symlink — a legitimate deployment layout, e.g.
+// ~/.orion -> /mnt/data/orion — must not be refused. Before the
+// fix, ensurePlanningDir compared the resolved planning dir
+// against the UNRESOLVED data dir, so every write under a
+// symlinked data dir failed with "resolves outside the data dir".
+func TestPlanningSymlinkedDataDirIsAccepted(t *testing.T) {
+	real := filepath.Join(t.TempDir(), "real")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// The store is pointed at the symlink; a task_create for a
+	// chat must persist under the REAL directory.
+	store := NewPlanningStore(link)
+	tools := planningToolsFor(t, store)
+	chat := permissions.WithApprovalContext(context.Background(), 111, 111)
+	execPlanning(t, tools, chat, "task_create", map[string]any{"title": "symlinked data dir task"})
+	if _, err := os.Stat(filepath.Join(real, "chats", "111", "tasks.json")); err != nil {
+		t.Fatalf("task not persisted under the real data dir: %v", err)
+	}
+	list := execPlanning(t, tools, chat, "task_list", map[string]any{})
+	if !strings.Contains(list, "symlinked data dir task") {
+		t.Fatalf("task_list missing the task: %s", list)
+	}
+}
+
+// TestPlanningSymlinkedDataDirNotYetCreated (F-A6-P2-12): the same
+// acceptance must hold when the data dir does not exist yet — the
+// symlink is on a PARENT (e.g. the TempDir itself is reached
+// through a link) and only the leaf is created by the write.
+func TestPlanningSymlinkedDataDirNotYetCreated(t *testing.T) {
+	real := filepath.Join(t.TempDir(), "real")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// The data dir itself (under the link) does not exist yet.
+	missing := filepath.Join(link, "orion-data")
+	if err := ensurePlanningDir(filepath.Join(missing, "chats", "111"), missing); err != nil {
+		t.Fatalf("ensurePlanningDir under a not-yet-created symlinked data dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(real, "orion-data", "chats", "111")); err != nil {
+		t.Fatalf("planning dir not created under the real data dir: %v", err)
+	}
+}
+
+// TestPlanningEscapingSymlinkStillRefused (F-A6-P2-12 guard): the
+// fix must not weaken the F-A5-P2-34 refusal — a planning dir
+// that resolves OUTSIDE the (resolved) data dir, e.g. a planted
+// symlinked chats/ dir, is still refused, and a planning dir
+// that is itself a symlink is still refused.
+func TestPlanningEscapingSymlinkStillRefused(t *testing.T) {
+	dataDir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Plant chats/ as a symlink escaping the data dir.
+	if err := os.Symlink(outside, filepath.Join(dataDir, "chats")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := ensurePlanningDir(filepath.Join(dataDir, "chats", "111"), dataDir); err == nil {
+		t.Fatal("planning dir escaping the data dir via a symlinked chats/ must be refused")
+	}
+	// A planning dir that is itself a symlink is refused too.
+	real := filepath.Join(t.TempDir(), "real")
+	if err := os.MkdirAll(filepath.Join(real, "chats"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(real, "chats", "111")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := ensurePlanningDir(filepath.Join(real, "chats", "111"), real); err == nil {
+		t.Fatal("a planning dir that is itself a symlink must be refused")
+	}
+}
+
 func TestPlanningDirFuncOverride(t *testing.T) {
 	dataDir := t.TempDir()
 	store := NewPlanningStore(dataDir)

@@ -13,8 +13,14 @@
 # config is written only on first install, with no secrets in it —
 # add your provider API key / Telegram token afterwards (see README).
 #
-# Build info (VCS commit + build date) is baked into the binaries
-# with -ldflags -X, so `orion version` reports the real build.
+# Build info (version from the exact-match git tag, VCS commit +
+# build date) is baked into the binaries with -ldflags -X, so
+# `orion version` reports the real build. When HEAD is not exactly
+# on a tag, no -X Version is passed and the binary reports the
+# source default in internal/version/version.go (the release this
+# tree is working towards) — never "dev", never a stale tag
+# (F-A6-P2-16: the rc10 binary reported rc9 because Version was a
+# const ldflags could not override).
 set -euo pipefail
 
 PROG="install.sh"
@@ -100,7 +106,18 @@ else
 	COMMIT="unknown"
 fi
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Version from the exact-match tag (v0.2.0-rc11 -> 0.2.0-rc11). On an
+# untagged commit TAG_VERSION is empty and Version is left at its
+# source default (see internal/version/version.go), so the installed
+# binary still reports a sane version.
+TAG_VERSION=""
+if command -v git >/dev/null 2>&1; then
+	TAG_VERSION="$(git -C "$REPO_ROOT" describe --tags --exact-match 2>/dev/null | sed -E 's/^v//')" || TAG_VERSION=""
+fi
 LDFLAGS="-X github.com/irfan/orion/internal/version.Commit=${COMMIT} -X github.com/irfan/orion/internal/version.BuildDate=${BUILD_DATE}"
+if [ -n "$TAG_VERSION" ]; then
+	LDFLAGS="$LDFLAGS -X github.com/irfan/orion/internal/version.Version=${TAG_VERSION}"
+fi
 
 # Install target: an explicit --prefix wins; otherwise /usr/local/bin
 # when writable, else ~/.local/bin (no sudo needed, on PATH in most
@@ -167,7 +184,7 @@ build_one() {
 	STAGE_TMP="${STAGE_TMP% $tmp}"
 }
 
-echo "building orion, oriond and orion-seccomp (commit ${COMMIT}, built ${BUILD_DATE})..."
+echo "building orion, oriond and orion-seccomp (version ${TAG_VERSION:-$(grep -E '^var Version' internal/version/version.go | sed -E 's/.*"([^"]+)".*/\1/')}, commit ${COMMIT}, built ${BUILD_DATE})..."
 build_one ./cmd/orion orion
 if [ -d cmd/oriond ]; then
 	build_one ./cmd/oriond oriond

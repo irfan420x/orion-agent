@@ -167,6 +167,58 @@ func TestValidateEnum(t *testing.T) {
 	}
 }
 
+func TestValidateEnumDoesNotShortCircuitOtherConstraints(t *testing.T) {
+	// Audit 6 F-A6-P2-11: if a value matched an enum entry,
+	// validate returned success immediately and pattern, bounds,
+	// and type checks never ran — enum ["a","b"] + pattern
+	// "^[0-9]+$" accepted "a". Enum membership is now one
+	// constraint among others: a value must satisfy all of them.
+	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			// "1" satisfies enum + pattern; "a" is in the enum
+			// but violates the pattern; "2" satisfies the
+			// pattern but is not in the enum.
+			"code": map[string]any{"type": "string", "enum": []any{"a", "1"}, "pattern": "^[0-9]+$"},
+			// 1 is in the enum but below the minimum; 5 and 10
+			// satisfy enum + bounds; 7 satisfies the bounds but
+			// is not in the enum.
+			"level": map[string]any{"type": "integer", "enum": []any{1, 5, 10}, "minimum": 5, "maximum": 10},
+		},
+	})
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		args string
+		want string
+	}{
+		{"in enum but violates pattern", `{"code":"a"}`, `parameter "code" must match pattern`},
+		{"satisfies pattern but not in enum", `{"code":"2"}`, `parameter "code" must be one of`},
+		{"in enum but below minimum", `{"level":1}`, `parameter "level" must be >= 5`},
+		{"satisfies bounds but not in enum", `{"level":7}`, `parameter "level" must be one of`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+			assertInvalidArgs(t, err, tc.want)
+			if *ran != 0 {
+				t.Fatalf("tool ran despite invalid args %s", tc.args)
+			}
+		})
+	}
+
+	// Values satisfying every constraint still pass.
+	for _, args := range []string{`{"code":"1"}`, `{"level":5}`, `{"level":10}`} {
+		if _, err := r.Execute(ctx, "stub", json.RawMessage(args)); err != nil {
+			t.Fatalf("Execute(%s): expected success, got %v", args, err)
+		}
+	}
+	if *ran != 3 {
+		t.Fatalf("tool ran %d time(s), want 3 (only the valid calls)", *ran)
+	}
+}
+
 func TestValidateNonObjectArgs(t *testing.T) {
 	r, ran := newValidatingRegistry(t)
 	ctx := context.Background()

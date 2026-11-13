@@ -3,15 +3,22 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc10.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc11.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1055 tests pass, 0 fail, 4 skip — Ollama live tests
-> plus one MCP process test that needs a live server; race clean). The model can now delegate to subagents (`subagent_spawn` /
+> built and tested (1,059 tests total — 1,055 pass, 0 fail, 4 skip —
+> Ollama live tests plus one MCP process test that needs a live server;
+> race clean; counts verified by Audit 6 on rc10, see
+> `AUDIT6_2026-11-13.md` — the rc11 suite count is confirmed by the
+> release coordinator before tagging). The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
 > history — fixed by a calibrated token estimator; same turn now costs
 > ~3.3k tokens). The TypeScript desktop/web UI is v0.2 only (see
 > [LANGUAGE_DECISION.md](LANGUAGE_DECISION.md)).
+>
+> **License: MIT** — see [LICENSE](LICENSE). The repository is public
+> at https://github.com/irfan420x/orion-agent; anyone may use, copy,
+> and modify the code under the MIT terms.
 
 ## Quick start
 
@@ -23,7 +30,7 @@ subagents — built in Go, local-first, Linux/macOS first.
 > finds the toolchain itself (PATH, then `~/go1.27.4/bin/go`).
 
 ```sh
-# 0. Get the code (the repo is private — you need access to it):
+# 0. Get the code (the repo is public, MIT-licensed — no access needed):
 git clone https://github.com/irfan420x/orion-agent.git
 cd orion-agent
 
@@ -82,11 +89,13 @@ a block with its command, file writes as ✍️ lines, repeats collapse
 to (×N). Displayed commands are redacted, so secrets never leak
 into the chat. The final reply is a structured message in your
 language, with a runtime footer (model, tokens, steps, duration)
-you can toggle with `/footer`. The `/` menu offers 17 commands
-(`/help`, `/new`, `/stop`, `/status`, `/model`, `/usage`, `/undo`,
-`/retry`, `/pause`, `/agents`, `/title`, `/compress`, `/save`,
-`/restart`, `/whoami`, `/footer`, `/memory`); sessions persist in
-`~/.orion/sessions.json`.
+you can toggle with `/footer`. The `/` menu offers 19 commands
+(`/help`, `/new`, `/sessions`, `/resume`, `/stop`, `/status`, `/model`,
+`/usage`, `/undo`, `/retry`, `/pause`, `/agents`, `/title`, `/compress`,
+`/save`, `/restart`, `/whoami`, `/footer`, `/memory`); per-chat
+command state (title, footer preference, pause flag, usage totals)
+persists in `~/.orion/sessions.json`, while conversation transcripts
+persist separately as per-session JSONL files (see [Sessions](#sessions)).
 
 # Run oriond as a service (systemd user unit, oriond.service):
 ./install.sh --systemd                  # installs + enables the unit
@@ -101,10 +110,11 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-21/21 packages, 1055 tests passing, 0 failing, 4 skipped (the live
-Ollama tests, which need a running Ollama server, plus one MCP test
+21/21 packages, 1,059 tests total (1,055 passing, 0 failing, 4 skipped —
+the live Ollama tests, which need a running Ollama server, plus one MCP test
 that needs a live server process), race clean — `go test
--count=1 ./...`, verified 2026-11-13. Run the suite with `go test ./...` or `make test`.
+-count=1 ./...`, verified by Audit 6 on rc10, 2026-11-13
+(`AUDIT6_2026-11-13.md`). Run the suite with `go test ./...` or `make test`.
 
 ## Configuration
 
@@ -211,6 +221,78 @@ established on the host, `shell_exec` refuses the command
 missing seccomp filter is likewise refused unless
 `sandbox.allow_without_seccomp=true` is set.
 
+## MCP servers (confinement)
+
+MCP servers configured in `<data_dir>/mcp.json` (e.g. `~/.orion/mcp.json`,
+never read from the repo) run **confined by default**, under the same
+sandbox `shell_exec` uses: new mount/PID/IPC/UTS namespaces, a
+pivot_root into a chroot holding only `/usr` (read-only) and the
+sandbox work dir, and the `orion-seccomp` filter. A sandboxed server
+cannot read `~/.orion/config.json` (the provider keys, the Telegram
+token), `~/.ssh`, or the home directory — `HOME` is `/work` and
+`TMPDIR` is `/tmp` inside the sandbox, and its environment is
+scrubbed like `shell_exec`'s. Confinement is fail-closed: when the
+sandbox is unavailable, the server binary is not visible inside the
+chroot, or the seccomp launcher is missing, the server is refused at
+start — it never silently runs unsandboxed.
+
+Consequences the operator must know:
+
+- The server binary must live under `/usr` (or a path that resolves
+  there, e.g. `/bin`, `/sbin` — the merged-`/usr` symlinks). A binary
+  in `~/.local/bin`, `/opt`, or anywhere else is refused at start.
+- MCP servers keep the host network namespace: they are network-class
+  by design (the permission gate treats every `mcp__<server>__<tool>`
+  as network, so it needs approval on Telegram), and API-backed
+  servers cannot function without egress. The network does not help
+  exfiltrate what the server cannot read — the config, keys, and home
+  directory are outside the chroot.
+- Opt-out is per server and explicit: `"sandbox": false` in `mcp.json`
+  runs that server fully trusted, like a hook — it can read the
+  agent's config and home directory. The daemon logs the opt-out on
+  start.
+- Known limitation (Audit 6, F-A6-P2-14): sandboxed MCP servers share
+  the sandbox work dir (`<data_dir>/sandbox/work`, i.e. `/work`) with
+  `shell_exec`, so a server can read files a shell turn left in
+  `/work` and plant files a later shell turn might run. Do not leave
+  secrets in `/work`; see [SECURITY.md](SECURITY.md).
+
+## Per-chat budget and USD cost
+
+One Telegram chat cannot spend the daemon's whole allowance. Each
+chat gets its own daily token budget — default **100,000 tokens per
+UTC day** (`per_chat_daily_token_budget` in `config.json`, 0 =
+unlimited, 1,000–10,000,000) — enforced in `runChatTurn`
+(`internal/app`): a pre-flight check refuses a turn whose projected
+input would exceed the remaining budget, a mid-turn check aborts
+after a provider response that crosses it (it reads the main
+agent's usage; subagent spend is charged at turn end by the sweep
+— Audit 6, F-A6-P2-6), and the turn's spend is
+recorded even when the turn fails (so an over-budget turn is logged,
+and the *next* turn is the one refused). Spend is persisted to
+`<data_dir>/budget.json`, so a daemon restart does not reset any
+chat's daily total; yesterday's spend never counts against today.
+Side-channel provider calls (selector, extraction, auto-compact)
+and finished-but-unfetched subagent tasks are charged to the owning
+chat at turn end, so they count against the same budget. Metering of
+`/compress` itself is an rc11 fix (Audit 6, F-A6-1 — no production
+caller passed the metering sink on the `/compress` path in rc10);
+the release coordinator verifies it landed before tagging. See
+[SECURITY.md](SECURITY.md) for the enforcement points and the known
+metering gaps still open in rc11.
+
+`/usage` shows the chat's day: tokens today with the
+prompt/completion/subagent split, the daily budget (limit,
+remaining, UTC-midnight reset), and an **estimated USD cost**
+(`internal/cost`, price table v2026-11-13, effective 2026-11-13 —
+standard on-demand list prices, USD per 1M tokens). The figure is
+an estimate, labelled as such wherever it appears: cache hits,
+peak/off-peak rates, batch and enterprise rates are not reflected.
+Each (provider, model) bucket is priced at its own model's rate, so
+a morning on `deepseek-chat` is never repriced at an afternoon
+switch to another model. A model with no price in the table reports
+its cost as "unknown", never $0.
+
 ## Sessions
 
 Every conversation is kept as an append-only per-session JSONL
@@ -243,6 +325,9 @@ is never deleted or modified by the migration.
 | `orion skills` / `orion skills search <q>` | Loaded skills (`~/.orion/skills/*.md`) |
 | `orion subagent run "brief"` | Run a brief as a managed child agent |
 | `orion agents` | List subagent tasks with status, duration, tokens and result summary (same view as Telegram `/agents`) |
+| `orion sessions` / `orion sessions list` | List CLI sessions (transcripts, newest first) |
+| `orion sessions resume <id\|prefix>` | Resume a CLI session: its transcript becomes the working history |
+| `orion sessions new` | Start a fresh CLI session (old transcript stays saved) |
 | `orion telegram test/poll` | Verify token / start gateway |
 | `orion daemon` / `oriond` | Telegram polling daemon |
 | `orion version` | Print version |
@@ -280,3 +365,10 @@ files inside `t.TempDir()` only.
 ## Layout
 
 See [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE). The repository is public
+(https://github.com/irfan420x/orion-agent); the MIT license permits
+use, copying, modification, and distribution, including commercial
+use, under its terms.

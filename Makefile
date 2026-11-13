@@ -10,8 +10,10 @@
 #   make version   print the version the next build will report
 #   make clean     remove ./bin
 #
-# Build info (commit + date) is baked in with -ldflags -X so
-# `orion version` reports the real build.
+# Build info (version from the exact-match git tag, commit + date)
+# is baked in with -ldflags -X so `orion version` reports the real
+# build. An untagged build reports the source default in
+# internal/version/version.go (never "dev", never a stale tag).
 
 GO ?= go
 # Fall back to the per-user Go installs this VM/container setup is
@@ -26,7 +28,17 @@ endif
 VERSION_PKG := github.com/irfan/orion/internal/version
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS := -X $(VERSION_PKG).Commit=$(COMMIT) -X $(VERSION_PKG).BuildDate=$(DATE)
+# Version source of truth: the exact-match git tag (v0.2.0-rc11 -> 0.2.0-rc11),
+# set via -ldflags -X. When HEAD is not exactly on a tag (an untagged
+# commit between releases) TAG_VERSION is empty and no -X is passed,
+# so the binary reports the source default in internal/version
+# (the release this tree is working towards) — never "dev" and never
+# a stale tag. See F-A6-P2-16: Version used to be a const stuck at
+# rc9 while the tag was rc10, because ldflags cannot override a const.
+TAG_VERSION := $(shell git describe --tags --exact-match 2>/dev/null | sed -E 's/^v//')
+VERSION_DEFAULT := $(shell grep -E '^var Version' internal/version/version.go | sed -E 's/.*"([^"]+)".*/\1/')
+EFFECTIVE_VERSION := $(if $(TAG_VERSION),$(TAG_VERSION),$(VERSION_DEFAULT))
+LDFLAGS := -X $(VERSION_PKG).Commit=$(COMMIT) -X $(VERSION_PKG).BuildDate=$(DATE) $(if $(TAG_VERSION),-X $(VERSION_PKG).Version=$(TAG_VERSION))
 
 BIN_DIR ?= bin
 
@@ -56,7 +68,7 @@ fmt:
 	@test -z "$$(gofmt -l cmd internal)" || { echo "gofmt -l:"; gofmt -l cmd internal; exit 1; }
 
 version:
-	@echo "orion $(shell grep -E '^const Version' internal/version/version.go | sed -E 's/.*"([^"]+)".*/\1/') commit $(COMMIT) built $(DATE)"
+	@echo "orion $(EFFECTIVE_VERSION) commit $(COMMIT) built $(DATE)"
 
 clean:
 	rm -rf $(BIN_DIR)

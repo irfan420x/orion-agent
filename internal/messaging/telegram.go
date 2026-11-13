@@ -242,6 +242,35 @@ func (g *TelegramGateway) logf(format string, args ...any) {
 	g.logger(format, args...)
 }
 
+// logReceivedUpdate records one update GetUpdates returned: its id,
+// its kind, and the sender/chat ids. Message text and callback data
+// are NEVER logged (the text is user/model content; the data holds a
+// pending-request id). The line exists so a lost tap is
+// diagnosable: if getUpdates returned the callback query, this line
+// is in the log and the loss is downstream of the poll; if it is
+// absent, the update never reached this poller at all (another
+// getUpdates consumer confirmed it server-side, or Telegram never
+// delivered it) — no code downstream can fix that, and guessing
+// otherwise wastes the next incident.
+func (g *TelegramGateway) logReceivedUpdate(upd Update) {
+	switch {
+	case upd.CallbackQuery != nil:
+		from := int64(0)
+		if upd.CallbackQuery.From != nil {
+			from = upd.CallbackQuery.From.ID
+		}
+		g.logf("telegram poll: received update %d callback_query id=%s from=%d", upd.UpdateID, upd.CallbackQuery.ID, from)
+	case upd.Message != nil:
+		from := int64(0)
+		if upd.Message.From != nil {
+			from = upd.Message.From.ID
+		}
+		g.logf("telegram poll: received update %d message chat=%d from=%d", upd.UpdateID, upd.Message.Chat.ID, from)
+	default:
+		g.logf("telegram poll: received update %d (other type, skipped)", upd.UpdateID)
+	}
+}
+
 // WithAllowedChats restricts Poll to messages from the given chat IDs
 // (private chats are positive, groups negative). With no IDs the option
 // is a no-op; with at least one, every other chat is dropped before the
@@ -1071,6 +1100,17 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// Semaphore bounding concurrent handlers; striped locks serialise
 	// handlers for the same chat (best-effort per-chat ordering).
 	sem := make(chan struct{}, maxPollHandlers)
+	// cbSem bounds concurrent callback handlers SEPARATELY from
+	// turns (rc11 W7): a callback query (an inline-keyboard tap) is
+	// a millisecond Resolve, but a turn handler holds its sem slot
+	// for the whole turn — including a 90s approval wait and
+	// multi-minute model runs. When callbacks shared the turn
+	// semaphore, all 8 slots held meant the poll loop blocked
+	// acquiring a slot for a tap and the callback was never
+	// dispatched: zero tap lines, gate timed out, polling stalled
+	// for every chat (the live rc10 incident, cards 245 and 253).
+	// Callbacks must never wait behind turns.
+	cbSem := make(chan struct{}, maxPollHandlers)
 	var chatLocks [64]sync.Mutex
 	chatLock := func(chatID int64) *sync.Mutex {
 		return &chatLocks[uint64(chatID)%uint64(len(chatLocks))]
@@ -1227,7 +1267,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// (even when no handler is installed) so the button's spinner
 	// clears instead of hanging.
 	handleCallback := func(q TGCallbackQuery) {
-		defer func() { <-sem }()
+		defer func() { <-cbSem }()
 		defer func() {
 			if r := recover(); r != nil {
 				g.logf("telegram poll: callback handler panicked: %v", r)
@@ -1300,6 +1340,16 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		backoff = time.Second
 
 		for _, upd := range updates {
+			// Every received update is logged (id + kind + sender
+			// / chat ids only — never message text or callback
+			// data): the rc10 incident was undiagnosable precisely
+			// because nothing recorded whether getUpdates ever
+			// RETURNED the tap. With this line the next incident
+			// reads either "received update N callback_query" (the
+			// loss is downstream of the poll) or nothing at all
+			// (the loss is upstream: another poller confirmed it,
+			// or Telegram never delivered it).
+			g.logReceivedUpdate(upd)
 			// Callback queries (inline-keyboard taps) are handled
 			// on their own path, outside the per-chat lock (see
 			// handleCallback): a tap must be able to resolve a
@@ -1307,6 +1357,9 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			// holds the chat's lock. The sender is checked the
 			// same way as for messages — a tap from a
 			// non-allowlisted user can never approve anything.
+			// The callback slot comes from cbSem, NOT the turn
+			// semaphore (see above): a tap is dispatched even
+			// when every turn slot is held.
 			if upd.CallbackQuery != nil {
 				q := upd.CallbackQuery
 				if !g.IsSenderAllowed(q.From) {
@@ -1321,7 +1374,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 					return nil
 				}
 				select {
-				case sem <- struct{}{}:
+				case cbSem <- struct{}{}:
 				case <-ctx.Done():
 					return nil
 				}

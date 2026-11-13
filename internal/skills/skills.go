@@ -15,7 +15,15 @@
 // third-party skills you have not read. Discovery loads only regular
 // files from the skills directory: symlinks are refused, so a synced
 // or checked-out directory cannot smuggle in a skill that lives
-// outside it.
+// outside it; hardlinked files are refused too, and the file is
+// opened (O_NOFOLLOW) before it is stat'ed, so the checks apply to
+// the file actually read (Audit 6 F-A6-P2-10). Load time also
+// refuses any skill body containing a BEGIN/END SKILL delimiter
+// marker line or an activation directive (Audit 6 F-A6-2): the
+// delimiters are only labelling, so a body that carries its own
+// END marker could close the block early and inject a fake footer
+// plus fresh instructions, and the bar against that has to be in
+// code at load time, not in a prompt instruction.
 package skills
 
 import (
@@ -25,9 +33,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // maxFileSize caps how much of any one skill file is read into memory.
@@ -83,12 +93,22 @@ func (s Skill) clone() Skill {
 // on error. The skill is copied on entry, so later mutation of the
 // caller's Skill (in particular its Tools slice) cannot corrupt the
 // registry. A nil Registry is an error, not a panic.
+//
+// The skill's content is validated the same way file loads are
+// (see validateSkillContent): a body containing a BEGIN/END SKILL
+// delimiter marker line or an activation directive is refused here
+// too, so the registry — which is what the skill tool invokes from
+// — can never hold a skill whose body blurs the delimiter boundary,
+// however the skill was constructed (Audit 6 F-A6-2).
 func (r *Registry) Register(s Skill) error {
 	if r == nil {
 		return errors.New("skills: Register on nil Registry")
 	}
 	if strings.TrimSpace(s.Name) == "" {
 		return errors.New("skills: cannot register skill with empty name")
+	}
+	if err := validateSkillContent(s.Content); err != nil {
+		return fmt.Errorf("skills: cannot register skill %q: %w", s.Name, err)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -233,20 +253,39 @@ func (r *Registry) LoadFile(path string) (Skill, error) {
 // parseFile reads one skill file (capped at maxFileSize) and parses it.
 // Symlinks are refused here too, so the single-file LoadFile path has
 // the same guarantee as LoadDir (Audit 5 F-A5-P2-26).
+//
+// The file is opened first and stat'ed second, from the open file
+// descriptor (Audit 6 F-A6-P2-10): the old Lstat-then-Open order let
+// the path be swapped between the check and the read. Opening with
+// O_NOFOLLOW refuses a symlink at open time (ELOOP) instead of
+// following it, O_NONBLOCK keeps a FIFO in the skills dir from
+// hanging the open, and the fstat on the opened descriptor is what
+// the regular-file and hardlink (nlink > 1) refusals are based on —
+// so every check describes the file actually read, not the path
+// that was checked a moment earlier. LoadDir's own Lstat pre-check
+// is only an early, clearer error; the checks here are authoritative.
 func parseFile(path string) (Skill, error) {
 	if strings.TrimSpace(path) == "" {
 		return Skill{}, errors.New("skills: empty file path")
 	}
-	if info, err := os.Lstat(path); err != nil {
-		return Skill{}, fmt.Errorf("skills: cannot stat %q: %w", path, err)
-	} else if info.Mode()&os.ModeSymlink != 0 {
-		return Skill{}, fmt.Errorf("skills: refusing symlink %q: skill files must be regular files", path)
-	}
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return Skill{}, fmt.Errorf("skills: refusing symlink %q: skill files must be regular files", path)
+		}
 		return Skill{}, fmt.Errorf("skills: cannot open %q: %w", path, err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Skill{}, fmt.Errorf("skills: cannot stat %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return Skill{}, fmt.Errorf("skills: refusing non-regular file %q (mode %s): skill files must be regular files", path, info.Mode())
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+		return Skill{}, fmt.Errorf("skills: refusing hardlinked file %q (link count %d): skill files must not be hardlinked", path, st.Nlink)
+	}
 
 	// LimitReader caps memory use; reading one byte past the cap lets us
 	// detect an oversized file instead of silently truncating it.
@@ -260,6 +299,13 @@ func parseFile(path string) (Skill, error) {
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return Skill{}, fmt.Errorf("skills: file %q is empty", path)
 	}
+	// A body that carries its own delimiter marker (or an
+	// activation directive) must never load: it could close the
+	// BEGIN/END block early at invoke time and inject a fake
+	// footer plus fresh instructions (Audit 6 F-A6-2).
+	if err := validateSkillContent(string(data)); err != nil {
+		return Skill{}, fmt.Errorf("skills: file %q: %w", path, err)
+	}
 	skill, warnings := parseSkill(path, string(data))
 	for _, w := range warnings {
 		log.Printf("orion: skills: %s: %s", path, w)
@@ -272,6 +318,114 @@ func parseFile(path string) (Skill, error) {
 		return Skill{}, fmt.Errorf("skills: file %q has no skill name (no \"# \" heading and the file name yields none)", path)
 	}
 	return skill, nil
+}
+
+// skillMarkerLine matches a line that parses as a skill-content
+// delimiter: the exact form formatSkillBody emits
+// (===== BEGIN SKILL "name" CONTENT ===== /
+// ===== END SKILL "name" CONTENT =====), with the name quoted or
+// bare. The match is anchored at the start of the (trimmed) line
+// and not at its end: a line beginning with a marker reads as a
+// marker to the model even with trailing text after it.
+var skillMarkerLine = regexp.MustCompile(`^===== (BEGIN|END) SKILL\s+.+\sCONTENT =====`)
+
+// validateSkillContent rejects skill text that can blur the
+// BEGIN/END delimiter boundary (Audit 6 F-A6-2): any line that
+// parses as a BEGIN/END SKILL marker, and any line shaped as an
+// activation directive ("Activate skill ...", "Activate the ...
+// skill ...", "Activate \"name\""). The delimiters are only
+// labelling — a body containing its own END marker can close the
+// block early and inject a fake footer plus fresh instructions,
+// and a body-directed switch ("END SKILL" + "BEGIN SKILL
+// \"other\"" + "Activate") is the same attack one step further
+// along — so the bar has to be in code at load time, not in the
+// prompt's hierarchy instruction, which is advisory. Skills are
+// operator-installed, so this is third-party-skill risk; a
+// legitimate skill never needs a marker line or an activation
+// directive in its body, and the error names the offending line so
+// the author can rephrase it instead of guessing.
+func validateSkillContent(content string) error {
+	for i, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if skillMarkerLine.MatchString(trimmed) {
+			return fmt.Errorf("line %d contains a skill delimiter marker %q: skill bodies must not contain BEGIN/END SKILL marker lines", i+1, truncateLine(trimmed))
+		}
+		if isActivateDirective(trimmed) {
+			return fmt.Errorf("line %d contains an activation directive %q: skill bodies must not direct skill activation", i+1, truncateLine(trimmed))
+		}
+	}
+	return nil
+}
+
+// NeutralizeSkillMarkers rewrites any line in content that parses as
+// a BEGIN/END SKILL delimiter marker so it no longer parses as one:
+// the line is prefixed with "[neutralised skill marker] ", which
+// breaks the line-anchored marker match while keeping the original
+// text readable. This is the belt-and-braces second bar behind the
+// load-time rejection in validateSkillContent: a Skill constructed
+// programmatically (tests, or a future loader path) can never blur
+// the delimiter boundary when rendered by tools.formatSkillBody,
+// even if it bypasses load-time validation. Activation directives
+// are not neutralised here — they are rejected at load time, and
+// the renderer's job is the delimiter boundary only.
+func NeutralizeSkillMarkers(content string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if skillMarkerLine.MatchString(strings.TrimSpace(line)) {
+			lines[i] = "[neutralised skill marker] " + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// truncateLine caps a line quoted in an error message, so a
+// hostile multi-kilobyte line cannot flood the log.
+func truncateLine(line string) string {
+	const maxLen = 120
+	if len(line) <= maxLen {
+		return line
+	}
+	return line[:maxLen] + "…"
+}
+
+// isActivateDirective reports whether line is shaped as an
+// instruction to activate a skill: it starts with "activate"
+// (any case) and then names a skill — "Activate skill ...",
+// "Activate the ... skill ...", or "Activate \"name\" ...".
+// Plain prose that merely contains the word "activate" ("to
+// activate the tool, ...") does not match: the directive has to
+// lead the line and reference a skill. There is no defined
+// textual activation syntax in the codebase — activation goes
+// through the skill tool — so any line shaped like one is a
+// body-directed switch attempt, not a legitimate instruction.
+func isActivateDirective(line string) bool {
+	lower := strings.ToLower(line)
+	if lower != "activate" && !strings.HasPrefix(lower, "activate ") && !strings.HasPrefix(lower, "activate\t") {
+		return false
+	}
+	rest := strings.TrimSpace(lower[len("activate"):])
+	// "Activate skill ..." / "Activate skill" (bare).
+	if rest == "skill" || strings.HasPrefix(rest, "skill ") || strings.HasPrefix(rest, "skill\t") || strings.HasPrefix(rest, "skill\"") {
+		return true
+	}
+	// "Activate the ... skill ..." / "Activate the skill ...".
+	if strings.HasPrefix(rest, "the ") || strings.HasPrefix(rest, "the\t") {
+		rest = strings.TrimSpace(rest[len("the"):])
+		if rest == "skill" || strings.HasPrefix(rest, "skill ") || strings.HasPrefix(rest, "skill\t") {
+			return true
+		}
+		// "Activate the other skill" — a word between "the" and
+		// "skill" is still a skill reference.
+		if idx := strings.Index(rest, " skill"); idx > 0 && !strings.Contains(rest[:idx], " ") {
+			return true
+		}
+	}
+	// "Activate \"name\" ..." — a quoted name after Activate is a
+	// skill reference in this context.
+	if strings.HasPrefix(rest, "\"") {
+		return true
+	}
+	return false
 }
 
 // parseSkill extracts the name, description, and tools from file content.
@@ -352,20 +506,39 @@ func parseSkill(path, content string) (Skill, []string) {
 	// count, because a skill author who writes one of those
 	// intends a restriction, and the old exact-match-only parse
 	// silently gave them none (Audit 5 F-A5-P2-25).
+	//
+	// A level-3 "### Tools" heading is accepted as the Tools
+	// section too (Audit 6 F-A6-P2-9): a skill author who nests
+	// the section under a "## " section used to get no tool list
+	// and no error at all. It still warns, so the author learns
+	// the canonical form is "## Tools"; a level-3 heading that
+	// merely looks like Tools warns the same way a level-2 one
+	// does. Deeper headings (#### and below) still end the
+	// section without opening one.
 	inTools := false
 	seenTools := map[string]bool{}
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if lvl := headingLevel(trimmed); lvl > 0 {
-			if lvl == 2 {
-				title := strings.TrimSpace(strings.TrimPrefix(trimmed, "## "))
+			switch lvl {
+			case 2, 3:
+				title := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
 				isTools, toolsLike := normalizeToolsHeading(title)
-				inTools = isTools
-				if toolsLike && !warnedHeadings[title] {
-					warnedHeadings[title] = true
+				headingKey := strings.Repeat("#", lvl) + " " + title
+				if lvl == 3 && isTools {
+					inTools = true
+					if !warnedHeadings[headingKey] {
+						warnedHeadings[headingKey] = true
+						warnings = append(warnings, fmt.Sprintf("level-3 Tools heading %q treated as the Tools section; prefer \"## Tools\"", title))
+					}
+				} else {
+					inTools = isTools
+				}
+				if toolsLike && !warnedHeadings[headingKey] {
+					warnedHeadings[headingKey] = true
 					warnings = append(warnings, fmt.Sprintf("unrecognised Tools-like heading %q — no tool restriction applied; use \"## Tools\", \"## Allowed Tools\", or \"## Available Tools\"", title))
 				}
-			} else {
+			default:
 				inTools = false
 			}
 			continue

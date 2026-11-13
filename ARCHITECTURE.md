@@ -1,28 +1,59 @@
-# Orion Architecture (v0.2.0-rc10)
+# Orion Architecture (v0.2.0-rc11)
+
+Orion is MIT-licensed (see [LICENSE](LICENSE)); the repository is
+public at https://github.com/irfan420x/orion-agent.
+
+21 packages (`go list ./...`):
 
 ```
 cmd/orion      CLI: run, chat, config, status, tools, memory, skills,
-               subagent, agents, telegram, daemon, version
+               subagent, agents, telegram, daemon, sessions, version
 cmd/oriond     Daemon: Telegram polling until interrupted
 internal/app   Wiring: config -> provider -> tools -> memory -> agent
                -> subagents -> skills -> audit. Built exactly once,
-               used by both entrypoints.
+               used by both entrypoints. Per-chat agents, sessions
+               (JSONL transcripts), the permission gate, and the
+               per-chat budget live here.
+internal/budget  Per-chat daily token budget (default 100,000/UTC day),
+               persisted to <DataDir>/budget.json; pre-flight check,
+               mid-turn abort, turn-end recording.
 internal/config  JSON config + env overrides + validation (0600 file)
-internal/model   Provider interface {Chat, Stream} + providers:
-               openai (OpenAI-compatible: OpenAI, vLLM, OpenRouter,
-               Hermes-class open models), anthropic, ollama.
-               NewProvider factory; retries with backoff.
 internal/core    Agent loop: system prompt + recent memory -> provider
                -> tool calls -> tool results -> reply. Max steps,
                per-iteration timeouts, ctx cancellation, streaming
                final turn, memory recording, graceful shutdown.
-internal/tools   Registry + 22 tools (shell, files, web, calculator,
-               datetime, process list, skill, grep, glob, todo/task,
-               subagent; MCP tools register dynamically). Central
-               schema validation in Registry.Execute. Shell delegates denylist
-               checks to internal/security.
+               Also: compaction, recall v2, skill activation, hooks
+               wiring, cost attribution.
+internal/cost    USD cost estimates: versioned price table
+               (v2026-11-13, effective 2026-11-13) + per-(provider,
+               model) day pricing for /usage; unknown price reports
+               "unknown", never $0.
+internal/hooks   Hook bus: PreToolUse / PostToolUse / Stop events run
+               as external executables under ~/.orion/hooks only,
+               scrubbed env, fail-closed PreToolUse.
+internal/mcp     MCP client (stdio): launches configured servers from
+               <DataDir>/mcp.json, exposes mcp__<server>__<tool>
+               tools; servers run sandboxed by default (fail-closed),
+               16 MiB line cap, 64 tools/server + 64 KiB schema cap.
 internal/memory  FileStore: JSON file, atomic writes, facts + 200-msg
                conversation history, case-insensitive fact search.
+               Also typed memories (~/.orion/memories/*.md) with
+               recall v2, drift verification, and session extraction.
+internal/messaging Telegram gateway (Bot API over HTTP, long polling)
+               + CLI channel. Telegram ONLY — no WhatsApp/Baileys.
+               Both channels call app.Handle -> same agent, same memory.
+               19 slash commands, per-chat session store
+               (sessions.json), sender check + owner tier.
+internal/model   Provider interface {Chat, Stream} + providers:
+               openai (OpenAI-compatible: OpenAI, vLLM, OpenRouter,
+               Hermes-class open models), anthropic, ollama, deepseek.
+               NewProvider factory; retries with backoff; nested
+               connect/progress/total timeouts (10s/60s/100s).
+internal/permissions Permission gate: destructive/network tool classes,
+               Telegram Approve/Deny/Always/Never with persisted
+               rules (permissions.json, 0600), 90 s timeout, card
+               expiry edit. The denylist stays absolute and can never
+               be approved.
 internal/sandbox  Namespace + pivot_root sandbox for shell_exec
                (on by default; user/mount/net namespaces,
                read-only /usr, minimal /etc copy, writable /work),
@@ -31,16 +62,28 @@ internal/sandbox  Namespace + pivot_root sandbox for shell_exec
                (fail-closed) when the sandbox is enabled but cannot
                be established, unless the operator explicitly opted
                into an unsandboxed fallback.
+internal/sandbox/cmd/launcher  orion-seccomp: the tiny static helper
+               that installs the seccomp filter on itself and execs
+               the sandboxed command (filters persist across execve).
 internal/security  Canonical token-based IsBlockedCommand (ONE copy),
                secret scanner/redactor, SHA-256 hash-chained audit log.
-internal/messaging Telegram gateway (Bot API over HTTP, long polling)
-               + CLI channel. Telegram ONLY — no WhatsApp/Baileys.
-               Both channels call app.Handle -> same agent, same memory.
+internal/session Per-session JSONL transcripts: append-only, one file
+               per session, with rotation, resume, and legacy
+               memory.json migration.
+internal/skills  Registry loading Markdown skill files (*.md) with
+               name/description/tools parsing; bodies delimited with
+               BEGIN/END SKILL markers.
 internal/subagent  Manager: spawn tasks with timeouts, concurrency
                limit, cancel, Wait/WaitAll, panic recovery. Executor
                is injected (the agent loop) to avoid import cycles.
-internal/skills  Registry loading Markdown skill files (*.md) with
-               name/description/tools parsing.
+internal/tools   Registry + 22 tools (shell, files, web, calculator,
+               datetime, process list, skill, grep, glob, todo/task,
+               subagent; MCP tools register dynamically). Central
+               schema validation in Registry.Execute. Shell delegates denylist
+               checks to internal/security.
+internal/version Single shared version string (var, set from the git
+               tag at build time; source default is the release the
+               tree is working towards). Reported by `orion version`.
 ```
 
 ## Data flow

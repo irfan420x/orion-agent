@@ -42,11 +42,15 @@
 //     turn to the transcript as an explicit "dropped,
 //     unsummarised" record (Audit 5 F-A5-1).
 //   - Summary verification: a summary is accepted only if it
-//     preserves something from the summarised turns (at least one
-//     shared content token, and not below a length floor relative
-//     to the input) — a provider returning filler such as
-//     "Nothing durable was discussed." is refused and the prefix is
-//     left untouched (Audit 5 F-A5-2).
+//     preserves something from the summarised turns (at least
+//     minSharedContentTokens distinct shared content tokens, at
+//     least minSummaryDistinctTokens distinct content words of
+//     its own, a minimum information density, and not below a
+//     length floor relative to the input) — a provider returning
+//     filler such as "Nothing durable was discussed.", or a
+//     degenerate summary of one word repeated hundreds of times,
+//     is refused and the prefix is left untouched (Audit 5
+//     F-A5-2; Audit 6 F-A6-P2-1).
 //
 // The manual /compress path (App.compressWithOn) is untouched and
 // keeps working exactly as before; auto-compaction reuses its
@@ -64,6 +68,7 @@ import (
 
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/security"
 )
 
 // Auto-compaction thresholds, as fractions of the history budget.
@@ -110,6 +115,35 @@ const (
 	minSummaryRunes       = 20
 	maxSummaryLengthFloor = 100
 	summaryLengthDivisor  = 2000
+	// minSharedContentTokens is how many DISTINCT content tokens
+	// a summary must share with the turns it replaces (Audit 6
+	// F-A6-P2-1): one shared token is not verification — a summary
+	// of the word "project" repeated 200 times shares exactly one
+	// token and proves nothing. Three is the earlier design's
+	// bar: a summary preserving a single genuine fact ("favourite
+	// number is 17") shares three, so real summaries still pass
+	// while degenerate ones do not. Refusing a summary is safe:
+	// the compaction fails, the breaker counts it, and history
+	// is left untouched.
+	minSharedContentTokens = 3
+	// minSummaryDistinctTokens is how many distinct content words
+	// a summary must contain at all: a summary of one word
+	// repeated 200 times has exactly one, however long it is.
+	minSummaryDistinctTokens = 3
+	// minSummaryDensityPercent is the minimum information density
+	// of a summary: distinct content words, as a percentage of
+	// all words. Repetition padding ("project project project
+	// ...") collapses the density towards zero; ordinary prose
+	// sits well above 10%.
+	minSummaryDensityPercent = 10
+	// summariserPromptOverheadTokens reserves room inside
+	// maxCompactionInputTokens for the summariser prompt header,
+	// the system message and per-message role framing, so the
+	// TOTAL provider-bound input — not just the message bodies —
+	// stays within the 16,000-token cap (Audit 6 F-A6-P2-2). The
+	// header is ~45 tokens and the system message ~8; 128 leaves
+	// ample margin for role framing on many-message prefixes.
+	summariserPromptOverheadTokens = 128
 	// maxDroppedTurnContentRunes truncates one spilled turn's
 	// content in the "dropped, unsummarised" transcript record.
 	maxDroppedTurnContentRunes = 500
@@ -508,7 +542,12 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 	}
 	old := append([]model.Message(nil), all[:len(all)-keepRecent]...)
 	recent := append([]model.Message(nil), all[len(all)-keepRecent:]...)
-	toSummarise := boundedOldPrefix(old, maxCompactionInputTokens)
+	// Bounded input, total not per-message (F-A6-P2-2): the
+	// summariser's whole input — messages plus the prompt
+	// overhead it is wrapped in — fits the 16,000-token cap, and
+	// a single giant message is truncated to the cap instead of
+	// being handed to the provider whole.
+	toSummarise := boundedOldPrefix(old, maxCompactionInputTokens-summariserPromptOverheadTokens)
 	kept := append(append([]model.Message(nil), old[len(toSummarise):]...), recent...)
 
 	summariser := c.summariserFor(a)
@@ -524,6 +563,16 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 		a.noteCompactionFailure(errors.New("summariser returned an empty summary"))
 		return false
 	}
+	// Redact before anything else touches the summary (Audit 6
+	// F-A6-P2-3): a summariser echoing a secret from the turns
+	// must not reach the stored fact or the transcript. The
+	// transcript's own scrub is a second layer, not the only one
+	// — the memory fact has no scrub of its own.
+	summary = security.RedactSecrets(summary)
+	if strings.TrimSpace(summary) == "" {
+		a.noteCompactionFailure(errors.New("summary contained nothing after redaction"))
+		return false
+	}
 	// What-not-to-save gate, as in /compress: the summary is
 	// model-derived text on its way to becoming a stored fact.
 	// Derivable content is dropped; if nothing worth keeping
@@ -535,13 +584,17 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 		a.noteCompactionFailure(errors.New("summary contained nothing worth saving (gate dropped it all)"))
 		return false
 	}
-	// Preservation check (F-A5-2): the summary must preserve
-	// something from the turns it replaces — at least one shared
-	// content token, and not below a length floor relative to the
-	// input. A provider returning filler ("Nothing durable was
-	// discussed.") passes the gate above but preserves nothing,
-	// and dropping the prefix on its word would lose the history
-	// for a sentence that says nothing.
+	// Preservation check (F-A5-2, hardened F-A6-P2-1): the summary
+	// must preserve something from the turns it replaces — at
+	// least minSharedContentTokens distinct shared content tokens,
+	// at least minSummaryDistinctTokens distinct content words of
+	// its own, a minimum information density, and not below a
+	// length floor relative to the input. A provider returning
+	// filler ("Nothing durable was discussed.") passes the gate
+	// above but preserves nothing, and dropping the prefix on its
+	// word would lose the history for a sentence that says
+	// nothing; a summary of one word repeated 200 times shares a
+	// single token and fails the same way.
 	if !summaryPreservesSource(summary, toSummarise) {
 		a.noteCompactionFailure(errors.New("summary preserved nothing from the summarised turns (no shared content tokens, or below the length floor)"))
 		return false
@@ -579,9 +632,14 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, all []model.Message) bool 
 
 // boundedOldPrefix takes the oldest messages of old whose estimated
 // tokens fit within maxTokens, so the summariser never receives a
-// prompt over the provider context. At least one message is always
-// taken, even if it alone exceeds the cap — a single giant turn
-// still gets summarised rather than skipped.
+// prompt over the provider context. A single message that alone
+// exceeds the cap is TRUNCATED to the cap (Audit 6 F-A6-P2-2) —
+// the old "at least one message, even if it alone exceeds the cap"
+// rule handed one 20,004-token message to the provider uncapped.
+// Truncation only bounds what the summariser sees: the caller
+// still drops the whole message (len counts the original), so the
+// giant turn is summarised from its truncated view and then gone,
+// never left behind un-summarised.
 func boundedOldPrefix(old []model.Message, maxTokens int) []model.Message {
 	total := 0
 	n := 0
@@ -590,20 +648,78 @@ func boundedOldPrefix(old []model.Message, maxTokens int) []model.Message {
 		if n > 0 && total+t > maxTokens {
 			break
 		}
+		if n == 0 && t > maxTokens {
+			return []model.Message{truncateMessageToTokens(m, maxTokens)}
+		}
 		total += t
 		n = i + 1
 	}
 	if n == 0 && len(old) > 0 {
-		n = 1
+		// maxTokens <= 0: nothing fits whole, so the first
+		// message is truncated to (effectively) nothing rather
+		// than handed over whole.
+		return []model.Message{truncateMessageToTokens(old[0], maxTokens)}
 	}
 	return old[:n]
 }
 
+// truncateMessageToTokens returns a copy of m whose estimated token
+// cost fits budget. Content is truncated by runes; tool calls are
+// dropped from the copy — their arguments are not summarised, and
+// keeping them could blow the budget on their own. A message that
+// already fits is returned unchanged.
+func truncateMessageToTokens(m model.Message, budget int) model.Message {
+	if messageTokens(m) <= budget {
+		return m
+	}
+	out := m
+	out.ToolCalls = nil
+	// messageTokens charges 4 framing tokens; the rest of the
+	// budget is content.
+	contentBudget := budget - 4
+	if contentBudget <= 0 {
+		out.Content = ""
+		return out
+	}
+	out.Content = truncateRunesToTokens(m.Content, contentBudget)
+	return out
+}
+
+// truncateRunesToTokens returns the longest rune prefix of s whose
+// estimated token count fits budget. CountTokens is not strictly
+// monotonic in prefix length (a run's per-token cost changes as
+// its distinct-rune count crosses 2→3), so the binary search is
+// followed by a verify-and-shrink loop: the result always fits,
+// and the shrink is short because the non-monotonicity is only a
+// few tokens. Truncating by runes keeps the result valid UTF-8.
+func truncateRunesToTokens(s string, budget int) string {
+	r := []rune(s)
+	if model.CountTokens(s) <= budget {
+		return s
+	}
+	lo, hi := 0, len(r)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if model.CountTokens(string(r[:mid])) <= budget {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	for lo > 0 && model.CountTokens(string(r[:lo])) > budget {
+		lo--
+	}
+	return string(r[:lo])
+}
+
 // summaryPreservesSource reports whether summary preserves anything
-// from source: at least one shared content token with the source
-// turns, and not below a length floor relative to the input size.
-// A source with no content tokens at all cannot verify any summary,
-// so every summary of it is refused.
+// from source: at least minSharedContentTokens DISTINCT shared
+// content tokens with the source turns, at least
+// minSummaryDistinctTokens distinct content words of its own, a
+// minimum information density, and not below a length floor
+// relative to the input size. A source with no content tokens at
+// all cannot verify any summary, so every summary of it is
+// refused.
 func summaryPreservesSource(summary string, source []model.Message) bool {
 	var sb strings.Builder
 	for _, m := range source {
@@ -619,7 +735,21 @@ func summaryPreservesSource(summary string, source []model.Message) bool {
 		// turns is refused rather than trusted.
 		return false
 	}
-	if sharedTokenCount(contentTokens(summary), srcTokens) == 0 {
+	summaryTokens := contentTokens(summary)
+	// Distinctness (F-A6-P2-1): a summary of one word repeated
+	// 200 times has exactly one distinct content token, however
+	// long it is — it says one thing, not a summary.
+	if len(summaryTokens) < minSummaryDistinctTokens {
+		return false
+	}
+	if sharedTokenCount(summaryTokens, srcTokens) < minSharedContentTokens {
+		return false
+	}
+	// Information density (F-A6-P2-1): distinct content words
+	// must be at least minSummaryDensityPercent of all words, so
+	// repetition padding collapses the ratio towards zero while
+	// ordinary prose stays well above it.
+	if words := len(strings.Fields(summary)); words > 0 && len(summaryTokens)*100 < minSummaryDensityPercent*words {
 		return false
 	}
 	floor := len([]rune(src)) / summaryLengthDivisor
@@ -685,6 +815,13 @@ func (a *Agent) defaultCompactionSummariser(ctx context.Context, old []model.Mes
 	if a.provider == nil {
 		return "", errors.New("no provider available for auto-compaction")
 	}
+	// Bound the TOTAL provider-bound input (Audit 6 F-A6-P2-2):
+	// a direct caller may pass an unbounded slice, so re-apply
+	// the cap here — messages plus prompt overhead fit
+	// maxCompactionInputTokens, with a giant message truncated
+	// rather than sent whole. Redact (F-A6-P2-3): the prompt
+	// must never carry a secret pasted into the transcript.
+	old = boundedOldPrefix(old, maxCompactionInputTokens-summariserPromptOverheadTokens)
 	var b strings.Builder
 	// Name what must survive, explicitly: pending items, open
 	// questions and user instructions/preferences used to depend
@@ -693,7 +830,7 @@ func (a *Agent) defaultCompactionSummariser(ctx context.Context, old []model.Mes
 	// (compressWithOn) — keep the two in sync.
 	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers, pending items and open questions, and anything the user asked to remember, including user instructions and preferences. Do not invent anything not in the messages.\n\n")
 	for _, m := range old {
-		fmt.Fprintf(&b, "%s: %s\n", m.Role, m.Content)
+		fmt.Fprintf(&b, "%s: %s\n", m.Role, security.RedactSecrets(m.Content))
 	}
 	temp := 0.0
 	resp, err := a.provider.Chat(ctx, model.ChatRequest{
@@ -729,7 +866,11 @@ func (a *Agent) defaultCompactionSummariser(ctx context.Context, old []model.Mes
 // fact-aware recall that surfaces it does not care which path
 // wrote it.
 func appendSummaryFact(store memory.Store, summary string) error {
-	summary = strings.TrimSpace(summary)
+	// Redact defensively (Audit 6 F-A6-P2-3): the fact store has
+	// no scrub of its own, so a summary carrying a secret must be
+	// cleaned here as well as at the call site. Redaction is
+	// idempotent, so double application is harmless.
+	summary = security.RedactSecrets(strings.TrimSpace(summary))
 	if summary == "" {
 		return errors.New("core: summary must not be empty")
 	}

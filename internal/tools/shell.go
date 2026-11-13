@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -45,6 +46,21 @@ const (
 // has userinfo before the host. A credential-less proxy (plain
 // http://proxy:8080, or a NO_PROXY host list) is kept, so proxied
 // egress keeps working.
+//
+// The scrub is two-legged (Audit 6, F-A6-P2-20): name-based (the
+// rules above — a variable whose NAME looks like a credential is
+// dropped) AND value-shape-based (a variable whose VALUE looks
+// like a known secret shape is dropped, whatever its name is —
+// MY_NOTE=sk-... must not reach a child just because the name is
+// innocuous). The value patterns are the well-known provider
+// prefixes from the secret scanner (security/scanner.go), kept as
+// a focused list on purpose: a generic high-entropy detector
+// would also drop legitimate long values (base64 config blobs,
+// document IDs), so only shapes that are secrets by construction
+// are matched. Dropping is strictly redacting: no variable the
+// old scrub kept is newly kept, and a dropped variable is gone
+// entirely — no partial secret can leak through a surrounding
+// value.
 func scrubEnv() []string {
 	out := make([]string, 0, len(os.Environ()))
 	for _, kv := range os.Environ() {
@@ -65,9 +81,48 @@ func scrubEnv() []string {
 		if strings.Contains(upper, "PROXY") && proxyCarriesCredentials(upper, value) {
 			continue
 		}
+		if valueLooksLikeSecret(value) {
+			continue
+		}
 		out = append(out, kv)
 	}
 	return out
+}
+
+// secretValuePatterns are secret shapes matched against an
+// environment variable's VALUE, whatever the variable is named
+// (Audit 6, F-A6-P2-20). Each pattern is a provider prefix that
+// identifies a credential by construction, mirroring the
+// detectors in security/scanner.go: OpenAI/Anthropic API keys,
+// Stripe keys, GitHub tokens, AWS access keys, Slack tokens,
+// Telegram bot tokens, JWTs, and private-key blocks. The match is
+// a substring match — a secret embedded in a longer value (a note
+// containing a pasted key) still drops the variable.
+var secretValuePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{8,}`),
+	regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}`),
+	regexp.MustCompile(`(?i)(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}`),
+	regexp.MustCompile(`(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{20,}`),
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
+	regexp.MustCompile(`(?:AKIA|ASIA)[0-9A-Z]{16}`),
+	regexp.MustCompile(`xox[baprse]-[A-Za-z0-9-]{10,}`),
+	regexp.MustCompile(`\b\d{8,10}:[A-Za-z0-9_-]{30,}\b`),
+	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`),
+	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
+}
+
+// valueLooksLikeSecret reports whether an environment variable
+// value contains a known secret shape (see
+// secretValuePatterns). It is the value leg of the ScrubEnv
+// scrub: a secret-shaped value under an innocuous name is still a
+// secret, and must not reach a child process.
+func valueLooksLikeSecret(value string) bool {
+	for _, re := range secretValuePatterns {
+		if re.MatchString(value) {
+			return true
+		}
+	}
+	return false
 }
 
 // proxyCarriesCredentials reports whether a proxy environment variable

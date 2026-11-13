@@ -364,6 +364,11 @@ func (t *Transcript) CorruptLines() int {
 // resumes at the next line, and the line is one corrupt line, not
 // a fatal error. The final line need not end with a newline. The
 // read is bounded: an overlong line never accumulates in memory.
+//
+// Callers MUST check overlong before any emptiness test: an
+// overlong line arrives with nil bytes, so a TrimSpace-then-empty
+// check would silently swallow it without counting it (Audit 6
+// F-A6-P2-4).
 func scanLines(f *os.File, fn func(line []byte, overlong bool) error) error {
 	r := bufio.NewReaderSize(f, 64*1024)
 	for {
@@ -427,12 +432,15 @@ func (t *Transcript) scanLocked() error {
 	}
 	defer f.Close()
 	err = scanLines(f, func(line []byte, overlong bool) error {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			return nil
-		}
+		// Overlong first: the line arrives with nil bytes, so
+		// the emptiness check below would swallow it uncounted
+		// (Audit 6 F-A6-P2-4).
 		if overlong {
 			t.corrupt++
+			return nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
 			return nil
 		}
 		var r Record
@@ -476,12 +484,15 @@ func (t *Transcript) recordsLocked() ([]Record, int, error) {
 	var out []Record
 	corrupt := 0
 	err = scanLines(f, func(line []byte, overlong bool) error {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			return nil
-		}
+		// Overlong first: the line arrives with nil bytes, so
+		// the emptiness check below would swallow it uncounted
+		// (Audit 6 F-A6-P2-4).
 		if overlong {
 			corrupt++
+			return nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
 			return nil
 		}
 		var r Record
@@ -673,12 +684,15 @@ func (t *Transcript) Summaries() ([]string, error) {
 // holding only Migrated message records imports the store turns
 // not already present (matched as a multiset on role+content, in
 // order — a partial import is always a prefix of the store's
-// sequence, so the remainder is exactly the turns after it). Once
-// any live (non-migrated) record exists, the session has run
-// turns of its own and migration never runs again, so nothing is
-// imported twice. On a mid-way error it returns the count
-// appended so far alongside the error, and the next open resumes
-// the remainder.
+// sequence, so the remainder is exactly the turns after it).
+// Compaction summaries and dropped-turn spill records are
+// boundaries, not blockers (Audit 6 F-A6-P2-5): a session that
+// compacted after a partial migration still imports its remainder
+// — only a live (non-migrated) message blocks migration, because
+// the session has then run turns of its own and importing older
+// turns after them would scramble the order. On a mid-way error
+// it returns the count appended so far alongside the error, and
+// the next open resumes the remainder.
 func (t *Transcript) MigrateFrom(msgs []model.Message, importedAt time.Time) (int, error) {
 	if t == nil {
 		return 0, errors.New("session: transcript is nil")
@@ -695,8 +709,15 @@ func (t *Transcript) MigrateFrom(msgs []model.Message, importedAt time.Time) (in
 	if err != nil {
 		return 0, err
 	}
+	// Only a live (non-migrated) MESSAGE blocks migration. A
+	// compaction summary or a dropped-turn spill is a boundary
+	// record, not a live turn: it says what happened to older
+	// history, and the unmigrated remainder still belongs after
+	// it (Audit 6 F-A6-P2-5). The old guard refused the whole
+	// remainder on ANY non-migrated record, so one summary
+	// permanently blocked the rest of the legacy history.
 	for _, r := range recs {
-		if r.Kind != KindMessage || !r.Migrated {
+		if r.Kind == KindMessage && !r.Migrated {
 			return 0, nil
 		}
 	}

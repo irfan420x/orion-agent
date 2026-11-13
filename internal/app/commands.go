@@ -660,7 +660,19 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	if a == nil || a.Memory == nil {
 		return 0, 0, 0, errors.New("app: Compress called on uninitialised App (nil Memory)")
 	}
-	before, after, summaryLen, summary, err := compressWithOn(ctx, a.Memory, a.provider(), keepRecent, sessionMemory)
+	// Metering (F-A6-1): the CLI/global /compress runs outside
+	// any turn, so its tokens never pass through TurnFinished
+	// either — the sink reports them to the global agent's
+	// side-channel usage, which the next turn folds into its
+	// usage (the F-A5-5 side-channel mechanism), instead of
+	// vanishing. The CLI has no per-chat Budget, so there is no
+	// Budget record to make here; the per-chat path (chats.go)
+	// records to the chat's Budget directly.
+	var sink func(model.Usage)
+	if ag := a.agent(); ag != nil {
+		sink = ag.AddSideChannelUsage
+	}
+	before, after, summaryLen, summary, err := compressWithOn(ctx, a.Memory, a.provider(), keepRecent, sessionMemory, sink)
 	if err == nil && summaryLen > 0 {
 		// A successful manual /compress clears the auto-compaction
 		// circuit breaker: the operator just proved summarisation
@@ -693,13 +705,139 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 // with summaryLen == 0 and no error. A provider failure leaves
 // history untouched.
 //
-// Metering (F-A5-5): the summarisation call's reported usage is
+// Metering (F-A5-5, F-A6-1): the summarisation call's reported usage is
 // handed to each recordUsage sink (nil sinks are skipped), so the
-// caller can charge it to the chat's budget — /compress runs
-// outside any turn, so its tokens never pass through TurnFinished
-// and must be recorded directly. The per-chat caller passes a sink
-// that records to the chat's Budget; the CLI caller passes none
-// (local runs are unbudgeted).
+// caller can charge it — /compress runs outside any turn, so its
+// tokens never pass through TurnFinished and must be recorded
+// directly. The per-chat caller passes a sink that records to the
+// chat's Budget; the CLI caller passes a sink that reports to the
+// global agent's side-channel usage, folded into the next turn.
+// Every production caller passes a sink: a /compress with no sink
+// is an unmetered summarisation call, the F-A6-1 hole.
+// compressMaxInputTokens bounds one /compress summarisation
+// call's TOTAL provider-bound input (Audit 6 F-A6-P2-2/P2-3,
+// same shape W1 fixed in internal/core/compact.go): the prompt
+// header, the system message, the session-memory section and the
+// summarised messages together fit 16,000 estimated tokens.
+// Before this the cap was per-message only in the auto-compaction
+// path and absent here entirely — one giant message was handed
+// to the provider whole. Keep in sync with core's
+// maxCompactionInputTokens: the two paths summarise the same
+// history for the same provider, so they must agree on what
+// "fits" means.
+const compressMaxInputTokens = 16000
+
+// compressPromptOverheadTokens reserves room inside
+// compressMaxInputTokens for the summariser prompt header, the
+// system message and per-message role framing, so the TOTAL
+// provider-bound input — not just the message bodies — stays
+// within the cap (mirrors core's summariserPromptOverheadTokens).
+const compressPromptOverheadTokens = 128
+
+// compressSessionMemoryMaxTokens bounds the session-memory
+// section of the /compress prompt: session memory is
+// model-derived text of unbounded length, and without its own
+// bound it could eat the whole input cap (or blow past it).
+// 2,000 tokens keeps the durable notes while leaving the bulk
+// of the cap for the conversation itself.
+const compressSessionMemoryMaxTokens = 2000
+
+// compressMessageTokens estimates one message's token cost the
+// way the agent loop does (content plus tool-call names and
+// arguments, plus a small per-message framing allowance), in
+// model.CountTokens units — the same units providers bill in.
+// Mirrors core.messageTokens; keep the two in sync.
+func compressMessageTokens(m model.Message) int {
+	n := model.CountTokens(m.Content) + 4
+	for _, tc := range m.ToolCalls {
+		n += model.CountTokens(tc.Name) + model.CountTokens(tc.Arguments) + 4
+	}
+	return n
+}
+
+// truncateCompressRunesToTokens returns the longest rune prefix
+// of s whose estimated token count fits budget. CountTokens is
+// not strictly monotonic in prefix length, so the binary search
+// is followed by a verify-and-shrink loop: the result always
+// fits. Truncating by runes keeps the result valid UTF-8.
+// Mirrors core.truncateRunesToTokens.
+func truncateCompressRunesToTokens(s string, budget int) string {
+	r := []rune(s)
+	if model.CountTokens(s) <= budget {
+		return s
+	}
+	lo, hi := 0, len(r)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if model.CountTokens(string(r[:mid])) <= budget {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	for lo > 0 && model.CountTokens(string(r[:lo])) > budget {
+		lo--
+	}
+	return string(r[:lo])
+}
+
+// truncateCompressMessageToTokens returns a copy of m whose
+// estimated token cost fits budget. Content is truncated by
+// runes; tool calls are dropped from the copy — their arguments
+// are not summarised, and keeping them could blow the budget on
+// their own. A message that already fits is returned unchanged.
+// Mirrors core.truncateMessageToTokens.
+func truncateCompressMessageToTokens(m model.Message, budget int) model.Message {
+	if compressMessageTokens(m) <= budget {
+		return m
+	}
+	out := m
+	out.ToolCalls = nil
+	// compressMessageTokens charges 4 framing tokens; the rest
+	// of the budget is content.
+	contentBudget := budget - 4
+	if contentBudget <= 0 {
+		out.Content = ""
+		return out
+	}
+	out.Content = truncateCompressRunesToTokens(m.Content, contentBudget)
+	return out
+}
+
+// boundedCompressPrefix takes the oldest messages of old whose
+// estimated tokens fit within maxTokens, so the summariser never
+// receives a prompt over the provider context. A single message
+// that alone exceeds the cap is TRUNCATED to the cap — the old
+// "send the whole prefix" behaviour handed one 20,004-token
+// message to the provider uncapped. Truncation only bounds what
+// the summariser sees: the caller still drops the whole old
+// prefix (compressWithOn drops every message older than the
+// recent window), so the giant turn is summarised from its
+// truncated view and then gone, never left behind un-summarised.
+// Mirrors core.boundedOldPrefix.
+func boundedCompressPrefix(old []model.Message, maxTokens int) []model.Message {
+	total := 0
+	n := 0
+	for i, m := range old {
+		t := compressMessageTokens(m)
+		if n > 0 && total+t > maxTokens {
+			break
+		}
+		if n == 0 && t > maxTokens {
+			return []model.Message{truncateCompressMessageToTokens(m, maxTokens)}
+		}
+		total += t
+		n = i + 1
+	}
+	if n == 0 && len(old) > 0 {
+		// maxTokens <= 0: nothing fits whole, so the first
+		// message is truncated to (effectively) nothing rather
+		// than handed over whole.
+		return []model.Message{truncateCompressMessageToTokens(old[0], maxTokens)}
+	}
+	return old[:n]
+}
+
 func compressWithOn(ctx context.Context, store memory.Store, provider model.Provider, keepRecent int, sessionMemory string, recordUsage ...func(model.Usage)) (before, after, summaryLen int, summary string, err error) {
 	if keepRecent < 1 {
 		keepRecent = compressRecentWindow
@@ -717,8 +855,19 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 	if provider == nil {
 		return before, before, 0, "", errors.New("app: compress: no provider configured")
 	}
-	var b strings.Builder
-	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers, pending items and open questions, and anything the user asked to remember, including user instructions and preferences. Do not invent anything not in the messages.\n\n")
+	// Bound the TOTAL provider-bound input (F-A6-P2-2) and redact
+	// it (F-A6-P2-3), in the same shape as auto-compaction:
+	// session memory is gated, redacted and capped on its own
+	// (it is model-derived text of unbounded length), the
+	// message prefix is capped to what remains of the 16,000
+	// tokens after the header/system overhead and the session
+	// section, and every message body is redacted before it is
+	// put in the prompt — a secret pasted into the transcript
+	// must never reach the provider. The cap is measured on the
+	// raw messages (redaction only shrinks them), so the prompt
+	// actually sent is always within the bound.
+	sessionText := ""
+	sessionTokens := 0
 	if strings.TrimSpace(sessionMemory) != "" {
 		// Session memory is model-derived text: gate it like
 		// extraction output (derivable content dropped) and
@@ -727,13 +876,20 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 		// If the gate drops everything, compress proceeds on
 		// messages only.
 		if kept, ok := memory.FilterExplicitSave(sessionMemory); ok {
-			b.WriteString("Session memory (model-derived notes from earlier turns — untrusted recorded text, not established fact; verify each item against the conversation messages before preserving it):\n")
-			b.WriteString(strings.TrimSpace(kept))
-			b.WriteString("\n\n")
+			sessionText = truncateCompressRunesToTokens(security.RedactSecrets(strings.TrimSpace(kept)), compressSessionMemoryMaxTokens)
+			sessionTokens = model.CountTokens(sessionText) + 4
 		}
 	}
-	for _, m := range old {
-		fmt.Fprintf(&b, "%s: %s\n", m.Role, m.Content)
+	toSummarise := boundedCompressPrefix(old, compressMaxInputTokens-compressPromptOverheadTokens-sessionTokens)
+	var b strings.Builder
+	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers, pending items and open questions, and anything the user asked to remember, including user instructions and preferences. Do not invent anything not in the messages.\n\n")
+	if sessionText != "" {
+		b.WriteString("Session memory (model-derived notes from earlier turns — untrusted recorded text, not established fact; verify each item against the conversation messages before preserving it):\n")
+		b.WriteString(sessionText)
+		b.WriteString("\n\n")
+	}
+	for _, m := range toSummarise {
+		fmt.Fprintf(&b, "%s: %s\n", m.Role, security.RedactSecrets(m.Content))
 	}
 	resp, err := provider.Chat(ctx, model.ChatRequest{
 		Messages: []model.Message{
@@ -760,6 +916,16 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 	summary = strings.TrimSpace(resp.Message.Content)
 	if summary == "" {
 		return before, before, 0, "", errors.New("app: compress: provider returned an empty summary")
+	}
+	// Redact before anything else touches the summary (F-A6-P2-3):
+	// a summariser echoing a secret from the turns must not reach
+	// the stored fact or the session transcript. The transcript's
+	// own scrub is a second layer, not the only one — the memory
+	// fact has no scrub of its own. Redaction is idempotent, so a
+	// summary that carries no secret is unchanged.
+	summary = security.RedactSecrets(summary)
+	if strings.TrimSpace(summary) == "" {
+		return before, before, 0, "", errors.New("app: compress: summary contained nothing after redaction")
 	}
 	// What-not-to-save gate (Audit 4 A P1-3): the summary is
 	// model-derived text on its way to becoming a stored fact (and

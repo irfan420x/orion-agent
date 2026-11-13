@@ -437,6 +437,37 @@ func (a *App) Handle(ctx context.Context, input string) (string, error) {
 	return reply, err
 }
 
+// NewPermissionGate builds the permission/confirmation gate
+// (P1-O2) shared by every Telegram entrypoint (F-A6-3): oriond,
+// `orion daemon` and `orion telegram poll` all call this one
+// constructor instead of each wiring a gate (or, as before rc11,
+// forgetting to). Rules persist under the data dir
+// (permissions.json, 0600); a load error is logged and the gate
+// starts with no rules rather than refusing startup. The prompter
+// is the caller's: it sends the approval prompt on that
+// entrypoint's gateway. The gate is installed on the app
+// (SetPermissionGate) before it is returned, so per-chat agents
+// built afterwards carry it, and the global agent gets it now.
+// A nil prompter builds a gate that denies every gated call
+// (fail closed). Callers must still install their callback
+// handler on the gateway, or approvals can never be answered.
+func (a *App) NewPermissionGate(prompter permissions.Prompter) (*permissions.Gate, error) {
+	if a == nil || a.Config == nil {
+		return nil, errors.New("app: NewPermissionGate called on uninitialised App (nil Config)")
+	}
+	rulePath := ""
+	if a.Config.DataDir != "" {
+		rulePath = filepath.Join(a.Config.DataDir, "permissions.json")
+	}
+	ruleStore := permissions.NewRuleStore(rulePath)
+	if err := ruleStore.LoadError(); err != nil && a.Logger != nil {
+		a.Logger.Printf("permissions: file unusable, starting with no rules: %v", err)
+	}
+	gate := permissions.NewGate(ruleStore, prompter)
+	a.SetPermissionGate(gate)
+	return gate, nil
+}
+
 // Close shuts the app down: subagents first, then the per-chat
 // agents (P1-O3 — each saves its chat store and closes only that
 // store), then the global agent (which saves and closes the shared
