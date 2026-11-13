@@ -1605,27 +1605,71 @@ func TestManagerServerEnvRedactsSecretShapedValues(t *testing.T) {
 	}
 }
 
+// readBadlineCount reads the fake badlines server's line count
+// (written atomically after each full line). It returns -1 when
+// the file does not exist yet or is unparsable.
+func readBadlineCount(countFile string) int {
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
 // TestNearCapInvalidLinesKillServer (F-A6-P2-21): a server
 // streaming near-cap (15 MiB) invalid-JSON lines indefinitely
 // must be killed after a few consecutive lines, not left burning
 // CPU in readLoop/handleLine forever. Memory was already bounded
 // by the line cap; this bounds the CPU.
+//
+// The wait for the kill is load-adaptive (F-A9-P2-9): each
+// near-cap line is ~15 MiB and the client must read it in 64 KiB
+// fragments and reject it, which takes seconds per line under
+// -race — the old fixed 20 s deadline expired before the 5-line
+// kill could land. The deadline is estimated from the observed
+// per-line cost (the count file, updated by the server after each
+// full line is written — i.e. after the client consumed it):
+// 20 lines' worth, floored at 60 s and capped at 4 min, so a
+// server that is never killed still fails the test in bounded
+// time. The kill itself is still asserted exactly: the client
+// must die with the near-cap error after at most 5+5 lines.
 func TestNearCapInvalidLinesKillServer(t *testing.T) {
 	dir := t.TempDir()
 	countFile := filepath.Join(dir, "badlines-count")
 	c := NewClient("badlines", fakeServerConfig(t, "badlines", map[string]string{"ORION_TEST_FAKE_BADLINE_FILE": countFile}), dir)
 	t.Cleanup(func() { _ = c.Close() })
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := c.Start(ctx); err != nil {
 		t.Fatalf("Start badlines server: %v", err)
 	}
-	deadline := time.Now().Add(20 * time.Second)
+	start := time.Now()
+	deadline := start.Add(60 * time.Second)
 	for c.Alive() && time.Now().Before(deadline) {
+		if n := readBadlineCount(countFile); n >= 1 {
+			// Re-estimate from all lines seen so far: elapsed
+			// per line so far, times 20 lines of headroom
+			// for a kill that must land after 5 lines.
+			// Stable while the server keeps streaming (the
+			// deadline does not run away: elapsed/n stays
+			// ~per-line), floored and capped as above.
+			d := start.Add(20 * time.Since(start) / time.Duration(n))
+			if d.After(start.Add(4 * time.Minute)) {
+				d = start.Add(4 * time.Minute)
+			}
+			if d.Before(start.Add(60 * time.Second)) {
+				d = start.Add(60 * time.Second)
+			}
+			deadline = d
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if c.Alive() {
-		t.Fatal("client still alive after 20s of near-cap invalid lines; want it killed after 5 consecutive lines")
+		t.Fatalf("client still alive after %s of near-cap invalid lines (%d lines written); want it killed after 5 consecutive lines", time.Since(start).Round(time.Second), readBadlineCount(countFile))
 	}
 	if err := c.deadError(); err == nil || !strings.Contains(err.Error(), "near-cap invalid lines") {
 		t.Errorf("death error = %v, want the near-cap invalid-line kill", err)

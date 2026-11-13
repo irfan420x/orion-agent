@@ -1439,19 +1439,26 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	//     the longest contiguous run of decided updates.
 	//   - A re-delivered update (after a crash mid-turn Telegram
 	//     re-delivers every unconfirmed update for 24h) is
-	//     re-dispatched and the turn runs again from scratch.
-	//     That re-run is NOT guaranteed idempotent at the tool
-	//     level: tools the killed turn already ran may run a
-	//     second time, and the user may get a second reply. That
-	//     is the safe direction — a duplicate beats silence —
-	//     and the window for it is small (a turn that already
-	//     finished is confirmed microseconds after its reply),
-	//     but it is real, and operators should prefer
-	//     idempotent tools. What IS guaranteed: a turn is never
-	//     dispatched twice CONCURRENTLY — inFlight dedupes
-	//     re-fetched updates while their handler is still
-	//     running, and the per-chat lock serialises a re-run
-	//     against any turn for the same chat.
+	//     re-dispatched and the turn runs again — but its tools
+	//     do NOT re-run blindly (F-A9-1): the handler carries
+	//     the update id in its context (see WithUpdateID below)
+	//     and the agent loop replays recorded tool results from
+	//     the durable tool journal instead of re-executing them
+	//     (see core.ToolJournal). Subagent lifecycle tools are
+	//     excluded from the journal — their results reference
+	//     in-process state that does not survive a restart — so
+	//     they re-execute against the live Manager, and the
+	//     run-1 child is dead with the old process, so no work
+	//     is duplicated. A re-delivered turn may still send a
+	//     second reply when the killed run had already replied
+	//     but was not yet confirmed (the confirmation window
+	//     is microseconds, so this is rare) — the journal
+	//     dedups tool execution, not replies. What IS
+	//     guaranteed: a turn is never dispatched twice
+	//     CONCURRENTLY — inFlight dedupes re-fetched updates
+	//     while their handler is still running, and the
+	//     per-chat lock serialises a re-run against any turn
+	//     for the same chat.
 	//   - If a handler blocks forever, the watermark stays
 	//     behind it forever: later updates are still fetched
 	//     and dispatched (the poll loop does not stall behind
@@ -1660,9 +1667,16 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			lastEdit = time.Now()
 		}
 		emit := func(ev core.ProgressEvent) {
-			cardMu.Lock()
-			card.Add(ev)
-			cardMu.Unlock()
+			// The Add is wrapped so a panic inside it still
+			// releases cardMu (F-A9-P2-7): the deferred final
+			// card edit must be able to take the lock on the
+			// panic path. The unlock stays before syncCard —
+			// syncCard takes cardMu itself.
+			func() {
+				cardMu.Lock()
+				defer cardMu.Unlock()
+				card.Add(ev)
+			}()
 			// Tool-call and compaction events can change the card;
 			// other kinds (step/turn) are ignored by
 			// TerminalCard.Add anyway. A compaction event alone
@@ -1678,7 +1692,29 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 
 		// "typing" while the turn runs, re-sent every 4s: Telegram
 		// shows a chat action for only a few seconds.
+		//
+		// stopTyping closes typingDone and does the final card
+		// edit. It is a sync.OnceFunc registered as a defer
+		// (F-A9-P2-7): the old code closed typingDone on the
+		// normal return path only, so a handler panic unwound
+		// past it to the recover defer and the typing goroutine
+		// leaked — one goroutine plus one Telegram POST every
+		// 4s per panicked turn, until daemon restart. The
+		// explicit stopTyping() call after the handler returns
+		// runs it on the normal path (before the reply, as
+		// before); the defer runs it on the panic path, and
+		// the Once makes the second call a no-op.
 		typingDone := make(chan struct{})
+		stopTyping := sync.OnceFunc(func() {
+			close(typingDone)
+			// Final card edit: show the finished state
+			// (including any failed tool call) even if the
+			// last event was inside the throttle window.
+			// syncCard is a no-op when the card was never
+			// created or nothing changed.
+			syncCard(true)
+		})
+		defer stopTyping()
 		go func() {
 			ticker := time.NewTicker(typingResendInterval)
 			defer ticker.Stop()
@@ -1702,14 +1738,16 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			senderID = upd.Message.From.ID
 		}
 		handlerCtx := WithSenderID(ctx, senderID)
+		// The update id travels with the turn (F-A9-1): the
+		// agent loop reads it from the context and replays
+		// recorded tool results from the durable tool journal
+		// instead of re-executing them, so a turn killed
+		// mid-execution and re-delivered after a restart runs
+		// each tool exactly once. Callbacks carry no turn and
+		// get no update id.
+		handlerCtx = core.WithUpdateID(handlerCtx, upd.UpdateID)
 		reply, stats, herr := handler(handlerCtx, chatID, upd.Message.Text, emit)
-		close(typingDone)
-
-		// Final card edit: show the finished state (including any
-		// failed tool call) even if the last event was inside the
-		// throttle window. syncCard is a no-op when the card was
-		// never created or nothing changed.
-		syncCard(true)
+		stopTyping()
 
 		if herr != nil {
 			msg := fmt.Sprintf("Sorry, I hit an error: %v", herr)

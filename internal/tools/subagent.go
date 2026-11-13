@@ -381,6 +381,16 @@ func (t *subagentResultTool) Execute(ctx context.Context, args json.RawMessage) 
 			t.set.mu.Unlock()
 			if !already {
 				t.set.sink.AddSubagentUsage(res.Usage.Tokens)
+				// Mark the usage charged in the Manager too
+				// (F-A9-P2-8): if this task is later evicted, its
+				// tokens must not be folded into the dead-letter
+				// ledger on top of this charge. This is what
+				// saves the CLI path, which has no sweep: a
+				// fetched task there would otherwise be
+				// double-counted on eviction. The delivered
+				// set above stays the exactly-once guard for
+				// the sink; MarkCharged is idempotent.
+				t.set.mgr.MarkCharged(id)
 			}
 		}
 	}

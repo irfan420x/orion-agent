@@ -25,6 +25,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -146,6 +147,18 @@ type taskEntry struct {
 	result    Result
 	finished  bool
 	detached  bool
+	// charged is set by MarkCharged once a task's usage has been
+	// charged by a consumer (the per-chat sweep, or a fetch that
+	// recorded the tokens in its own delivered set). Only a
+	// SETTLED usage may be marked: chargers skip unsettled tasks,
+	// so an unsettled task is never charged and must never be
+	// marked. GetResult deliberately does NOT set this flag — it
+	// is also called by non-charging readers (list, /agents,
+	// pending-token estimates), and marking on a peek would let
+	// an eviction silently drop tokens no consumer ever charged.
+	// Eviction folds only uncharged tokens into the dead-letter
+	// ledger (F-A9-P2-8); a charged task contributes 0 tokens.
+	charged bool
 }
 
 // Manager runs subagent tasks with bounded concurrency.
@@ -158,22 +171,29 @@ type Manager struct {
 	wg            sync.WaitGroup
 	shutdown      bool
 	// deadLetterTokens / deadLetterTasks are the dead-letter ledger
-	// (F-A8-P2-1): tokens of finished tasks that left the registry
-	// through eviction, and how many such tasks there were. Eviction
+	// (F-A8-P2-1, semantics fixed F-A9-P2-8): tokens of finished
+	// tasks that left the registry through eviction WITHOUT ever
+	// being charged, and how many such tasks there were. Eviction
 	// is involuntary — unlike Forget, nobody decided these results
-	// were consumed — so their recorded usage is folded here at
-	// eviction time instead of silently voided. A task evicted
-	// while its usage was still unsettled contributes its late
-	// usage to the ledger when the executor eventually returns (see
-	// awaitLateOutcome). The ledger is diagnostic / recovery
-	// accounting: the Manager cannot see the app-side swept set or
-	// the tools-side delivered set, so a consumer adding this total
-	// to a charged total must first reconcile it against tasks it
-	// knows were already charged elsewhere (fetch / sweep). In
-	// practice the ledger is nearly unreachable — the per-chat
-	// sweep charges finished tasks at the end of every turn, and
-	// the cap below is 10x the old one — but no evicted token is
-	// ever silently lost again.
+	// were consumed — so an evicted task's recorded usage is folded
+	// here at eviction time instead of silently voided, but ONLY
+	// when the task was never charged (see taskEntry.charged):
+	// folding an already-charged task's tokens would double-count
+	// them against the charged total. A charged evicted task still
+	// counts in deadLetterTasks but contributes 0 tokens. A task
+	// evicted while its usage was still unsettled contributes its
+	// late usage to the ledger when the executor eventually returns
+	// (see awaitLateOutcome); that fold is exact because chargers
+	// skip unsettled tasks, so the late usage was never chargeable
+	// before eviction. The ledger is therefore exactly "evicted
+	// but never charged" and a consumer may add DeadLetterTokens
+	// to a charged total without reconciliation — see
+	// DrainDeadLetter, which hands the total out once and resets
+	// it. Every eviction is logged (see evictLocked). In practice
+	// the ledger is nearly unreachable — the per-chat sweep charges
+	// finished tasks at the end of every turn, and the cap below
+	// is 10x the old one — but no evicted token is ever silently
+	// lost again, and no evicted token is ever counted twice.
 	deadLetterTokens int
 	deadLetterTasks  int
 }
@@ -279,10 +299,11 @@ func (m *Manager) SpawnForChat(chatID int64, brief string, timeout time.Duration
 	// Bound memory: evict the oldest finished tasks once the
 	// registry grows past maxEntries, so a long daemon run cannot
 	// grow List / WaitAll without bound. Eviction preserves token
-	// accounting (F-A8-P2-1): it skips unsettled finished tasks
+	// accounting (F-A8-P2-1, F-A9-P2-8): it skips unsettled finished tasks
 	// while any settled finished task can be evicted instead, and
-	// folds every evicted task's recorded usage into the
-	// dead-letter ledger (see DeadLetterTokens).
+	// folds an evicted task's recorded usage into the
+	// dead-letter ledger only if the task was never charged
+	// (see DeadLetterTokens).
 	m.evictFinishedLocked()
 	m.mu.Unlock()
 
@@ -302,11 +323,15 @@ func (m *Manager) SpawnForChat(chatID int64, brief string, timeout time.Duration
 const maxEntries = 1000
 
 // DeadLetterTokens returns the tokens folded into the dead-letter
-// ledger by eviction (F-A8-P2-1): the recorded usage of finished
-// tasks that left the registry through eviction, including late
-// usage that arrived after an unsettled task was evicted. It is 0
-// until the first eviction. See the Manager field comment for the
-// reconciliation caveat before adding this to a charged total.
+// ledger by eviction (F-A8-P2-1, semantics F-A9-P2-8): the recorded
+// usage of finished tasks that left the registry through eviction
+// WITHOUT ever being charged. A task charged before eviction
+// contributes 0 tokens (it still counts in DeadLetterTasks). Late
+// usage that arrived after an unsettled task was evicted is
+// included, because it was never chargeable before eviction. The
+// total is therefore exactly "evicted but never charged" and may
+// be added to a charged total with no double-count; see
+// DrainDeadLetter for the consuming read.
 func (m *Manager) DeadLetterTokens() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -317,25 +342,72 @@ func (m *Manager) DeadLetterTokens() int {
 // the registry (F-A8-P2-1). It counts evicted tasks, not ledger
 // contributions: a task evicted while unsettled is counted at
 // eviction time, and its late tokens join DeadLetterTokens when
-// they arrive.
+// they arrive; a task evicted after being charged is counted too,
+// but contributes 0 tokens (F-A9-P2-8).
 func (m *Manager) DeadLetterTasks() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.deadLetterTasks
 }
 
+// MarkCharged records that a task's usage has been charged by a
+// consumer (the per-chat sweep, or a fetch that recorded the tokens
+// in its own delivered set). It reports whether this call newly
+// marked the task: false for an unknown id, an unfinished task, an
+// unsettled task, or a task already marked. Only a SETTLED usage
+// can be charged — chargers skip unsettled tasks — so an unsettled
+// task is never marked, and its late usage stays recoverable. The
+// mark is what keeps eviction from double-counting: evictLocked
+// folds only uncharged tokens into the dead-letter ledger. The
+// flag is not an exactly-once guard between the fetch and sweep
+// chargers — each keeps its own guard (the delivered set, the
+// swept set) and they charge separate buckets — it records only
+// that at least one consumer charged the usage, so the ledger
+// must not count it again.
+func (m *Manager) MarkCharged(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.entries[id]
+	if !ok || !entry.finished || !entry.result.UsageSettled || entry.charged {
+		return false
+	}
+	entry.charged = true
+	return true
+}
+
+// DrainDeadLetter returns the dead-letter ledger's uncharged token
+// total and resets the ledger to zero (tokens and task count).
+// It is the ledger's consuming read (F-A9-P2-8): after the
+// charged-flag fix the total is exactly "evicted but never
+// charged", so a caller — e.g. the app/session-close path — may
+// add the drained total to its charged total once, with no
+// double-count and no reconciliation. Draining is destructive by
+// design: a second call returns 0 until further evictions occur.
+// The total is daemon-wide and unattributed to any chat, so it
+// must NOT be added to a single chat's per-chat usage line.
+func (m *Manager) DrainDeadLetter() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	total := m.deadLetterTokens
+	m.deadLetterTokens = 0
+	m.deadLetterTasks = 0
+	return total
+}
+
 // evictFinishedLocked deletes the oldest finished entries until the
 // registry is at most maxEntries. Callers must hold m.mu.
 //
-// Token accounting (F-A8-P2-1) is preserved two ways. First,
-// eviction prefers settled finished tasks: an unsettled task's
-// usage is not final yet (its executor is still running past the
-// timeout), so evicting it would strand the late usage the
-// F-A7-2(a) waiter exists to recover — the task is skipped while
-// any settled finished task can be evicted instead. Second, every
-// evicted task's recorded usage is folded into the dead-letter
-// ledger, so no evicted token is silently voided. Only when every
-// finished entry is unsettled and room is still needed does
+// Token accounting (F-A8-P2-1, semantics F-A9-P2-8) is preserved
+// two ways. First, eviction prefers settled finished tasks: an
+// unsettled task's usage is not final yet (its executor is still
+// running past the timeout), so evicting it would strand the late
+// usage the F-A7-2(a) waiter exists to recover — the task is skipped
+// while any settled finished task can be evicted instead. Second,
+// every evicted task's recorded usage is folded into the
+// dead-letter ledger ONLY if the task was never charged (see
+// evictLocked): a charged task's tokens are already counted
+// elsewhere, and folding them again would double-count. Only when
+// every finished entry is unsettled and room is still needed does
 // eviction take the oldest unsettled ones — the registry must not
 // grow unboundedly — and those entries are marked detached, so
 // their late usage still lands in the ledger when it arrives
@@ -382,14 +454,25 @@ func (m *Manager) evictFinishedLocked() {
 }
 
 // evictLocked removes one finished entry from the registry and
-// folds its recorded usage into the dead-letter ledger. Callers
-// must hold m.mu. The entry is marked detached so a late-arrival
-// waiter that may still hold its pointer folds any later usage
-// into the ledger instead of writing onto a detached object.
+// folds its recorded usage into the dead-letter ledger — but ONLY
+// if the task was never charged (F-A9-P2-8): a charged task
+// contributes 0 tokens (it still counts in deadLetterTasks), so
+// charged + ledger never double-counts. The entry is marked
+// detached so a late-arrival waiter that may still hold its
+// pointer folds any later usage into the ledger instead of
+// writing onto a detached object. Every eviction is logged with
+// the token count and whether the task was already charged; the
+// log line carries only the task id and counts, never the brief
+// or output.
 func (m *Manager) evictLocked(e *taskEntry) {
 	e.detached = true
-	m.deadLetterTokens += e.result.Usage.Tokens
+	folded := 0
+	if !e.charged {
+		folded = e.result.Usage.Tokens
+		m.deadLetterTokens += folded
+	}
 	m.deadLetterTasks++
+	log.Printf("subagent: evicted task %s: %d tokens folded into dead-letter ledger (already charged: %v)", e.task.ID, folded, e.charged)
 	delete(m.entries, e.task.ID)
 }
 

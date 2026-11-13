@@ -160,6 +160,23 @@ type Agent struct {
 	// the next call.
 	hooksBus *hooks.Bus
 	hooksMu  sync.RWMutex
+	// journal is the durable per-update record of completed
+	// tool calls (F-A9-1), installed by the app via
+	// SetToolJournal. Nil means no journal: the agent runs
+	// exactly as before, and a re-delivered turn re-runs its
+	// tools. journalMu guards it; executeTool reads it on every
+	// tool call, so a journal installed mid-run applies to the
+	// next call.
+	journal   *ToolJournal
+	journalMu sync.RWMutex
+	// journalOcc counts, for the run currently holding runMu,
+	// how many times each (tool, canonical-arguments) pair has
+	// reached the journal lookup — the occurrence index that
+	// disambiguates a repeated identical call inside one turn
+	// from a re-delivery replay (see executeTool). It is reset
+	// at the start of every run and only touched while runMu is
+	// held, so it needs no lock of its own.
+	journalOcc map[string]int
 	// transcript is the per-session JSONL transcript (see
 	// compact.go): every message stored in memory is also
 	// appended there. Nil means no transcript is wired.
@@ -393,6 +410,44 @@ func (a *Agent) hooks() *hooks.Bus {
 	return a.hooksBus
 }
 
+// SetToolJournal installs the durable per-update tool-call
+// journal (F-A9-1) the agent consults around every tool call: a
+// re-delivered turn replays recorded results instead of
+// re-executing the tools. A nil journal removes it (no dedup, as
+// before). It is safe for concurrent use with a running turn:
+// the next tool call sees the new journal. The app installs one
+// journal per app (built from the data dir); subagent child
+// agents never get one — see newSubagentExecutor.
+func (a *Agent) SetToolJournal(j *ToolJournal) {
+	a.journalMu.Lock()
+	defer a.journalMu.Unlock()
+	a.journal = j
+}
+
+// toolJournal returns the installed journal, or nil.
+func (a *Agent) toolJournal() *ToolJournal {
+	a.journalMu.RLock()
+	defer a.journalMu.RUnlock()
+	return a.journal
+}
+
+// nextJournalOccurrence returns the 0-based occurrence index of
+// this (tool, canonical-arguments) pair in the current run and
+// advances the count. It is only called from executeTool while
+// runMu is held, so the per-run map needs no lock of its own.
+// The index counts only calls that reached the journal lookup —
+// gate denials, hook blocks and skill-restriction refusals never
+// reach it — so both runs of an identical call sequence agree.
+func (a *Agent) nextJournalOccurrence(tool, canonicalArgs string) int {
+	if a.journalOcc == nil {
+		a.journalOcc = map[string]int{}
+	}
+	key := tool + "\x00" + canonicalArgs
+	occ := a.journalOcc[key]
+	a.journalOcc[key] = occ + 1
+	return occ
+}
+
 // SystemPrompt returns Orion's identity and operating rules.
 func (a *Agent) SystemPrompt() string { return systemPrompt }
 
@@ -523,6 +578,12 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 	// turn does not carry its tool restriction into this one — the
 	// model re-invokes the skill when it needs it again.
 	a.clearActiveSkill()
+
+	// A new turn starts with a clean journal-occurrence slate
+	// (F-A9-1): the occurrence index counts calls within this
+	// run only, so a re-delivered turn's first identical call is
+	// occurrence 0, matching the killed run's first call.
+	a.journalOcc = map[string]int{}
 
 	// Progress-event bookkeeping. Everything below this point is a
 	// real turn, so every return from here on emits exactly one
@@ -1211,6 +1272,17 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 // executeTool runs one tool call. Arguments must be a JSON object string;
 // invalid JSON and tool failures are returned as error text so the caller
 // can feed them back to the model instead of aborting the loop.
+//
+// Re-delivery dedup (F-A9-1): when the turn carries a Telegram update
+// id (see WithUpdateID) and a journal is installed, a call the killed
+// run already executed is replayed from the journal instead of
+// re-executed — the lookup sits after the gate and the PreToolUse
+// hooks (a denied or blocked call never ran, so it is re-decided on
+// every delivery, never replayed) and before anything executes. A
+// call that executes is recorded durably before its result is
+// returned. Subagent lifecycle tools are excluded (see
+// journalExcludedTools): their results reference in-process Manager
+// state that does not survive a restart.
 func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 	args, ok := parseToolArguments(tc)
 	if !ok {
@@ -1248,29 +1320,57 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 			a.logf("tool %q pre-tool hooks: %s", tc.Name, out.Warning)
 		}
 	}
+	// Re-delivery replay (F-A9-1): the gate and the hooks have
+	// allowed the call and nothing has executed yet, so this is
+	// the point to check the journal. A hit returns the recorded
+	// result without executing — no gate re-decision is needed,
+	// the call already passed it once, and replay executes
+	// nothing. The occurrence index is consumed here, so a call
+	// refused below by the skill restriction (which never
+	// executes) still advances the count identically in both
+	// runs of the same call sequence (see ToolJournal).
+	var journal *ToolJournal
+	var journalUpdateID int64
+	var journalCanon string
+	var journalOcc int
+	if !journalExcludedTool(tc.Name) {
+		if j := a.toolJournal(); j != nil {
+			if uid := UpdateIDFromContext(ctx); uid != 0 {
+				journalCanon = CanonicalToolArguments(string(args))
+				journalOcc = a.nextJournalOccurrence(tc.Name, journalCanon)
+				if result, ok := j.Lookup(uid, tc.Name, journalCanon, journalOcc); ok {
+					a.logf("tool %q: replaying recorded result for update %d (occurrence %d); not re-executed", tc.Name, uid, journalOcc)
+					return result
+				}
+				journal = j
+				journalUpdateID = uid
+			}
+		}
+	}
 	// Skill invocation is handled here, not in the registry: the
 	// registry's skill tool is stateless (it just loads the body),
 	// while activation — which skill is active, which tools it
 	// allows — is agent-loop state (see executeSkillTool).
+	var result string
+	var executed bool
 	if tc.Name == "skill" {
-		result := a.executeSkillTool(ctx, tc, args)
-		a.postToolHooks(ctx, tc.Name, args, result)
-		return result
-	}
-	// Skill allowed-tool enforcement: while a skill with a tool
-	// restriction is active, any other tool is refused here — after
-	// the gate has decided, before the registry (and its schema
-	// validation) is reached — so a call planned before the skill
-	// was invoked cannot slip through, and a refused call never
-	// reaches tool code or the denylist.
-	if allowed, reason := a.skillAllows(tc.Name); !allowed {
+		result = a.executeSkillTool(ctx, tc, args)
+		executed = true
+	} else if allowed, reason := a.skillAllows(tc.Name); !allowed {
+		// Skill allowed-tool enforcement: while a skill with a tool
+		// restriction is active, any other tool is refused here — after
+		// the gate has decided, before the registry (and its schema
+		// validation) is reached — so a call planned before the skill
+		// was invoked cannot slip through, and a refused call never
+		// reaches tool code or the denylist. A refused call never
+		// executed, so it is not journalled: a re-delivered turn
+		// re-decides it (and its occurrence was already consumed
+		// above, so the sequence still agrees).
 		a.logf("tool %q blocked by active skill: %s", tc.Name, reason)
 		return fmt.Sprintf("Error: tool %q is not allowed while a skill is active: %s. End the skill with the skill tool (action \"end\") or use an allowed tool.", tc.Name, reason)
-	}
-	// The registry enforces the security denylist for shell tools; log
-	// denials here so they are visible in the agent log.
-	result, err := a.tools.Execute(ctx, tc.Name, args)
-	if err != nil {
+	} else if res, err := a.tools.Execute(ctx, tc.Name, args); err != nil {
+		// The registry enforces the security denylist for shell tools; log
+		// denials here so they are visible in the agent log.
 		var toolErr *tools.ToolError
 		if errors.As(err, &toolErr) && toolErr.Kind == "denied" {
 			a.logf("tool %q denied: %v", tc.Name, err)
@@ -1278,11 +1378,47 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 			a.logf("tool %q failed: %v", tc.Name, err)
 		}
 		result = fmt.Sprintf("Error executing tool %q: %v", tc.Name, err)
-		a.postToolHooks(ctx, tc.Name, args, result)
-		return result
+		// The tool RAN (and failed): its error result is recorded
+		// like any other, so a re-delivered turn does not re-run
+		// a call whose side effects may already have happened.
+		executed = true
+	} else {
+		result = res
+		executed = true
+	}
+	// Record the executed call durably (F-A9-1) before the result
+	// is returned to the loop: the record is on disk before the
+	// model sees the result, so a kill after this point replays
+	// instead of re-executing. A record failure is fail-open and
+	// loud: the turn proceeds, and a re-delivered turn may re-run
+	// this one call (the pre-journal behaviour).
+	if executed && journal != nil {
+		if err := journal.Record(journalUpdateID, tc.Name, journalCanon, result, journalOcc); err != nil {
+			a.logf("tool %q: journal record failed for update %d: %v (a re-delivered turn may re-run this call)", tc.Name, journalUpdateID, err)
+		}
 	}
 	a.postToolHooks(ctx, tc.Name, args, result)
 	return result
+}
+
+// journalExcludedTools are the tools the journal never records
+// or replays (F-A9-1): the subagent lifecycle tools return
+// references to in-process Manager state (task ids, live task
+// status) that does not survive a daemon restart, so a replayed
+// result would point the model at a dead task — or replay a
+// stale "still running" on every fetch, forever. Re-executing
+// them against the live Manager is always honest state, and the
+// run-1 child is dead with the old process, so re-running a
+// spawn cannot duplicate work.
+var journalExcludedTools = map[string]bool{
+	"subagent_spawn": true, "subagent_list": true,
+	"subagent_result": true, "subagent_stop": true,
+}
+
+// journalExcludedTool reports whether name is excluded from the
+// tool journal.
+func journalExcludedTool(name string) bool {
+	return journalExcludedTools[name]
 }
 
 // postToolHooks runs the PostToolUse hooks for a completed tool call

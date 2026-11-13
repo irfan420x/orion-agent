@@ -193,7 +193,17 @@ func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *
 				captured = ev.Usage.TotalTokens
 			}
 		})
-		out, runErr := child.Run(ctx, brief)
+		// The child turn must NOT inherit the parent's Telegram
+		// update id (F-A9-1): the child agent has no journal, and
+		// even if one were ever wired, the child's tool calls
+		// must not share the parent update's journal namespace —
+		// a child's identical call could replay the parent's
+		// result, or vice versa. Clearing the id keeps the
+		// child's tools always executing fresh, and the run-1
+		// child is dead with the old process, so a re-delivered
+		// parent turn that re-spawns cannot duplicate the
+		// child's work.
+		out, runErr := child.Run(core.WithUpdateID(ctx, 0), brief)
 		// Release the child's ephemeral store. Save/Close are
 		// no-ops for the ephemeral store; the error is ignored
 		// because there is nothing durable that could fail — the

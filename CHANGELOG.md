@@ -4,6 +4,89 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc14] — 2026-11-13
+
+### Audit 9 fixes (v0.2.0-rc14) — see `AUDIT9_2026-11-13.md`
+
+Fixes the 1 P1 and the P2 batch from the fresh-eyes audit of rc13
+(0 P0, 1 P1, 9 P2). **Verdict: NOT production-ready** — the 24–72 h
+daemon soak (F-A3-4) is still open, and F-A3-2 (no pprof/debug
+endpoint) is still open. Verified by the release coordinator on the
+final commit: **1,177 tests pass, 0 fail, 4 skip (total 1,181),
+21/21 packages, race clean 21/21, no data race**; live DeepSeek proof
+`17*23+5=396` (rc13: 1,151 total: 1,147 pass,
+0 fail, 4 skip).
+
+- **F-A9-1** — Re-delivered turns no longer re-run their tools: a
+  durable per-update tool journal (`internal/core/tooljournal.go`,
+  one 0600 JSONL file per update id under `<dataDir>/tool-journal/`,
+  append + Sync before the result returns, 24 h retention) records
+  completed tool calls keyed by (update id, tool, canonical
+  arguments, occurrence); on re-delivery the recorded result is
+  replayed instead of executing again. The update id is plumbed
+  through PollStream into the agent context
+  (`internal/messaging/telegram.go`, `core.WithUpdateID`), wired in
+  app Build / AgentForChat / provider-switch paths
+  (`internal/app/app.go`, `internal/app/chats.go`), and cleared for
+  subagent child turns (`internal/app/subagent.go`). Subagent
+  lifecycle tools are excluded (their results reference in-process
+  Manager state that dies with the restart). Regression tests in
+  `internal/core/tooljournal_test.go`,
+  `internal/core/agent_journal_test.go`,
+  `internal/messaging/rc14_journal_test.go`, and
+  `internal/app/rc14_journal_test.go` — including a kill-mid-turn
+  replay test with a without-journal negative control that runs the
+  tool twice.
+- **F-A9-P2-6** — Ollama no longer drops MaxTokens: `buildRequest`
+  maps it to `options.num_predict`, merged with temperature into one
+  Options map (`internal/model/ollama.go:132-142`), with wire-level
+  regression tests for Chat and Stream
+  (`internal/model/ollama_rc14_test.go`).
+- **F-A9-P2-1** — Skills-validator negation carve-out now checks
+  that the negated verb is an activate form, not merely that a
+  negation word is present (`clauseNegatesVerb`,
+  `internal/skills/skills.go:856`).
+- **F-A9-P2-8** — Dead-letter ledger is now a real consumer:
+  finished tasks carry a `charged` flag (`MarkCharged`,
+  `internal/subagent/subagent.go:367`); eviction folds only
+  uncharged tokens and logs every eviction; `DrainDeadLetter`
+  (subagent.go:388) surfaces the ledger. The sweep
+  (`internal/app/chats.go:717`) and the fetch path
+  (`internal/tools/subagent.go:393`) both mark charged — the fetch
+  site was a coordinator-found gap the worker missed (the CLI path
+  has no sweep, so a fetched-only task would still have
+  double-counted on eviction).
+- **F-A9-P2-2** — Bare-"Activate" trim set extended to `.!?,;:`
+  (`internal/skills/skills.go:667`).
+- **F-A9-P2-3** — Object-order shield now walks the direct-object
+  region of the activate verb instead of only its first object
+  (`segmentNamesSkillAsActivateObject`,
+  `internal/skills/skills.go:764`): "Activate the tool and the
+  skill" / "Activate the tool, then the skill" are rejected,
+  "Activate the tool using the skill" still loads.
+- **F-A9-P2-4** — `activateWord` now matches reactivate forms
+  (`reactivat(e|es|ed|ing|ion)`, `internal/skills/skills.go:439`);
+  `-ion` nouns are directives only when governed by a directive verb
+  (`start/begin/trigger/...`), so prose discussion ("Skill
+  activation is manual.") does not false-positive.
+- **F-A9-P2-5** — Marker regex widened: delimiters `=`, `-`, `*`;
+  `-`/`_` joins inside marker words (`END-SKILL`, `BEGIN_SKILL`);
+  list-item/bullet prefix allowed (`internal/skills/skills.go:351`).
+- **F-A9-P2-7** — Panicked turns no longer leak the typing
+  goroutine: `stopTyping` is a `sync.OnceFunc` registered as a
+  defer (`internal/messaging/telegram.go:1708,1717`), so it runs on
+  the panic path too and does the final card edit in the same defer;
+  `emit`'s `card.Add` is wrapped so a panic inside it still releases
+  cardMu.
+- **F-A9-P2-9** — Both timing-flaky tests under -race are
+  deterministic now (test-only changes): the sweep test drives the
+  sweep in lock-step with a TryLock spin and verifies the
+  interleaving (a marked filler proves the sweep passed the blocked
+  task while it was still running; `internal/app/rc12_w2_test.go`),
+  and the MCP kill test's deadline is load-adaptive (20× observed
+  per-line cost, floored at 60 s, capped at 4 min;
+  `internal/mcp/mcp_test.go`).
+
 ## [0.2.0-rc13] — 2026-11-13
 
 ### Audit 8 fixes (v0.2.0-rc13) — see `AUDIT8_2026-11-13.md`

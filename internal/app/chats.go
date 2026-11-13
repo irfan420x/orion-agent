@@ -230,6 +230,11 @@ func (a *App) AgentForChat(chatID int64) (*core.Agent, error) {
 	// policy as the global agent (nil-safe: a hand-built App has
 	// no Hooks, and SetHooks(nil) means "no hooks").
 	agent.SetHooks(a.Hooks)
+	// Tool journal (F-A9-1): the chat agent replays recorded
+	// tool results on a re-delivered turn instead of
+	// re-executing them (nil-safe: a hand-built App has no
+	// journal, and SetToolJournal(nil) means "no dedup").
+	agent.SetToolJournal(a.toolJournal)
 	if g := a.permissionGate(); g != nil {
 		agent.SetPermissionGate(g)
 	}
@@ -704,6 +709,12 @@ func (a *App) sweepFinishedSubagents(cs *chatSession, chatID int64) int {
 		if already {
 			continue
 		}
+		// Mark the usage charged in the Manager too (F-A9-P2-8):
+		// if this task is later evicted, its tokens must not be
+		// folded into the dead-letter ledger on top of this charge.
+		// MarkCharged only marks settled tasks, and this task is
+		// settled (unsettled ones were skipped above).
+		a.Subagents.MarkCharged(ts.ID)
 		total += res.Usage.Tokens
 	}
 	return total
@@ -803,6 +814,9 @@ func (a *App) SwitchProviderForChat(chatID int64, name string) error {
 	// Hook wiring (rc9): same hook policy as the global agent
 	// (nil-safe — see AgentForChat).
 	agent.SetHooks(a.Hooks)
+	// Tool journal (F-A9-1): same journal as the global agent
+	// (nil-safe — see AgentForChat).
+	agent.SetToolJournal(a.toolJournal)
 	if g := a.permissionGate(); g != nil {
 		agent.SetPermissionGate(g)
 	}
@@ -1145,6 +1159,9 @@ func (a *App) rebuildChatAgentsForDefault() error {
 		// Hook wiring (rc9): same hook policy as the global agent
 		// (nil-safe — see AgentForChat).
 		agent.SetHooks(a.Hooks)
+		// Tool journal (F-A9-1): same journal as the global agent
+		// (nil-safe — see AgentForChat).
+		agent.SetToolJournal(a.toolJournal)
 		if g := a.permissionGate(); g != nil {
 			agent.SetPermissionGate(g)
 		}

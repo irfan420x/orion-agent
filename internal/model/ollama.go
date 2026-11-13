@@ -127,8 +127,20 @@ func (p *ollamaProvider) buildRequest(req ChatRequest, stream bool) (ollamaChatR
 		Tools:    toOpenAITools(req.Tools),
 		Stream:   stream,
 	}
-	if req.Temperature != nil {
-		r.Options = map[string]any{"temperature": *req.Temperature}
+	// Options merges every set sampling/cap field into ONE map
+	// (F-A9-P2-6): temperature and the MaxTokens cap (Ollama's
+	// num_predict) must coexist — assigning a fresh map per
+	// field would overwrite the other. num_predict is set only
+	// when MaxTokens > 0, so an uncapped request sends no cap,
+	// exactly like the OpenAI/DeepSeek providers omit max_tokens.
+	if req.Temperature != nil || req.MaxTokens > 0 {
+		r.Options = map[string]any{}
+		if req.Temperature != nil {
+			r.Options["temperature"] = *req.Temperature
+		}
+		if req.MaxTokens > 0 {
+			r.Options["num_predict"] = req.MaxTokens
+		}
 	}
 	return r, nil
 }

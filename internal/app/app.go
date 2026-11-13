@@ -43,6 +43,14 @@ type App struct {
 	// config.PerChatDailyTokenBudget in Build; nil for hand-built
 	// Apps, which are then unbudgeted.
 	Budget *budget.Budget
+	// toolJournal is the durable per-update record of completed
+	// tool calls (F-A9-1), built from <dataDir>/tool-journal in
+	// Build; nil for hand-built Apps and when the journal could
+	// not be opened (the daemon logs and runs without one).
+	// Every per-chat agent gets it at build time (see chats.go),
+	// so a re-delivered turn replays recorded tool results
+	// instead of re-executing them.
+	toolJournal *core.ToolJournal
 	// Hooks is the hook bus (rc9, audit P0 #6), loaded from
 	// <dataDir>/hooks in Build; nil for hand-built Apps, which run
 	// without hooks. The bus is shared by the global agent and
@@ -261,7 +269,46 @@ func Build(path string) (*App, error) {
 	// under <DataDir>/sessions/. Best-effort — see
 	// wireGlobalTranscript.
 	app.wireGlobalTranscript()
+	// Durable tool journal (F-A9-1): per-update records of
+	// completed tool calls, so a turn killed mid-execution and
+	// re-delivered after a restart replays recorded results
+	// instead of re-running its tools. Best-effort like the
+	// audit log above: a journal that cannot be opened is
+	// logged and the daemon runs without one (the pre-journal
+	// behaviour), never a startup failure.
+	if journal, err := core.NewToolJournal(filepath.Join(cfg.DataDir, "tool-journal")); err != nil {
+		logger.Printf("tool journal: disabled (%v); re-delivered turns may re-run tools", err)
+	} else {
+		app.toolJournal = journal
+		agent.SetToolJournal(journal)
+	}
 	return app, nil
+}
+
+// ToolJournal returns the app's durable per-update tool-call
+// journal (F-A9-1), or nil when the app has none (hand-built
+// Apps, or a journal that could not be opened at Build).
+func (a *App) ToolJournal() *core.ToolJournal {
+	if a == nil {
+		return nil
+	}
+	return a.toolJournal
+}
+
+// SetToolJournal installs the durable per-update tool-call
+// journal on the app and on its global agent. It is setup-time
+// only (tests, and Build): per-chat agents pick it up at build
+// time from the app (see AgentForChat), so a journal installed
+// after a chat's agent was built applies to that chat's next
+// agent rebuild, not to a run in flight.
+func (a *App) SetToolJournal(j *core.ToolJournal) {
+	if a == nil {
+		return
+	}
+	a.toolJournal = j
+	if a.Agent != nil {
+		a.Agent.SetToolJournal(j)
+	}
 }
 
 // Local is the provider-free slice of the app: config, tools, memory

@@ -325,24 +325,30 @@ func parseFile(path string) (Skill, error) {
 // (===== BEGIN SKILL "name" CONTENT ===== /
 // ===== END SKILL "name" CONTENT =====), with the name quoted or
 // bare. The match is deliberately fuzzy, not exact (Audit 7
-// F-A7-P2-1, widened by Audit 8 F-A8-P2-5): a model's reading is
-// fuzzy, so the delimiter is recognised by its OPENING, not by an
-// exact spelling. The old 4-6 "=" bound was arbitrary — 3- and
-// 7-equals variants loaded — so any run of "=" (one or more)
-// counts; the spaces around BEGIN/END are optional, including
-// between END and SKILL ("ENDSKILL" loaded on rc12); the word is
-// SKILL or SKILLS; and nothing more is required. CONTENT is
-// optional, a closing "=" run is optional, and trailing text is
-// irrelevant: a line that opens like a delimiter reads as one to
-// the model even truncated ("===== END SKILL \"x\" CONTENT") or
-// annotated ("... CONTENT (continued) ====="). The match is
-// anchored at the start of the (trimmed, quote-stripped) line:
-// a marker merely mentioned mid-line ("See the ===== END SKILL
-// ... format") does not match, and ordinary prose that merely
-// mentions SKILL does not match — there must be a leading "=" run
-// followed by BEGIN/END SKILL. The word boundaries matter:
-// "SKILLFUL" and "ENDLESS" are different words and do not match.
-var skillMarkerLine = regexp.MustCompile(`(?i)^=+\s*(BEGIN|END)\s*SKILLS?\b`)
+// F-A7-P2-1, widened by Audit 8 F-A8-P2-5 and Audit 9 F-A9-P2-5):
+// a model's reading is fuzzy, so the delimiter is recognised by
+// its OPENING, not by an exact spelling. The old 4-6 "=" bound was
+// arbitrary — 3- and 7-equals variants loaded — so any run of a
+// delimiter character ("=", "-" or "*", one or more) counts; the
+// spaces around BEGIN/END are optional, including between END and
+// SKILL ("ENDSKILL" loaded on rc12), and "-" or "_" may join the
+// marker words instead ("END-SKILL", "BEGIN_SKILL" loaded on
+// rc13); the word is SKILL or SKILLS; and nothing more is
+// required. CONTENT is optional, a closing delimiter run is
+// optional, and trailing text is irrelevant: a line that opens
+// like a delimiter reads as one to the model even truncated
+// ("===== END SKILL \"x\" CONTENT") or annotated ("... CONTENT
+// (continued) ====="). A list-item prefix ("- ", "* ", "1. ")
+// before the delimiter run does not hide the marker either
+// ("- ===== END SKILL ..." loaded on rc13). The match is
+// anchored at the start of the (trimmed, quote-stripped) line,
+// apart from that optional list prefix: a marker merely mentioned
+// mid-line ("See the ===== END SKILL ... format") does not match,
+// and ordinary prose that merely mentions SKILL does not match —
+// there must be a leading delimiter run followed by BEGIN/END
+// SKILL. The word boundaries matter: "SKILLFUL" and "ENDLESS"
+// are different words and do not match.
+var skillMarkerLine = regexp.MustCompile(`(?i)^(?:[-*+]\s+|\d+[.)]\s+)?[=\-*]+\s*(BEGIN|END)[-_\s]*SKILLS?\b`)
 
 // stripMarkerQuotePrefix removes leading Markdown blockquote
 // markers ("> ") from a trimmed line, so a quoted marker line
@@ -359,8 +365,8 @@ func stripMarkerQuotePrefix(line string) string {
 
 // validateSkillContent rejects skill text that can blur the
 // BEGIN/END delimiter boundary (Audit 6 F-A6-2, fuzzy variants
-// Audit 7 F-A7-P2-1, widened Audit 8 F-A8-P2-5): any line that
-// parses as a BEGIN/END SKILL marker (case-insensitive, any "="
+// Audit 7 F-A7-P2-1, widened Audit 8 F-A8-P2-5 and Audit 9
+// F-A9-P2-5): any line that parses as a BEGIN/END SKILL marker (case-insensitive, any "="
 // run, optional spaces, optionally blockquoted, CONTENT and the
 // closing run optional), and any line shaped as an activation
 // directive (see isActivateDirective). The delimiters are only
@@ -418,31 +424,132 @@ func truncateLine(line string) string {
 	return line[:maxLen] + "…"
 }
 
-// activateWord matches the whole word "activate" (any case).
-// The word boundaries matter: "deactivate", "reactivate", and
-// "activation" must not match.
-var activateWord = regexp.MustCompile(`(?i)\bactivate\b`)
+// activateWord matches the whole word "activate" and its verb and
+// noun forms (any case): activate/activates/activated/activating,
+// reactivate/reactivates/reactivated/reactivating, and the -ion
+// nouns activation/reactivation (Audit 9 F-A9-P2-4). Re-activating
+// is directing activation, so the re- forms must match — the old
+// `\bactivate\b` let "Reactivate the skill" and "Start activating
+// the skill now" load. The word boundaries still matter:
+// "deactivate" and "deactivation" must not match (there is no word
+// boundary between "de" and "activate"), and the -ion nouns are
+// matched only so isActivateOccurrenceDirective can apply its
+// prose guard to them: a line merely discussing activation
+// ("Skill activation is manual.") is not a directive.
+var activateWord = regexp.MustCompile(`(?i)\b(?:re)?activat(?:e|es|ed|ing|ion)\b`)
 
-// skillWord and toolWord match the whole words "skill"/"skills"
-// and "tool"/"tools" (any case) in the text after "activate".
-var (
-	skillWord = regexp.MustCompile(`(?i)\bskills?\b`)
-	toolWord  = regexp.MustCompile(`(?i)\btools?\b`)
-)
-
-// wordIndex reports the index of the first whole-word occurrence
-// of re in s, or -1 when there is none.
-func wordIndex(s string, re *regexp.Regexp) int {
-	if loc := re.FindStringIndex(s); loc != nil {
-		return loc[0]
-	}
-	return -1
-}
+// skillWord matches the whole word "skill"/"skills" (any case) in
+// the text after "activate".
+var skillWord = regexp.MustCompile(`(?i)\bskills?\b`)
 
 // skillToolBigram matches the compound "skill tool" / "skills tools"
 // (any case): the sanctioned activation path — activation goes
 // through the skill tool.
 var skillToolBigram = regexp.MustCompile(`(?i)\bskills?\s+tools?\b`)
+
+// activateVerbForms is the set of verb forms of "activate" (Audit 9
+// F-A9-P2-4): the forms a negation can govern, and the forms that
+// can direct activation. The -ion nouns are not verbs and are
+// deliberately absent: they are handled by the prose guard in
+// isActivateOccurrenceDirective.
+var activateVerbForms = map[string]bool{
+	"activate": true, "activates": true, "activated": true, "activating": true,
+	"reactivate": true, "reactivates": true, "reactivated": true, "reactivating": true,
+}
+
+// activationDirectiveVerbs is the set of verbs that can govern an
+// -ion activation noun as a directive (Audit 9 F-A9-P2-4): "Begin
+// activation of the skill" directs activation, while a noun on its
+// own ("Reactivation happens automatically") is discussion, not a
+// directive.
+var activationDirectiveVerbs = map[string]bool{
+	"start": true, "starts": true, "started": true, "starting": true,
+	"begin": true, "begins": true, "began": true, "begun": true, "beginning": true,
+	"trigger": true, "triggers": true, "triggered": true, "triggering": true,
+	"initiate": true, "initiates": true, "initiated": true, "initiating": true,
+	"commence": true, "commences": true, "commenced": true, "commencing": true,
+	"perform": true, "performs": true, "performed": true, "performing": true,
+	"request": true, "requests": true, "requested": true, "requesting": true,
+	"enable": true, "enables": true, "enabled": true, "enabling": true,
+}
+
+// negationSkipWords are the words skipped when finding the verb a
+// negation word negates (Audit 9 F-A9-P2-1): the infinitive marker
+// "to", adverbs, auxiliaries, and articles. Skipping them lands on
+// the lexical verb: "should not ever activate" → "activate";
+// "do not forget to activate" → "forget".
+var negationSkipWords = map[string]bool{
+	"to":   true,
+	"ever": true, "really": true, "just": true, "only": true,
+	"actually": true, "simply": true, "merely": true,
+	"certainly": true, "definitely": true, "even": true, "still": true,
+	"be": true, "been": true, "being": true, "am": true, "is": true,
+	"are": true, "was": true, "were": true,
+	"have": true, "has": true, "had": true,
+	"do": true, "does": true, "did": true,
+	"the": true, "a": true, "an": true, "this": true, "that": true,
+	"these": true, "those": true,
+}
+
+// activateObjectClosers are words that end the direct-object region
+// after "activate" (Audit 9 F-A9-P2-3): a preposition or
+// instrumental head ("using", "with", "via", "by", "through",
+// "for", "to", "of", ...), a subordinating conjunction, or a verb
+// starting a new predicate ("run", "check", "use", ...). A "skill"
+// named only after one of these is the object of that preposition
+// or verb, not of "activate", so it does not make the line a
+// directive.
+var activateObjectClosers = map[string]bool{
+	// Prepositions / instrumental heads.
+	"using": true, "with": true, "via": true, "by": true, "through": true,
+	"for": true, "to": true, "of": true, "in": true, "on": true, "at": true,
+	"from": true, "into": true, "over": true, "under": true, "per": true,
+	// Subordinating conjunctions: what follows is a new clause.
+	"when": true, "while": true, "if": true, "because": true, "before": true,
+	"after": true, "unless": true, "although": true, "though": true,
+	"since": true, "that": true, "which": true, "who": true, "as": true,
+	// Verbs starting a new predicate: "Activate the tool and run
+	// the skill" names the skill as the object of "run", not of
+	// "activate". ("start"/"begin" are deliberately absent: starting
+	// a skill is close enough to activating it that the line errs
+	// toward rejection.)
+	"run": true, "runs": true, "running": true,
+	"check": true, "checks": true, "checking": true,
+	"use": true, "uses": true,
+	"open": true, "opens": true, "opening": true,
+	"close": true, "closes": true, "closing": true,
+	"load": true, "loads": true, "loading": true,
+	"call": true, "calls": true, "calling": true,
+	"invoke": true, "invokes": true, "invoking": true,
+	"send": true, "sends": true, "sending": true,
+	"get": true, "gets": true, "getting": true,
+	"set": true, "sets": true, "setting": true,
+	"read": true, "reads": true, "reading": true,
+	"write": true, "writes": true, "writing": true,
+	"create": true, "creates": true, "creating": true,
+	"delete": true, "deletes": true, "deleting": true,
+	"list": true, "lists": true, "listing": true,
+	"show": true, "shows": true, "showing": true,
+	"print": true, "prints": true, "printing": true,
+	"deploy": true, "deploys": true, "deploying": true,
+	"install": true, "installs": true, "installing": true,
+	"configure": true, "configures": true, "configuring": true,
+	"test": true, "tests": true, "testing": true,
+	"verify": true, "verifies": true, "verifying": true,
+	"do": true, "does": true, "did": true,
+	"make": true, "makes": true, "making": true,
+	"go": true, "goes": true, "going": true,
+	"come": true, "comes": true, "coming": true,
+	"take": true, "takes": true, "taking": true,
+	"give": true, "gives": true, "giving": true,
+	"put": true, "puts": true, "putting": true,
+	"keep": true, "keeps": true, "keeping": true,
+	"find": true, "finds": true, "finding": true,
+	"try": true, "tries": true, "trying": true,
+	"let": true, "lets": true, "letting": true,
+	"help": true, "helps": true, "helping": true,
+	"see": true, "sees": true, "seeing": true,
+}
 
 // nonSkillObjectWord matches a word that names a non-skill object
 // a quoted name can denote: a mode, a virtual environment, a
@@ -459,14 +566,17 @@ var nonSkillObjectWords = map[string]bool{
 
 // isActivateDirective reports whether line is shaped as an
 // instruction to activate a skill (Audit 6 F-A6-2, widened by
-// Audit 7 F-A7-P2-1, refined by Audit 8 F-A8-P2-6/F-A8-P2-7).
+// Audit 7 F-A7-P2-1, refined by Audit 8 F-A8-P2-6/F-A8-P2-7 and
+// Audit 9 F-A9-P2-1/F-A9-P2-2/F-A9-P2-3/F-A9-P2-4).
 //
-// EVERY occurrence of the word "activate" in the line is examined
-// (F-A8-P2-6): the old code looked only at the first, so a "tool"
-// object on the first occurrence shielded a second directive
-// ("Activate the tool, then activate the skill"). Each occurrence
-// is judged on its own segment — the text up to the next
-// "activate" (or the end of the line) — so a skill named by a
+// EVERY occurrence of "activate" — in any of its forms (activate,
+// activates, activated, activating, reactivate and its forms, and
+// the -ion nouns activation/reactivation, Audit 9 F-A9-P2-4) — in
+// the line is examined (F-A8-P2-6): the old code looked only at the
+// first, so a "tool" object on the first occurrence shielded a
+// second directive ("Activate the tool, then activate the skill").
+// Each occurrence is judged on its own segment — the text up to the
+// next "activate" (or the end of the line) — so a skill named by a
 // later occurrence is never attributed to an earlier one, and
 // vice versa.
 //
@@ -484,9 +594,14 @@ var nonSkillObjectWords = map[string]bool{
 // of the occurrence it excuses, so it cannot shield a later
 // directive:
 //   - Negation: when the clause immediately before the occurrence
-//     negates it ("should not activate", "do not activate",
-//     "never activate"), the line is a defensive instruction, not
-//     a directive. The negation is looked for only in the final
+//     negates an activate verb form ("should not activate", "do
+//     not activate", "never activate", "must not activate",
+//     "cannot activate", "refuse to activate"), the line is a
+//     defensive instruction, not a directive. The negation must
+//     govern activate itself (Audit 9 F-A9-P2-1): "do not forget
+//     to activate" and "do not hesitate to activate" negate a
+//     different verb ("forget"/"hesitate") and are still
+//     directives. The negation is looked for only in the final
 //     clause fragment before the occurrence (split on sentence
 //     terminators and clause separators), so it never leaks
 //     across a sentence ("The skill is not broken. Activate the
@@ -500,22 +615,36 @@ var nonSkillObjectWords = map[string]bool{
 //     not exempt ("To activate the skill, just do it." is still
 //     a directive), and neither does naming some other tool
 //     ("To activate the skill, use the tool.").
-//   - Object order: when both "tool" and "skill" follow an
-//     occurrence in its segment, the one that comes first is the
-//     object of the instruction. "To activate the tool, run it
-//     once" (tool first, or no skill at all) is prose and loads;
-//     "Activate the skill using the tool" (skill first) is a
-//     directive and is refused.
+//   - Object order: every object of the occurrence in its segment
+//     is considered (Audit 9 F-A9-P2-3), not just the first. A
+//     skill named as a conjoined or elided object ("Activate the
+//     tool and the skill", "Activate the tool, then the skill")
+//     is still a directive; a skill named only after an
+//     instrumental or prepositional head ("Activate the tool
+//     using the skill", "Activate the tool for this skill") is
+//     the object of that phrase, not of "activate", and loads.
+//     "To activate the tool, run it once" (tool only, or no skill
+//     at all) is prose and loads; "Activate the skill using the
+//     tool" (skill first) is a directive and is refused.
+//   - Reactivation forms: "reactivate" and "activating" direct
+//     activation like "activate" does (Audit 9 F-A9-P2-4). The
+//     -ion nouns ("activation"/"reactivation") direct it only
+//     when governed by a directive verb in the same clause
+//     ("Begin activation of the skill"); a line merely discussing
+//     them ("Reactivation happens automatically", "This skill
+//     explains activation") loads.
 //
 // SECURITY JUDGEMENT (F-A8-P2-7 vs Audit 7): the Audit 8 false
 // positive "bare Activate." (e.g. a venv step) is NOT admitted.
 // A line consisting solely of "Activate" — with or without
-// trailing punctuation — is indistinguishable from the Audit 7
-// bare-"Activate" evasion, and admitting the punctuated form
-// would admit the evasion with a period appended. The bare rule
-// therefore stays as it was. A venv step can name its object
-// ("Activate the venv." loads) or be a list item ("- Activate."
-// already loads: the line is not bare). Where this function had
+// trailing punctuation (".", "!", "?", ";", ":", "," — Audit 9
+// F-A9-P2-2: the trim set is the punctuation the validator treats
+// as a sentence terminator or clause separator) — is
+// indistinguishable from the Audit 7 bare-"Activate" evasion, and
+// admitting the punctuated form would admit the evasion with a
+// period appended. The bare rule therefore stays as it was. A venv
+// step can name its object ("Activate the venv." loads) or be a
+// list item ("- Activate." already loads: the line is not bare). Where this function had
 // to choose between a false positive (legitimate prose blocked)
 // and a false negative (an evasion admitted), it errs toward
 // security (reject). A line about a skill that merely mentions
@@ -533,8 +662,9 @@ func isActivateDirective(line string) bool {
 	// Bare "Activate" (allowing trailing sentence punctuation):
 	// an imperative with no object at all, in a skill body,
 	// can only be read as "activate [a skill]". See the
-	// SECURITY JUDGEMENT above: this includes "Activate.".
-	if bare := strings.TrimRight(lower, ".!:"); bare == "activate" {
+	// SECURITY JUDGEMENT above: this includes "Activate.",
+	// "Activate?", and "Activate;" (Audit 9 F-A9-P2-2).
+	if bare := strings.TrimRight(lower, ".!?,;:"); bare == "activate" {
 		return true
 	}
 	locs := activateWord.FindAllStringIndex(lower, -1)
@@ -551,20 +681,41 @@ func isActivateDirective(line string) bool {
 }
 
 // isActivateOccurrenceDirective reports whether one occurrence of
-// "activate" (at loc in the lowercased line) is a directive, judged
-// on its segment — the text after it up to the next "activate".
+// "activate" (at loc in the lowercased line, in any of its forms —
+// see activateWord) is a directive, judged on its segment — the
+// text after it up to the next "activate".
 func isActivateOccurrenceDirective(lower string, loc []int, segment string) bool {
 	seg := strings.TrimSpace(segment)
 	if seg == "" {
 		return false
 	}
+	word := lower[loc[0]:loc[1]]
+	before := lower[:loc[0]]
+	// -ion noun forms (Audit 9 F-A9-P2-4): "activation" /
+	// "reactivation" is a noun, not a verb, so on its own it is
+	// discussion, not a directive. It directs activation only when
+	// governed by a directive verb in the same clause ("Begin
+	// activation of the skill"), and only when the skill is named
+	// as its complement ("of the skill"). A negated governing verb
+	// ("do not begin activation of the skill") is defensive, like
+	// a negated activate verb form.
+	if strings.HasSuffix(word, "ion") {
+		if clauseNegatesVerb(before, activateVerbForms) || clauseNegatesVerb(before, activationDirectiveVerbs) {
+			return false
+		}
+		if !clauseGovernorIsDirectiveVerb(before) {
+			return false
+		}
+		return segmentNamesSkillForActivationNoun(seg)
+	}
 	// Negated in its own clause: a defensive instruction, not a
-	// directive (see isActivateDirective).
-	if clauseHasNegation(lower[:loc[0]]) {
+	// directive (see isActivateDirective). The negation must govern
+	// an activate verb form (Audit 9 F-A9-P2-1).
+	if clauseHasNegation(before) {
 		return false
 	}
 	// Infinitive documenting the sanctioned skill-tool path.
-	if prevWordIs(lower[:loc[0]], "to") && skillToolBigram.MatchString(seg) {
+	if prevWordIs(before, "to") && skillToolBigram.MatchString(seg) {
 		return false
 	}
 	// "Activate \"name\" ..." — a quoted name after Activate is a
@@ -573,38 +724,195 @@ func isActivateOccurrenceDirective(lower string, loc []int, segment string) bool
 	if seg[0] == '"' || seg[0] == '\'' {
 		return isQuotedSkillReference(seg)
 	}
-	skillIdx := wordIndex(seg, skillWord)
-	if skillIdx < 0 {
-		return false
-	}
-	// Object-order rule (see above): a "tool" named before the
-	// first "skill" in this occurrence's segment makes the tool
-	// the object, not the skill.
-	if toolIdx := wordIndex(seg, toolWord); toolIdx >= 0 && toolIdx < skillIdx {
-		return false
-	}
-	return true
+	// Object rule (Audit 9 F-A9-P2-3): any "skill" named as an
+	// object of this occurrence in its clause is a directive —
+	// including a conjoined or elided object ("and the skill",
+	// ", then the skill"). A skill named only after an object
+	// closer ("using", "for", ...) is the object of that phrase
+	// instead, and does not make the line a directive.
+	return segmentNamesSkillAsActivateObject(seg)
 }
 
-// clauseHasNegation reports whether the final clause fragment of
-// before (the text preceding one "activate" occurrence) negates
-// it. The fragment is cut at the last sentence terminator or
-// clause separator (".", "!", "?", ",", ";", ":"), so a negation
-// in an earlier clause or sentence never excuses this occurrence.
-func clauseHasNegation(before string) bool {
+// isObjectContinuationWord reports whether word (a raw whitespace
+// field, punctuation included) can continue the direct-object
+// region after a comma: only a conjunction or the elision "then"
+// ("Activate the tool, then the skill"). A comma before anything
+// else ends the region: "Activate the tool, the skill is ready"
+// names the skill as the subject of a new clause, not as an
+// object of "activate".
+func isObjectContinuationWord(raw string) bool {
+	w := strings.Trim(raw, ".,;:()[]\"'`!?")
+	return w == "then" || w == "and" || w == "or"
+}
+
+// segmentNamesSkillAsActivateObject reports whether seg — the text
+// after one "activate" occurrence, up to the next occurrence —
+// names a skill as an object of that "activate" (Audit 9
+// F-A9-P2-3). Every object of the verb in the clause is
+// considered, not just the first: "Activate the tool and the
+// skill" and "Activate the tool, then the skill" are directives,
+// because the skill is a conjoined / elided object of the same
+// "activate". A skill named only after an object closer (see
+// activateObjectClosers) is not: "Activate the tool using the
+// skill" names the skill as the instrument of "using", and
+// "Activate the tool for this skill" names it in a "for" phrase,
+// so both still load. The object region runs from the occurrence
+// through articles, adjectives, and the conjunctions "and"/"or"
+// and the elision "then"; a comma keeps it open only before
+// "then"/"and"/"or", and a sentence terminator (".", "!", "?",
+// ";", ":") closes it.
+func segmentNamesSkillAsActivateObject(seg string) bool {
+	fields := strings.Fields(seg)
+	for i, raw := range fields {
+		word := strings.Trim(raw, ".,;:()[]\"'`!?")
+		if word == "" {
+			// A standalone punctuation field: a sentence
+			// terminator closes the region; a comma keeps it
+			// open only before "then"/"and"/"or".
+			if strings.ContainsAny(raw, ".!?;:") {
+				return false
+			}
+			if strings.Contains(raw, ",") {
+				if i+1 < len(fields) && isObjectContinuationWord(fields[i+1]) {
+					continue
+				}
+				return false
+			}
+			continue
+		}
+		if word == "skill" || word == "skills" {
+			return true
+		}
+		if activateObjectClosers[word] {
+			return false
+		}
+		if strings.ContainsAny(raw, ".!?;:") {
+			// A sentence terminator attached to this word
+			// ("tool.") ends the clause: nothing after it in
+			// this segment can be an object of this occurrence.
+			return false
+		}
+		if strings.HasSuffix(raw, ",") {
+			if i+1 < len(fields) && isObjectContinuationWord(fields[i+1]) {
+				continue
+			}
+			return false
+		}
+	}
+	return false
+}
+
+// segmentNamesSkillForActivationNoun reports whether seg — the text
+// after an -ion activation noun — names the skill being activated:
+// the complement ("of the skill"), or a quoted skill reference
+// ("activation of \"other\""). The noun's complement is an "of"
+// phrase, so unlike the verb form the skill may follow a
+// preposition here (Audit 9 F-A9-P2-4).
+func segmentNamesSkillForActivationNoun(seg string) bool {
+	s := strings.TrimSpace(seg)
+	// Strip a leading "of" complement head (and its article).
+	for {
+		fields := strings.Fields(s)
+		if len(fields) == 0 {
+			return false
+		}
+		first := strings.Trim(fields[0], ".,;:()[]\"'`")
+		if first == "of" || first == "the" || first == "a" || first == "an" {
+			s = strings.TrimSpace(strings.Join(fields[1:], " "))
+			continue
+		}
+		break
+	}
+	if s != "" && (s[0] == '"' || s[0] == '\'') {
+		return isQuotedSkillReference(s)
+	}
+	return skillWord.MatchString(s)
+}
+
+// isNegationWord reports whether w negates a verb: "not", "never",
+// "cannot", "refuse" (and its forms), or any "n't" contraction.
+func isNegationWord(w string) bool {
+	switch w {
+	case "not", "never", "cannot", "refuse", "refuses", "refused":
+		return true
+	}
+	return strings.HasSuffix(w, "n't")
+}
+
+// clauseNegatesVerb reports whether the final clause fragment of
+// before negates a verb in verbs (Audit 9 F-A9-P2-1). The fragment
+// is cut at the last sentence terminator or clause separator (".",
+// "!", "?", ",", ";", ":"), so a negation in an earlier clause or
+// sentence never excuses this occurrence. For each negation word
+// in the fragment, the verb it negates is the first word after it
+// once the skip words (see negationSkipWords) are passed over; the
+// carve-out applies only when that verb is in verbs. When the
+// words run out, the negated verb is the occurrence itself (the
+// next word after the fragment), which is activation-related by
+// construction, so that counts too: "should not activate"
+// (negation, then nothing) is a genuine negation of activate,
+// while "do not forget to activate" is not — the verb after "not"
+// is "forget".
+func clauseNegatesVerb(before string, verbs map[string]bool) bool {
 	frag := before
 	if idx := strings.LastIndexAny(frag, ".!?,;:"); idx >= 0 {
 		frag = frag[idx+1:]
 	}
-	for _, w := range strings.Fields(frag) {
-		w = strings.Trim(w, ".,;:()[]\"'`")
-		switch {
-		case w == "not", w == "never", w == "cannot",
-			w == "refuse", w == "refuses", w == "refused":
-			return true
-		case strings.HasSuffix(w, "n't"):
+	words := make([]string, 0, len(strings.Fields(frag)))
+	for _, f := range strings.Fields(frag) {
+		words = append(words, strings.Trim(f, ".,;:()[]\"'`"))
+	}
+	for i, w := range words {
+		if !isNegationWord(w) {
+			continue
+		}
+		j := i + 1
+		for j < len(words) && negationSkipWords[words[j]] {
+			j++
+		}
+		if j >= len(words) {
 			return true
 		}
+		if verbs[words[j]] {
+			return true
+		}
+	}
+	return false
+}
+
+// clauseHasNegation reports whether the final clause fragment of
+// before negates the "activate" occurrence that follows it (Audit
+// 9 F-A9-P2-1): the negation must govern an activate verb form,
+// not merely appear in the clause. "should not activate", "do not
+// activate", "never activate", "must not activate", "cannot
+// activate", and "refuse to activate" are defensive instructions
+// and load; "do not forget to activate", "do not hesitate to
+// activate", and "never hesitate to activate" negate a different
+// verb ("forget"/"hesitate") and are still directives.
+func clauseHasNegation(before string) bool {
+	return clauseNegatesVerb(before, activateVerbForms)
+}
+
+// clauseGovernorIsDirectiveVerb reports whether the last word of
+// the final clause fragment of before (articles skipped) is a verb
+// that can govern an -ion activation noun as a directive (Audit 9
+// F-A9-P2-4): "Begin activation of the skill" is governed by
+// "begin", while "This skill explains activation" is governed by
+// "explains" and "Skill activation is manual" by nothing at all —
+// both discussion, not directives.
+func clauseGovernorIsDirectiveVerb(before string) bool {
+	frag := before
+	if idx := strings.LastIndexAny(frag, ".!?,;:"); idx >= 0 {
+		frag = frag[idx+1:]
+	}
+	fields := strings.Fields(frag)
+	for i := len(fields) - 1; i >= 0; i-- {
+		w := strings.Trim(fields[i], ".,;:()[]\"'`")
+		switch w {
+		case "the", "a", "an", "this", "that", "these", "those":
+			continue
+		}
+		return activationDirectiveVerbs[w]
 	}
 	return false
 }
