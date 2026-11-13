@@ -6,6 +6,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Audit 4 (v0.2.0-rc7) — see `AUDIT4_2026-11-13.md`
+
+Fresh-eyes production-readiness audit of rc6 plus the fresh-install
+run (F-A3-3, now closed). No P0 found in any of the three workstreams
+(A security, B stability/correctness, C fresh install). All eight P1s
+fixed in rc7 (below) and re-proven with regression tests. **Verdict:
+NOT production-ready** — the 24–72 h daemon soak (F-A3-4) is still
+open (longest continuous run ~1h39m) and the live config still runs
+with the sandbox disabled (A P1-5, operational decision, not a code
+fix). Live token accounting verified against real DeepSeek usage: a
+trivial turn costs 3,453 tokens, footer == provider total exactly.
+Daemon incident during the audit: a VM/runtime restart (~05:10 UTC)
+killed the rc6 daemon silently; state files intact, daemon restarted
+(rc6, then rc7). P2 backlog recorded in the report.
+
 ### Fixed — Audit 4 (v0.2.0-rc7)
 
 All Audit 4 P1 findings (workstreams A security, B stability, C
