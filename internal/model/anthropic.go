@@ -359,170 +359,204 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/messages"
 	headers := p.headers()
 	headers["Accept"] = "text/event-stream"
-	resp, err := doStreamRequest(ctx, p.client, http.MethodPost, url, headers, payload)
-	if err != nil {
-		return nil, fmt.Errorf("anthropic: stream request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-		return nil, apiError("anthropic", resp.StatusCode, body)
-	}
+	// totalTimeout bounds the whole Stream call — every setup
+	// attempt, the scan, and the Chat fallback — so a stalled
+	// provider can never eat the agent step's whole budget.
+	ctx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		resp, err := doStreamRequest(ctx, p.client, http.MethodPost, url, headers, payload)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: stream request failed: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+			resp.Body.Close()
+			return nil, apiError("anthropic", resp.StatusCode, body)
+		}
 
-	// Accumulate one entry per content block, keyed by its stream index.
-	type streamBlock struct {
-		typ   string // text | tool_use
-		id    string
-		name  string
-		text  strings.Builder
-		input strings.Builder
-	}
-	var blocks []*streamBlock
-	blockAt := func(index int) *streamBlock {
-		for len(blocks) <= index {
-			blocks = append(blocks, &streamBlock{})
+		// Accumulate one entry per content block, keyed by its stream index.
+		type streamBlock struct {
+			typ   string // text | tool_use
+			id    string
+			name  string
+			text  strings.Builder
+			input strings.Builder
 		}
-		return blocks[index]
-	}
-	inputTokens, outputTokens := 0, 0
-	stopReason := ""
-	emitted := 0
+		var blocks []*streamBlock
+		blockAt := func(index int) *streamBlock {
+			for len(blocks) <= index {
+				blocks = append(blocks, &streamBlock{})
+			}
+			return blocks[index]
+		}
+		inputTokens, outputTokens := 0, 0
+		stopReason := ""
+		emitted := 0
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	event := ""
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			// A blank line ends one SSE event: the event type
-			// must not leak into the next block, or a data-only
-			// line would be misrouted to the previous event.
-			event = ""
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" {
-			continue
-		}
-		switch event {
-		case "message_start":
-			var ev struct {
-				Message struct {
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		event := ""
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				// A blank line ends one SSE event: the event type
+				// must not leak into the next block, or a data-only
+				// line would be misrouted to the previous event.
+				event = ""
+				continue
+			}
+			if strings.HasPrefix(line, "event:") {
+				event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "" {
+				continue
+			}
+			switch event {
+			case "message_start":
+				var ev struct {
+					Message struct {
+						Usage struct {
+							InputTokens int `json:"input_tokens"`
+						} `json:"usage"`
+					} `json:"message"`
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err == nil {
+					inputTokens = ev.Message.Usage.InputTokens
+				}
+			case "content_block_start":
+				var ev struct {
+					Index        int `json:"index"`
+					ContentBlock struct {
+						Type  string          `json:"type"`
+						ID    string          `json:"id,omitempty"`
+						Name  string          `json:"name,omitempty"`
+						Input json.RawMessage `json:"input,omitempty"`
+					} `json:"content_block"`
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					continue
+				}
+				b := blockAt(ev.Index)
+				b.typ = ev.ContentBlock.Type
+				b.id = ev.ContentBlock.ID
+				b.name = ev.ContentBlock.Name
+				if len(ev.ContentBlock.Input) > 0 {
+					b.input.Write(ev.ContentBlock.Input)
+				}
+			case "content_block_delta":
+				var ev struct {
+					Index int `json:"index"`
+					Delta struct {
+						Type        string `json:"type"`
+						Text        string `json:"text,omitempty"`
+						PartialJSON string `json:"partial_json,omitempty"`
+					} `json:"delta"`
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					continue
+				}
+				b := blockAt(ev.Index)
+				switch ev.Delta.Type {
+				case "text_delta":
+					if ev.Delta.Text != "" {
+						emitted++
+						b.text.WriteString(ev.Delta.Text)
+						if err := fn(ev.Delta.Text); err != nil {
+							resp.Body.Close()
+							return nil, err
+						}
+					}
+				case "input_json_delta":
+					b.input.WriteString(ev.Delta.PartialJSON)
+				}
+			case "message_delta":
+				var ev struct {
+					Delta struct {
+						StopReason string `json:"stop_reason,omitempty"`
+					} `json:"delta"`
 					Usage struct {
-						InputTokens int `json:"input_tokens"`
+						OutputTokens int `json:"output_tokens"`
 					} `json:"usage"`
-				} `json:"message"`
-			}
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				inputTokens = ev.Message.Usage.InputTokens
-			}
-		case "content_block_start":
-			var ev struct {
-				Index        int `json:"index"`
-				ContentBlock struct {
-					Type  string          `json:"type"`
-					ID    string          `json:"id,omitempty"`
-					Name  string          `json:"name,omitempty"`
-					Input json.RawMessage `json:"input,omitempty"`
-				} `json:"content_block"`
-			}
-			if err := json.Unmarshal([]byte(data), &ev); err != nil {
-				continue
-			}
-			b := blockAt(ev.Index)
-			b.typ = ev.ContentBlock.Type
-			b.id = ev.ContentBlock.ID
-			b.name = ev.ContentBlock.Name
-			if len(ev.ContentBlock.Input) > 0 {
-				b.input.Write(ev.ContentBlock.Input)
-			}
-		case "content_block_delta":
-			var ev struct {
-				Index int `json:"index"`
-				Delta struct {
-					Type        string `json:"type"`
-					Text        string `json:"text,omitempty"`
-					PartialJSON string `json:"partial_json,omitempty"`
-				} `json:"delta"`
-			}
-			if err := json.Unmarshal([]byte(data), &ev); err != nil {
-				continue
-			}
-			b := blockAt(ev.Index)
-			switch ev.Delta.Type {
-			case "text_delta":
-				if ev.Delta.Text != "" {
-					emitted++
-					b.text.WriteString(ev.Delta.Text)
-					if err := fn(ev.Delta.Text); err != nil {
-						return nil, err
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err == nil {
+					if ev.Delta.StopReason != "" {
+						stopReason = ev.Delta.StopReason
+					}
+					if ev.Usage.OutputTokens != 0 {
+						outputTokens = ev.Usage.OutputTokens
 					}
 				}
-			case "input_json_delta":
-				b.input.WriteString(ev.Delta.PartialJSON)
-			}
-		case "message_delta":
-			var ev struct {
-				Delta struct {
-					StopReason string `json:"stop_reason,omitempty"`
-				} `json:"delta"`
-				Usage struct {
-					OutputTokens int `json:"output_tokens"`
-				} `json:"usage"`
-			}
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				if ev.Delta.StopReason != "" {
-					stopReason = ev.Delta.StopReason
-				}
-				if ev.Usage.OutputTokens != 0 {
-					outputTokens = ev.Usage.OutputTokens
-				}
 			}
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		if emitted == 0 && len(blocks) == 0 {
+		scanErr := scanner.Err()
+		resp.Body.Close()
+		// A tool_use block counts as usable only when it has a name:
+		// a bare content_block_start with no name can never execute.
+		haveToolCalls := false
+		for _, b := range blocks {
+			if b.typ == "tool_use" && strings.TrimSpace(b.name) != "" {
+				haveToolCalls = true
+				break
+			}
+		}
+		if scanErr != nil {
+			if isProgressTimeout(scanErr) && emitted == 0 && !haveToolCalls && attempt < maxAttempts-1 {
+				// The stream went silent before delivering
+				// anything usable: the attempt is worthless
+				// and safe to repeat — nothing was shown to
+				// the caller yet, so re-running the stream
+				// cannot duplicate a live chunk. Set it up
+				// again.
+				if berr := sleepBackoff(ctx, backoffDelays[attempt]); berr != nil {
+					return nil, berr
+				}
+				continue
+			}
+			// A truncated stream with usable chunks already delivered is not
+			// a failure; only fall back when nothing was delivered.
+			if emitted == 0 && !haveToolCalls {
+				return p.streamFallback(ctx, req, fn)
+			}
+			return nil, fmt.Errorf("anthropic: reading stream: %w", scanErr)
+		}
+		var content strings.Builder
+		var toolCalls []ToolCall
+		for _, b := range blocks {
+			switch b.typ {
+			case "text":
+				content.WriteString(b.text.String())
+			case "tool_use":
+				args := strings.TrimSpace(b.input.String())
+				if args == "" {
+					args = "{}"
+				}
+				toolCalls = append(toolCalls, ToolCall{ID: b.id, Name: b.name, Arguments: args})
+			}
+		}
+		if emitted == 0 && len(toolCalls) == 0 {
+			// Nothing usable was streamed. Fall back to a plain Chat so
+			// the caller still gets an answer instead of an empty reply.
 			return p.streamFallback(ctx, req, fn)
 		}
-		return nil, fmt.Errorf("anthropic: reading stream: %w", err)
+		msg := Message{Role: "assistant", Content: content.String(), ToolCalls: toolCalls}
+		usage := estimateUsage(req, msg, Usage{
+			PromptTokens:     inputTokens,
+			CompletionTokens: outputTokens,
+			TotalTokens:      inputTokens + outputTokens,
+		})
+		return &ChatResponse{
+			Message:      msg,
+			FinishReason: mapAnthropicStopReason(stopReason),
+			Usage:        usage,
+		}, nil
 	}
-	var content strings.Builder
-	var toolCalls []ToolCall
-	for _, b := range blocks {
-		switch b.typ {
-		case "text":
-			content.WriteString(b.text.String())
-		case "tool_use":
-			args := strings.TrimSpace(b.input.String())
-			if args == "" {
-				args = "{}"
-			}
-			toolCalls = append(toolCalls, ToolCall{ID: b.id, Name: b.name, Arguments: args})
-		}
-	}
-	if emitted == 0 && len(toolCalls) == 0 {
-		// Nothing usable was streamed. Fall back to a plain Chat so
-		// the caller still gets an answer instead of an empty reply.
-		return p.streamFallback(ctx, req, fn)
-	}
-	msg := Message{Role: "assistant", Content: content.String(), ToolCalls: toolCalls}
-	usage := estimateUsage(req, msg, Usage{
-		PromptTokens:     inputTokens,
-		CompletionTokens: outputTokens,
-		TotalTokens:      inputTokens + outputTokens,
-	})
-	return &ChatResponse{
-		Message:      msg,
-		FinishReason: mapAnthropicStopReason(stopReason),
-		Usage:        usage,
-	}, nil
+	return nil, fmt.Errorf("anthropic: stream failed after %d attempts", maxAttempts)
 }
 
 // streamFallback runs a plain Chat and emits its content as one chunk,

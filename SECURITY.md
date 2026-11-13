@@ -51,10 +51,17 @@ command is refused before anything is spawned.
   and those work (`unshare -rm`, `unshare -rmn` succeed as root).
 - The sandbox is therefore built from namespaces directly, with no
   new dependency (`internal/sandbox`, stdlib only): the child is
-  started with `CLONE_NEWUSER` (agent uid/gid mapped to root
-  inside), `CLONE_NEWNS`, and — unless `allow_network` is set —
-  `CLONE_NEWNET` (a network namespace whose only interface is a
-  down loopback: no network at all).
+  started with `CLONE_NEWNS`, `CLONE_NEWIPC` (its own SysV IPC
+  namespace), `CLONE_NEWUTS` (its own hostname), `CLONE_NEWPID`
+  (its own PID namespace — see "PID namespace" below), and —
+  unless `allow_network` is set — `CLONE_NEWNET` (a network
+  namespace whose only interface is a down loopback: no network at
+  all). The user namespace is **not** created by the clone: the
+  wrapper mounts `/proc` first and only then drops into a fresh
+  user namespace with `unshare --user --map-root-user` (agent
+  uid/gid mapped to root inside), immediately before running user
+  code — see "PID namespace" for why the order matters. The end
+  state is the same as creating it at clone time.
 - Inside the namespaces a wrapper builds a chroot root under
   `<root>/.orion-root` and runs the command there as `/bin/sh -c`
   with cwd `/work`:
@@ -73,7 +80,9 @@ command is refused before anything is spawned.
     as `/work` — the only persistent writable place.
   - The chroot root itself is remounted read-only (`--rbind`, which
     replicates the submounts — a plain self-bind drops them).
-  - `/proc` and `/sys` are empty directories: no host process or
+  - `/proc` is a real procfs for the new PID namespace (see "PID
+    namespace" below): `ps` and `ls /proc` work, but only ever show
+    namespace processes. `/sys` is an empty directory: no host
     kernel information leaks in.
 - Environment: the usual scrubbed env, plus `HOME=/work`,
   `TMPDIR=/tmp`, `PATH` set to the in-sandbox directories.
@@ -81,6 +90,89 @@ command is refused before anything is spawned.
   own contents. Proven by `TestSandboxContainsDestructiveCommand`
   and `TestShellExecSandboxContains` (temp dirs only, canary file
   outside the root survives, canary inside `/work` is destroyed).
+
+### PID namespace
+
+Added 2026-11-13 (v0.2 hardening). The sandboxed child is started
+with `CLONE_NEWPID`, so it is PID 1 in its own PID namespace: it
+cannot see host processes (`ls /proc` shows only namespace PIDs)
+and cannot signal them (`kill -0 <host-pid>` fails with ESRCH).
+Proven live by `TestSandboxPIDNamespaceIsolatesHost` (host canary
+`sleep`, known PID) and `TestSandboxProcReflectsNamespace`.
+
+**Why the user namespace moved out of the clone.** `/proc` must be
+mounted for the PID namespace to be observable (`ps`, `ls /proc`).
+On this host the kernel (7.0.0-44-generic, custom) refuses procfs
+mounts from inside a nested user namespace: every variant was
+tried and fails with EPERM — single clone with
+`CLONE_NEWUSER|CLONE_NEWPID`, two-stage `unshare` (user namespace
+first, then PID namespace inside it), `subset=pid` and plain
+mounts, `/proc` and arbitrary mountpoints, even mounting proc for a
+PID namespace owned by the cell's user namespace from inside a
+nested one. The same mount succeeds from the cell's user namespace
+(no nested user namespace). So the user namespace is **not**
+created at clone time. The wrapper instead runs first as the
+agent's uid in the host user namespace, mounts `/proc` (and
+everything else), `pivot_root`s, detaches the old root, and only
+then drops into a fresh user namespace with `unshare --user
+--map-root-user` immediately before running user code. The end
+state is identical to creating it at clone time — root inside its
+own user namespace, capabilities only over its own namespaces.
+
+**The mount namespace follows the user namespace.** The mount
+namespace is created by the clone, so it is owned by the host user
+namespace; after the switch the process would hold no capabilities
+over it and could not mount anything at all — not even a tmpfs on
+`/tmp` inside its own namespace. That would also void the seccomp
+control test (mounts would be blocked with or without the filter,
+so the filter's blocking would be unprovable). So the switch is
+immediately followed by a fresh mount namespace (`unshare
+--mount`, a copy of the prepared one), owned by the new user
+namespace: the process owns its mount namespace again, exactly as
+when the user namespace was created at clone time, and seccomp —
+not the lack of a capability — is what restricts mounts.
+
+**`/proc` contents.** Mounted with `subset=pid` when the kernel
+supports it (5.8+): `/proc` then contains only per-process entries
+plus `self`/`thread-self` — no `/proc/sys`, `/proc/kcore`,
+`/proc/kallsyms` or `/proc/sysrq-trigger` at all. On older kernels
+the fallback is a plain proc mount with `/proc/sys` bound
+read-only. Either way a sandboxed process sees only its own
+namespace's processes, and `/proc/sys` is not writable.
+
+**PID 1 reaping.** The user shell is PID 1 (the `exec` chain
+preserves the PID through the wrapper, the `unshare` switch and the
+seccomp launcher). It reaps orphaned children through its normal
+wait loop — proven by `TestSandboxPID1ReapsOrphans` (a grandchild
+orphaned onto PID 1 leaves no zombie). PID 1 exiting kills the
+whole namespace, so nothing can linger after the command ends.
+
+**Fail-closed decision (explicit).** There are three layers, and
+none of them degrades silently:
+1. The PID namespace is requested atomically with the other
+   namespaces in the single `clone` — if its creation fails the
+   clone fails, the child never starts, and the command never runs.
+   There is no code path where the PID namespace is silently
+   missing. (`TestPrepareRequestsPIDNamespace` pins the flags.)
+2. The wrapper exits 126 before running any user code if the
+   `/proc` mount fails (or any other setup step fails).
+   (`TestSandboxWrapperRefusesWithoutProc` proves it by running
+   the wrapper where the mount is refused.)
+3. Availability is probed up front: `sandbox.Available()` runs a
+   trivial command through the full wrapper, including the PID
+   namespace and the `/proc` mount. If the host cannot do it, the
+   sandbox reports unavailable and `shell_exec` falls back to the
+   denylist alone — loudly: a warning is logged and the result is
+   marked `[warning: sandbox ...]`. That is the pre-existing,
+   deliberate policy for a host that cannot sandbox at all (see
+   "Limits" below); it is a once-per-process capability decision,
+   not a per-command silent downgrade, and it is not changed by
+   this phase.
+
+This makes `unshare(1)` (util-linux, in `/usr`) a sandbox
+availability dependency alongside `python3`: if it is absent the
+wrapper fails before user code runs and the probe reports the
+sandbox unavailable.
 
 ### Config
 
@@ -100,9 +192,12 @@ between runs; `/tmp` does not.
 
 - **Availability is host-dependent.** Nested uid/gid mapping is
   blocked for unprivileged users on this VM (the cell itself is a
-  user-namespaced container; writing `uid_map` as `nobody` fails
-  with EPERM), so the sandbox only works when the agent runs as
-  root, or on a host that allows unprivileged user namespaces.
+  user-namespaced container), so the sandbox only works when the
+  agent runs as root, or on a host that allows unprivileged user
+  namespaces. The wrapper does all of its mounts before the
+  user-namespace switch, while running as the agent's uid in the
+  host user namespace, so as a non-root agent the very first mount
+  fails and the probe reports the sandbox unavailable.
   `sandbox.Available()` probes the real mechanism (a trivial
   command through the full wrapper) and caches the result. When
   sandbox mode is on but unavailable — or setup fails — `shell_exec`
@@ -117,16 +212,17 @@ between runs; `/tmp` does not.
   (The pivot replaces the earlier plain chroot, which was escapable
   via a cwd held outside it.)
 - The wrapper `pivot_root`s into the new root and detaches the old
-  (host) root. The detach cannot use the `umount` CLI: libmount
-  needs `/proc/mounts` (or `/proc/self/mountinfo`) to find the
-  mount, and `/proc` is deliberately not mounted in the sandbox
-  (strace-proven 2026-11-13: `umount` never issues the `umount2`
-  syscall, it fails opening `/proc/mounts`). It calls `umount2(2)`
-  directly via `python3` (present in the new root through the
-  `/usr` bind mount; the syscall number is arch-dependent). If
-  `python3` is unavailable the wrapper exits 126 and the sandbox
-  is unavailable rather than running with the host root visible —
-  which also makes `python3` a sandbox availability dependency.
+  (host) root. The detach calls `umount2(2)` directly via `python3`
+  (present in the new root through the `/usr` bind mount; the
+  syscall number is arch-dependent) instead of the `umount` CLI:
+  the direct syscall is proven and never depends on `/proc` or
+  libmount — the CLI was strace-proven (2026-11-13) to fail opening
+  `/proc/mounts` back when `/proc` was not mounted at all, and
+  there is no reason to re-prove it now that the namespace's own
+  `/proc` exists. If `python3` is unavailable the wrapper exits
+  126 and the sandbox is unavailable rather than running with the
+  host root visible — which also makes `python3` a sandbox
+  availability dependency.
 - A sandboxed command cannot see the agent's real working
   directory or workspace — only `<root>/work`. Point `root` at a
   project directory's parent (or copy files in) when a command
@@ -159,7 +255,9 @@ Design (`internal/sandbox/seccomp.go`):
   `kexec_load`, `kexec_file_load`, `init_module`/`finit_module`/
   `delete_module`, `clock_settime`/`settimeofday`/`adjtimex`/
   `clock_adjtime`, `sethostname`/`setdomainname` — the sandbox
-  shares the host UTS namespace and clock), keyrings (`keyctl`,
+  has its own UTS namespace (so hostname changes are contained
+  there anyway) but shares the host clock, so clock syscalls are
+  blocked outright), keyrings (`keyctl`,
   `add_key`, `request_key`), kernel attack surface (`ptrace`,
   `bpf`, `perf_event_open`, `userfaultfd`, `fanotify_init`),
   chroot escape via file handles (`open_by_handle_at`,

@@ -16,6 +16,36 @@ import (
 	"github.com/irfan/orion/internal/sandbox"
 )
 
+// Caps defaults: the size limits on tool results and conversation
+// history. These are the policy values; the enforcement lives in
+// internal/tools (Registry.Execute) and internal/core (trimHistory).
+//
+// DefaultMaxToolResultBytes mirrors tools.DefaultMaxToolResultBytes:
+// keep the two in sync — the config value is what NewAgent pushes
+// into the registry, the tools value is what a registry enforces
+// when no agent ever configured it (direct registry use, tests).
+// 256 KiB: the same default web_fetch already used, so one tool
+// result costs at most ~64K estimated tokens and can never by
+// itself exhaust a provider context window.
+//
+// DefaultMaxHistoryTokens is the token budget for the history fed to
+// the provider on each step. 32K: DeepSeek (the default provider)
+// offers a 64K window, so 32K of history leaves headroom for the
+// tool definitions, the completion, and the ~4 chars/token estimate
+// being rough (CountTokens under-counts dense text). Local Ollama
+// models with smaller windows should set this lower in config.
+const (
+	DefaultMaxToolResultBytes = 256 * 1024
+	DefaultMaxHistoryTokens   = 32768
+)
+
+const (
+	minMaxToolResultBytes = 1024
+	maxMaxToolResultBytes = 10 * 1024 * 1024 // matches web_fetch's max_bytes ceiling
+	minMaxHistoryTokens   = 1024             // system prompt alone is ~600 tokens
+	maxMaxHistoryTokens   = 1000000
+)
+
 // knownProviders is the set of provider names the model layer
 // supports. Config and model must agree here; a name outside this set
 // can never produce a working provider. It is unexported (and only
@@ -92,6 +122,19 @@ type Config struct {
 	DataDir              string  `json:"data_dir"`
 	MaxSteps             int     `json:"max_steps"`
 	TimeoutSeconds       int     `json:"timeout_seconds"`
+	// MaxToolResultBytes caps the bytes of any single tool result
+	// that reach the model (enforced centrally in the tools
+	// registry; see TruncateToolResult). Results over the cap are
+	// truncated with a "[truncated ...]" note carrying the original
+	// size, never dropped and never an error.
+	MaxToolResultBytes int `json:"max_tool_result_bytes"`
+	// MaxHistoryTokens caps the estimated tokens of the conversation
+	// history fed to the provider on each step (system prompt +
+	// recent history + recall injection + in-turn messages).
+	// Over-budget history is trimmed oldest-first in the agent loop
+	// (never the system prompt, never the latest user turn, never
+	// breaking a tool-call/tool-result pair).
+	MaxHistoryTokens int `json:"max_history_tokens"`
 	// Temperature, when set, is passed to the provider on every call.
 	// Nil means the provider default. 0 requests deterministic output
 	// (used by the live-model E2E test); the valid range is 0-2.
@@ -141,10 +184,12 @@ func defaultConfig(dataDir string) *Config {
 			"anthropic": {Name: "anthropic", Model: "claude-sonnet-4-5"},
 			"ollama":    {Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.1"},
 		},
-		Model:          "",
-		DataDir:        dataDir,
-		MaxSteps:       20,
-		TimeoutSeconds: 120,
+		Model:              "",
+		DataDir:            dataDir,
+		MaxSteps:           20,
+		TimeoutSeconds:     120,
+		MaxToolResultBytes: DefaultMaxToolResultBytes,
+		MaxHistoryTokens:   DefaultMaxHistoryTokens,
 	}
 	if dataDir != "" {
 		cfg.Sandbox = sandbox.Config{Root: sandbox.DefaultRoot(dataDir)}
@@ -207,6 +252,17 @@ func (c *Config) Validate() error {
 	}
 	if c.TimeoutSeconds < 1 || c.TimeoutSeconds > 3600 {
 		return errors.New("config: timeout_seconds must be between 1 and 3600")
+	}
+	// Absurd caps are rejected rather than silently clamped: a
+	// 1-byte tool cap would truncate every result into uselessness,
+	// and a 1 GB cap (or a 1-token history) would defeat the limits
+	// entirely. The bounds are generous — 1 KiB to 10 MiB per tool
+	// result, 1K to 1M history tokens — so any sane tuning passes.
+	if c.MaxToolResultBytes < minMaxToolResultBytes || c.MaxToolResultBytes > maxMaxToolResultBytes {
+		return fmt.Errorf("config: max_tool_result_bytes must be between %d and %d", minMaxToolResultBytes, maxMaxToolResultBytes)
+	}
+	if c.MaxHistoryTokens < minMaxHistoryTokens || c.MaxHistoryTokens > maxMaxHistoryTokens {
+		return fmt.Errorf("config: max_history_tokens must be between %d and %d", minMaxHistoryTokens, maxMaxHistoryTokens)
 	}
 	if c.Temperature != nil && (*c.Temperature < 0 || *c.Temperature > 2) {
 		return errors.New("config: temperature must be between 0 and 2")

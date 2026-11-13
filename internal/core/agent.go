@@ -115,6 +115,17 @@ func NewAgent(cfg *config.Config, provider model.Provider, registry *tools.Regis
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = defaultTimeoutSeconds
 	}
+	if cfg.MaxToolResultBytes <= 0 {
+		cfg.MaxToolResultBytes = config.DefaultMaxToolResultBytes
+	}
+	if cfg.MaxHistoryTokens <= 0 {
+		cfg.MaxHistoryTokens = config.DefaultMaxHistoryTokens
+	}
+	// Push the tool-result cap into the registry: Registry.Execute
+	// is the central choke point for result size, and the agent is
+	// where config meets the registry. A registry shared by several
+	// agents takes the cap of the most recently created one.
+	registry.SetMaxResultBytes(cfg.MaxToolResultBytes)
 	return &Agent{
 		provider: provider,
 		tools:    registry,
@@ -163,6 +174,15 @@ func (a *Agent) maxSteps() int {
 		return defaultMaxSteps
 	}
 	return a.cfg.MaxSteps
+}
+
+// maxHistoryTokens returns the token budget for the history fed to
+// the provider on each step.
+func (a *Agent) maxHistoryTokens() int {
+	if a.cfg.MaxHistoryTokens <= 0 {
+		return config.DefaultMaxHistoryTokens
+	}
+	return a.cfg.MaxHistoryTokens
 }
 
 // Run executes one user turn: it sends the user input (with system prompt
@@ -275,6 +295,11 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 	// the recent window no longer covers are injected into the system
 	// message. The section is appended only when non-empty, so the
 	// system prompt is byte-identical when nothing is relevant.
+	// The injected section counts against the history budget like
+	// any other message (trimHistoryToBudget measures the augmented
+	// system message), so recall + history together stay within
+	// budget: when the window is tight, the oldest turns are
+	// dropped to pay for the recall, never the system message.
 	if items := a.recallFor(input, recent); len(items) > 0 {
 		messages[0].Content += formatRecallSection(items)
 	}
@@ -299,9 +324,22 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		// returns: tool execution below gets a fresh timeout
 		// derived from the parent ctx, so a slow provider call
 		// cannot starve the tools.
+		//
+		// The request window is trimmed to the history budget
+		// first (see trimHistoryToBudget): the in-flight messages
+		// grow with every tool result, and an unbounded request
+		// would blow the provider's context window mid-run. Only
+		// the request copy is trimmed — the agent's transcript
+		// (and the MaxStepsError transcript) keeps the full
+		// history, and memory already holds every message.
 		stepCtx, cancel := context.WithTimeout(ctx, a.timeout())
+		reqMessages := messages
+		if trimmed, stats := trimHistoryToBudget(messages, a.maxHistoryTokens()); stats.dropped > 0 || stats.truncated > 0 {
+			a.logf("step %d: history trimmed to %d-token budget: dropped %d message(s), truncated %d bytes", step+1, a.maxHistoryTokens(), stats.dropped, stats.truncated)
+			reqMessages = trimmed
+		}
 		req := model.ChatRequest{
-			Messages:    append([]model.Message(nil), messages...),
+			Messages:    append([]model.Message(nil), reqMessages...),
 			Tools:       a.tools.Definitions(),
 			Temperature: a.cfg.Temperature,
 		}
@@ -560,6 +598,199 @@ func repairHistory(msgs []model.Message) ([]model.Message, int) {
 		i++
 	}
 	return out, repaired
+}
+
+// messageTokens estimates the tokens one message costs in a
+// provider request: its content plus any tool-call names and
+// arguments, plus a small per-message allowance for the role and
+// framing the provider adds. It uses model.CountTokens — the same
+// ~4-runes-per-token estimate the model layer uses when a provider
+// does not report usage — so the budget is measured in the units
+// providers bill and context windows are sized in. A byte budget
+// would mis-measure dense non-ASCII text (Bengali in Telegram is
+// 3 bytes per rune but roughly one token per few runes), and the
+// estimate only has to keep the request comfortably inside the
+// window, not predict the provider's exact count.
+func messageTokens(m model.Message) int {
+	n := model.CountTokens(m.Content) + 4
+	for _, tc := range m.ToolCalls {
+		n += model.CountTokens(tc.Name) + model.CountTokens(tc.Arguments) + 4
+	}
+	return n
+}
+
+// trimStats reports what trimHistoryToBudget removed from the
+// request window.
+type trimStats struct {
+	dropped   int // messages dropped outright
+	truncated int // bytes cut from message contents
+}
+
+// historyUnits splits msgs into drop-safe units: an assistant message
+// plus the tool results that immediately follow it is one unit — a
+// tool call must never be separated from its results, or the next
+// provider call is rejected for a dangling call — and every other
+// message is its own unit. The system message is always unit 0.
+// Units are returned in order, oldest first.
+func historyUnits(msgs []model.Message) [][2]int {
+	var units [][2]int
+	for i := 0; i < len(msgs); {
+		end := i + 1
+		if msgs[i].Role == "assistant" && len(msgs[i].ToolCalls) > 0 {
+			for end < len(msgs) && msgs[end].Role == "tool" {
+				end++
+			}
+		}
+		units = append(units, [2]int{i, end})
+		i = end
+	}
+	return units
+}
+
+// trimHistoryToBudget returns a copy of msgs whose estimated token
+// cost fits within budget, degrading gracefully instead of failing
+// the turn when history (or a single tool result) grows past it:
+//
+//   - the system prompt is never dropped and never truncated — it
+//     carries the identity, the rules, and the fact-aware recall
+//     section, so recall + history together stay within budget
+//     because the recall-augmented system message is measured here
+//     like any other message and the oldest turns pay for it;
+//   - the latest user turn is never dropped, and neither is the
+//     most recent turn as a whole (usually the tool result the
+//     model just produced): if it alone exceeds the budget it is
+//     truncated by the rule below, not dropped;
+//   - tool-call/tool-result pairing is never broken: whole units
+//     are dropped (see historyUnits), and content truncation only
+//     ever touches a message's Content, never its ToolCalls, so a
+//     result always keeps the call that requested it;
+//   - when dropping whole turns is not enough — a single tool
+//     result (or a huge user turn) is larger than the budget on its
+//     own — the largest remaining messages are truncated head-first
+//     with a marker carrying the original size, so the loop
+//     continues with partial data instead of erroring out.
+//
+// The caller's slice is never modified: only the request window is
+// trimmed, while the agent's transcript and memory keep the full
+// history. A history already within budget is returned unchanged
+// (a copy, so later mutation of the result cannot affect the
+// caller's messages).
+func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, trimStats) {
+	out := append([]model.Message(nil), msgs...)
+	if len(out) == 0 || budget <= 0 {
+		return out, trimStats{}
+	}
+	costs := make([]int, len(out))
+	total := 0
+	for i, m := range out {
+		costs[i] = messageTokens(m)
+		total += costs[i]
+	}
+	if total <= budget {
+		return out, trimStats{}
+	}
+	// The latest user turn is the last user-role message; the loop
+	// may have appended a deferred-call reminder after the original
+	// input, and that reminder is the turn that must survive.
+	lastUser := -1
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i].Role == "user" {
+			lastUser = i
+			break
+		}
+	}
+	var stats trimStats
+	drop := make([]bool, len(out))
+	// Phase 1: drop the oldest droppable units until the window
+	// fits or nothing droppable remains. Units are oldest-first,
+	// so the most recent turns survive longest. Three units are
+	// never dropped: the system prompt, the unit holding the latest
+	// user turn, and the most recent turn itself (usually the
+	// tool result the model just produced — dropping it would
+	// leave the model with nothing to continue from; if it alone
+	// exceeds the budget, phase 2 truncates it instead).
+	units := historyUnits(out)
+	for ui, u := range units {
+		if total <= budget {
+			break
+		}
+		if u[0] == 0 {
+			continue // system prompt: never dropped
+		}
+		if lastUser >= u[0] && lastUser < u[1] {
+			continue // latest user turn: never dropped
+		}
+		if ui == len(units)-1 {
+			continue // most recent turn: truncate, never drop
+		}
+		for i := u[0]; i < u[1]; i++ {
+			drop[i] = true
+			total -= costs[i]
+			stats.dropped++
+		}
+	}
+	// Phase 2: still over budget — one message alone exceeds it.
+	// Truncate the largest remaining non-system message contents,
+	// head-first, until the window fits. The system prompt is
+	// never truncated; the latest user turn is truncated only if
+	// it is itself the largest remaining message (dropping it is
+	// forbidden, cutting it with a marker beats failing the turn).
+	// The loop always makes progress: each cut removes the whole
+	// overage plus slack for the marker the truncation itself adds
+	// (the marker is fixed text, so a cut smaller than it would
+	// grow the message), and the loop stops — accepting a small
+	// overage — when a message is at the floor and cutting further
+	// cannot shrink the window. It can never spin.
+	for total > budget {
+		big := -1
+		for i := 1; i < len(out); i++ {
+			if drop[i] || len(out[i].Content) == 0 {
+				continue
+			}
+			if big < 0 || costs[i] > costs[big] {
+				big = i
+			}
+		}
+		if big < 0 {
+			break
+		}
+		over := total - budget
+		// ~4 runes per token for the overage, plus slack for the
+		// marker appended below (~70 chars) so the cut always
+		// exceeds what the marker adds.
+		cutRunes := over*4 + 128
+		r := []rune(out[big].Content)
+		if len(r) <= 64 {
+			break // cannot cut further without emptying the message
+		}
+		keep := len(r) - cutRunes
+		if keep < 64 {
+			keep = 64
+		}
+		origBytes := len(out[big].Content)
+		kept := string(r[:keep])
+		out[big].Content = kept + fmt.Sprintf("\n[truncated for context budget: showing first %d bytes of %d total bytes]", len(kept), origBytes)
+		stats.truncated += origBytes - len(out[big].Content)
+		newCost := messageTokens(out[big])
+		if newCost >= costs[big] {
+			// At the floor: the marker now costs more than the
+			// cut saves. Stop and accept the small overage
+			// rather than looping forever.
+			break
+		}
+		total -= costs[big] - newCost
+		costs[big] = newCost
+	}
+	if stats.dropped == 0 && stats.truncated == 0 {
+		return out, stats
+	}
+	kept := make([]model.Message, 0, len(out))
+	for i, m := range out {
+		if !drop[i] {
+			kept = append(kept, m)
+		}
+	}
+	return kept, stats
 }
 
 // executeTool runs one tool call. Arguments must be a JSON object string;

@@ -281,96 +281,129 @@ func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/chat/completions"
 	headers := p.headers()
 	headers["Accept"] = "text/event-stream"
-	resp, err := doStreamRequest(ctx, p.client, http.MethodPost, url, headers, payload)
-	if err != nil {
-		return nil, fmt.Errorf("%s: stream request failed: %w", p.Name(), err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-		return nil, apiError(p.Name(), resp.StatusCode, body)
-	}
+	// totalTimeout bounds the whole Stream call — every setup
+	// attempt, the scan, and the Chat fallback — so a stalled
+	// provider can never eat the agent step's whole budget.
+	ctx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		resp, err := doStreamRequest(ctx, p.client, http.MethodPost, url, headers, payload)
+		if err != nil {
+			return nil, fmt.Errorf("%s: stream request failed: %w", p.Name(), err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+			resp.Body.Close()
+			return nil, apiError(p.Name(), resp.StatusCode, body)
+		}
 
-	var content strings.Builder
-	var toolCalls []openAIToolCall
-	finishReason := ""
-	emitted := 0
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
-		}
-		var chunk openAIStreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-		for _, choice := range chunk.Choices {
-			if choice.Delta.Content != "" {
-				emitted++
-				content.WriteString(choice.Delta.Content)
-				if err := fn(choice.Delta.Content); err != nil {
-					return nil, err
+		var content strings.Builder
+		var toolCalls []openAIToolCall
+		finishReason := ""
+		emitted := 0
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				break
+			}
+			var chunk openAIStreamChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
+			}
+			for _, choice := range chunk.Choices {
+				if choice.Delta.Content != "" {
+					emitted++
+					content.WriteString(choice.Delta.Content)
+					if err := fn(choice.Delta.Content); err != nil {
+						resp.Body.Close()
+						return nil, err
+					}
+				}
+				if len(choice.Delta.ToolCalls) > 0 {
+					mergeStreamToolCalls(&toolCalls, choice.Delta.ToolCalls)
+				}
+				if choice.FinishReason != "" {
+					finishReason = choice.FinishReason
 				}
 			}
-			if len(choice.Delta.ToolCalls) > 0 {
-				mergeStreamToolCalls(&toolCalls, choice.Delta.ToolCalls)
-			}
-			if choice.FinishReason != "" {
-				finishReason = choice.FinishReason
+		}
+		scanErr := scanner.Err()
+		resp.Body.Close()
+		// A merged call counts as usable only when it has a name:
+		// mergeStreamToolCalls pads the list when a delta index
+		// jumps, and a padded entry can never execute.
+		haveToolCalls := false
+		for _, tc := range toolCalls {
+			if strings.TrimSpace(tc.Function.Name) != "" {
+				haveToolCalls = true
+				break
 			}
 		}
-	}
-	// Filter the merged calls before deciding whether anything
-	// usable arrived: mergeStreamToolCalls pads the list when a
-	// delta index jumps, and a padded entry has no name and can
-	// never execute — it must not count as a tool call here, nor
-	// reach the agent as a nameless call.
-	msg := Message{Role: "assistant", Content: content.String()}
-	for _, tc := range toolCalls {
-		if strings.TrimSpace(tc.Function.Name) == "" {
-			continue
+		if scanErr != nil {
+			if isProgressTimeout(scanErr) && emitted == 0 && !haveToolCalls && attempt < maxAttempts-1 {
+				// The stream went silent before delivering
+				// anything usable: the attempt is worthless
+				// and safe to repeat — nothing was shown to
+				// the caller yet, so re-running the stream
+				// cannot duplicate a live chunk. Set it up
+				// again.
+				if berr := sleepBackoff(ctx, backoffDelays[attempt]); berr != nil {
+					return nil, berr
+				}
+				continue
+			}
+			// A truncated stream with usable chunks already delivered is not
+			// a failure; only fall back when nothing was delivered.
+			if emitted == 0 && !haveToolCalls {
+				return p.streamFallback(ctx, req, fn)
+			}
+			return nil, fmt.Errorf("%s: reading stream: %w", p.Name(), scanErr)
 		}
-		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
-			ID:        tc.ID,
-			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
-		})
-	}
-	if err := scanner.Err(); err != nil {
-		// A truncated stream with usable chunks already delivered is not
-		// a failure; only fall back when nothing was delivered.
+		// Filter the merged calls before deciding whether anything
+		// usable arrived: mergeStreamToolCalls pads the list when a
+		// delta index jumps, and a padded entry has no name and can
+		// never execute — it must not count as a tool call here, nor
+		// reach the agent as a nameless call.
+		msg := Message{Role: "assistant", Content: content.String()}
+		for _, tc := range toolCalls {
+			if strings.TrimSpace(tc.Function.Name) == "" {
+				continue
+			}
+			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
 		if emitted == 0 && len(msg.ToolCalls) == 0 {
+			// Nothing usable was streamed — including a valid SSE stream
+			// of role-only (empty) deltas, which previously returned nil
+			// having delivered nothing. Fall back to a plain Chat so the
+			// caller still gets an answer instead of an empty reply.
 			return p.streamFallback(ctx, req, fn)
 		}
-		return nil, fmt.Errorf("%s: reading stream: %w", p.Name(), err)
-	}
-	if emitted == 0 && len(msg.ToolCalls) == 0 {
-		// Nothing usable was streamed — including a valid SSE stream
-		// of role-only (empty) deltas, which previously returned nil
-		// having delivered nothing. Fall back to a plain Chat so the
-		// caller still gets an answer instead of an empty reply.
-		return p.streamFallback(ctx, req, fn)
-	}
-	if finishReason == "" {
-		if len(msg.ToolCalls) > 0 {
-			finishReason = "tool_calls"
-		} else {
-			finishReason = "stop"
+		if finishReason == "" {
+			if len(msg.ToolCalls) > 0 {
+				finishReason = "tool_calls"
+			} else {
+				finishReason = "stop"
+			}
 		}
+		// Streaming responses carry no usage unless stream_options is set;
+		// estimate the fields the provider left at zero.
+		usage := estimateUsage(req, msg, Usage{})
+		return &ChatResponse{Message: msg, FinishReason: finishReason, Usage: usage}, nil
 	}
-	// Streaming responses carry no usage unless stream_options is set;
-	// estimate the fields the provider left at zero.
-	usage := estimateUsage(req, msg, Usage{})
-	return &ChatResponse{Message: msg, FinishReason: finishReason, Usage: usage}, nil
+	return nil, fmt.Errorf("%s: stream failed after %d attempts", p.Name(), maxAttempts)
 }
 
 // mergeStreamToolCalls merges one SSE delta's tool calls into the

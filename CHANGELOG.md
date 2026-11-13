@@ -8,7 +8,52 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Telegram response style — live terminal card + command menu**
+- **Sandbox PID namespace** (`internal/sandbox/sandbox.go`):
+  `CLONE_NEWPID` joins the sandbox's user/mount/IPC/UTS/network
+  namespaces, so sandboxed processes can no longer see or signal
+  host processes (the sandboxed shell runs as PID 1 and reaps
+  orphans; `/proc` is a real procfs for the namespace). Restructure
+  forced by this host's kernel, which refuses procfs mounts from
+  inside a nested user namespace: the wrapper mounts `/proc` first
+  (as the agent's UID in the host user namespace), pivots, detaches
+  the old root, then drops into a fresh user namespace via
+  `exec unshare --user --map-root-user` plus a fresh mount
+  namespace. New dependencies: `unshare(1)` alongside `python3`.
+  Fail-closed: clone failure means the child never starts, and the
+  wrapper exits 126 before any user code if setup fails. Live
+  proof: a host canary process is invisible in the sandbox's
+  `/proc` and `kill -0` on it fails. See `SECURITY.md`.
+- **Tool-result and history size caps** (`internal/tools/caps.go`,
+  `internal/core/agent.go`, `internal/config`): every tool result
+  and error string is truncated centrally in `Registry.Execute`
+  (default 256 KiB, configurable via `MaxToolResultBytes`,
+  1 KiB–10 MiB); the agent loop trims conversation history to a
+  token budget (default 32K, `MaxHistoryTokens`, 1K–1M) oldest-first
+  while never dropping the system prompt or the latest user turn
+  and preserving tool-call/result pairing. Multi-MB tool output is
+  truncated safely and the loop continues. See `README.md`.
+- **Provider timeout architecture** (`internal/model/provider.go`):
+  three distinct, nested timeouts replace the old single 120s
+  client timeout — connection 10s, progress 60s (first byte and
+  mid-stream silence; any byte resets the window, so slow-but-
+  steady reasoning streams are never killed), total 100s inside the
+  120s step budget. Progress timeouts are retryable; a stalled
+  stream retries only when nothing usable was delivered, so live
+  output is never duplicated. See `ARCHITECTURE.md`.
+
+### Fixed
+
+- **Egress proxy regression caught at integration** (timeout
+  rework): the first custom `http.Transport` omitted `Proxy`,
+  which silently disabled the environment egress proxy and broke
+  live DeepSeek calls (`tls: first record does not look like a TLS
+  handshake`). `ProxyFromEnvironment` restored, pinned by
+  `TestSharedClientHonoursProxyEnv`. Live-verified again:
+  `TestLiveDeepSeek` PASS (396 in 1.52s).
+- **Stale SECURITY.md line**: the seccomp section claimed the
+  sandbox "shares the host UTS namespace" — UTS has been
+  namespaced since before this phase; corrected (own UTS
+  namespace, shared host clock).
   (`internal/core/events.go`, `internal/messaging/render.go`,
   `redact.go`, `commands.go`, `session.go`): the gateway now streams
   a Hermes-style "💻 terminal" card per turn — one message, edited

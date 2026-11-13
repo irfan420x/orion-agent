@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -302,5 +304,230 @@ func TestSandboxNoDevTTY(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q (harmless device nodes must still work):\n%s", want, out)
 		}
+	}
+}
+
+// procEntries returns the lines of a sandboxed `ls /proc` that are
+// pure numbers (i.e. PIDs) plus the non-numeric names, so tests can
+// assert about the visible process set without parsing `ps` output.
+func procEntries(t *testing.T, out string) (pids map[string]bool, names map[string]bool) {
+	t.Helper()
+	pids = map[string]bool{}
+	names = map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if _, err := strconv.Atoi(line); err == nil {
+			pids[line] = true
+		} else {
+			names[line] = true
+		}
+	}
+	return pids, names
+}
+
+// TestPrepareRequestsPIDNamespace is the unit-level half of the
+// fail-closed rule: Prepare must ask the clone for a PID namespace,
+// and must NOT ask for a user namespace or set uid/gid mappings —
+// the user namespace is created by the wrapper after the /proc
+// mount (see sandbox.go), so a clone that silently lacked NEW PID
+// would be a bug, not a degraded mode.
+func TestPrepareRequestsPIDNamespace(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "true")
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root")}
+	if err := cfg.Prepare(cmd, "true"); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	attr := cmd.SysProcAttr
+	if attr == nil {
+		t.Fatal("Prepare did not set SysProcAttr")
+	}
+	if attr.Cloneflags&syscall.CLONE_NEWPID == 0 {
+		t.Error("Cloneflags lack CLONE_NEWPID: the sandbox would run without a PID namespace")
+	}
+	if attr.Cloneflags&syscall.CLONE_NEWUSER != 0 {
+		t.Error("Cloneflags still request CLONE_NEWUSER: the user namespace is the wrapper's job (after the /proc mount), not the clone's")
+	}
+	if len(attr.UidMappings) != 0 || len(attr.GidMappings) != 0 {
+		t.Error("Prepare sets uid/gid mappings; the wrapper maps root via unshare --map-root-user")
+	}
+}
+
+// TestSandboxPIDNamespaceIsolatesHost is the live proof for the PID
+// namespace. A host canary process (sleep, known PID) runs outside
+// the sandbox; inside, that PID must not exist: it is absent from
+// /proc and kill -0 on it fails. The sandboxed shell must also see
+// itself as PID 1 — it is the namespace init.
+func TestSandboxPIDNamespaceIsolatesHost(t *testing.T) {
+	requireSandbox(t)
+	canary := exec.Command("sleep", "60")
+	if err := canary.Start(); err != nil {
+		t.Fatalf("start canary sleep: %v", err)
+	}
+	t.Cleanup(func() { canary.Process.Kill(); canary.Wait() })
+	pid := canary.Process.Pid
+	// A namespace only ever holds a handful of small PIDs; a host
+	// PID this small could collide with a real namespace PID and
+	// make the assertions meaningless. (Host PIDs here are in the
+	// thousands; this is belt-and-braces, not expected to trigger.)
+	if pid < 100 {
+		t.Skipf("canary pid %d too small to distinguish from namespace PIDs", pid)
+	}
+	root := filepath.Join(t.TempDir(), "root")
+	out, code := runSandboxed(t, root, fmt.Sprintf("echo SELF=$$; ls /proc; kill -0 %d 2>&1; echo KILL_EXIT=$?", pid), false)
+	if code != 0 {
+		t.Fatalf("probe exit %d, output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "SELF=1") {
+		t.Errorf("sandboxed shell is not PID 1, output:\n%s", out)
+	}
+	if strings.Contains(out, "KILL_EXIT=0") {
+		t.Errorf("kill -0 on host canary pid %d succeeded inside the sandbox; host processes must be unreachable, output:\n%s", pid, out)
+	}
+	pids, _ := procEntries(t, out)
+	if pids[strconv.Itoa(pid)] {
+		t.Errorf("host canary pid %d is visible in the sandbox's /proc, output:\n%s", pid, out)
+	}
+	if !pids["1"] {
+		t.Errorf("sandbox /proc does not list PID 1, output:\n%s", out)
+	}
+}
+
+// TestSandboxProcReflectsNamespace proves /proc inside is a real
+// procfs for the new PID namespace, not the host's and not an empty
+// directory: it lists PID 1 and self, /proc/1/comm names the shell,
+// /proc/self/status is readable, and /proc/sys cannot be written
+// (subset=pid hides it entirely; the plain-mount fallback binds it
+// read-only — either way the write must fail).
+func TestSandboxProcReflectsNamespace(t *testing.T) {
+	requireSandbox(t)
+	root := filepath.Join(t.TempDir(), "root")
+	out, code := runSandboxed(t, root, "ls /proc; cat /proc/1/comm; test -r /proc/self/status && echo SELF-STATUS-OK; echo x > /proc/sys/kernel/hostname 2>&1; echo SYS-WRITE-EXIT=$?", false)
+	if code != 0 {
+		t.Fatalf("probe exit %d, output:\n%s", code, out)
+	}
+	pids, names := procEntries(t, out)
+	if !pids["1"] {
+		t.Errorf("/proc does not list PID 1, output:\n%s", out)
+	}
+	if !names["self"] {
+		t.Errorf("/proc does not list self, output:\n%s", out)
+	}
+	lines := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		lines[strings.TrimSpace(line)] = true
+	}
+	if !lines["sh"] {
+		t.Errorf("/proc/1/comm is not the shell, output:\n%s", out)
+	}
+	if !strings.Contains(out, "SELF-STATUS-OK") {
+		t.Errorf("/proc/self/status is not readable, output:\n%s", out)
+	}
+	if strings.Contains(out, "SYS-WRITE-EXIT=0") {
+		t.Errorf("writing /proc/sys/kernel/hostname succeeded inside the sandbox; /proc/sys must not be writable, output:\n%s", out)
+	}
+}
+
+// TestSandboxPID1ReapsOrphans proves the namespace init reaps its
+// children. The user shell is PID 1; a grandchild orphaned onto it
+// (its parent, a subshell, exits immediately) must not linger as a
+// zombie — after it exits and the shell has waited, its /proc entry
+// must be gone. The check retries briefly so a slow reap cannot
+// flake the test.
+func TestSandboxPID1ReapsOrphans(t *testing.T) {
+	requireSandbox(t)
+	root := filepath.Join(t.TempDir(), "root")
+	cmd := `(sleep 0.2 & echo $! > /work/orphan.pid)
+sleep 1
+P=$(cat /work/orphan.pid)
+echo "ORPHAN=$P"
+for i in 1 2 3 4 5; do [ -e /proc/$P/stat ] || break; sleep 0.2; done
+if [ -e /proc/$P/stat ]; then echo "ZOMBIE-LEAK: $(cat /proc/$P/stat)"; else echo REAPED-OK; fi`
+	out, code := runSandboxed(t, root, cmd, false)
+	if code != 0 {
+		t.Fatalf("probe exit %d, output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "REAPED-OK") {
+		t.Errorf("orphan was not reaped by PID 1, output:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "ORPHAN=") {
+			if n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(line), "ORPHAN=")); err != nil || n < 1 || n > 1000 {
+				t.Errorf("orphan pid %q is not a small namespace PID, output:\n%s", line, out)
+			}
+		}
+	}
+}
+
+var (
+	nestedProcProbeOnce sync.Once
+	nestedProcBlocked   bool
+	nestedProcProbed    bool
+)
+
+// procMountBlockedInNestedUserNS probes the host fact the fail-closed
+// test depends on: whether a procfs mount is refused from inside a
+// nested user namespace. On this host it is (EPERM — the kernel only
+// allows the mount from the cell's user namespace). If a future host
+// allows it, the wrapper-failure test below is skipped instead of
+// asserting a failure that cannot happen there.
+func procMountBlockedInNestedUserNS(t *testing.T) bool {
+	t.Helper()
+	nestedProcProbeOnce.Do(func() {
+		dir := t.TempDir()
+		cmd := exec.Command("unshare", "-Urm", "/bin/sh", "-c", "mount -t proc proc "+dir+" 2>/dev/null")
+		// The mount happens in the child's fresh mount namespace
+		// (unshare -m), so a success could not leak to the host.
+		if err := cmd.Run(); err != nil {
+			nestedProcBlocked = true
+		}
+		nestedProcProbed = true
+	})
+	if !nestedProcProbed {
+		t.Fatal("nested proc-mount probe did not run")
+	}
+	return nestedProcBlocked
+}
+
+// TestSandboxWrapperRefusesWithoutProc is the fail-closed proof for
+// the /proc mount: if the wrapper cannot mount procfs, it must exit
+// 126 before running any user code. The wrapper is run directly
+// inside a nested user namespace (via unshare -Urm, no PID
+// namespace), where this host refuses the mount — the marker command
+// must never run, so the marker file must not exist. The root tree
+// is built by Prepare first, exactly as for a real run.
+func TestSandboxWrapperRefusesWithoutProc(t *testing.T) {
+	if !procMountBlockedInNestedUserNS(t) {
+		t.Skip("this host allows procfs mounts inside a nested user namespace, so the wrapper-failure path is not exercisable here")
+	}
+	root := filepath.Join(t.TempDir(), "root")
+	cfg := Config{Enabled: true, Root: root}
+	dummy := exec.Command("/bin/sh", "-c", "true")
+	dummy.Env = os.Environ()
+	if err := cfg.Prepare(dummy, "true"); err != nil {
+		t.Fatalf("Prepare (build root tree): %v", err)
+	}
+	marker := filepath.Join(root, "work", "marker.txt")
+	wcmd := exec.Command("unshare", "-Urm", "/bin/sh", "-c", wrapperScript, "orion-sandbox", root, "echo MARKER > /work/marker.txt")
+	var buf bytes.Buffer
+	wcmd.Stdout = &buf
+	wcmd.Stderr = &buf
+	err := wcmd.Run()
+	code := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("run wrapper directly: %v", err)
+		}
+	}
+	if code != 126 {
+		t.Errorf("wrapper without a working /proc mount: exit %d, want 126 (setup failure, before user code), output:\n%s", code, buf.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("marker file %s exists: user code ran despite the failed /proc mount", marker)
 	}
 }

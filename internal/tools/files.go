@@ -225,7 +225,7 @@ type fileReadTool struct {
 func (t *fileReadTool) Name() string { return "file_read" }
 
 func (t *fileReadTool) Description() string {
-	return "Read a text file (up to 1MB) and return its contents. Paths are confined to the working directory and the temp directory."
+	return "Read a text file (up to 1MB) and return its contents. Larger files are truncated to 1MB with a marker stating the true size. Paths are confined to the working directory and the temp directory."
 }
 
 func (t *fileReadTool) Definition() model.ToolDefinition {
@@ -265,9 +265,11 @@ func (t *fileReadTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if info.IsDir() {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a directory, not a file", path)}
 	}
-	if info.Size() > maxFileRead {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("file %q is %d bytes, over the 1MB read limit", path, info.Size())}
-	}
+	// No size refusal here: a file over the read cap is truncated
+	// with a marker (below), not an error — the model gets the
+	// first megabyte and knows the rest was cut, instead of getting
+	// nothing. readFileBounded reads at most maxFileRead+1 bytes,
+	// so memory stays bounded whatever the file size.
 	data, err := readFileBounded(ctx, path)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot read %q: %w", path, err)}
@@ -276,9 +278,15 @@ func (t *fileReadTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		// The file grew between Stat and ReadFile: truncate and say so
 		// instead of silently returning a partial file. Back off to a
 		// UTF-8 boundary so the cut never splits a multi-byte rune.
+		// When Stat knew the true size (a regular file over the cap),
+		// report it; for a FIFO the size is unknown (0 at Stat) and
+		// the plain marker is used, as the grow-path tests expect.
 		cut := data[:maxFileRead]
 		for len(cut) > 0 && !utf8.Valid(cut) {
 			cut = cut[:len(cut)-1]
+		}
+		if info.Size() > maxFileRead {
+			return string(cut) + fmt.Sprintf("\n[truncated to 1MB] (file is %d bytes)", info.Size()), nil
 		}
 		return string(cut) + "\n[truncated to 1MB]", nil
 	}

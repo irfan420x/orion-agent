@@ -65,13 +65,17 @@ func scrubEnv() []string {
 // is left to run to completion (or its timeout): a command that
 // produces more than the cap is a truncated success, not an error,
 // so legitimate large output still reaches the model with a marker.
+// total counts every byte the command produced, including discarded
+// ones, so the marker can report the true output size.
 type cappedWriter struct {
 	buf      *bytes.Buffer
 	limit    int
 	exceeded bool
+	total    int
 }
 
 func (w *cappedWriter) Write(p []byte) (int, error) {
+	w.total += len(p)
 	if w.exceeded {
 		return len(p), nil
 	}
@@ -229,7 +233,10 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	sb.WriteString("output:\n")
 	sb.WriteString(output)
 	if truncated {
-		sb.WriteString("\n[truncated]")
+		// Keep the "[truncated]" marker (existing callers and tests
+		// match on it) and add the true output size, which the
+		// writer counted even for discarded bytes.
+		sb.WriteString(fmt.Sprintf("\n[truncated] (output exceeded %d bytes; total output was %d bytes)", maxShellOutput, out.total))
 	}
 	if sandboxWarn != "" {
 		sb.WriteString("\n[warning: " + sandboxWarn + "]")

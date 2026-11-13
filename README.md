@@ -98,6 +98,8 @@ tests). Run the suite with `go test ./...` or `make test`.
   "data_dir": "~/.orion",
   "max_steps": 20,
   "timeout_seconds": 120,
+  "max_tool_result_bytes": 262144,
+  "max_history_tokens": 32768,
   "sandbox": { "enabled": false, "root": "~/.orion/sandbox", "allow_network": false }
 }
 ```
@@ -107,6 +109,47 @@ Environment overrides: `ORION_PROVIDER`, `ORION_API_KEY`, `ORION_MODEL`,
 `ORION_SANDBOX_ROOT`. Secrets are never printed:
 `orion config show` masks them, and the secret scanner redacts them
 from logs and audit entries.
+
+### Size caps: tool results and history
+
+Two limits keep a runaway tool or a long conversation from blowing
+up the model's context window (and the daemon's memory). Both are
+configurable in `config.json`; both degrade gracefully — truncate
+with a marker — instead of failing the turn.
+
+- `max_tool_result_bytes` (default `262144` = 256 KiB, allowed
+  1 KiB–10 MiB): the maximum bytes of any single tool result that
+  reach the model. Enforced centrally in the tool registry, so it
+  covers every tool, built-in or added later. A result over the cap
+  is cut at a UTF-8 boundary and marked
+  `[truncated: showing first N bytes of M total bytes]`, so the
+  model knows data was cut. Tool error text is capped the same way.
+  Per-tool caps still bound memory while a tool runs (`shell_exec`
+  64 KiB with a marker reporting the true total output size,
+  `file_read` 1 MiB, `web_fetch` 256 KiB by default): a file over
+  1 MiB is returned truncated with its true size, not refused.
+  Lower this if your provider has a small context window; raise it
+  (up to 10 MiB) if you routinely need large file reads.
+- `max_history_tokens` (default `32768`, allowed 1K–1M): the token
+  budget for the history fed to the provider on each step — system
+  prompt, recent history, fact-aware recall injection, and in-turn
+  messages, estimated with `model.CountTokens` (~4 runes/token,
+  the same estimate the model layer uses for usage). The default
+  fits DeepSeek's 64K window with room for tool definitions and
+  the completion; set it lower for local Ollama models with
+  smaller windows. When the window is over budget the agent loop
+  trims the oldest turns first and never drops the system prompt,
+  never drops the latest user turn or the most recent turn, and
+  never breaks a tool-call/tool-result pair (whole turns are
+  dropped, and content is only ever cut — never the tool-call
+  fields). If a single tool result alone exceeds the budget it is
+  truncated head-first with a `[truncated for context budget …]`
+  marker and the turn continues. The full transcript is still
+  kept in memory and in the `MaxStepsError` transcript; only the
+  request window is trimmed. Recall counts against the same
+  budget, so recall + history together stay within it: when the
+  window is tight, the oldest turns pay for the recalled facts,
+  never the system prompt.
 
 Switch providers without rebuilding:
 
@@ -144,7 +187,9 @@ evidence (this VM has ~700 MiB free, so no Hermes model runs here).
 sandbox via `sandbox.enabled` — see [SECURITY.md](SECURITY.md)), `file_read`,
 `file_write`, `file_edit`, `file_list`, `web_fetch`, `web_search`
 (real DuckDuckGo search), `calculator` (full expression parser),
-`datetime`, `process_list`.
+`datetime`, `process_list`. Every tool result is capped at
+`max_tool_result_bytes` (default 256 KiB) before it reaches the model;
+see "Size caps" under [Configuration](#configuration).
 
 ## Safety
 

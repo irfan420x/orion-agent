@@ -43,10 +43,37 @@ func (e *ToolError) Unwrap() error { return e.Err }
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
+	// maxResultBytes caps every tool result (and tool error text)
+	// returned by Execute. Zero means the default
+	// (DefaultMaxToolResultBytes); SetMaxResultBytes overrides it,
+	// normally from config via core.NewAgent.
+	maxResultBytes int
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry { return &Registry{tools: map[string]Tool{}} }
+
+// SetMaxResultBytes overrides the per-result cap enforced by Execute.
+// A non-positive value restores the default. It is safe for
+// concurrent use with Execute.
+func (r *Registry) SetMaxResultBytes(n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n <= 0 {
+		n = DefaultMaxToolResultBytes
+	}
+	r.maxResultBytes = n
+}
+
+// MaxResultBytes returns the per-result cap Execute enforces.
+func (r *Registry) MaxResultBytes() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.maxResultBytes <= 0 {
+		return DefaultMaxToolResultBytes
+	}
+	return r.maxResultBytes
+}
 
 // Register adds a tool; duplicate names are an error. A nil tool or a
 // tool with an empty (or whitespace-only) name is rejected instead of
@@ -114,6 +141,10 @@ func (r *Registry) Definitions() []model.ToolDefinition {
 // unchanged. Unknown tools are reported as kind "unknown_tool" so the
 // model learns the tool does not exist instead of retrying with
 // different arguments.
+//
+// Results (and error text) are also capped to MaxResultBytes via
+// TruncateToolResult: a truncated result carries a marker with its
+// original size, so the model knows data was cut.
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (result string, err error) {
 	// A panicking tool must not crash the daemon (or the agent run):
 	// recover here and report the panic as an execution error, the
@@ -136,13 +167,23 @@ func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessag
 	if err != nil {
 		var toolErr *ToolError
 		if errors.As(err, &toolErr) {
+			// Tool errors are fed back to the model as text too,
+			// so they get the same size cap as results: a failing
+			// tool must not be able to flood the context through
+			// its error string either.
 			return "", &ToolError{
 				Tool: toolErr.Tool,
 				Kind: toolErr.Kind,
-				Err:  errors.New(security.RedactSecrets(toolErr.Err.Error())),
+				Err:  errors.New(TruncateToolResult(security.RedactSecrets(toolErr.Err.Error()), r.MaxResultBytes())),
 			}
 		}
-		return "", fmt.Errorf("%s", security.RedactSecrets(err.Error()))
+		return "", fmt.Errorf("%s", TruncateToolResult(security.RedactSecrets(err.Error()), r.MaxResultBytes()))
 	}
-	return security.RedactSecrets(result), nil
+	// Central choke point for tool-result size: every tool's output
+	// passes through here, so no tool — built-in or added later —
+	// can return unbounded data to the model. Per-tool caps bound
+	// memory while a tool runs; this bounds what the model sees.
+	// Over-cap results are truncated with a marker carrying the
+	// original size, never dropped and never an error.
+	return TruncateToolResult(security.RedactSecrets(result), r.MaxResultBytes()), nil
 }

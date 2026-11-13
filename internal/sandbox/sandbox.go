@@ -10,13 +10,30 @@
 //     container mechanism this host offers is Linux namespaces, and
 //     those work: unshare -rm and unshare -rmn both succeed as root.
 //   - So the sandbox is built from namespaces directly, with no new
-//     dependency: the child is started with CLONE_NEWUSER (uid/gid 0
-//     mapped to the agent's own uid/gid), CLONE_NEWNS, CLONE_NEWIPC
-//     (its own SysV IPC namespace: no host shared memory, semaphores
-//     or message queues are visible) and CLONE_NEWUTS (its own
-//     hostname), and — unless AllowNetwork is set — CLONE_NEWNET (a
-//     network namespace whose only interface is a down loopback: no
-//     network at all).
+//     dependency: the child is started with CLONE_NEWNS,
+//     CLONE_NEWIPC (its own SysV IPC namespace: no host shared memory,
+//     semaphores or message queues are visible), CLONE_NEWUTS (its own
+//     hostname), CLONE_NEWPID (its own PID namespace: the sandboxed
+//     process is PID 1, it cannot see or signal host processes), and
+//     — unless AllowNetwork is set — CLONE_NEWNET (a network
+//     namespace whose only interface is a down loopback: no network
+//     at all). The user namespace is deliberately NOT created by the
+//     clone: this host's kernel refuses procfs mounts from inside a
+//     nested user namespace (proven 2026-11-13: every variant —
+//     single clone, two-stage unshare, subset=pid or plain, /proc or
+//     an arbitrary mountpoint — fails with EPERM, while the same
+//     mount succeeds from the cell's user namespace), and /proc must
+//     be mounted for the PID namespace to be observable. So the
+//     wrapper mounts /proc first, while still running as the agent's
+//     uid in the host user namespace, and only then drops into a
+//     fresh user namespace with `unshare --user --map-root-user`
+//     (agent uid/gid mapped to root inside) immediately before
+//     running user code. The end state is identical to creating the
+//     user namespace at clone time — root inside its own user
+//     namespace, with no capabilities over any host namespace — but
+//     the ordering is what makes the /proc mount possible. See
+//     SECURITY.md ("PID namespace") for the full reasoning, the
+//     experiments, and the fail-closed rules.
 //   - Inside the namespaces a small shell wrapper (run before any
 //     user code) makes mounts private, then builds a chroot root
 //     under <root>/.orion-root: /usr bind-mounted read-only, a
@@ -25,13 +42,18 @@
 //     credentials tmpfs, and bind-mounting it is refused in a nested
 //     user namespace), the harmless device nodes (/dev/null, zero,
 //     full, random, urandom) bind-mounted individually, a tmpfs on
-//     /tmp, and <root>/work bind-mounted read-write as /work. The
-//     chroot root itself is remounted read-only (via --rbind, which
-//     replicates the submounts — a plain self-bind drops them), and
-//     /work is remounted nodev+nosuid so no device node created
-//     there can ever be opened. The command then runs as /bin/sh -c
-//     inside the chroot with cwd /work, HOME=/work, TMPDIR=/tmp, and
-//     the agent's scrubbed env.
+//     /tmp, and <root>/work bind-mounted read-write as /work. It also
+//     mounts a fresh procfs on /proc, tied to the new PID namespace,
+//     so `ps` and `ls /proc` show only namespace processes (see the
+//     /proc paragraph below). The chroot root itself is remounted
+//     read-only (via --rbind, which replicates the submounts — a plain
+//     self-bind drops them), and /work is remounted nodev+nosuid so no
+//     device node created there can ever be opened. The command then
+//     runs as /bin/sh -c inside the chroot with cwd /work, HOME=/work,
+//     TMPDIR=/tmp, and the agent's scrubbed env — after the wrapper
+//     has dropped into the fresh user namespace (see above), so the
+//     user code runs as root inside its own user namespace and never
+//     as the agent's uid in the host user namespace.
 //   - A plain chroot is escapable on its own: a process with
 //     CAP_SYS_CHROOT (uid 0 in its user namespace) can chroot to a
 //     subdirectory while its cwd is outside it, walk up past the
@@ -52,6 +74,21 @@
 //     vanishes with the namespace). /home, /etc, /usr and every other
 //     host path are either absent or read-only, so even `rm -rf /`
 //     inside can only destroy the sandbox's own contents.
+//   - /proc is a real procfs for the new PID namespace, mounted by
+//     the wrapper before the pivot (see above for why it must be
+//     mounted before the user-namespace switch). It is mounted with
+//     subset=pid when the kernel supports it (kernel 5.8+): then
+//     /proc contains only per-process entries plus self/thread-self
+//     — no /proc/sys, /proc/kcore, /proc/kallsyms or
+//     /proc/sysrq-trigger at all. On older kernels the fallback is a
+//     plain proc mount with /proc/sys bound read-only. Either way a
+//     sandboxed process sees only its own namespace's processes:
+//     host PIDs do not exist there (kill -0 on one fails with
+//     ESRCH), and the namespace init — the user shell itself, PID 1
+//     — reaps orphaned children through its normal wait loop
+//     (proven by TestSandboxPID1ReapsOrphans: dash reaps an orphan
+//     reparented to it). /sys stays an empty directory: no host
+//     kernel information leaks in.
 //   - On top of the namespaces, a seccomp filter (see seccomp.go)
 //     denies escape-relevant syscalls — mounts, namespace creation,
 //     kernel modules, reboot, keyrings, BPF, host clock/hostname
@@ -68,13 +105,19 @@
 //     this VM (the cell itself is a user-namespaced container; writing
 //     uid_map as nobody fails with EPERM), so the sandbox only works
 //     when the agent runs as root, or on a host that allows
-//     unprivileged user namespaces. Available() probes the real
-//     mechanism and reports false otherwise; shell_exec then falls
-//     back to the denylist alone, with a warning.
+//     unprivileged user namespaces. The wrapper does all of its
+//     mounts before the user-namespace switch, while running as the
+//     agent's uid in the host user namespace, so as a non-root agent
+//     the very first mount fails and the probe reports the sandbox
+//     unavailable. Available() probes the real mechanism and reports
+//     false otherwise; shell_exec then falls back to the denylist
+//     alone, with a warning.
+//   - /sys is an empty directory inside: no host kernel information
+//     leaks in. /proc, by contrast, is a real procfs for the new PID
+//     namespace (see above) — tools that need it (ps, /proc/self/…)
+//     work, but only ever see namespace processes.
 //   - The sandbox is an ADDITIONAL layer, never a replacement: the
 //     token-based IsBlockedCommand denylist still runs first.
-//   - /proc and /sys are empty directories inside: no host process
-//     or kernel information leaks in, and tools that need them fail.
 package sandbox
 
 import (
@@ -215,6 +258,23 @@ mount --bind "$ROOT/work" "$NEWROOT/work" || exit 126
 mount -o remount,bind,rw,nodev,nosuid "$NEWROOT/work" || exit 126
 mount --rbind "$NEWROOT" "$NEWROOT" || exit 126
 mount -o remount,bind,ro,nosuid,nodev "$NEWROOT" || exit 126
+# /proc for the new PID namespace. The wrapper is PID 1 in the new
+# namespace (the clone created it), so a procfs mounted here is tied
+# to that namespace and shows only its processes — never host PIDs.
+# It MUST be mounted now, before the user-namespace switch below:
+# this host's kernel refuses procfs mounts from inside a nested user
+# namespace (EPERM, proven every way it can be tried), so once the
+# wrapper has dropped into the fresh user namespace the mount is
+# impossible. subset=pid (kernel 5.8+) hides everything but
+# per-process entries — no /proc/sys, /proc/kcore, /proc/kallsyms or
+# /proc/sysrq-trigger. Fall back to a plain proc mount with /proc/sys
+# bound read-only on older kernels. If neither mount works, refuse:
+# a half-built sandbox never runs user code (exit 126).
+if ! mount -t proc -o nosuid,nodev,noexec,subset=pid proc "$NEWROOT/proc" 2>/dev/null; then
+  mount -t proc -o nosuid,nodev,noexec proc "$NEWROOT/proc" || exit 126
+  mount --bind "$NEWROOT/proc/sys" "$NEWROOT/proc/sys" || exit 126
+  mount -o remount,bind,ro "$NEWROOT/proc/sys" || exit 126
+fi
 # Pivot into the new root and detach the old (host) root. A plain
 # chroot is escapable: a process with CAP_SYS_CHROOT (uid 0 in its
 # user namespace) can chroot to a subdirectory while its cwd is
@@ -228,13 +288,13 @@ mount -o remount,bind,ro,nosuid,nodev "$NEWROOT" || exit 126
 cd "$NEWROOT" || exit 126
 pivot_root . .old-root || exit 126
 cd / || exit 126
-# Detach the old (host) root. The umount(8) CLI cannot do this:
-# libmount needs /proc/mounts (or /proc/self/mountinfo) to find the
-# mount, and /proc is deliberately not mounted in the sandbox —
-# proven by strace (2026-11-13): umount never issues the umount2
-# syscall, it fails opening /proc/mounts. So call umount2(2)
-# directly via python3 (present in the chroot through the /usr bind
-# mount; the number is arch-dependent). If python3 or the arch is
+# Detach the old (host) root. Call umount2(2) directly via python3
+# (present in the chroot through the /usr bind mount; the number is
+# arch-dependent) instead of the umount(8) CLI: the direct syscall is
+# proven and never depends on /proc or libmount — the CLI was
+# strace-proven (2026-11-13) to fail opening /proc/mounts when /proc
+# was not mounted, and there is no reason to re-prove it now that
+# the namespace's own /proc exists. If python3 or the arch is
 # unavailable, refuse to run: leaving the host root mounted at
 # /.old-root would defeat the pivot.
 case "$(uname -m)" in
@@ -243,15 +303,39 @@ case "$(uname -m)" in
   *) exit 126 ;;
 esac
 python3 -c "import ctypes,sys; libc=ctypes.CDLL('libc.so.6', use_errno=True); sys.exit(0 if libc.syscall($UMOUNT2, b'/.old-root', 2)==0 else 1)" || exit 126
+# Drop into a fresh user namespace before any user code runs. The
+# wrapper has been running as the agent's uid in the host user
+# namespace until now (that is what allowed the mounts and the /proc
+# mount above); from here on the command runs as root inside its own
+# user namespace, with capabilities only over its own namespaces and
+# none over any host namespace — the same end state as creating the
+# user namespace at clone time, reached one step later so the /proc
+# mount stays possible. unshare --map-root-user maps the agent's
+# uid/gid to root inside (it writes the uid/gid maps for itself;
+# exec keeps this shell as PID 1 of the namespace, so the user shell
+# is PID 1 and reaps orphaned children). If the switch fails,
+# unshare exits non-zero and no user code runs.
+#
+# The mount namespace was created by the clone, so it is owned by
+# the host user namespace — after the switch the process would hold
+# no capabilities over it and could not mount anything at all, not
+# even a tmpfs on /tmp inside its own namespace. That would also
+# void the seccomp control test (mounts would be blocked with or
+# without the filter, so the filter's blocking would be unprovable).
+# So the switch is immediately followed by a fresh mount namespace,
+# a copy of the prepared one, owned by the new user namespace: the
+# process owns its mount namespace again, exactly as when the user
+# namespace was created at clone time, and seccomp — not the lack of
+# a capability — is what restricts mounts.
 # Seccomp: when Prepare staged the helper into the root, run the
 # command through it (it installs the filter, then execs /bin/sh).
 # Otherwise run the command directly; the missing filter was
 # already warned about on the host side. (The root is already the
 # new root after the pivot, so no chroot is needed here.)
 if [ -x /orion-seccomp ]; then
-  exec /orion-seccomp /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
+  exec unshare --user --map-root-user unshare --mount /orion-seccomp /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
 fi
-exec /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
+exec unshare --user --map-root-user unshare --mount /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
 `
 
 var (
@@ -300,13 +384,27 @@ func runProbe() {
 }
 
 // Prepare rewrites cmd (a /bin/sh -c <command> invocation) to run
-// inside the sandbox: new user, mount and (unless AllowNetwork)
+// inside the sandbox: new mount, PID and (unless AllowNetwork)
 // network namespaces, then the wrapper builds the root and
 // pivot_roots into it (see wrapperScript). It creates the sandbox
 // root, its work dir, the root tree, the minimal /etc copies and the
 // merged-/usr symlinks on the host first; those are plain directories
 // and idempotent, so concurrent sandboxed commands can share one root
 // safely.
+//
+// The user namespace is NOT created here. The wrapper mounts /proc
+// first — the kernel on this host refuses procfs mounts from inside
+// a nested user namespace — and only then drops into a fresh user
+// namespace with `unshare --user --map-root-user` (agent uid/gid
+// mapped to root inside). The clone therefore requests the PID
+// namespace but no user namespace, and sets no uid/gid mappings:
+// the child starts as the agent's uid in the host user namespace
+// and the wrapper switches it before any user code runs. The PID
+// namespace is requested atomically with the other namespaces in
+// the single clone: if its creation fails the clone fails, the child
+// never starts, and the command never runs unconfined — there is no
+// path where the PID namespace is silently missing. See SECURITY.md
+// ("PID namespace") for the fail-closed rules.
 //
 // cmd.Env should already hold the caller's scrubbed environment when
 // Prepare is called; Prepare overrides HOME, TMPDIR and PATH to the
@@ -397,7 +495,7 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 	// filter, with a warning logged once by setupSeccomp.
 	cfg.setupSeccomp(newRoot)
 
-	cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS)
+	cloneFlags := uintptr(syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID)
 	if !cfg.AllowNetwork {
 		cloneFlags |= uintptr(syscall.CLONE_NEWNET)
 	}
@@ -406,11 +504,9 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 		attr = &syscall.SysProcAttr{}
 	}
 	attr.Cloneflags |= cloneFlags
-	// Map the agent's own uid/gid to root inside the namespace:
-	// that is what grants the namespaced process the capabilities
-	// (mount, chroot) it needs, and only inside its own namespaces.
-	attr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}}
-	attr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}}
+	// No UidMappings/GidMappings: the user namespace is created by
+	// the wrapper (after the /proc mount), not by the clone — see
+	// the wrapperScript comment and SECURITY.md ("PID namespace").
 	cmd.SysProcAttr = attr
 
 	// The user command travels as argv, never inside the script

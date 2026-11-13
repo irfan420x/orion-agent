@@ -81,3 +81,86 @@ Telegram update / CLI line
   tests (scanner redaction + explicit masking in the CLI).
 - Tests use `t.TempDir()` and `httptest` only. No test touches the
   real home directory, the live network, or a live destructive command.
+
+## Provider timeouts (internal/model)
+
+One stalled attempt used to eat the whole agent step: the
+per-attempt HTTP client timeout (120s) was the same as the step
+context (120s), so a hung DeepSeek call left the agent with no time
+to retry and no time to report a clear error. The timeouts below are
+three DISTINCT bounds, one per failure mode, and they nest:
+
+```
+connectTimeout (10s)  <  progressTimeout (60s)  <  totalTimeout (100s)  <  step timeout (120s)
+```
+
+All three live as package-level vars in
+`internal/model/provider.go` (`connectTimeout`, `progressTimeout`,
+`totalTimeout`) and are shared by all three providers
+(OpenAI-compatible incl. DeepSeek, Anthropic, Ollama) through the
+shared helpers `doWithRetry` / `doStreamRequest` and the shared
+`sharedHTTPClient` — there is no per-provider timeout logic.
+
+| Timeout | What it bounds | How it is enforced |
+|---|---|---|
+| `connectTimeout` = 10s | TCP dial + TLS handshake | `http.Transport.DialContext` (dial timeout read from the var on every dial) + `TLSHandshakeTimeout`. Fails fast on an unreachable or black-holed endpoint. |
+| `progressTimeout` = 60s | Silence: first byte AND mid-stream gaps | First byte: transport `ResponseHeaderTimeout`. Body: `progressReader`, a wrapper around every response body (see below). |
+| `totalTimeout` = 100s | One whole `Chat` or `Stream` invocation, including retries, backoff and any `Chat` fallback | A context derived with `WithTimeout` by `doWithRetry` and by each `Stream` function for the whole streaming call. 100s sits inside the agent step's 120s (`internal/core`: `defaultTimeoutSeconds`) with 20s to spare, so the provider returns a clear timeout error while the step still has time to record it. If the step budget ever grows, `totalTimeout` should grow with it; it must always stay below the step timeout. The caller's own context remains the final outer bound. |
+
+There is deliberately no `http.Client.Timeout`: it is fixed when
+the client is built and would be a second, per-attempt wall-clock
+bound that a slow-but-steady stream must never hit. The per-call
+context is the wall-clock bound, and it is read at call time, so
+tests can tune the vars down against fake slow servers (a test that
+changes `connectTimeout` or `progressTimeout` must also rebuild the
+client with `newSharedHTTPClient()`, since the transport fields are
+fixed at build time — see `setTestTimeouts` in
+`internal/model/timeout_test.go`).
+
+### Progress, not wall-clock, is the signal for streams
+
+`progressReader` (`internal/model/provider.go`) wraps a response
+body and aborts a read that goes silent for `progressTimeout` with
+a `*progressTimeoutError` (a `net.Error` with `Timeout() == true`).
+Every byte that arrives resets the window, so a reasoning model
+that streams slowly but STEADILY is never killed, however long the
+whole response takes — only a stream that goes completely silent
+for the full 60s is aborted. 60s is deliberately generous:
+reasoning models (DeepSeek reasoner, Claude extended thinking) can
+pause for tens of seconds between bursts, and time-to-first-token
+alone can reach ~30s under load; a 60s silence means the server or
+a proxy is stuck, not thinking.
+
+The reader runs one pump goroutine per body. The pump owns its
+read buffer and hands completed chunks to `Read` over a channel,
+so no buffer is ever shared with a caller that moved on after a
+timeout. `Close` is idempotent and unblocks the pump; the pump
+also exits on its own at EOF/error, so a fully-read body leaves no
+goroutine behind.
+
+### Retry interaction
+
+- A progress timeout is a transient, retryable fault: the error
+  implements `net.Error` with `Timeout() == true`, so the existing
+  retry policy (`isRetryableTransportError`, 429/5xx + `Retry-After`)
+  applies to it unchanged. A stalled `Chat` body read is retried
+  inside `doWithRetry` like a failed round trip; a stalled stream
+  setup is retried inside `doStreamRequest`.
+- A stream that stalls mid-way is retried ONLY when nothing usable
+  was delivered yet (no content chunk emitted, no named tool call
+  announced). Re-running the stream then cannot duplicate a live
+  chunk. Once a chunk is live with the caller, a stall returns a
+  clear progress-timeout error instead — the stream is never
+  silently restarted after delivery started.
+- A stream that yields nothing usable (empty deltas, a bare
+  `content_block_start`, a truncated stream) still falls back to a
+  single `Chat` call, as before; the fallback is bounded by the
+  same `totalTimeout` context as the stream attempts.
+- One subtlety the implementation respects: `doStreamRequest` must
+  NOT derive a `totalTimeout` context of its own, because the
+  response body outlives the call — cancelling a context derived
+  there would kill the caller's stream the moment the helper
+  returned. The total bound for streaming lives in the `Stream`
+  functions, which derive one context for the whole call and pass
+  it down.
+
