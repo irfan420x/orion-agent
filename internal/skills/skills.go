@@ -909,6 +909,49 @@ var baseFormNonVerbs = map[string]bool{
 // "setting" (an object-region verb, R3) and the ambiguous nouns
 // ("files", "notes", "guides", "training", "learning",
 // "building") are verbs too, so they stay out.
+//
+// F-A15-1/F-A15-2 extend the list with the never-verb classes
+// Audit 15's probe surface shows. A bare noun or adjective after
+// a plural subject is a noun phrase, not a verb by shape, and a
+// suffix-bearing pure noun or adjective cannot take a guarded
+// plural as its object:
+//   - bare never-verb adjectives ("hot", "tall", "young", "red",
+//     "cold", "dark", "wide", "deep", "soft", "hard", "angry",
+//     "sorry", "afraid", "alive", "asleep", "aware", "able");
+//   - adjective/adverb-dominant words whose marginal verb
+//     readings never take a bare-plural or gerund object in
+//     skill-doc positions ("fast" — to fast is intransitive;
+//     "slow", "free" — primarily adjectives here; "busy" — to
+//     busy takes a reflexive, not a bare plural; "very" — a
+//     degree adverb, never a verb). Their transitive verb
+//     readings ("free/slow the plan") are sacrificed: the
+//     adjective reading dominates in the tested positions, and
+//     the validator errs toward rejection for adjective-dominant
+//     words (the D2 precedent);
+//   - pure -ss nouns ("business", "success", "loss", "class",
+//     "glass") — no verb reading; genuine -ss verbs ("boss",
+//     "progress", "process", "address", "access") stay out;
+//   - pure -s nouns ("series", "species") — no verb reading;
+//   - a pure -ing noun ("ceiling") — no verb reading; genuine
+//     -ing verbs ("feeling", "meaning", "flooring") and the
+//     ambiguous nouns ("building", "training", "learning")
+//     stay out;
+//   - pure -ed adjectives ("rugged", "wicked") — no verb
+//     reading; genuine -ed verb forms ("closed", "trained",
+//     "opened", "finished", "tired", "excited", "learned",
+//     "crooked") stay out (Audit 15 §6 O4);
+//   - bare nouns ("notebook", "guidebook", "keyboard",
+//     "pencil") — no verb reading in skill-doc clause-final
+//     position; "keyboard"/"pencil" have marginal verb readings
+//     ("keyboard the plan", "pencil the plan") that never occur
+//     as bare clause-final verbs, so the noun reading wins.
+//
+// A noun + subordinator is still a noun phrase, not a clause
+// ("…the skill series/ceiling/business that helps" rejects —
+// the subordinator attaches a relative clause; only a genuine
+// verb form such as "reports" loads before "that"), so these
+// words reject in every verb position and the -s/-ss asymmetry
+// Audit 15 §6 O16/O18 documented is now consistent.
 var neverVerbWords = map[string]bool{
 	// Pure -s/-ing nouns (F-A14-4).
 	"analysis": true, "status": true, "news": true,
@@ -922,6 +965,27 @@ var neverVerbWords = map[string]bool{
 	// Common adjectives that are never verbs.
 	"happy": true, "sad": true, "glad": true, "good": true,
 	"bad": true, "great": true, "big": true, "small": true,
+	// Bare never-verb adjectives (F-A15-1).
+	"hot": true, "tall": true, "young": true, "red": true,
+	"cold": true, "dark": true, "wide": true, "deep": true,
+	"soft": true, "hard": true, "angry": true, "sorry": true,
+	"afraid": true, "alive": true, "asleep": true,
+	"aware": true, "able": true,
+	// Adjective/adverb-dominant words (F-A15-1/F-A15-3).
+	"fast": true, "slow": true, "free": true, "busy": true,
+	"very": true,
+	// Pure -ss nouns (F-A15-1).
+	"business": true, "success": true, "loss": true,
+	"class": true, "glass": true,
+	// Pure -s nouns (F-A15-1/F-A15-2).
+	"series": true, "species": true,
+	// Pure -ing noun (F-A15-2).
+	"ceiling": true,
+	// Pure -ed adjectives (F-A15-2).
+	"rugged": true, "wicked": true,
+	// Bare nouns (F-A15-1).
+	"notebook": true, "guidebook": true, "keyboard": true,
+	"pencil": true,
 }
 
 // adjectiveVerbs are verbs that are also common adjectives in
@@ -929,12 +993,21 @@ var neverVerbWords = map[string]bool{
 // and "the open venv" — an adjective + noun, not a verb + object.
 // A word here never takes a guarded noun as its bare plural object,
 // so the guarded-plural rejection still fires for it ("…the skill
-// and the open tools" rejects, Audit 13 §7 D2). The list is
-// deliberately tiny: only "open" is documented as an adjective in
-// this position; the other object-region verbs ("make", "create",
-// "use", "run", "help") are never adjectives.
+// and the open tools" rejects, Audit 13 §7 D2). The class is the
+// object-closer verbs (see activateObjectClosers) that are also
+// common adjectives in attributive position: "open", "close"
+// ("nearby tools") and "set" ("tools of the set", "a set routine")
+// — F-A15-4. The rc19 comment's "only open is documented as an
+// adjective" was wrong for `close` and `set`. Suffixed forms
+// ("opened", "closed", "sets") still take the object, because the
+// list holds base forms only and a suffixed form has verb evidence
+// ("…the skill and the venv opened users" loads). Noun-verbs such
+// as "test"/"list"/"check" are NOT in the class: "test tools" is a
+// noun+noun compound, not an adjective + noun phrase, so their
+// verb reading wins (F-A14-2). The other object-region verbs
+// ("make", "create", "use", "run", "help") are never adjectives.
 var adjectiveVerbs = map[string]bool{
-	"open": true,
+	"open": true, "close": true, "set": true,
 }
 
 // subjectModifiers are determiners and adjectives that can sit
@@ -1131,7 +1204,23 @@ func isVerbShapedAt(word string, plural bool) bool {
 // noun phrase (F-A12-1) — in predicate position ("the skill
 // running tools") the same participle does take the object, so the
 // exclusion applies only while inSubject.
+//
+// F-A15-2: a suffix-bearing pure noun or adjective ("series",
+// "species", "ceiling", "rugged", "wicked") never takes a guarded
+// plural either — the suffix alone is not verb evidence. The
+// never-verb check below is the discriminator, not a blanket -ed
+// exclusion: Audit 15 suggested excluding -ed forms in subject
+// position uniformly, but a genuine -ed verb DOES take a guarded
+// object for a compound subject ("…the skill and the venv
+// closed/trained/opened/finished/tired/excited tools" load on
+// both rc18 and rc19 and are defensible, Audit 15 §6 O4), so an
+// -ed exclusion would break genuine past-tense verb+object
+// clauses. Only a never-verb -ed adjective ("rugged", "wicked")
+// is excluded, via neverVerbWords.
 func verbTakesGuardedObject(word string, inSubject bool) bool {
+	if neverVerbWords[word] {
+		return false
+	}
 	if adjectiveVerbs[word] {
 		return false
 	}
@@ -1146,12 +1235,16 @@ func verbTakesGuardedObject(word string, inSubject bool) bool {
 // (verbFormNonVerbs), an ambiguous noun head
 // (verbFormAmbiguousNouns), a named non-skill object noun ("venv",
 // "tool", "mode" — nonSkillObjectWords plus "tool"), or a bare
-// plural ("reports", "answers", "analysis"). Adjectives ("new",
-// "ready", "happy") and adverbs ("quickly") are not noun heads,
-// even when they sit inside the subject noun phrase: only a noun
-// head completes the phrase, so a participle after an adjective
-// ("the new running tests") is still a modifier, not the
-// predicate.
+// plural ("reports", "answers", "analysis"). A pure -ss noun
+// ("class", "glass", "business", "success", "loss") is a singular
+// noun head too (F-A15-3): it is never a verb form — hasVerbSuffix
+// excludes -ss for exactly that reason — so it can be the subject
+// of a participle phrase ("…the skill and the class running
+// tests" loads, Audit 15 §6 O9). Adjectives ("new", "ready",
+// "happy") and adverbs ("quickly") are not noun heads, even when
+// they sit inside the subject noun phrase: only a noun head
+// completes the phrase, so a participle after an adjective ("the
+// new running tests") is still a modifier, not the predicate.
 func isNounHead(word string) bool {
 	if verbFormNonVerbs[word] || verbFormAmbiguousNouns[word] {
 		return true
@@ -1159,7 +1252,7 @@ func isNounHead(word string) bool {
 	if nonSkillObjectWords[word] || word == "tool" {
 		return true
 	}
-	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 {
+	if strings.HasSuffix(word, "s") && len(word) > 2 {
 		return true
 	}
 	return false
@@ -1429,7 +1522,7 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// ("tests waiting"). This also comes before the
 		// object-region verb check: a participle like "running"
 		// is a noun phrase head here, not the clause verb.
-		if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 && !verbFormAmbiguousNouns[word] {
+		if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 && !verbFormAmbiguousNouns[word] && !neverVerbWords[word] {
 			return true, false
 		}
 		// A listed base-form verb takes a gerund/participle
@@ -1438,6 +1531,33 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// reason (F-A13-2).
 		if baseFormVerbs[word] {
 			return true, false
+		}
+		// The candidate must be able to head the clause: a noun
+		// head (the subject of the participle phrase — "files
+		// running tests") or a verb (taking the participle
+		// phrase as a gerund object — "build waiting tests").
+		// A never-verb word that is not a noun head ("big
+		// running tests", F-A15-3) can be neither, so the
+		// participle phrase is a noun-phrase modifier, not a
+		// clause. A participle (-ing/-ed) is an adjective in
+		// this position, not a head ("tired running tests") —
+		// unless it is itself a noun head ("training running
+		// tests"). A bare word after a plural subject is a verb
+		// by shape (F-A14-1), so the plural path needs no
+		// noun/verb evidence beyond not being a never-verb
+		// word; after a singular subject a bare word needs noun
+		// or verb evidence. A bare singular noun the validator
+		// cannot recognise as a noun head ("notebook running
+		// tests") is a known limitation: it rejects here, while
+		// a listed noun head ("class running tests") loads.
+		if neverVerbWords[word] && !isNounHead(word) {
+			return false, true
+		}
+		if (strings.HasSuffix(word, "ing") && len(word) > 4 || strings.HasSuffix(word, "ed") && len(word) > 3) && !isNounHead(word) {
+			return false, true
+		}
+		if !plural && !isNounHead(word) && !isVerbShaped(word) {
+			return false, true
 		}
 		// A participle with an object ("files running tests",
 		// "files running the tests") is a verb phrase, so the
@@ -1642,7 +1762,23 @@ func compoundSubjectStartsClause(fields []string, k int) bool {
 			// the subject ("the running venv"): skip both,
 			// so the head noun is never misread as the verb.
 			// The head noun has been seen, so the subject
-			// noun phrase is complete from here on.
+			// noun phrase is complete from here on. But a
+			// modifier before a participle ("big running
+			// tests", F-A15-3) heads a participle phrase,
+			// not a single noun: the participle and its
+			// object are part of the phrase too, so skip
+			// all three and do NOT mark the subject
+			// complete — the participle is a modifier, not
+			// a noun head. Skipping only two would leave
+			// the object ("tests") exposed as a
+			// clause-final -s verb.
+			if j+1 < len(fields) {
+				next := strings.Trim(fields[j+1], ".,;:()[]\"'`!?")
+				if strings.HasSuffix(next, "ing") && len(next) > 4 || strings.HasSuffix(next, "ed") && len(next) > 3 {
+					j += 2
+					continue
+				}
+			}
 			sawNoun = true
 			j++
 			continue

@@ -4,6 +4,119 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc20] — 2026-11-14
+
+### Audit 15 fixes (v0.2.0-rc20) — see `AUDIT15_2026-11-14.md`
+
+Fixes all four P2s from the fresh-eyes audit of rc19 (0 P0, 0 P1, 4 P2).
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open, and F-A3-2 (no pprof/debug endpoint) is still open.
+Verified by the release coordinator on the final commit: **1,209
+tests pass, 0 fail, 4 skip (total 1,213), 21/21 packages, race clean
+21/21, no data race**; live DeepSeek proof `17*23+5=396` in 3.1 s
+(rc19: 1,207 total: 1,203 pass, 0 fail, 4 skip). New regression
+tests: `internal/skills/rc20_skills_test.go`, 6 functions, 227
+subtests (52 + 21 + 29 + 10 finding shapes, 60 must-load guards,
+55 must-reject guards incl. 23 bonus cases). Negative control:
+all 112 finding subtests and all 23 bonus subtests fail on rc19
+logic and pass with the fix (stash/restore byte-identical,
+sha256 `9a09ad41…`); all 92 guard subtests pass on both.
+
+- **F-A15-1** — rc19's `isVerbShapedAt` re-opened noun phrases after
+  plural/compound subjects: the plural widening returned true for
+  ANY word not in `neverVerbWords`, so a bare noun or adjective
+  after a plural subject read as a verb by shape: "…the skills
+  business/success/loss/class/glass" (pure -ss nouns), "…the skills
+  notebook/guidebook/keyboard/pencil" (bare nouns), "…the skills
+  hot/tall/young/red/cold/dark/wide/deep/soft/hard" and "…the skills
+  angry/sorry/afraid/alive/asleep/aware/able" (bare adjectives),
+  "…the skills free/busy" (transitive-only verbs, no intransitive
+  reading) — 52 shapes, loading on rc19, rejecting on rc18. The
+  fix extends `neverVerbWords` with the never-verb classes the
+  probe surface shows (36 words): bare never-verb adjectives,
+  adjective/adverb-dominant words (fast/slow/free/busy/very),
+  pure -ss nouns, pure -s nouns (series, species), a pure -ing
+  noun (ceiling), pure -ed adjectives (rugged, wicked), and bare
+  nouns (notebook/guidebook/keyboard/pencil). Genuine -ss verbs
+  (boss/progress/process/address/access) and genuine -ing/-ed verb
+  forms (feeling/meaning/flooring, building/training/learning,
+  closed/trained/opened/finished) stay OUT, so they keep loading.
+  A noun + subordinator is still a noun phrase, not a clause, so
+  "…the skill series/ceiling/business that helps" now rejects
+  consistently (only a genuine verb form such as "reports" loads
+  before "that").
+- **F-A15-2** — `verbTakesGuardedObject` let suffix-bearing pure
+  nouns/adjectives take guarded plurals: it excluded only
+  `adjectiveVerbs` ("open") and -ing in subject position, then
+  returned `isVerbShaped`, which is true for any -s/-ed/-ing
+  suffix: "…the skill series/species tools/users/settings/items/
+  meetings", "…the skill ceiling tools/items/users/meetings",
+  "…the skill rugged/wicked tools/users" (21 shapes). The fix is
+  the same `neverVerbWords` extension, now consulted by
+  `verbTakesGuardedObject` before the suffix test. The audit also
+  suggested a uniform -ed exclusion in subject position; that is
+  DELIBERATELY NOT applied — a genuine -ed verb takes a guarded
+  object for a compound subject ("…the skill and the venv
+  closed/trained/opened/finished/tired/excited tools" load on both
+  and are defensible, Audit 15 §6 O4), so the discriminator is the
+  word's class (never-verb adjective vs genuine verb form), not
+  its suffix.
+- **F-A15-3** — the participle-with-object branch in `clauseVerbAt`
+  never consulted the candidate's class, so a never-verb adjective
+  or adverb before a participle + object read as a clause head:
+  "…the skill and the big/small/happy/sad/glad/good/bad/great/
+  very/fast/free/busy/tired/hot/tall/young/red running tests",
+  "…the skill and the big/very waiting tests", "…the skill big/
+  very running tests", "…the skill and the slow/soft/dark running
+  tests", "…the skill and the big running guides", "…the skill and
+  the angry/sorry running tests" (29 shapes, loading on both rc18
+  and rc19). The fix gates the branch: the candidate must be able
+  to head the clause — a noun head (the subject of the participle
+  phrase, "files running tests") or a verb (taking the participle
+  phrase as a gerund object, "build waiting tests"). A never-verb
+  word that is not a noun head ("big running tests") and a
+  participle that is not itself a noun head ("tired running
+  tests") can be neither. A bare word after a plural subject is a
+  verb by shape (F-A14-1), so the plural path needs no noun/verb
+  evidence beyond not being a never-verb word. `isNounHead` now
+  also recognises a pure -ss noun ("class", "glass") as a singular
+  noun head, so the O9 noun-head + predicate-participle shapes
+  keep loading. The -s verb sub-branch in the same block now also
+  consults `neverVerbWords` ("…the skills series/analysis
+  waiting" rejects). Fixing the branch exposed a second hole:
+  `compoundSubjectStartsClause` skipped only two words for a
+  modifier, so a modifier before a participle phrase left its
+  object ("tests") exposed as a clause-final -s verb — the scan
+  now skips the whole participle phrase (modifier + participle +
+  object) and does not mark the subject complete.
+- **F-A15-4** — `adjectiveVerbs` listed only "open", so the other
+  adjective-verbs took a guarded plural as their object: "…the
+  skill and the close/set tools/users/meetings", "…the skill
+  close/set tools/users", "…the skills close tools" (10 shapes).
+  The fix extends the class to {open, close, set} — the
+  object-closer verbs that are also common adjectives in
+  attributive position ("close" = nearby tools, "set" = tools of
+  the set) — and documents the class property. Suffixed forms
+  ("opened", "closed", "sets") still take the object, because the
+  list holds base forms only. Noun-verbs such as "test"/"list"
+  are NOT in the class: "test tools" is a noun+noun compound, not
+  an adjective + noun phrase, so their verb reading wins.
+
+Bonus (pre-existing fail-open, closed as a consequence of the
+`neverVerbWords` extension — 23 shapes, all loading on rc19):
+pure -s nouns clause-finally and before an article/pronoun/adverb/
+preposition/subordinator ("…the skills series/species",
+"…the skills series the plan/guides/you/quickly/for beginners/
+when ready", "…the skill series the plan/guides"), the pure -ing
+noun "ceiling" ("…the skill ceiling", "…the skill ceiling the
+plan/for beginners/that helps"), the never-verb -ed adjective
+"rugged" ("…the skill rugged", "…the skill rugged the plan"),
+and -s nouns before a participle with no object ("…the skills
+analysis/series waiting"). Known limitation (documented in the
+code): a bare singular noun the validator cannot recognise as a
+noun head ("notebook running tests") rejects in the participle
+branch, while a listed noun head ("class running tests") loads.
+
 ## [0.2.0-rc19] — 2026-11-14
 
 ### Audit 14 fixes (v0.2.0-rc19) — see `AUDIT14_2026-11-14.md`
