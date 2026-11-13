@@ -65,7 +65,7 @@ func (s *outageServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if s.delivered.Add(1) == 1 {
-			fmt.Fprint(w, `{"ok":true,"result":[{"update_id":7,"message":{"message_id":1,"chat":{"id":1},"text":"hello after outage"}}]}`)
+			fmt.Fprint(w, `{"ok":true,"result":[{"update_id":7,"message":{"message_id":1,"chat":{"id":1},"from":{"id":1},"text":"hello after outage"}}]}`)
 			return
 		}
 		fmt.Fprint(w, `{"ok":true,"result":[]}`)

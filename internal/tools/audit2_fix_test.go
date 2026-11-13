@@ -96,6 +96,48 @@ func TestAudit2ScrubEnvStripsCredentialVars(t *testing.T) {
 	}
 }
 
+// TestAudit2ScrubEnvStripsCredentialProxy: a credential-bearing
+// proxy URL (P2-O6) must not reach a shell child — the proxy password
+// would otherwise be visible to any command the model runs. A
+// credential-less proxy URL and the NO_PROXY host list are kept, so
+// proxied egress keeps working.
+func TestAudit2ScrubEnvStripsCredentialProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://proxy-user:fake-proxy-pass@proxy.example:8080")
+	t.Setenv("http_proxy", "http://proxy.example:8080")
+	t.Setenv("HTTP_PROXY", "http://only-user@proxy.example:8080")
+	t.Setenv("NO_PROXY", "localhost,127.0.0.1")
+	t.Setenv("PROXY_USER", "proxy-user")
+	t.Setenv("ALL_PROXY", "socks5://proxy.example:1080")
+	t.Setenv("PATH", "/usr/bin:/bin")
+	env := scrubEnv()
+	joined := strings.Join(env, "\n")
+	for _, leak := range []string{
+		"fake-proxy-pass", "proxy-user", "only-user@proxy.example",
+	} {
+		if strings.Contains(joined, leak) {
+			t.Errorf("scrubEnv leaked proxy credential %q", leak)
+		}
+	}
+	// The credential-bearing variables themselves must be gone.
+	for _, gone := range []string{"HTTPS_PROXY=", "HTTP_PROXY=", "PROXY_USER="} {
+		if strings.Contains(joined, gone) {
+			t.Errorf("scrubEnv kept credential-bearing %q", gone)
+		}
+	}
+	// Credential-less proxy settings survive: dropping them would
+	// break egress for deployments behind a proxy.
+	for _, keep := range []string{
+		"http_proxy=http://proxy.example:8080",
+		"NO_PROXY=localhost,127.0.0.1",
+		"ALL_PROXY=socks5://proxy.example:1080",
+		"PATH=/usr/bin:/bin",
+	} {
+		if !strings.Contains(joined, keep) {
+			t.Errorf("scrubEnv dropped credential-less %q", keep)
+		}
+	}
+}
+
 // TestAudit2FileListCapsRead: a directory with more than maxListRead
 // entries must be reported as "more than N" without reading them
 // all into memory, and only the first maxListEntries shown.

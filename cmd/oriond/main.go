@@ -16,6 +16,7 @@ import (
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/messaging"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/version"
 )
 
@@ -88,7 +89,11 @@ func run(args []string) int {
 	if baseURL := os.Getenv("ORION_TELEGRAM_BASE_URL"); baseURL != "" {
 		messaging.SetDefaultBaseURL(baseURL)
 	}
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
+	// P2-O5: LOUD warning when the allow-all opt-in is set.
+	if w := a.Config.AllowAllTelegramWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "oriond: %s\n", w)
+	}
+	gwOpts := []messaging.GatewayOption{
 		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
 		// Polling-health notes (transient getUpdates failures and
 		// the recovery after them) go to stderr, where the rest of
@@ -97,7 +102,14 @@ func run(args []string) int {
 		// looks alive while polling is down.
 		messaging.WithLogger(func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "oriond: "+format+"\n", args...)
-		}))
+		}),
+	}
+	if a.Config.AllowAllTelegramChats {
+		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
+		// every chat once the window (from daemon start) elapses.
+		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
+	}
+	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
 		return 1
@@ -157,6 +169,39 @@ func run(args []string) int {
 		}()
 	}
 
+	// --- P1-O2 permission gate + P1-O4 owner tier -------------------
+	// The owner is the FIRST allowlisted chat (see
+	// messaging.OwnerIDFromAllowlist): the operator who installed
+	// the bot. Daemon-wide operations (/restart) are owner-only;
+	// per-chat operations are safe for any allowlisted chat once
+	// isolated (P1-O3). There is deliberately no config field for
+	// the owner — the allowlist already names them.
+	ownerID := messaging.OwnerIDFromAllowlist(a.Config.TelegramAllowedChats)
+	if ownerID != 0 {
+		fmt.Fprintf(os.Stderr, "oriond: owner chat %d (first telegram_allowed_chats entry); /restart is owner-only\n", ownerID)
+	} else {
+		fmt.Fprintln(os.Stderr, "oriond: no owner (empty allowlist with allow-all opt-in); /restart is refused for everyone")
+	}
+	// Permission gate (P1-O2): rules persist under the data dir
+	// (permissions.json, 0600). The prompter sends the Telegram
+	// inline-keyboard approval message; the callback handler
+	// resolves it. Local CLI runs never install a gate (see the
+	// permissions package doc) — the gate applies to
+	// Telegram-driven turns only.
+	ruleStore := permissions.NewRuleStore(filepath.Join(a.Config.DataDir, "permissions.json"))
+	if err := ruleStore.LoadError(); err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: permissions file unusable, starting with no rules: %v\n", err)
+	}
+	gate := permissions.NewGate(ruleStore, func(ctx context.Context, req permissions.ApprovalRequest) error {
+		text := fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool.", req.Summary(), req.ChatID, req.SenderID)
+		_, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, text, messaging.ApprovalKeyboard(req.ID))
+		return err
+	})
+	a.SetPermissionGate(gate)
+	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
+		return handleApprovalCallback(ctx, gw, gate, ownerID, q)
+	})
+
 	allowed := make(map[int64]bool, len(a.Config.TelegramAllowedChats))
 	for _, id := range a.Config.TelegramAllowedChats {
 		allowed[id] = true
@@ -168,13 +213,13 @@ func run(args []string) int {
 		}
 		return runTurn(a, store, ctx, chatID, last, nil)
 	}
-	env := buildCommandEnv(a, store, username, allowed, restart, retry)
+	env := buildCommandEnv(a, store, username, allowed, ownerID, restart, retry)
 	registry := messaging.DefaultRegistry(env)
 	// A menu failure must not kill the daemon: log and keep polling.
 	if err := gw.SetMyCommands(ctx, registry.BotCommands()); err != nil {
 		fmt.Fprintf(os.Stderr, "oriond: warning: setMyCommands failed (the / menu will be stale): %v\n", err)
 	}
-	turnFn := buildTurnHandler(a, store, registry, env)
+	turnFn := buildTurnHandler(a, store, registry, env, ownerID, username)
 
 	pollErr := make(chan error, 1)
 	go func() { pollErr <- gw.PollStream(ctx, turnFn) }()
@@ -211,9 +256,63 @@ func run(args []string) int {
 	}
 }
 
+// handleApprovalCallback resolves one permission-gate approval
+// tap (P1-O2). The decision comes from the button's callback data
+// (perm:<decision>:<requestID>); the pending request is looked up
+// in the gate, and only the user whose turn requested the tool call
+// — or the owner — may answer it. A tap from anyone else (e.g.
+// another member of a group chat) is refused without touching the
+// pending request, so a stranger can neither approve nor deny
+// someone else's tool call. The approval message is edited in place
+// to show the outcome, and the query is answered to clear the
+// button spinner. A tap on an expired request is told so.
+func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, gate *permissions.Gate, ownerID int64, q messaging.TGCallbackQuery) error {
+	decision, id, ok := messaging.ParsePermissionCallback(q.Data)
+	if !ok {
+		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
+	}
+	req, found := gate.Pending(id)
+	if !found {
+		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+	}
+	senderID := int64(0)
+	if q.From != nil {
+		senderID = q.From.ID
+	}
+	if senderID != req.SenderID && senderID != ownerID {
+		return gw.AnswerCallbackQuery(ctx, q.ID, "Only the person who asked can approve this.")
+	}
+	var persist *permissions.Action
+	approved := false
+	outcome := ""
+	switch decision {
+	case "approve":
+		approved, outcome = true, "✅ Approved — running it now."
+	case "deny":
+		approved, outcome = false, "❌ Denied."
+	case "always":
+		allow := permissions.ActionAllow
+		persist, approved, outcome = &allow, true, "✅ Approved — I won't ask again for this tool."
+	case "never":
+		deny := permissions.ActionDeny
+		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool."
+	}
+	if !gate.Resolve(id, approved, persist) {
+		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+	}
+	// Edit the prompt in place so the chat shows the outcome. The
+	// edit carries the outcome only (no tool arguments): the
+	// prompt's summary is user/model-derived text and EditMessageText
+	// sends HTML, so echoing it back could break the markup.
+	if q.Message != nil {
+		_ = gw.EditMessageText(ctx, q.Message.Chat.ID, q.Message.MessageID, "⚠️ Approval request: "+outcome)
+	}
+	return gw.AnswerCallbackQuery(ctx, q.ID, outcome)
+}
+
 // runTurn runs one real agent turn for a chat: it records the input
 // for /retry, registers the turn's cancel function so /stop can
-// cancel it, runs HandleStream (the emit is the terminal-card feed),
+// cancel it, runs HandleStreamForChat (the emit is the terminal-card feed),
 // and records the turn's token usage in the session — including on
 // error, since a failed turn still consumed tokens.
 func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
@@ -221,6 +320,13 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 		return "", nil, errors.New("oriond: app is nil")
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	// The turn runs on the CHAT's agent (P1-O3) with the approval
+	// context the permission gate reads (P1-O2): the chat the
+	// prompt goes to, and the sender who may answer it (P1-O4).
+	// The wrapped ctx is also the registered one, so /stop cancels
+	// exactly this turn.
+	senderID, _ := messaging.SenderIDFromContext(ctx)
+	runCtx = permissions.WithApprovalContext(runCtx, chatID, senderID)
 	registered := a.RegisterRun(chatID, runCtx, cancel)
 	if registered {
 		defer a.UnregisterRun(chatID, runCtx)
@@ -229,11 +335,23 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 	if store != nil {
 		store.SetLastInput(chatID, text)
 	}
-	reply, stats, err := a.HandleStream(runCtx, text, emit)
+	// P2-O9 per-chat daily token budget: refuse the turn before it
+	// runs when the chat is already over budget; record the spend
+	// afterwards (Record always accounts the tokens, even when the
+	// turn pushed the chat over, so the next turn is refused).
+	if a.Budget != nil {
+		if err := a.Budget.Check(chatID, 0); err != nil {
+			return "", nil, err
+		}
+	}
+	reply, stats, err := a.HandleStreamForChat(runCtx, chatID, text, emit)
 	if stats != nil && store != nil {
 		// Best effort: a failed usage write must never fail the
 		// turn that just completed.
 		_ = store.AddUsage(chatID, stats.Tokens)
+		if a.Budget != nil {
+			_ = a.Budget.Record(chatID, stats.Tokens)
+		}
 	}
 	if err != nil {
 		return "", nil, err
@@ -243,25 +361,74 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 
 // buildTurnHandler builds the PollStream TurnFunc: slash commands are
 // dispatched (no agent run, no footer, no usage recorded); paused
-// daemons answer non-command messages with the paused reply; anything
-// else runs the agent with the footer gated on the chat's preference
+// chats answer non-command messages with the paused reply; anything
+// else runs the chat's agent with the footer gated on the chat's preference
 // (read once at turn start). A turn cancelled by /stop returns no
 // reply at all — the /stop command already told the chat — instead
 // of a second "Sorry, I hit an error" message.
-func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messaging.Registry, env *messaging.CommandEnv) messaging.TurnFunc {
+//
+// Per-chat overrides (P1-O3/P1-O4): the shared env holds
+// daemon-default fallbacks, but every chat-scoped capability is
+// rebound per turn here, so a command can only ever act on the
+// caller's chat: /model switches only the caller's provider, /status
+// and /memory report the caller's state, /pause pauses only the
+// caller's chat. /restart is owner-only and is intercepted here
+// before Dispatch — the shared env's Restart cannot refuse (it
+// returns nothing), so the check lives at this layer.
+func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messaging.Registry, env *messaging.CommandEnv, ownerID int64, botUsername string) messaging.TurnFunc {
 	return func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		senderID, _ := messaging.SenderIDFromContext(ctx)
 		if registry != nil && env != nil {
 			// Per-turn copy of the env with this chat's ID: the
 			// shared env must never carry mutable per-chat state
 			// (PollStream handles chats concurrently).
 			turnEnv := *env
 			turnEnv.ChatID = chatID
+			turnEnv.SwitchProvider = func(name string) error {
+				return a.SwitchProviderForChat(chatID, name)
+			}
+			turnEnv.ModelInfo = func() (string, string, []string) {
+				return a.ModelInfoForChat(chatID)
+			}
+			turnEnv.Status = func() string { return a.StatusLineForChat(chatID) }
+			turnEnv.MemoryInfo = func() (string, error) { return a.MemorySummaryForChat(chatID) }
+			turnEnv.SessionMemory = func(ctx context.Context) (string, error) {
+				return a.SessionMemoryTextForChat(ctx, chatID)
+			}
+			turnEnv.Pause = func(on bool) { _ = store.SetPaused(chatID, on) }
+			turnEnv.IsPaused = func() bool { return store.IsPaused(chatID) }
+			// /restart is daemon-wide (it restarts the daemon for
+			// everyone), so it stays owner-only even though
+			// /new and /model are per-chat-safe once isolated:
+			// the audit's literal "/new owner-only" suggestion
+			// is superseded by isolation (a per-chat /new cannot
+			// touch another chat), but nothing isolates a
+			// restart. A non-owner is refused with a reply, not
+			// a handler error.
+			if name, _, ok := messaging.Parse(text); ok && name == "restart" {
+				if senderID != ownerID {
+					return "⛔ /restart is owner-only. Your chat can use every other command, but only the owner can restart the daemon for everyone.", nil, nil
+				}
+			}
+			// Whoami shows the SENDER's role: in a group chat the
+			// sender may be the owner even though the chat ID is
+			// the group's. (In a private chat the shared env's
+			// Whoami already reports owner when chat == owner.)
+			if senderID != 0 && senderID == ownerID && senderID != chatID {
+				turnEnv.Whoami = func(id int64) string {
+					name := botUsername
+					if name == "" {
+						name = "unknown"
+					}
+					return fmt.Sprintf("Chat ID: %d\nSender ID: %d\nBot: @%s\nAllowlisted: yes\nRole: owner", id, senderID, name)
+				}
+			}
 			if reply, handled, err := registry.Dispatch(ctx, &turnEnv, text); handled {
 				return reply, nil, err
 			}
 		}
-		if store != nil && store.IsPaused() {
-			return "⏸ Orion is paused. Send /pause off to resume.", nil, nil
+		if store != nil && store.IsPaused(chatID) {
+			return "⏸ Orion is paused for this chat. Send /pause off to resume.", nil, nil
 		}
 		footerOn := true
 		if store != nil {
@@ -285,7 +452,21 @@ func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messa
 // implementation. No field is left nil: a command that calls a nil
 // field would panic (recovered by PollStream as a handler error),
 // and a silently missing capability would be a stub.
-func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername string, allowed map[int64]bool, restart func(), retry func(context.Context, int64) (string, *core.TurnStats, error)) *messaging.CommandEnv {
+//
+// Chat-scoped fields (NewSession, Undo, Compress, SaveConversation)
+// take the chat ID and call the per-chat App methods directly
+// (P1-O3). Fields whose signatures carry no chat ID
+// (SwitchProvider, ModelInfo, Status, MemoryInfo, SessionMemory,
+// Pause, IsPaused) are wired here to daemon-default fallbacks and
+// rebound per turn by buildTurnHandler — a command dispatched
+// outside a turn (never in production) sees the daemon default,
+// never another chat's state. Pause/IsPaused have no daemon
+// default (pause is per chat since P1-O3), so their shared-env
+// fallback addresses chat 0 — no real chat — and exists only so
+// the field is never nil; buildTurnHandler always rebinds them.
+// ownerID is the first allowlisted chat; Whoami reports "owner"
+// for it, "admin" for other allowlisted chats.
+func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername string, allowed map[int64]bool, ownerID int64, restart func(), retry func(context.Context, int64) (string, *core.TurnStats, error)) *messaging.CommandEnv {
 	return &messaging.CommandEnv{
 		Status: a.StatusLine,
 		ModelInfo: func() (string, string, []string) {
@@ -303,7 +484,7 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 		},
 		Session: store.Get,
 		NewSession: func(chatID int64) error {
-			if err := a.NewSession(); err != nil {
+			if err := a.NewSessionForChat(chatID); err != nil {
 				return err
 			}
 			store.Reset(chatID)
@@ -311,7 +492,7 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 		},
 		StopRun: a.StopRun,
 		Undo: func(chatID int64, n int) ([]string, error) {
-			undone, err := a.UndoLastTurns(n)
+			undone, err := a.UndoLastTurnsForChat(chatID, n)
 			if err != nil {
 				return nil, err
 			}
@@ -319,12 +500,12 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 			return undone, nil
 		},
 		Retry:    retry,
-		Pause:    func(on bool) { _ = store.SetPaused(on) },
-		IsPaused: store.IsPaused,
+		Pause:    func(on bool) { _ = store.SetPaused(0, on) },
+		IsPaused: func() bool { return store.IsPaused(0) },
 		Agents:   a.AgentsSummary,
 		SetTitle: store.SetTitle,
 		Compress: func(ctx context.Context, chatID int64, keepRecent int) (int, int, int, error) {
-			return a.Compress(ctx, keepRecent)
+			return a.CompressForChat(ctx, chatID, keepRecent)
 		},
 		SaveConversation: func(chatID int64) (string, int, error) {
 			sess := store.Get(chatID)
@@ -335,6 +516,9 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 			role, allowlisted := "user", "no"
 			if allowed[chatID] {
 				role, allowlisted = "admin", "yes"
+			}
+			if ownerID != 0 && chatID == ownerID {
+				role = "owner"
 			}
 			name := botUsername
 			if name == "" {
@@ -354,7 +538,7 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 		SaveFeedbackMemory: a.SaveFeedbackMemory,
 		SessionMemory:      a.SessionMemoryText,
 		CompressWithSessionMemory: func(ctx context.Context, chatID int64, keepRecent int, sessionMemory string) (int, int, int, error) {
-			return a.CompressWithSessionMemory(ctx, keepRecent, sessionMemory)
+			return a.CompressWithSessionMemoryForChat(ctx, chatID, keepRecent, sessionMemory)
 		},
 	}
 }

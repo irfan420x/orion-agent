@@ -5,7 +5,7 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc7.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (717 tests pass, 0 fail, 3 skip — Ollama live tests;
+> built and tested (809 tests pass, 0 fail, 3 skip — Ollama live tests;
 > race clean). The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -101,7 +101,7 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-14/14 packages, 717 tests passing, 0 failing, 3 skipped (the live
+17/17 packages, 809 tests passing, 0 failing, 3 skipped (the live
 Ollama tests, which need a running Ollama server), race clean — `go test
 -count=1 ./...`, verified 2026-11-13. Run the suite with `go test ./...` or `make test`.
 
@@ -203,6 +203,7 @@ evidence (this VM has ~700 MiB free, so no Hermes model runs here).
 | `orion memory list/add/get/search` | Long-term facts |
 | `orion skills` / `orion skills search <q>` | Loaded skills (`~/.orion/skills/*.md`) |
 | `orion subagent run "brief"` | Run a brief as a managed child agent |
+| `orion agents` | List subagent tasks with status, duration, tokens and result summary (same view as Telegram `/agents`) |
 | `orion telegram test/poll` | Verify token / start gateway |
 | `orion daemon` / `oriond` | Telegram polling daemon |
 | `orion version` | Print version |
@@ -213,7 +214,9 @@ evidence (this VM has ~700 MiB free, so no Hermes model runs here).
 sandbox via `sandbox.enabled` — see [SECURITY.md](SECURITY.md)), `file_read`,
 `file_write`, `file_edit`, `file_list`, `web_fetch`, `web_search`
 (real DuckDuckGo search), `calculator` (full expression parser),
-`datetime`, `process_list`. Every tool result is capped at
+`datetime`, `process_list`, `subagent_spawn` (run a brief as a
+managed child agent), `subagent_list`, `subagent_result`,
+`subagent_stop`. Every tool result is capped at
 `max_tool_result_bytes` (default 256 KiB) before it reaches the model;
 see "Size caps" under [Configuration](#configuration).
 

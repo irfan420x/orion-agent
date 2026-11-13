@@ -82,6 +82,15 @@ var blockedBinaries = map[string]bool{
 	"nsenter": true, "unshare": true, "systemd-run": true,
 	"setpriv": true, "capsh": true, "expect": true, "socat": true,
 	"ssh": true, "scp": true, "sftp": true,
+	// Network administration (P2-O10): ip/ifconfig/route reconfigure
+	// interfaces, addresses and the routing table; iptables/ip6tables
+	// rewrite firewall rules; nc/ncat open raw TCP/UDP connections
+	// and listeners (a listener is an exfiltration / remote-access
+	// channel). The agent never needs to reconfigure the host
+	// network — web_fetch is the sanctioned way to reach the
+	// network — so all of these are refused outright, like ssh.
+	"ip": true, "ifconfig": true, "iptables": true, "ip6tables": true,
+	"route": true, "nc": true, "ncat": true,
 	// Shell interpreters: refused outright (see the package comment).
 	// The tool layer invokes /bin/sh -c itself and never routes through
 	// IsBlockedCommand, so this cannot break the agent's own execution.

@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/irfan/orion/internal/sandbox"
 )
@@ -38,6 +39,20 @@ import (
 const (
 	DefaultMaxToolResultBytes = 256 * 1024
 	DefaultMaxHistoryTokens   = 32768
+	// DefaultPerChatDailyTokenBudget is the per-chat daily token
+	// budget (P2-O9): one Telegram chat may consume this many tokens
+	// per UTC day before the budget check refuses further turns.
+	// 100K is ~30 trivial turns a day; a chat doing real work can
+	// raise it in config, and 0 disables the budget (unlimited).
+	DefaultPerChatDailyTokenBudget = 100000
+	// DefaultAllowAllTelegramWindowMinutes is how long the
+	// allow_all_telegram_chats opt-in stays effective (P2-O5): 10
+	// minutes from daemon start, per the audit's suggestion — long
+	// enough to send /whoami and learn your chat ID, short enough
+	// that a forgotten opt-in cannot leave the bot open forever.
+	// internal/messaging mirrors this as DefaultAllowAllWindow;
+	// keep the two in sync.
+	DefaultAllowAllTelegramWindowMinutes = 10
 )
 
 const (
@@ -128,10 +143,22 @@ type Config struct {
 	// agent, including shell_exec. The safe path is to leave this
 	// false and list your chat IDs in TelegramAllowedChats (send
 	// /whoami to the bot to learn your chat ID).
-	AllowAllTelegramChats bool   `json:"allow_all_telegram_chats"`
-	DataDir               string `json:"data_dir"`
-	MaxSteps              int    `json:"max_steps"`
-	TimeoutSeconds        int    `json:"timeout_seconds"`
+	//
+	// TIME-BOXED (P2-O5): the opt-in is NOT permanent. It stays
+	// effective only for AllowAllTelegramChatsWindowMinutes (default
+	// 10) from daemon start; after that the gateway refuses every
+	// chat until the daemon is restarted with a real allowlist.
+	// The opt-in exists so a first-time operator can discover their
+	// chat ID — it must never be left on as a permanent open door.
+	AllowAllTelegramChats bool `json:"allow_all_telegram_chats"`
+	// AllowAllTelegramChatsWindowMinutes bounds the allow-all opt-in
+	// window in minutes (see AllowAllTelegramChats). 0 means the
+	// default (10 minutes); the valid range is 1-120. It is read
+	// through AllowAllWindow, which applies the default.
+	AllowAllTelegramChatsWindowMinutes int    `json:"allow_all_telegram_chats_window_minutes"`
+	DataDir                            string `json:"data_dir"`
+	MaxSteps                           int    `json:"max_steps"`
+	TimeoutSeconds                     int    `json:"timeout_seconds"`
 	// MaxToolResultBytes caps the bytes of any single tool result
 	// that reach the model (enforced centrally in the tools
 	// registry; see TruncateToolResult). Results over the cap are
@@ -145,6 +172,14 @@ type Config struct {
 	// (never the system prompt, never the latest user turn, never
 	// breaking a tool-call/tool-result pair).
 	MaxHistoryTokens int `json:"max_history_tokens"`
+	// PerChatDailyTokenBudget caps the tokens one Telegram chat may
+	// consume per UTC day (P2-O9; enforced by internal/budget). The
+	// default is DefaultPerChatDailyTokenBudget (100000). 0 disables
+	// the budget for every chat (unlimited); the valid range for a
+	// set budget is 1000-10000000. The budget is per chat, so one
+	// chat cannot spend the daemon's whole allowance, and it resets
+	// at UTC midnight.
+	PerChatDailyTokenBudget int `json:"per_chat_daily_token_budget"`
 	// Temperature, when set, is passed to the provider on every call.
 	// Nil means the provider default. 0 requests deterministic output
 	// (used by the live-model E2E test); the valid range is 0-2.
@@ -159,13 +194,17 @@ type Config struct {
 	TelegramFooter *bool `json:"telegram_footer,omitempty"`
 
 	// Sandbox configures sandbox mode for shell_exec (user+mount
-	// namespace chroot; see internal/sandbox). Disabled by default:
-	// when off, shell_exec behaves exactly as before, protected
-	// only by the IsBlockedCommand denylist. When on and the
-	// mechanism is available, commands run confined to
-	// Sandbox.Root/work; when on but unavailable, shell_exec
-	// REFUSES the command (fail-closed) unless
-	// sandbox.allow_unsandboxed_fallback is explicitly true.
+	// namespace chroot; see internal/sandbox). Enabled by default:
+	// shell_exec runs confined to Sandbox.Root/work, and a command
+	// whose sandbox cannot be established is REFUSED (fail-closed)
+	// unless sandbox.allow_unsandboxed_fallback is explicitly true,
+	// and a command whose seccomp filter cannot be applied is
+	// REFUSED unless sandbox.allow_without_seccomp is explicitly
+	// true. Turning the sandbox off is an explicit operator
+	// opt-out: set sandbox.enabled=false (or ORION_SANDBOX=off).
+	// An omitted "enabled" key in the config file never turns it
+	// off — Load unmarshals over the enabled-by-default value, so
+	// only an explicit false opts out.
 	Sandbox sandbox.Config `json:"sandbox"`
 
 	// TrustedEgressCIDRs lists CIDR ranges this deployment's egress
@@ -211,10 +250,15 @@ func defaultConfig(dataDir string) *Config {
 		TimeoutSeconds:     120,
 		MaxToolResultBytes: DefaultMaxToolResultBytes,
 		MaxHistoryTokens:   DefaultMaxHistoryTokens,
+		// P2-O5/P2-O9 defaults: a 10-minute allow-all window and a
+		// 100K-token per-chat daily budget.
+		AllowAllTelegramChatsWindowMinutes: DefaultAllowAllTelegramWindowMinutes,
+		PerChatDailyTokenBudget:            DefaultPerChatDailyTokenBudget,
 	}
-	if dataDir != "" {
-		cfg.Sandbox = sandbox.Config{Root: sandbox.DefaultRoot(dataDir)}
-	}
+	// Sandbox defaults ON (sandbox.DefaultConfig): a fresh install
+	// confines shell_exec, and only an explicit opt-out
+	// (sandbox.enabled=false, or ORION_SANDBOX=off) turns it off.
+	cfg.Sandbox = sandbox.DefaultConfig(dataDir)
 	return cfg
 }
 
@@ -245,6 +289,33 @@ func Default() *Config {
 		return defaultConfig("")
 	}
 	return cfg
+}
+
+// AllowAllWindow returns the effective allow-all opt-in window
+// (P2-O5): the configured minutes, or the 10-minute default when the
+// field is unset (0). The gateway measures the window from its own
+// creation (daemon start); see messaging.WithAllowAll.
+func (c *Config) AllowAllWindow() time.Duration {
+	mins := c.AllowAllTelegramChatsWindowMinutes
+	if mins <= 0 {
+		mins = DefaultAllowAllTelegramWindowMinutes
+	}
+	return time.Duration(mins) * time.Minute
+}
+
+// AllowAllTelegramWarning returns the LOUD startup warning for the
+// allow-all opt-in (P2-O5): it names the risk, the auto-disable
+// window, and the fix (set telegram_allowed_chats). It returns ""
+// when the opt-in is off, so callers can print it unconditionally.
+// The daemon startup paths print this to stderr whenever it is
+// non-empty — an operator who enables allow-all must not be able to
+// miss that the bot is open to every Telegram chat, even briefly.
+func (c *Config) AllowAllTelegramWarning() string {
+	if !c.AllowAllTelegramChats {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: allow_all_telegram_chats is ON — ANY Telegram chat can drive this agent (including shell_exec) until the opt-in auto-disables %s after daemon start. This is for first-time setup only (send /whoami to learn your chat ID): set telegram_allowed_chats in config.json and restart, and never leave allow_all_telegram_chats=true in a running deployment.",
+		c.AllowAllWindow())
 }
 
 // DefaultPath returns the default config file path
@@ -287,6 +358,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Temperature != nil && (*c.Temperature < 0 || *c.Temperature > 2) {
 		return errors.New("config: temperature must be between 0 and 2")
+	}
+	// P2-O5: the allow-all window is 1-120 minutes; 0 means "use the
+	// default" (AllowAllWindow applies it) so hand-built configs
+	// that never set the field still validate.
+	if c.AllowAllTelegramChatsWindowMinutes < 0 || c.AllowAllTelegramChatsWindowMinutes > 120 {
+		return errors.New("config: allow_all_telegram_chats_window_minutes must be between 1 and 120 (0 means the 10-minute default)")
+	}
+	// P2-O9: the per-chat daily budget is 0 (unlimited) or
+	// 1000-10M tokens. A negative or absurd value is a typo, not a
+	// tuning choice, and is rejected rather than silently clamped.
+	if c.PerChatDailyTokenBudget != 0 && (c.PerChatDailyTokenBudget < 1000 || c.PerChatDailyTokenBudget > 10000000) {
+		return errors.New("config: per_chat_daily_token_budget must be 0 (unlimited) or between 1000 and 10000000")
 	}
 	if strings.TrimSpace(c.DataDir) == "" {
 		return errors.New("config: data_dir must not be empty")

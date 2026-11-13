@@ -27,6 +27,28 @@ func TestIsBlockedCommand(t *testing.T) {
 		"dd if=/dev/zero of=/dev/sda",
 		"shutdown -h now",
 		"",
+		// P2-O10: network-administration binaries are refused
+		// outright, including through paths, wrappers and
+		// variable indirection (the rc7 var-indirection fix
+		// resolves $x before the binary is checked).
+		"ip addr",
+		"/sbin/ip addr show",
+		"sudo ip link set eth0 down",
+		"ifconfig eth0 192.168.1.2",
+		"iptables -L",
+		"ip6tables -F",
+		"sudo iptables -A INPUT -j ACCEPT",
+		"route -n",
+		"route add default gw 10.0.0.1",
+		"nc -l 8080",
+		"nc 10.0.0.1 4444",
+		"ncat -l -p 8080",
+		"x=ip; $x addr",
+		"x=iptables; $x -L",
+		"x=nc; $x -l 8080",
+		"export x=route; $x -n",
+		"ip addr | head",
+		"echo hi; iptables -F",
 	}
 	for _, cmd := range blocked {
 		if !IsBlockedCommand(cmd) {
@@ -38,6 +60,11 @@ func TestIsBlockedCommand(t *testing.T) {
 		"echo hello",
 		"ls -la",
 		"rm /tmp/somefile.txt",
+		// The words ip/route/nc as arguments are not the binaries:
+		// only the leading (resolved) command is checked.
+		"echo ip addr",
+		"grep -r route /tmp/notes.txt",
+		"echo nc",
 	}
 	for _, cmd := range allowed {
 		if IsBlockedCommand(cmd) {

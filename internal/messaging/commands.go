@@ -70,7 +70,9 @@ type CommandEnv struct {
 	// in seconds, for /usage.
 	Limits func() (maxSteps, timeoutSeconds int)
 	// SwitchProvider switches the daemon default provider (persisted,
-	// effective next turn) or returns an error naming the problem.
+	// effective next turn) for chats without a per-chat override;
+	// chats with an override keep their provider. Returns an error
+	// naming the problem.
 	SwitchProvider func(name string) error
 	// Usage returns daemon-wide token/turn totals (all chats).
 	Usage func() (tokens int, turns int)
@@ -437,12 +439,12 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 
 	r.Register(Command{
 		Name:        "model",
-		Description: "Show or switch model (switches the daemon default)",
+		Description: "Show or switch model (switches this chat's model)",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
 			provider, modelName, providers := env.ModelInfo()
 			args = strings.TrimSpace(args)
 			if args == "" {
-				return fmt.Sprintf("Current: %s / %s\nAvailable providers: %s\n\n/model <name> switches the daemon default provider (persisted, effective from the next turn, for all chats). Session-scoped switching is not implemented yet.",
+				return fmt.Sprintf("Current: %s / %s\nAvailable providers: %s\n\n/model <name> switches this chat's provider (persisted for this chat, effective from the next turn). Other chats are unaffected.",
 					provider, modelName, strings.Join(providers, ", ")), nil
 			}
 			name := strings.ToLower(strings.Fields(args)[0])
@@ -450,7 +452,7 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 				return fmt.Sprintf("❌ %v\nAvailable providers: %s", err, strings.Join(providers, ", ")), nil
 			}
 			provider, modelName, _ = env.ModelInfo()
-			return fmt.Sprintf("✅ Switched to %s / %s. This switches the daemon default — it applies to all chats from the next turn.", provider, modelName), nil
+			return fmt.Sprintf("✅ Switched to %s / %s. This switches the provider for this chat. Other chats are unaffected.", provider, modelName), nil
 		},
 	})
 
@@ -507,7 +509,7 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 
 	r.Register(Command{
 		Name:        "pause",
-		Description: "Pause new work globally; '/pause off' resumes",
+		Description: "Pause new work in this chat; '/pause off' resumes",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
 			switch strings.ToLower(strings.TrimSpace(args)) {
 			case "", "on":

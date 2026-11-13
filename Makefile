@@ -35,7 +35,13 @@ BIN_DIR ?= bin
 build:
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orion ./cmd/orion
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/oriond ./cmd/oriond
-	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orion-seccomp ./internal/sandbox/cmd/launcher
+	# The seccomp launcher MUST be built by the normal build: with
+	# the sandbox ON by default, a missing orion-seccomp makes
+	# every shell_exec fail closed (F-A3-1), so a build that
+	# forgets the launcher ships a broken agent. CGO_ENABLED=0
+	# keeps it static, so it runs inside the chroot (see
+	# internal/sandbox/seccomp.go).
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orion-seccomp ./internal/sandbox/cmd/launcher
 
 install:
 	./install.sh

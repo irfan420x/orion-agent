@@ -89,11 +89,46 @@ type TGMessage struct {
 	From      *TGUser `json:"from,omitempty"`
 }
 
+// TGCallbackQuery is a Telegram callback query: a tap on an inline
+// keyboard button. Message is the message the button belongs to
+// (nil for buttons on messages the bot can no longer see); Data is
+// the button's callback_data, which the bot defined when it sent
+// the keyboard.
+type TGCallbackQuery struct {
+	ID      string     `json:"id"`
+	From    *TGUser    `json:"from"`
+	Message *TGMessage `json:"message,omitempty"`
+	Data    string     `json:"data"`
+}
+
 // Update is a single Telegram update.
 type Update struct {
-	UpdateID int64      `json:"update_id"`
-	Message  *TGMessage `json:"message,omitempty"`
+	UpdateID      int64            `json:"update_id"`
+	Message       *TGMessage       `json:"message,omitempty"`
+	CallbackQuery *TGCallbackQuery `json:"callback_query,omitempty"`
 }
+
+// InlineKeyboardButton is one button in an inline keyboard. Only
+// Text and CallbackData are used: tapping the button delivers a
+// callback query carrying CallbackData.
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+// InlineKeyboardMarkup is Telegram's reply_markup for inline
+// keyboards: rows of buttons.
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+// CallbackHandler handles a callback query (an inline-keyboard tap).
+// It is invoked by PollStream outside any per-chat lock — a tap
+// must be able to resolve a pending approval while the turn that
+// requested it is still blocked waiting for the answer, and the
+// per-chat lock is held by that turn. A handler error is logged, it
+// never kills polling.
+type CallbackHandler func(ctx context.Context, q TGCallbackQuery) error
 
 // TelegramGateway is a client for the Telegram Bot API.
 //
@@ -105,6 +140,17 @@ type Update struct {
 // Poll drops messages from any other chat before the handler runs.
 // Anyone who discovers the bot username could otherwise drive the OS
 // agent, including its shell tool.
+//
+// The allowlist is ALSO the sender allowlist (P1-O4): a message is
+// accepted only when its SENDER's user ID is allowlisted, not merely
+// when its chat is. In a private chat the chat ID equals the user
+// ID, so existing single-user configs behave exactly as before. In
+// a group chat, only allowlisted members may drive the bot — other
+// members' messages are dropped even though the group itself is
+// allowlisted. A message with no sender (channel posts, anonymous
+// admins) is dropped: there is nobody to authorise. See
+// IsSenderAllowed; IsChatAllowed is unchanged (another worker owns
+// it) and still runs first.
 type TelegramGateway struct {
 	token   string
 	baseURL string
@@ -120,6 +166,20 @@ type TelegramGateway struct {
 	fetchMu sync.Mutex
 	// allowedChats is nil when no allowlist is set (all chats pass).
 	allowedChats map[int64]bool
+	// allowAll is set by WithAllowAll when the operator explicitly
+	// opted into allowing every chat (P2-O5). With no allowlist the
+	// opt-in allows all chats — but only inside allowAllWindow from
+	// allowAllSince (daemon start); IsChatAllowed is the only
+	// enforcement point. allowAllExpiredLogged makes the expiry log
+	// line fire once, not on every dropped message.
+	allowAll              bool
+	allowAllSince         time.Time
+	allowAllWindow        time.Duration
+	allowAllExpiredLogged bool
+	// callbackHandler, when set via SetCallbackHandler, receives
+	// callback-query updates (inline-keyboard taps). It is invoked
+	// outside any per-chat lock (see CallbackHandler).
+	callbackHandler CallbackHandler
 	// logger, when set via WithLogger, receives polling-health notes:
 	// transient getUpdates failures and the recovery after them. It is
 	// nil by default (silent). Only redacted errors are ever passed
@@ -202,17 +262,161 @@ func WithAllowedChats(ids ...int64) GatewayOption {
 	}
 }
 
+// DefaultAllowAllWindow is the allow-all opt-in window when the
+// caller passes no (or a non-positive) window to WithAllowAll: 10
+// minutes from gateway creation. It mirrors
+// config.DefaultAllowAllTelegramWindowMinutes; keep the two in sync.
+const DefaultAllowAllWindow = 10 * time.Minute
+
+// WithAllowAll marks the gateway as running under the explicit
+// allow-all opt-in (P2-O5): with no allowlist, IsChatAllowed allows
+// every chat — but only for window from gateway creation (daemon
+// start). Once the window elapses IsChatAllowed refuses every chat
+// until the daemon restarts with a real allowlist. A non-positive
+// window means DefaultAllowAllWindow. When an allowlist is also set
+// (WithAllowedChats), the allowlist wins: only listed chats pass,
+// and the window is irrelevant. The window is measured from
+// creation, not from first use, so an idle daemon still closes.
+func WithAllowAll(window time.Duration) GatewayOption {
+	return func(g *TelegramGateway) {
+		if window <= 0 {
+			window = DefaultAllowAllWindow
+		}
+		g.allowAll = true
+		g.allowAllSince = time.Now()
+		g.allowAllWindow = window
+	}
+}
+
 // IsChatAllowed reports whether chatID may drive the agent through this
 // gateway. With no allowlist set, every chat is allowed. That is the
 // per-chat enforcement only: the daemon entry points refuse to start
 // polling with an empty allowlist at all (see CheckTelegramAllowlist),
 // so a gateway with no allowlist should only ever exist in tests or
 // behind an explicit allow-all opt-in.
+//
+// TIME-BOX (P2-O5): the allow-all opt-in (WithAllowAll) is enforced
+// here and nowhere else. Inside the window every chat passes; once
+// it elapses every chat is refused, including chats that were
+// allowed a moment earlier. The expiry is logged once (via the
+// gateway logger, when set) so the daemon log shows why the bot
+// went silent instead of failing silently.
 func (g *TelegramGateway) IsChatAllowed(chatID int64) bool {
-	if len(g.allowedChats) == 0 {
+	if len(g.allowedChats) > 0 {
+		return g.allowedChats[chatID]
+	}
+	if !g.allowAll {
 		return true
 	}
-	return g.allowedChats[chatID]
+	if g.allowAllSince.IsZero() {
+		// Hand-built gateway with no start time recorded: there is
+		// no window to measure, so nothing to expire. Gateways
+		// built by NewTelegramGateway always set the start time
+		// through WithAllowAll.
+		return true
+	}
+	window := g.allowAllWindow
+	if window <= 0 {
+		window = DefaultAllowAllWindow
+	}
+	if time.Since(g.allowAllSince) < window {
+		return true
+	}
+	g.mu.Lock()
+	logged := g.allowAllExpiredLogged
+	g.allowAllExpiredLogged = true
+	g.mu.Unlock()
+	if !logged {
+		g.logf("telegram allow-all opt-in expired after %s: refusing all chats until restart with telegram_allowed_chats set", window)
+	}
+	return false
+}
+
+// IsSenderAllowed reports whether the Telegram USER who sent a
+// message may drive the agent (P1-O4). The check is on the sender,
+// not the chat: the allowlist holds user IDs (in a private chat the
+// user ID equals the chat ID, so existing configs are unaffected),
+// and a group chat's allowlisting must never authorise every member
+// of the group. A nil sender (channel posts, anonymous admins) is
+// never allowed — there is nobody to authorise.
+//
+// When no allowlist is set, IsChatAllowed's own rule decides: a
+// gateway with no allowlist and no allow-all opt-in allows
+// everyone (tests and the explicit opt-in path); with the allow-all
+// opt-in, the window still applies. A nil sender is refused even
+// then.
+func (g *TelegramGateway) IsSenderAllowed(from *TGUser) bool {
+	if from == nil || from.ID == 0 {
+		return false
+	}
+	if len(g.allowedChats) > 0 {
+		return g.allowedChats[from.ID]
+	}
+	// No allowlist: mirror the chat decision (allow-all window
+	// included) so the two checks can never disagree about an
+	// open gateway.
+	return g.IsChatAllowed(from.ID)
+}
+
+// OwnerIDFromAllowlist derives the owner user ID from the Telegram
+// allowlist: the FIRST entry is the owner. The owner is the
+// operator who installed the bot; their private chat ID is their
+// user ID, and the allowlist is ordered with the owner first by
+// convention (the daemon logs the derivation at startup so a
+// mis-ordered list is visible). There is deliberately no config
+// field for the owner: the allowlist already names them, and a
+// second source of truth would drift. An empty allowlist has no
+// owner (0): daemon-wide operations are then refused for everyone
+// until an allowlist exists.
+func OwnerIDFromAllowlist(allowedChats []int64) int64 {
+	for _, id := range allowedChats {
+		if id != 0 {
+			return id
+		}
+	}
+	return 0
+}
+
+// SetCallbackHandler installs the handler for callback-query
+// updates (inline-keyboard taps). A nil handler removes it (taps
+// are then answered with "not handled" and dropped). Safe for
+// concurrent use with PollStream.
+func (g *TelegramGateway) SetCallbackHandler(h CallbackHandler) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.callbackHandler = h
+}
+
+// callbackHandlerFor returns the installed callback handler, or nil.
+func (g *TelegramGateway) callbackHandlerFor() CallbackHandler {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.callbackHandler
+}
+
+// senderIDKey is the context key for the Telegram sender user ID of
+// the update being handled.
+type senderIDKey struct{}
+
+// WithSenderID returns ctx carrying the Telegram sender user ID
+// for the update being handled. PollStream sets it before invoking
+// the turn handler, so the turn (and the permission gate, via the
+// approval context) knows who asked, not just which chat.
+func WithSenderID(ctx context.Context, senderID int64) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, senderIDKey{}, senderID)
+}
+
+// SenderIDFromContext reads the sender user ID carried by ctx. ok
+// is false when ctx carries none.
+func SenderIDFromContext(ctx context.Context) (int64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	id, ok := ctx.Value(senderIDKey{}).(int64)
+	return id, ok
 }
 
 // CheckTelegramAllowlist enforces the daemon startup rule for the
@@ -566,6 +770,85 @@ func (g *TelegramGateway) SendMessageHTML(ctx context.Context, chatID int64, htm
 	return g.sendMessageRaw(ctx, chatID, htmlText, "HTML")
 }
 
+// SendMessageWithKeyboard sends one plain-text message with an inline
+// keyboard to chatID and returns the new message's id. It is the
+// approval prompt's transport: the keyboard's buttons carry
+// callback_data the callback handler resolves. The text is sent as
+// plain text (no parse mode), so approval summaries never need HTML
+// escaping. Long texts are sent as-is (approval prompts are short
+// by construction); callers must keep them under 4096 runes.
+func (g *TelegramGateway) SendMessageWithKeyboard(ctx context.Context, chatID int64, text string, keyboard InlineKeyboardMarkup) (int64, error) {
+	result, err := g.call(ctx, "sendMessage", nil, struct {
+		ChatID      int64                `json:"chat_id"`
+		Text        string               `json:"text"`
+		ReplyMarkup InlineKeyboardMarkup `json:"reply_markup"`
+	}{ChatID: chatID, Text: text, ReplyMarkup: keyboard})
+	if err != nil {
+		return 0, err
+	}
+	var msg sendMessageResult
+	if err := json.Unmarshal(result, &msg); err != nil {
+		return 0, fmt.Errorf("messaging: telegram sendMessage: decode result: %w", err)
+	}
+	return msg.MessageID, nil
+}
+
+// AnswerCallbackQuery answers a callback query (removes the loading
+// spinner on the tapped button, and optionally shows a short toast).
+// text is shown as a toast when non-empty (Telegram caps it at 200
+// runes). It is best-effort from the caller's view: a failed answer
+// must never fail the approval it acknowledges.
+func (g *TelegramGateway) AnswerCallbackQuery(ctx context.Context, callbackID, text string) error {
+	_, err := g.call(ctx, "answerCallbackQuery", nil, struct {
+		CallbackQueryID string `json:"callback_query_id"`
+		Text            string `json:"text,omitempty"`
+	}{CallbackQueryID: callbackID, Text: text})
+	return err
+}
+
+// Permission callback data format: "perm:<decision>:<requestID>",
+// where decision is approve, deny, always or never. The request ID
+// is the gate's opaque pending-request ID (16 hex chars).
+const permissionCallbackPrefix = "perm:"
+
+// ApprovalKeyboard builds the inline keyboard for an approval
+// prompt: Approve once / Deny on the first row, Always allow /
+// Never allow on the second. "Always"/"Never" persist a standing
+// rule for the tool, so the user is not asked again.
+func ApprovalKeyboard(requestID string) InlineKeyboardMarkup {
+	return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+		{
+			{Text: "✅ Approve once", CallbackData: permissionCallbackPrefix + "approve:" + requestID},
+			{Text: "❌ Deny", CallbackData: permissionCallbackPrefix + "deny:" + requestID},
+		},
+		{
+			{Text: "✅ Always allow", CallbackData: permissionCallbackPrefix + "always:" + requestID},
+			{Text: "⛔ Never allow", CallbackData: permissionCallbackPrefix + "never:" + requestID},
+		},
+	}}
+}
+
+// ParsePermissionCallback parses callback data from an approval
+// keyboard button. It returns the decision ("approve", "deny",
+// "always" or "never") and the pending-request ID. ok is false for
+// any other callback data (other buttons, other features).
+func ParsePermissionCallback(data string) (decision, requestID string, ok bool) {
+	if !strings.HasPrefix(data, permissionCallbackPrefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(data, permissionCallbackPrefix)
+	decision, requestID, found := strings.Cut(rest, ":")
+	if !found || requestID == "" {
+		return "", "", false
+	}
+	switch decision {
+	case "approve", "deny", "always", "never":
+		return decision, requestID, true
+	default:
+		return "", "", false
+	}
+}
+
 // SendChatAction sends a chat action (e.g. "typing") to chatID, so the
 // user sees the bot working while a turn runs.
 func (g *TelegramGateway) SendChatAction(ctx context.Context, chatID int64, action string) error {
@@ -867,7 +1150,16 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		}()
 		_ = g.SendChatAction(ctx, chatID, "typing")
 
-		reply, stats, herr := handler(ctx, chatID, upd.Message.Text, emit)
+		// The handler runs with the sender in its context (P1-O4):
+		// the turn handler reads it for the owner tier and the
+		// permission gate's approval context. A nil From cannot
+		// reach here — the sender check above drops it.
+		senderID := int64(0)
+		if upd.Message.From != nil {
+			senderID = upd.Message.From.ID
+		}
+		handlerCtx := WithSenderID(ctx, senderID)
+		reply, stats, herr := handler(handlerCtx, chatID, upd.Message.Text, emit)
 		close(typingDone)
 
 		// Final card edit: show the finished state (including any
@@ -893,6 +1185,39 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		}
 		// Best effort: a failed reply must not kill polling.
 		_ = g.SendMessage(ctx, chatID, reply)
+	}
+
+	// handleCallback answers one callback query (an inline-keyboard
+	// tap). It runs OUTSIDE the per-chat lock on purpose: a tap
+	// resolves a pending approval while the turn that requested it
+	// is still blocked waiting for the answer, and that turn holds
+	// the chat's lock — handling the tap under the same lock would
+	// deadlock the approval round-trip. A handler panic or error is
+	// logged and polling continues; the query is always answered
+	// (even when no handler is installed) so the button's spinner
+	// clears instead of hanging.
+	handleCallback := func(q TGCallbackQuery) {
+		defer func() { <-sem }()
+		defer func() {
+			if r := recover(); r != nil {
+				g.logf("telegram poll: callback handler panicked: %v", r)
+				_ = g.AnswerCallbackQuery(ctx, q.ID, "Sorry, that tap failed.")
+			}
+		}()
+		senderID := int64(0)
+		if q.From != nil {
+			senderID = q.From.ID
+		}
+		cbCtx := WithSenderID(ctx, senderID)
+		h := g.callbackHandlerFor()
+		if h == nil {
+			_ = g.AnswerCallbackQuery(ctx, q.ID, "This button is not handled right now.")
+			return
+		}
+		if err := h(cbCtx, q); err != nil {
+			g.logf("telegram poll: callback handler error: %v", err)
+			_ = g.AnswerCallbackQuery(ctx, q.ID, "Sorry, that tap failed.")
+		}
 	}
 
 	// consecutiveFailures counts back-to-back transient getUpdates
@@ -945,6 +1270,34 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		backoff = time.Second
 
 		for _, upd := range updates {
+			// Callback queries (inline-keyboard taps) are handled
+			// on their own path, outside the per-chat lock (see
+			// handleCallback): a tap must be able to resolve a
+			// pending approval while the turn that requested it
+			// holds the chat's lock. The sender is checked the
+			// same way as for messages — a tap from a
+			// non-allowlisted user can never approve anything.
+			if upd.CallbackQuery != nil {
+				q := upd.CallbackQuery
+				if !g.IsSenderAllowed(q.From) {
+					if q.From != nil {
+						g.logf("telegram poll: dropped callback query from non-allowlisted user %d", q.From.ID)
+					} else {
+						g.logf("telegram poll: dropped callback query with no sender")
+					}
+					continue
+				}
+				if ctx.Err() != nil {
+					return nil
+				}
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return nil
+				}
+				go handleCallback(*q)
+				continue
+			}
 			if upd.Message == nil || strings.TrimSpace(upd.Message.Text) == "" {
 				continue
 			}
@@ -957,6 +1310,19 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			// telegram_allowed_chats. The text is never logged.
 			if !g.IsChatAllowed(upd.Message.Chat.ID) {
 				g.logf("telegram poll: dropped message from non-allowlisted chat %d (add it to telegram_allowed_chats to allow it)", upd.Message.Chat.ID)
+				continue
+			}
+			// Sender check (P1-O4): the chat being allowlisted is
+			// not enough — the SENDER must be allowlisted too. In
+			// a group chat this stops non-allowlisted members
+			// driving the bot through the group's allowlisting;
+			// a message with no sender is dropped outright.
+			if !g.IsSenderAllowed(upd.Message.From) {
+				if upd.Message.From != nil {
+					g.logf("telegram poll: dropped message from non-allowlisted user %d in chat %d", upd.Message.From.ID, upd.Message.Chat.ID)
+				} else {
+					g.logf("telegram poll: dropped message with no sender in chat %d", upd.Message.Chat.ID)
+				}
 				continue
 			}
 			if ctx.Err() != nil {

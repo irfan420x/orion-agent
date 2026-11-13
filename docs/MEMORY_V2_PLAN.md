@@ -1,7 +1,7 @@
 # Memory v2 plan — Claude Code-inspired (patterns only)
 
 Status: **implemented 2026-11-13 (v0.2.0-rc4)** — all 7 steps landed
-and verified (653 tests passing, race clean). One design correction
+and verified (809 tests passing, race clean). One design correction
 during implementation: feedback memories are standing guidance, so
 they bypass the topical selector and the surfaced exclusion and are
 injected every turn (max 2, own section header) — the topical

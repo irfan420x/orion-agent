@@ -15,12 +15,12 @@ import (
 // --- HMAC-signed audit chain (v2) tests ---
 //
 // Every test here uses its own temp directory (and therefore its own
-// temp audit.key); no test reads or writes the real ~/.orion key, and
-// no test ever logs or prints key material.
+// temp audit key, at <dir>-keys/audit.key); no test reads or writes
+// the real ~/.orion key, and no test ever logs or prints key material.
 
 // hmacLog is a small helper: open a fresh log in a temp dir and append
 // n entries. It returns the log, the log path and the directory (which
-// also holds audit.key and audit.jsonl.head).
+// holds audit.jsonl.head; the key lives in the sibling <dir>-keys).
 func hmacLog(t *testing.T, n int) (*AuditLog, string, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -74,9 +74,10 @@ func readAuditHeadFile(t *testing.T, logPath string) auditHead {
 }
 
 // TestAuditKeyFileCreated0600AndReused: opening a log creates
-// audit.key (0600, 32 bytes) in the log directory, and reopening
-// reuses the same key — the chain appended under the first handle
-// still verifies under the second.
+// audit.key (0600, 32 bytes) in the key directory next to the log
+// directory (<dir>-keys, P2-O8 — never in the log directory itself),
+// and reopening reuses the same key — the chain appended under the
+// first handle still verifies under the second.
 func TestAuditKeyFileCreated0600AndReused(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.jsonl")
@@ -84,13 +85,17 @@ func TestAuditKeyFileCreated0600AndReused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAuditLog: %v", err)
 	}
-	keyPath := filepath.Join(dir, "audit.key")
+	keyPath := auditKeyPath(dir)
 	key1, err := os.ReadFile(keyPath)
 	if err != nil {
 		t.Fatalf("ReadFile key: %v", err)
 	}
 	if len(key1) != auditKeyLen {
 		t.Fatalf("key length = %d, want %d", len(key1), auditKeyLen)
+	}
+	// P2-O8: no key file may remain in the log directory itself.
+	if _, err := os.Stat(filepath.Join(dir, "audit.key")); !os.IsNotExist(err) {
+		t.Errorf("legacy key file still present in the log directory (err=%v)", err)
 	}
 	if st, err := os.Stat(keyPath); err != nil {
 		t.Fatalf("Stat key: %v", err)
@@ -122,10 +127,12 @@ func TestAuditKeyFileCreated0600AndReused(t *testing.T) {
 
 // TestAuditKeyWrongLengthRejected: a key file with the wrong length
 // is an error, never silently replaced — replacing the key would
-// orphan every v2 entry already in the log.
+// orphan every v2 entry already in the log. The short key is seeded
+// at the legacy location (migration input); a short key must be
+// rejected there, not migrated.
 func TestAuditKeyWrongLengthRejected(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "audit.key"), make([]byte, 16), 0o600); err != nil {
+	if err := os.WriteFile(auditKeyLegacyPath(dir), make([]byte, 16), 0o600); err != nil {
 		t.Fatalf("WriteFile key: %v", err)
 	}
 	if _, err := NewAuditLog(filepath.Join(dir, "audit.jsonl")); err == nil {
@@ -134,10 +141,13 @@ func TestAuditKeyWrongLengthRejected(t *testing.T) {
 }
 
 // TestAuditKeyModeTightenedOnOpen: a pre-existing world-readable key
-// file is tightened to 0600 on open, and its contents are kept.
+// file is tightened to 0600 on open, and its contents are kept. The
+// key is seeded at the legacy location, so this also exercises
+// migration: it must land at the new location, 0600, same bytes,
+// with the legacy file removed.
 func TestAuditKeyModeTightenedOnOpen(t *testing.T) {
 	dir := t.TempDir()
-	keyPath := filepath.Join(dir, "audit.key")
+	keyPath := auditKeyLegacyPath(dir)
 	key := make([]byte, auditKeyLen)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatalf("rand.Read: %v", err)
@@ -148,19 +158,24 @@ func TestAuditKeyModeTightenedOnOpen(t *testing.T) {
 	if _, err := NewAuditLog(filepath.Join(dir, "audit.jsonl")); err != nil {
 		t.Fatalf("NewAuditLog: %v", err)
 	}
-	st, err := os.Stat(keyPath)
+	// The migrated key lives at the new location, 0600, same bytes.
+	newPath := auditKeyPath(dir)
+	st, err := os.Stat(newPath)
 	if err != nil {
-		t.Fatalf("Stat key: %v", err)
+		t.Fatalf("Stat migrated key: %v", err)
 	}
 	if st.Mode().Perm() != 0o600 {
-		t.Errorf("key file mode = %o, want 0600 (tightened on open)", st.Mode().Perm())
+		t.Errorf("migrated key file mode = %o, want 0600 (tightened on open)", st.Mode().Perm())
 	}
-	after, err := os.ReadFile(keyPath)
+	after, err := os.ReadFile(newPath)
 	if err != nil {
-		t.Fatalf("ReadFile key: %v", err)
+		t.Fatalf("ReadFile migrated key: %v", err)
 	}
 	if !bytes.Equal(key, after) {
 		t.Error("key contents changed on open")
+	}
+	if _, err := os.Stat(keyPath); !os.IsNotExist(err) {
+		t.Errorf("legacy key file still present after migration (err=%v)", err)
 	}
 }
 
@@ -354,7 +369,7 @@ func TestAuditHeadAbsentDegradesToChainOnly(t *testing.T) {
 // Restoring the original key must make the same log verify again.
 func TestAuditWrongKeyDetected(t *testing.T) {
 	_, path, dir := hmacLog(t, 2)
-	keyPath := filepath.Join(dir, "audit.key")
+	keyPath := auditKeyPath(dir)
 	origKey, err := os.ReadFile(keyPath)
 	if err != nil {
 		t.Fatalf("ReadFile key: %v", err)

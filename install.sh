@@ -167,7 +167,7 @@ build_one() {
 	STAGE_TMP="${STAGE_TMP% $tmp}"
 }
 
-echo "building orion and oriond (commit ${COMMIT}, built ${BUILD_DATE})..."
+echo "building orion, oriond and orion-seccomp (commit ${COMMIT}, built ${BUILD_DATE})..."
 build_one ./cmd/orion orion
 if [ -d cmd/oriond ]; then
 	build_one ./cmd/oriond oriond
@@ -179,26 +179,35 @@ fi
 
 # Seccomp launcher: the sandbox's orion-seccomp helper is discovered
 # next to the orion binary, so install it alongside when present in
-# the tree. Without it the sandbox still works (namespaces +
-# pivot_root) but the seccomp filter stays inactive.
+# the tree. The sandbox is ON by default, and a missing launcher
+# makes every shell_exec FAIL CLOSED (refused, F-A3-1) unless the
+# operator explicitly opted into unfiltered runs with
+# sandbox.allow_without_seccomp=true — so a fresh install without
+# the launcher ships a broken agent, not a degraded one. The
+# launcher is therefore a REQUIRED install, not an optional extra:
+# die if its source is absent instead of silently skipping it.
+# CGO_ENABLED=0 keeps it static so it runs inside the chroot.
 if [ -d internal/sandbox/cmd/launcher ]; then
-	build_one ./internal/sandbox/cmd/launcher orion-seccomp
+	CGO_ENABLED=0 build_one ./internal/sandbox/cmd/launcher orion-seccomp
 	echo "installed seccomp launcher: $BIN_DIR/orion-seccomp"
+else
+	die "internal/sandbox/cmd/launcher not present — the sandbox is on by default and needs its launcher; refusing a launcher-less install"
 fi
 
 # Default config, first install only. Never overwrite an existing
 # config: it may hold API keys and a Telegram token. This matches
-# config.Default() (default provider ollama, local-first) and is
-# written 0600. Secrets are added afterwards by the user, never here.
+# config.Default() (default provider ollama, local-first, sandbox
+# ON by default) and is written 0600. Secrets are added afterwards
+# by the user, never here.
 CONFIG_DIR="$HOME/.orion"
 CONFIG_PATH="$CONFIG_DIR/config.json"
 
 # write_default_config writes the first-install default config to
 # $CONFIG_PATH via temp file + rename (see the atomic-install note
 # above). It never overwrites an existing file — callers check first.
-# This matches config.Default() (default provider ollama, local-first)
-# and is written 0600. Secrets are added afterwards by the user,
-# never here.
+# This matches config.Default() (default provider ollama,
+# local-first, sandbox ON by default) and is written 0600. Secrets
+# are added afterwards by the user, never here.
 write_default_config() {
 	mkdir -p "$CONFIG_DIR"
 	chmod 0700 "$CONFIG_DIR"
@@ -209,6 +218,11 @@ write_default_config() {
 	# "already exists" branch), so the install would look done
 	# while Orion cannot start. mktemp is 0600 already; chmod
 	# explicitly so the mode never depends on that.
+	# The sandbox block is explicit even though config.Default()
+	# enables it anyway: a fresh install must confine shell_exec,
+	# and the file should say so instead of relying on the
+	# reader knowing the code default. Only an explicit
+	# "enabled": false (or ORION_SANDBOX=off) opts out.
 	CONFIG_TMP="$(mktemp "$CONFIG_DIR/.install-config.XXXXXX")" || die "cannot create temp config in $CONFIG_DIR"
 	STAGE_TMP="$STAGE_TMP $CONFIG_TMP"
 	cat >"$CONFIG_TMP" <<EOF
@@ -245,7 +259,11 @@ write_default_config() {
   "telegram_allowed_chats": [],
   "data_dir": "$HOME/.orion",
   "max_steps": 20,
-  "timeout_seconds": 120
+  "timeout_seconds": 120,
+  "sandbox": {
+    "enabled": true,
+    "root": "$HOME/.orion/sandbox"
+  }
 }
 EOF
 	chmod 0600 "$CONFIG_TMP" || die "cannot chmod temp config"

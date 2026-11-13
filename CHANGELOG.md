@@ -6,6 +6,61 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### External-audit fixes (v0.2.0-rc8) — see `orion-muse-sync/audit.md`
+
+Fixes the security findings and docs staleness from the external
+audit (verified against rc7: 9 of its 10 findings genuinely open;
+Audit 4's rc7 fixes closed none of them). **Verdict: NOT
+production-ready** — the 24–72 h daemon soak (F-A3-4) is still open.
+809 tests pass, 0 fail, 3 skip (Ollama live tests), race clean,
+17/17 packages.
+
+- **P0-O1 — sandbox ON by default** (`internal/sandbox`,
+  `internal/config`, `install.sh`): a fresh install and any config
+  that omits the sandbox section confine `shell_exec` to the
+  namespace/pivot-root sandbox with the seccomp filter; only an
+  explicit `sandbox.enabled=false` (or `ORION_SANDBOX=off`) opts
+  out, and every unsandboxed run is logged. A missing
+  `orion-seccomp` launcher still refuses commands fail-closed
+  (F-A3-1) via `ErrSeccompUnavailable`. `make build` and
+  `install.sh` now build the launcher (static, `CGO_ENABLED=0`)
+  and install it next to `orion`/`oriond`; `install.sh` refuses a
+  launcher-less install. Live config enabled
+  (`sandbox.enabled=true`) and daemon restarted on the rc8 binary.
+- **P1-O2 — permission/confirmation gate** (`internal/permissions`,
+  `internal/core`): destructive (`shell_exec`, `file_write`,
+  `file_edit`, `subagent_spawn`) and network (`web_fetch`,
+  `web_search`) tools need approval — Telegram inline
+  Approve/Deny/Always/Never with persisted rules
+  (`permissions.json`, 0600), 90 s timeout, clean deny. The shell
+  denylist stays absolute and can never be approved. CLI runs stay
+  ungated (denylist only).
+- **P1-O3 — per-chat isolation** (`internal/app`,
+  `internal/messaging`): each chat has its own agent, history,
+  provider/model override, session memory, usage and pause
+  (`chats/<chatID>/`); `/new`, `/model`, `/pause`, `/undo`,
+  `/compress`, `/save`, `/status`, `/memory` act on the caller's
+  chat only. Long-term facts and typed memories stay shared (the
+  user's knowledge base).
+- **P1-O4 — sender check + owner tier** (`internal/messaging`,
+  `cmd/oriond`): the sender's user ID must be allowlisted, not just
+  the chat; `/restart` is owner-only (owner = first
+  `telegram_allowed_chats` entry). Approval taps accepted only from
+  the requesting sender or the owner.
+- **P2-O5..O10** (`internal/config`, `internal/tools`,
+  `internal/security`, `internal/budget`): `allow_all_telegram_chats`
+  time-boxed to 10 minutes from daemon start + loud startup warning;
+  `scrubEnv` strips credential-bearing proxy vars; file tools use
+  `O_NOFOLLOW` + fd-path verification (TOCTOU closed); audit-log HMAC
+  key moved out of the log dir with cross-process `flock`; per-chat
+  daily token budget (default 100,000/UTC day); `ip`, `ifconfig`,
+  `iptables`, `ip6tables`, `route`, `nc`, `ncat` added to the denylist.
+- **Docs**: ARCHITECTURE header (rc8, 14 tools, `agents` in CLI list),
+  CHANGELOG DeepSeek-default line corrected (code default is ollama),
+  MEMORY_V2_PLAN test count, README CLI table + Tools section (14
+  tools), SECURITY.md HMAC checkpoint documented, AUDIT3 corrections
+  (36 provider-stress tests, RSS band from the CSV).
+
 ### Audit 4 (v0.2.0-rc7) — see `AUDIT4_2026-11-13.md`
 
 Fresh-eyes production-readiness audit of rc6 plus the fresh-install
@@ -294,8 +349,9 @@ race clean, 14/14 packages.
   session.go`): `saveLocked` now fsyncs the parent directory
   after the temp-file fsync + rename, matching the memory/config
   stores, so a renamed `sessions.json` survives a crash.
-- **Version + docs sync** (`internal/version`): `Version` is now
-  `0.2.0-rc2` (was `0.1.0` while the tag was `v0.2.0-rc2`);
+- **Version + docs sync** (`internal/version`): `Version` is
+  `0.2.0-rc7` (the rc2-era sync fixed it from `0.1.0`, when the tag
+  was already `v0.2.0-rc2`);
   README status, SECURITY.md (seccomp launcher is built/installed
   by `install.sh`/`Makefile`; Telegram authorisation is refusal,
   not a warning; sandbox fallback is fail-closed) and
@@ -353,8 +409,10 @@ race clean, 14/14 packages.
   441 tests pass, race clean.
 - **DeepSeek provider** (`internal/model`, `internal/config`): a
   first-class provider reusing the OpenAI-compatible client
-  (defaults `https://api.deepseek.com/v1` + `deepseek-chat`), now the
-  default provider. Live-verified: `TestLiveDeepSeek` PASS
+  (defaults `https://api.deepseek.com/v1` + `deepseek-chat`), the
+  default provider in the live operator config
+  (`~/.orion/config.json`) — not the code default, which remains
+  `ollama` (`internal/config/config.go`). Live-verified: `TestLiveDeepSeek` PASS
   (17*23+5=396 in 1.57s) and `orion run` answers 396.
 - **Seccomp filter for the sandbox** (`internal/sandbox`): a
   pure-stdlib classic-BPF filter (no cgo/libseccomp) applied by the

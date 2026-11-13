@@ -262,6 +262,8 @@ func cmdConfig(args []string) error {
 		fmt.Printf("telegram_token:  %s\n", maskSecret(cfg.TelegramToken))
 		fmt.Printf("max_steps:       %d\n", cfg.MaxSteps)
 		fmt.Printf("timeout_seconds: %d\n", cfg.TimeoutSeconds)
+		fmt.Printf("sandbox_enabled: %v\n", cfg.Sandbox.Enabled)
+		fmt.Printf("sandbox_root:    %s\n", cfg.Sandbox.Root)
 		fmt.Println("providers:")
 		names := make([]string, 0, len(cfg.Providers))
 		for n := range cfg.Providers {
@@ -708,13 +710,24 @@ func cmdTelegram(ctx context.Context, args []string) error {
 		return fmt.Errorf("telegram: no token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
 	}
 	applyTelegramBaseURL()
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
+	// P2-O5: LOUD warning when the allow-all opt-in is set.
+	if w := a.Config.AllowAllTelegramWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
+	}
+	gwOpts := []messaging.GatewayOption{
 		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
 		// Polling-health notes and dropped-chat IDs go to stderr,
 		// where the rest of the CLI's lifecycle logging goes.
 		messaging.WithLogger(func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "orion: "+format+"\n", args...)
-		}))
+		}),
+	}
+	if a.Config.AllowAllTelegramChats {
+		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
+		// every chat once the window (from daemon start) elapses.
+		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
+	}
+	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
 	if err != nil {
 		return err
 	}
@@ -754,13 +767,24 @@ Run Telegram polling until interrupted. Takes no arguments.
 		return fmt.Errorf("daemon: no telegram token configured; run `orion chat` for CLI mode instead")
 	}
 	applyTelegramBaseURL()
-	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
+	// P2-O5: LOUD warning when the allow-all opt-in is set.
+	if w := a.Config.AllowAllTelegramWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
+	}
+	gwOpts := []messaging.GatewayOption{
 		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
 		// Polling-health notes and dropped-chat IDs go to stderr,
 		// where the rest of the CLI's lifecycle logging goes.
 		messaging.WithLogger(func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "orion: "+format+"\n", args...)
-		}))
+		}),
+	}
+	if a.Config.AllowAllTelegramChats {
+		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
+		// every chat once the window (from daemon start) elapses.
+		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
+	}
+	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
 	if err != nil {
 		return err
 	}

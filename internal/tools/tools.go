@@ -15,6 +15,13 @@ func timeoutSecondsToDuration(seconds int) time.Duration {
 
 // DefaultRegistry constructs a registry with all built-in tools registered.
 // It returns an error if any registration fails.
+//
+// The sandbox is OFF in the registry this returns: it is a
+// test/unconfigured constructor only. Production must use
+// DefaultRegistryWithSandbox(cfg.Sandbox) with the config-loaded
+// sandbox (default ON since rc8, see internal/config) — calling
+// this from production code would silently run shell_exec
+// unsandboxed.
 func DefaultRegistry() (*Registry, error) {
 	return DefaultRegistryWithSandbox(sandbox.Config{})
 }

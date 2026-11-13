@@ -14,9 +14,10 @@
 //     and clean truncation of the tail is undetectable without a
 //     checkpoint. v0 is accepted on read, never produced on write.
 //   - v2 (current): the chain hash is HMAC-SHA256 keyed by a 32-byte
-//     key stored in <log-dir>/audit.key (0600, generated with
-//     crypto/rand on first open; in production the log lives in
-//     ~/.orion, so the key is ~/.orion/audit.key). Recomputing the
+//     key stored in a SEPARATE directory from the log
+//     (<log-dir>-keys/audit.key, 0600 in its own 0700 directory;
+//     in production the log lives in ~/.orion, so the key is
+//     ~/.orion-keys/audit.key — see audit_key.go). Recomputing the
 //     chain after tampering requires the key, and verification with a
 //     different key fails. New entries are always v2.
 //
@@ -49,6 +50,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -142,16 +144,57 @@ func computeHashHMAC(key []byte, prevHash string, seq int, ts time.Time, actor, 
 // New entries are chained with HMAC-SHA256 under a persistent key
 // (see audit_key.go) and a signed head checkpoint records the chain
 // tip after every append, so Verify also detects clean truncation of
-// the tail. It is safe for concurrent use: Append takes the write lock,
-// while Verify and Entries take the read lock, so reads never block
-// appends (and vice versa only for the duration of an in-flight read).
+// the tail. It is safe for concurrent use in one process: Append
+// takes the write lock, while Verify and Entries take the read lock,
+// so reads never block appends (and vice versa only for the duration
+// of an in-flight read). It is also safe across processes (P2-O8):
+// every Append and every open takes an exclusive flock on
+// <log>.lock, and Verify/Entries take a shared flock, so an oriond
+// daemon and a CLI App appending to the same log can never
+// interleave sequence numbers or race the head checkpoint — flock
+// is released automatically if a process dies, so a crash can never
+// leave a stale lock behind. Append re-reads the on-disk tip under
+// the lock (another process may have appended since this handle
+// last read) and recovers a torn tail first, so the sequence number
+// it assigns is always the true tip + 1.
 type AuditLog struct {
 	mu       sync.RWMutex
 	path     string
 	headPath string
+	lockPath string
 	key      []byte
 	lastSeq  int
 	lastHash string
+}
+
+// acquireAuditLock takes an exclusive flock on the lock file (creating
+// it 0600), returning a release function. acquireAuditLockShared takes
+// a shared flock for readers. Both block until the lock is available;
+// the critical sections they guard (one append, one verify) are short.
+// The lock file itself is never removed: its contents are irrelevant,
+// only the flock on it matters.
+func acquireAuditLock(lockPath string) (func(), error) {
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("security: open audit lock %s: %w", lockPath, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("security: lock audit log %s: %w", lockPath, err)
+	}
+	return func() { _ = f.Close() }, nil
+}
+
+func acquireAuditLockShared(lockPath string) (func(), error) {
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("security: open audit lock %s: %w", lockPath, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("security: lock audit log %s: %w", lockPath, err)
+	}
+	return func() { _ = f.Close() }, nil
 }
 
 // NewAuditLog opens (or creates) the audit log at path. The parent
@@ -159,16 +202,19 @@ type AuditLog struct {
 // mode 0600. Modes are enforced on every open, not only on creation:
 // a pre-existing world-readable audit.jsonl is tightened to 0600 (and
 // its parent directory to 0700). The HMAC key is loaded or created in
-// the same directory (audit.key, 0600; see loadOrCreateAuditKey). An
-// existing log is fully loaded and its hash chain verified; a corrupt
-// chain, a malformed line, a wrong key, a tampered head, or a log
-// truncated behind its signed head is an error and the log is not
-// opened. A torn tail — a partially written last line left by a crash
-// mid-Append, with no trailing newline — is truncated on open so the
-// log recovers instead of refusing to open; see recoverTornTail.
-// On a successful open the signed head is advanced to the verified
-// tip, so a legacy log (or a log whose last append crashed between
-// the log fsync and the head update) gains a truncation checkpoint.
+// its own directory (<log-dir>-keys/audit.key, 0600; see
+// loadOrCreateAuditKey). An existing log is fully loaded and its hash
+// chain verified; a corrupt chain, a malformed line, a wrong key, a
+// tampered head, or a log truncated behind its signed head is an error
+// and the log is not opened. A torn tail — a partially written last
+// line left by a crash mid-Append, with no trailing newline — is
+// truncated on open so the log recovers instead of refusing to open;
+// see recoverTornTail. On a successful open the signed head is
+// advanced to the verified tip, so a legacy log (or a log whose last
+// append crashed between the log fsync and the head update) gains a
+// truncation checkpoint. The open holds an exclusive flock for the
+// verify + head-advance, so two processes opening the same log
+// concurrently cannot race the checkpoint (P2-O8).
 func NewAuditLog(path string) (*AuditLog, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("security: audit log path is empty")
@@ -201,7 +247,15 @@ func NewAuditLog(path string) (*AuditLog, error) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, fmt.Errorf("security: chmod audit log %s: %w", path, err)
 	}
-	al := &AuditLog{path: path, headPath: path + ".head", key: key}
+	al := &AuditLog{path: path, headPath: path + ".head", lockPath: path + ".lock", key: key}
+	// Exclusive flock for the recover + verify + head-advance: a
+	// second process opening (or appending to) the same log must
+	// wait, so the head checkpoint cannot be raced.
+	unlock, err := acquireAuditLock(al.lockPath)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	// Recover a torn tail from a crash mid-Append before verifying.
 	if err := recoverTornTail(path); err != nil {
 		return nil, err
@@ -513,15 +567,41 @@ func (a *AuditLog) verifyEntry(e Entry) error {
 // Append adds one v2 (HMAC-signed) entry to the log, fsyncing the
 // write so it survives a crash, then atomically advances the signed
 // head checkpoint to the new tip so truncation of this entry is
-// detectable. It is mutex-protected: concurrent appends keep a single
-// chain. If the head update fails, Append returns an error even
-// though the entry itself is already durable in the log — the next
-// open re-advances the head from the verified tip, but until then
-// the checkpoint is stale and truncation of the new entry would not
-// be detected, so the failure must not be silent.
+// detectable. It is mutex-protected in-process and flock-protected
+// across processes (P2-O8): under the exclusive lock it recovers a
+// torn tail and re-reads the on-disk tip, so a second process that
+// appended since this handle last read cannot make it reuse a
+// sequence number. If the head update fails, Append returns an
+// error even though the entry itself is already durable in the log
+// — the next open re-advances the head from the verified tip, but
+// until then the checkpoint is stale and truncation of the new
+// entry would not be detected, so the failure must not be silent.
 func (a *AuditLog) Append(actor, action, detail string) (Entry, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	unlock, err := acquireAuditLock(a.lockPath)
+	if err != nil {
+		return Entry{}, err
+	}
+	defer unlock()
+	// Recover a torn tail left by a crashed concurrent append,
+	// then re-read the true on-disk tip: another process may have
+	// appended since this handle last read, and the sequence
+	// number below must be tip+1, not this handle's stale tip+1.
+	// The re-read verifies the chain only (readLogEntries), not
+	// the head checkpoint: a broken head must not stop the entry
+	// itself from landing — the head failure is reported by the
+	// head update below, and Verify still catches a log truncated
+	// behind its head afterwards.
+	if err := recoverTornTail(a.path); err != nil {
+		return Entry{}, err
+	}
+	if entries, err := a.readLogEntries(false); err != nil {
+		return Entry{}, err
+	} else if len(entries) > 0 {
+		a.lastSeq = entries[len(entries)-1].Seq
+		a.lastHash = entries[len(entries)-1].Hash
+	}
 
 	e := Entry{
 		Seq:       a.lastSeq + 1,
@@ -577,24 +657,37 @@ func (a *AuditLog) Append(actor, action, detail string) (Entry, error) {
 // head checkpoint: a log truncated behind the head, or an entry
 // rewritten at the head's sequence, fails. It returns nil only if
 // the whole chain is intact. It takes the read lock, so it never
-// blocks Append; a partially written last line from a concurrent
-// Append is tolerated (the log is verified up to the last complete
-// entry).
+// blocks Append in-process; across processes it takes a shared flock
+// (P2-O8), so the log and head it reads cannot change under it mid-
+// read — a partially written last line from a concurrent Append is
+// still tolerated (the log is verified up to the last complete
+// entry) when one is in flight.
 func (a *AuditLog) Verify() error {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	_, err := a.readAndVerify(true)
+	unlock, err := acquireAuditLockShared(a.lockPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	_, err = a.readAndVerify(true)
 	return err
 }
 
 // Entries returns all entries in the log in file order. The returned
 // slice is a fresh copy; the caller may mutate it freely. It takes
-// the read lock, so it never blocks Append; a partially written last
-// line from a concurrent Append is omitted, not an error. A log
-// truncated behind its signed head is an error, not a shorter list.
+// the read lock, so it never blocks Append in-process, and a shared
+// flock across processes (P2-O8); a partially written last line
+// from a concurrent Append is omitted, not an error. A log truncated
+// behind its signed head is an error, not a shorter list.
 func (a *AuditLog) Entries() ([]Entry, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	unlock, err := acquireAuditLockShared(a.lockPath)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	entries, err := a.readAndVerify(true)
 	if err != nil {
 		return nil, err

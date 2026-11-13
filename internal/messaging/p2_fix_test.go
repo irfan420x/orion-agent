@@ -164,8 +164,8 @@ func TestPollHandlesChatsConcurrently(t *testing.T) {
 	fake := &fakeTelegram{
 		sendCh: make(chan sentMessage, 10),
 		updates: []Update{
-			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 1}, Text: "slow"}},
-			{UpdateID: 2, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 2}, Text: "fast"}},
+			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 1}, Text: "slow", From: &TGUser{ID: 1}}},
+			{UpdateID: 2, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 2}, Text: "fast", From: &TGUser{ID: 2}}},
 		},
 	}
 	srv := httptest.NewServer(fake)

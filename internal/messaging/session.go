@@ -8,8 +8,14 @@
 // survive a daemon restart. A missing file means defaults; a corrupt
 // file means defaults too (the load error is kept for the caller to
 // log) — a bad sessions file must never stop the daemon starting.
-// The pause flag is daemon-wide, not per chat, and persists the same
-// way.
+//
+// The pause flag is PER CHAT (P1-O3): /pause in one chat pauses
+// only that chat's new work, never another chat's. It is persisted
+// per session (Session.Paused). Older sessions files stored a single
+// daemon-wide "paused" flag; on load that flag is migrated onto
+// every stored session once, then dropped on the next save — a
+// daemon that was paused before the upgrade stays paused for the
+// chats it had, instead of silently resuming them.
 package messaging
 
 import (
@@ -29,10 +35,10 @@ type Session struct {
 	// FooterEnabled controls the runtime footer on final replies.
 	// Default true (see NewSessionStore's footerDefault).
 	FooterEnabled bool `json:"footer_enabled"`
-	// Paused is a per-chat copy of the daemon-wide pause flag at the
-	// time the session was read; the authoritative flag lives in
-	// SessionStore.paused. It is not persisted per session.
-	Paused bool `json:"-"`
+	// Paused is this chat's pause flag (/pause): while set, new
+	// non-command messages from this chat get a paused reply.
+	// Per chat (P1-O3) and persisted.
+	Paused bool `json:"paused,omitempty"`
 	// TotalTokens and Turns accumulate finished turns for this chat.
 	TotalTokens int `json:"total_tokens"`
 	Turns       int `json:"turns"`
@@ -47,22 +53,23 @@ type Session struct {
 }
 
 // persistedSessions is the on-disk shape for the session file.
+// Paused is the legacy daemon-wide pause flag (pre-P1-O3): it is
+// read for migration only (see load) and always written false.
 type persistedSessions struct {
 	Version  int                `json:"version"`
 	Paused   bool               `json:"paused"`
 	Sessions map[int64]*Session `json:"sessions"`
 }
 
-// SessionStore holds all chat sessions plus the daemon-wide pause
-// flag, with JSON persistence. All methods are safe for concurrent
-// use. Get returns a copy, so callers can read fields without holding
-// the lock; every mutation goes through a method that persists.
+// SessionStore holds all chat sessions, with JSON persistence. All
+// methods are safe for concurrent use. Get returns a copy, so
+// callers can read fields without holding the lock; every mutation
+// goes through a method that persists.
 type SessionStore struct {
 	mu            sync.RWMutex
 	path          string
 	footerDefault bool
 	sessions      map[int64]*Session
-	paused        bool
 	loadErr       error
 }
 
@@ -131,7 +138,17 @@ func (s *SessionStore) load() error {
 	if p.Sessions != nil {
 		s.sessions = p.Sessions
 	}
-	s.paused = p.Paused
+	// Migrate the legacy daemon-wide pause flag (pre-P1-O3): a
+	// daemon that was paused before the upgrade stays paused for
+	// every chat it had. The flag is then dropped on the next
+	// save (saveLocked always writes false).
+	if p.Paused {
+		for _, sess := range s.sessions {
+			if sess != nil {
+				sess.Paused = true
+			}
+		}
+	}
 	// Normalise: every stored session gets its ChatID from the key
 	// and a defined footer flag.
 	for id, sess := range s.sessions {
@@ -156,7 +173,7 @@ func (s *SessionStore) saveLocked() error {
 	}
 	p := persistedSessions{
 		Version:  1,
-		Paused:   s.paused,
+		Paused:   false, // legacy daemon-wide flag: migration-only, never written true
 		Sessions: s.sessions,
 	}
 	data, err := json.MarshalIndent(p, "", "  ")
@@ -217,13 +234,12 @@ func (s *SessionStore) Get(chatID int64) *Session {
 	defer s.mu.Unlock()
 	if sess, ok := s.sessions[chatID]; ok && sess != nil {
 		cp := *sess
-		cp.Paused = s.paused
 		cp.UndoStack = append([]string(nil), sess.UndoStack...)
 		return &cp
 	}
-	sess := &Session{ChatID: chatID, FooterEnabled: s.footerDefault, Paused: s.paused}
+	sess := &Session{ChatID: chatID, FooterEnabled: s.footerDefault}
 	s.sessions[chatID] = sess
-	return &Session{ChatID: chatID, FooterEnabled: s.footerDefault, Paused: s.paused}
+	return &Session{ChatID: chatID, FooterEnabled: s.footerDefault}
 }
 
 // SetTitle sets the session title and persists it.
@@ -285,19 +301,23 @@ func (s *SessionStore) Reset(chatID int64) {
 	sess.UndoStack = nil
 }
 
-// SetPaused sets the daemon-wide pause flag and persists it.
-func (s *SessionStore) SetPaused(on bool) error {
+// SetPaused sets the pause flag for ONE chat (P1-O3) and persists
+// it. Other chats are unaffected.
+func (s *SessionStore) SetPaused(chatID int64, on bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.paused = on
+	s.sessionLocked(chatID).Paused = on
 	return s.saveLocked()
 }
 
-// IsPaused reports the daemon-wide pause flag.
-func (s *SessionStore) IsPaused() bool {
+// IsPaused reports whether the chat is paused.
+func (s *SessionStore) IsPaused(chatID int64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.paused
+	if sess, ok := s.sessions[chatID]; ok && sess != nil {
+		return sess.Paused
+	}
+	return false
 }
 
 // Totals sums TotalTokens and Turns across all chats (daemon-wide

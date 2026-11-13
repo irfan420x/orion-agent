@@ -141,10 +141,36 @@ import (
 	"time"
 )
 
-// Config controls sandbox mode for shell_exec. It is opt-in: Enabled
-// defaults to false and behaviour is unchanged unless configured.
+// Config controls sandbox mode for shell_exec. It is opt-out, not
+// opt-in: the Orion default is ON (see DefaultConfig and
+// config.Default — a fresh install confines shell_exec), and
+// sandboxing stays on unless the operator explicitly turns it off
+// with sandbox.enabled=false in config (or ORION_SANDBOX=off).
+// A bare Config{} literal still has Enabled=false (Go zero value):
+// that is a deliberately unconfigured value for tests and for code
+// that has not opted into the default, never the production
+// default — do not construct a bare Config{} for production use;
+// use DefaultConfig or load it from config.
+//
+// Three distinct degradations, three distinct opt-ins — neither
+// implies another:
+//
+//   - enabled=false: no sandbox at all; the command runs
+//     unsandboxed, protected only by the denylist. This is the
+//     only way to turn sandboxing off, and shell_exec logs every
+//     such run so the opt-out is visible.
+//   - allow_without_seccomp=true: sandboxed, but WITHOUT syscall
+//     filtering when no usable orion-seccomp launcher can be
+//     found. The command is still confined by the namespaces and
+//     pivot_root; only the filter is missing.
+//   - allow_unsandboxed_fallback=true: unsandboxed, but ONLY when
+//     the sandbox is enabled and cannot be established at all
+//     (mechanism unavailable, Prepare failure). It never covers
+//     filter absence: a missing filter is refused even with this
+//     opt-in (see ErrSeccompUnavailable).
 type Config struct {
-	// Enabled turns sandbox mode on for shell_exec.
+	// Enabled turns sandbox mode on for shell_exec. Default true
+	// (see DefaultConfig); false is an explicit operator opt-out.
 	Enabled bool `json:"enabled"`
 	// Root is the sandbox root on the host. <root>/work is the
 	// command's working directory inside the sandbox (visible as
@@ -202,6 +228,24 @@ type Config struct {
 // DefaultRoot returns the default sandbox root under dataDir.
 func DefaultRoot(dataDir string) string {
 	return filepath.Join(dataDir, "sandbox")
+}
+
+// DefaultConfig returns the sandbox configuration Orion uses when
+// the operator configured nothing: sandboxing ON, rooted at
+// <dataDir>/sandbox (empty when dataDir is empty; Resolve fills it
+// in from the home directory later). This is the single place the
+// default-on decision lives — config.defaultConfig builds on it,
+// so a fresh install and a config file that omits the sandbox
+// section both confine shell_exec. Turning the sandbox off is an
+// explicit act (Enabled=false in the file, or ORION_SANDBOX=off);
+// an omitted "enabled" key never turns it off, because Load
+// unmarshals over these defaults instead of over a zero Config.
+func DefaultConfig(dataDir string) Config {
+	cfg := Config{Enabled: true}
+	if strings.TrimSpace(dataDir) != "" {
+		cfg.Root = DefaultRoot(dataDir)
+	}
+	return cfg
 }
 
 // Resolve returns c with defaults filled in: an empty Root becomes

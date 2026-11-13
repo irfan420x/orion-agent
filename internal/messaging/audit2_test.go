@@ -131,8 +131,8 @@ func TestPollRecoversFromHandlerPanic(t *testing.T) {
 	fake := &fakeTelegram{
 		sendCh: make(chan sentMessage, 10),
 		updates: []Update{
-			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 1}, Text: "boom"}},
-			{UpdateID: 2, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 2}, Text: "hi"}},
+			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 1}, Text: "boom", From: &TGUser{ID: 1}}},
+			{UpdateID: 2, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 2}, Text: "hi", From: &TGUser{ID: 2}}},
 		},
 	}
 	srv := httptest.NewServer(fake)
@@ -237,7 +237,7 @@ func TestPollRedactsHandlerErrorReplies(t *testing.T) {
 	fake := &fakeTelegram{
 		sendCh: make(chan sentMessage, 10),
 		updates: []Update{
-			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 1}, Text: "hi"}},
+			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 1}, Text: "hi", From: &TGUser{ID: 1}}},
 		},
 	}
 	srv := httptest.NewServer(fake)

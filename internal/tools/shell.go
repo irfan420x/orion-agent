@@ -36,10 +36,19 @@ const (
 // scrubEnv returns the process environment with secrets removed, for
 // the shell child: anything that looks like a credential never reaches
 // a command the model asked to run.
+//
+// Proxy variables get special treatment (P2-O6): a proxy URL often
+// carries credentials (https://user:password@proxy:8080), and the
+// plain host:port form is needed for egress to work at all, so proxy
+// variables are stripped ONLY when they carry credentials — either
+// the name says so (PROXY_USER, PROXY_PASSWORD, ...) or the value
+// has userinfo before the host. A credential-less proxy (plain
+// http://proxy:8080, or a NO_PROXY host list) is kept, so proxied
+// egress keeps working.
 func scrubEnv() []string {
 	out := make([]string, 0, len(os.Environ()))
 	for _, kv := range os.Environ() {
-		key, _, _ := strings.Cut(kv, "=")
+		key, value, _ := strings.Cut(kv, "=")
 		upper := strings.ToUpper(key)
 		if strings.HasPrefix(upper, "ORION_") ||
 			strings.Contains(upper, "API_KEY") ||
@@ -53,9 +62,38 @@ func scrubEnv() []string {
 			strings.Contains(upper, "BEARER") {
 			continue
 		}
+		if strings.Contains(upper, "PROXY") && proxyCarriesCredentials(upper, value) {
+			continue
+		}
 		out = append(out, kv)
 	}
 	return out
+}
+
+// proxyCarriesCredentials reports whether a proxy environment variable
+// carries credentials: either the name itself names a credential
+// (PROXY_USER, PROXY_PASS, ...) or the value is a proxy URL with
+// userinfo (scheme://user[:password]@host). A bare host list
+// (NO_PROXY) or a credential-less URL has none.
+func proxyCarriesCredentials(upperKey, value string) bool {
+	for _, marker := range []string{"USER", "PASS", "TOKEN", "SECRET", "CREDENTIAL", "AUTH"} {
+		if strings.Contains(upperKey, marker) {
+			return true
+		}
+	}
+	// userinfo is the part between "://" and the first "@" before
+	// the first "/" after the scheme. A "@" anywhere else (a path
+	// segment, a bare hostname) is not credentials.
+	rest := value
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	} else {
+		return false
+	}
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		rest = rest[:i]
+	}
+	return strings.Contains(rest, "@")
 }
 
 // cappedWriter collects output up to limit bytes and discards the
@@ -96,8 +134,14 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 // shellExecTool implements "shell_exec". sandboxCfg, when enabled,
 // confines the command to the sandbox (see internal/sandbox); the
 // denylist check below still runs first, so the sandbox is an
-// additional layer, never a replacement for it. A zero config means
-// sandboxing is off and behaviour is unchanged.
+// additional layer, never a replacement for it. Sandboxing is ON
+// by default in production: the registry gets cfg.Sandbox from
+// config.Load, whose default enables it, and only an explicit
+// operator opt-out (sandbox.enabled=false, or ORION_SANDBOX=off)
+// turns it off. A zero config means sandboxing is off — that is
+// the unconfigured value used by tests and by direct registry
+// construction, never a production default; do not rely on it to
+// run unsandboxed in production.
 type shellExecTool struct {
 	sandboxCfg sandbox.Config
 }
@@ -175,9 +219,10 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	// Without this, cmd.Run can block until a grandchild holding the
 	// stdout pipe exits, even after the shell itself is dead.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Sandbox mode (opt-in via config): confine the command to the
-	// namespace chroot. The denylist above has already run, so this
-	// is a second layer, not a substitute. Fail-closed by default:
+	// Sandbox mode (ON by default via config; see
+	// sandbox.DefaultConfig): confine the command to the namespace
+	// chroot. The denylist above has already run, so this is a
+	// second layer, not a substitute. Fail-closed by default:
 	// when the sandbox is enabled but cannot be established
 	// (mechanism unavailable, or setup failed), the command is
 	// REFUSED rather than run unsandboxed — an operator who opted
@@ -228,6 +273,16 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 				return "", &ToolError{Tool: t.Name(), Kind: "denied", Err: errors.New(msg)}
 			}
 		}
+	} else {
+		// Sandbox disabled: with the default now ON, a disabled
+		// sandbox in production means the operator explicitly
+		// opted out (sandbox.enabled=false, or
+		// ORION_SANDBOX=off). Log every unsandboxed run, so the
+		// opt-out — or a config that silently lost its sandbox
+		// setting — is visible in the log, not just in the file.
+		// (A zero sandbox.Config in tests hits this branch too;
+		// the log line is the same fact: no isolation.)
+		log.Printf("orion: shell_exec: sandbox disabled; running command without sandbox isolation (set sandbox.enabled=true to confine shell_exec)")
 	}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {

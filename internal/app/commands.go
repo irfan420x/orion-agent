@@ -118,6 +118,56 @@ func providerNeedsAPIKey(name string) bool {
 	}
 }
 
+// resolveProvider validates a provider name and builds the
+// provider, without changing any state. It is the shared
+// validation/construction step for SwitchProvider (daemon default)
+// and SwitchProviderForChat (one chat's override): both must reject
+// the same unknown/misconfigured providers, and neither may install
+// a half-built provider. It returns the provider, the resolved
+// config entry, and the canonical (lowercase) provider key.
+func (a *App) resolveProvider(name string) (model.Provider, config.ProviderConfig, string, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: unknown provider %q (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
+	}
+	if !config.KnownProvider(name) {
+		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: unknown provider %q (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
+	}
+	// Resolve the entry case-insensitively: the map key is the
+	// canonical lowercase name, but never assume it.
+	var entry config.ProviderConfig
+	var key string
+	found := false
+	for k, p := range a.Config.Providers {
+		if strings.EqualFold(k, name) {
+			entry, key, found = p, k, true
+			break
+		}
+	}
+	if !found {
+		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q is not configured (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
+	}
+	if strings.TrimSpace(entry.Name) == "" {
+		entry.Name = key
+	}
+	if strings.TrimSpace(entry.Model) == "" {
+		entry.Model = a.Config.Model
+	}
+	if providerNeedsAPIKey(name) && strings.TrimSpace(entry.APIKey) == "" {
+		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q requires an API key (set providers.%s.api_key or ORION_API_KEY)", name, name)
+	}
+	provider, err := model.NewProvider(model.ProviderConfig{
+		Name:    entry.Name,
+		APIKey:  entry.APIKey,
+		BaseURL: entry.BaseURL,
+		Model:   entry.Model,
+	})
+	if err != nil {
+		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q: %w", name, err)
+	}
+	return provider, entry, key, nil
+}
+
 // SwitchProvider switches the daemon's default provider, persists the
 // choice to the config file, and rebuilds the agent for subsequent
 // turns. Mechanism: the agent holds its provider by value, so there
@@ -134,49 +184,21 @@ func providerNeedsAPIKey(name string) bool {
 // provider with no API key configured (names the missing key). No
 // broken agent is ever installed: validation and provider
 // construction happen before any state changes.
+//
+// Per-chat effect (P1-O3): chats WITH a provider override keep their
+// provider; chats WITHOUT one follow the new default — their agents
+// are rebuilt after the swap (rebuildChatAgentsForDefault). The
+// daemon default is the default for chats, not a switch that
+// reaches into every chat.
 func (a *App) SwitchProvider(name string) error {
 	if a == nil || a.Config == nil {
 		return errors.New("app: SwitchProvider called on uninitialised App")
 	}
-	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" {
-		return fmt.Errorf("app: unknown provider %q (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
-	}
-	if !config.KnownProvider(name) {
-		return fmt.Errorf("app: unknown provider %q (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
-	}
-	// Resolve the entry case-insensitively: the map key is the
-	// canonical lowercase name, but never assume it.
-	var entry config.ProviderConfig
-	var key string
-	found := false
-	for k, p := range a.Config.Providers {
-		if strings.EqualFold(k, name) {
-			entry, key, found = p, k, true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("app: provider %q is not configured (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
-	}
-	if strings.TrimSpace(entry.Name) == "" {
-		entry.Name = key
-	}
-	if strings.TrimSpace(entry.Model) == "" {
-		entry.Model = a.Config.Model
-	}
-	if providerNeedsAPIKey(name) && strings.TrimSpace(entry.APIKey) == "" {
-		return fmt.Errorf("app: provider %q requires an API key (set providers.%s.api_key or ORION_API_KEY)", name, name)
-	}
-	provider, err := model.NewProvider(model.ProviderConfig{
-		Name:    entry.Name,
-		APIKey:  entry.APIKey,
-		BaseURL: entry.BaseURL,
-		Model:   entry.Model,
-	})
+	provider, _, _, err := a.resolveProvider(name)
 	if err != nil {
-		return fmt.Errorf("app: provider %q: %w", name, err)
+		return err
 	}
+	name = strings.ToLower(strings.TrimSpace(name))
 	// Persist first, then swap: if the save fails the daemon keeps
 	// running on the old provider instead of diverging from disk.
 	a.mu.Lock()
@@ -219,6 +241,10 @@ func (a *App) SwitchProvider(name string) error {
 		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger))
 	}
 	a.mu.Unlock()
+	// Chats without an override follow the new default; chats with
+	// one keep their provider. This runs after mu is released
+	// (lock order: chatsMu before mu, never the reverse).
+	_ = a.rebuildChatAgentsForDefault()
 	return nil
 }
 
@@ -390,10 +416,23 @@ func (a *App) UndoLastTurns(n int) ([]string, error) {
 	if a == nil || a.Memory == nil {
 		return nil, errors.New("app: UndoLastTurns called on uninitialised App (nil Memory)")
 	}
+	return undoLastTurnsOn(a.Memory, n)
+}
+
+// undoLastTurnsOn removes the last n user turns from store — each
+// turn is a user message plus everything that followed it up to the
+// next user message — and returns the undone user texts in
+// chronological order (oldest undone turn first). n < 1 and an empty
+// history are errors; nothing is removed when there is nothing to
+// undo. It is the store-level primitive behind UndoLastTurns (the
+// global store, for the CLI) and UndoLastTurnsForChat (one chat's
+// store, for Telegram): the logic is identical, only the store
+// differs, so there is exactly one implementation.
+func undoLastTurnsOn(store memory.Store, n int) ([]string, error) {
 	if n < 1 {
 		return nil, fmt.Errorf("app: undo count must be at least 1, got %d", n)
 	}
-	all, err := a.Memory.RecentMessages(0)
+	all, err := store.RecentMessages(0)
 	if err != nil {
 		return nil, fmt.Errorf("app: undo: read history: %w", err)
 	}
@@ -416,7 +455,7 @@ func (a *App) UndoLastTurns(n int) ([]string, error) {
 		undone = append(undone, all[i].Content)
 	}
 	kept := append([]model.Message(nil), all[:cut]...)
-	if err := a.Memory.ReplaceMessages(kept); err != nil {
+	if err := store.ReplaceMessages(kept); err != nil {
 		return nil, fmt.Errorf("app: undo: rewrite history: %w", err)
 	}
 	return undone, nil
@@ -454,10 +493,23 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	if a == nil || a.Memory == nil {
 		return 0, 0, 0, errors.New("app: Compress called on uninitialised App (nil Memory)")
 	}
+	return compressWithOn(ctx, a.Memory, a.provider(), keepRecent, sessionMemory)
+}
+
+// compressWithOn summarises store's conversation prefix older than
+// the recent window with a real model call (provider) and drops it:
+// the summary is stored as the "conversation-summary" fact (so
+// fact-aware recall still surfaces it) and only the recent window
+// stays in history. It is the store-level primitive behind Compress
+// (the global store, for the CLI) and CompressForChat (one chat's
+// store, for Telegram). When nothing is old enough (history fits the
+// window) it returns before == after with summaryLen == 0 and no
+// error. A provider failure leaves history untouched.
+func compressWithOn(ctx context.Context, store memory.Store, provider model.Provider, keepRecent int, sessionMemory string) (before, after, summaryLen int, err error) {
 	if keepRecent < 1 {
 		keepRecent = compressRecentWindow
 	}
-	all, err := a.Memory.RecentMessages(0)
+	all, err := store.RecentMessages(0)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("app: compress: read history: %w", err)
 	}
@@ -467,7 +519,6 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	}
 	old := all[:len(all)-keepRecent]
 	recent := all[len(all)-keepRecent:]
-	provider := a.provider()
 	if provider == nil {
 		return before, before, 0, errors.New("app: compress: no provider configured")
 	}
@@ -515,21 +566,22 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	if strings.TrimSpace(sessionMemory) != "" {
 		summary += "\n(Drew on session memory.)"
 	}
-	if err := a.Memory.AddFact("conversation-summary", summary); err != nil {
+	if err := store.AddFact("conversation-summary", summary); err != nil {
 		return before, before, 0, fmt.Errorf("app: compress: store summary: %w", err)
 	}
-	if err := a.Memory.ReplaceMessages(recent); err != nil {
+	if err := store.ReplaceMessages(recent); err != nil {
 		return before, before, 0, fmt.Errorf("app: compress: drop summarised messages: %w", err)
 	}
 	return before, len(recent), len([]rune(summary)), nil
 }
 
-// ExportConversation writes the current conversation as Markdown
+// ExportConversation writes ONE chat's conversation as Markdown
 // under DataDir/exports/conversation-<chatID>-<timestamp>.md and
 // returns the path and message count. Messages carry roles and
 // content; Orion's memory store records no per-message timestamps,
 // so the export says so instead of inventing times. The file is
-// created 0600 (it holds the user's conversation).
+// created 0600 (it holds the user's conversation). Only that chat's
+// history is exported — never another chat's.
 func (a *App) ExportConversation(chatID int64, title string, totalTokens, turns int) (string, int, error) {
 	if a == nil || a.Memory == nil {
 		return "", 0, errors.New("app: ExportConversation called on uninitialised App (nil Memory)")
@@ -537,7 +589,11 @@ func (a *App) ExportConversation(chatID int64, title string, totalTokens, turns 
 	if a.Config == nil || a.Config.DataDir == "" {
 		return "", 0, errors.New("app: ExportConversation: no data dir configured")
 	}
-	msgs, err := a.Memory.RecentMessages(0)
+	cs, err := a.chatSessionFor(chatID)
+	if err != nil {
+		return "", 0, fmt.Errorf("app: export: chat session: %w", err)
+	}
+	msgs, err := cs.store.RecentMessages(0)
 	if err != nil {
 		return "", 0, fmt.Errorf("app: export: read history: %w", err)
 	}
@@ -582,18 +638,26 @@ func (a *App) ProviderName() string { return a.providerName() }
 // read used by cmd/oriond's /model command.
 func (a *App) ActiveModel() string { return a.activeModel() }
 
-// MemorySummary renders the /memory view: fact count and the indexed
-// fact list (1-based, sorted by key — the same order ForgetFact
-// uses), message count and data dir.
+// MemorySummary renders the /memory view for the global (CLI)
+// store: fact count and the indexed fact list (1-based, sorted by
+// key — the same order ForgetFact uses), message count and data dir.
+// Telegram chats use MemorySummaryForChat, which counts that chat's
+// messages instead (the facts are shared either way).
 func (a *App) MemorySummary() (string, error) {
 	if a == nil || a.Memory == nil {
 		return "", errors.New("app: MemorySummary called on uninitialised App (nil Memory)")
 	}
-	facts, err := a.Memory.ListFacts()
+	return memorySummaryOn(a, a.Memory)
+}
+
+// memorySummaryOn renders the /memory view over store: the shared
+// fact list plus that store's message count.
+func memorySummaryOn(a *App, store memory.Store) (string, error) {
+	facts, err := store.ListFacts()
 	if err != nil {
 		return "", fmt.Errorf("app: memory: list facts: %w", err)
 	}
-	msgs, err := a.Memory.RecentMessages(0)
+	msgs, err := store.RecentMessages(0)
 	if err != nil {
 		return "", fmt.Errorf("app: memory: read history: %w", err)
 	}

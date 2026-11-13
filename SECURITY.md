@@ -378,6 +378,25 @@ timestamp, actor, action, and detail. `Verify()` recomputes the
 whole chain; any tampering (byte flip, deletion, reorder) fails
 verification. The log is created 0600 in a 0700 directory.
 
+New entries are v2: the chain hash is HMAC-SHA256 keyed by a
+persistent 32-byte audit key (the audit key file, 0600, stored
+separately from the log; generated with `crypto/rand` on first
+open, never logged or printed). Recomputing the chain after
+tampering requires the key, and verification with a different key
+fails — so unlike the legacy v0 unkeyed SHA-256 chain (accepted on
+read, never produced on write), a v2 chain cannot be silently
+rewritten by anyone with only write access to the log. After every
+successful append the log also advances a signed head checkpoint
+(`<log>.head`, 0600) recording the tip sequence number and hash,
+authenticated with the same key; `Verify()` rejects a log whose
+last entry is behind the head or whose entry at the head's
+sequence no longer matches it, so clean truncation of the tail is
+detected. A log with no head file (legacy, or no entries yet)
+verifies the chain only. The head is a checkpoint, not a separate
+trust root: deleting it together with truncating the log defeats
+it, and losing the key orphans the whole v2 chain (a wrong-length
+key file is an error, never silently replaced).
+
 ## Telegram authorisation
 
 - `telegram_allowed_chats` in config lists the chat IDs that may

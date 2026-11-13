@@ -25,6 +25,8 @@ type streamFake struct {
 	edits       []streamEdit // every editMessageText call, in order
 	actions     []string     // every sendChatAction action, in order
 	commands    []BotCommand // last setMyCommands body seen
+	answered    []string     // callback_query_ids answered, in order
+	keyboards   []string     // raw sendMessage bodies that carried reply_markup
 	updates     []Update
 	updateCalls int
 	nextMsgID   int64
@@ -66,9 +68,25 @@ func (f *streamFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.nextMsgID++
 		msg.MsgID = f.nextMsgID
 		f.sent = append(f.sent, msg)
+		if strings.Contains(string(body), "reply_markup") {
+			f.keyboards = append(f.keyboards, string(body))
+		}
 		id := msg.MsgID
 		f.mu.Unlock()
 		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d}}`, id)
+	case strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
+		var req struct {
+			CallbackQueryID string `json:"callback_query_id"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"ok":false,"description":"bad json"}`)
+			return
+		}
+		f.mu.Lock()
+		f.answered = append(f.answered, req.CallbackQueryID)
+		f.mu.Unlock()
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	case strings.HasSuffix(r.URL.Path, "/editMessageText"):
 		var e streamEdit
 		if err := json.Unmarshal(body, &e); err != nil {
@@ -224,7 +242,7 @@ func mustJSONArgsForTest(pairs ...string) string {
 // received is asserted.
 func TestPollStreamCardEndToEnd(t *testing.T) {
 	fake := &streamFake{updates: []Update{
-		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "hi"}},
+		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "hi", From: &TGUser{ID: 77}}},
 	}}
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
@@ -303,7 +321,7 @@ func TestPollStreamCardEndToEnd(t *testing.T) {
 // when the handler returns nil stats.
 func TestPollStreamNoFooterWhenStatsNil(t *testing.T) {
 	fake := &streamFake{updates: []Update{
-		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 9}, Text: "hi"}},
+		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 9}, Text: "hi", From: &TGUser{ID: 9}}},
 	}}
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
@@ -337,7 +355,7 @@ func TestPollStreamNoFooterWhenStatsNil(t *testing.T) {
 // calls sends no card message at all.
 func TestPollStreamNoToolCallsSendsNoCard(t *testing.T) {
 	fake := &streamFake{updates: []Update{
-		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 9}, Text: "hi"}},
+		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 9}, Text: "hi", From: &TGUser{ID: 9}}},
 	}}
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
@@ -375,7 +393,7 @@ func TestPollStreamEditFailureFallsBackToFreshCard(t *testing.T) {
 	fake := &streamFake{
 		failFirstEdit: true,
 		updates: []Update{
-			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 11}, Text: "hi"}},
+			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 11}, Text: "hi", From: &TGUser{ID: 11}}},
 		},
 	}
 	srv := httptest.NewServer(fake)
@@ -420,7 +438,7 @@ func TestPollStreamEditFailureFallsBackToFreshCard(t *testing.T) {
 // redacted apology and the card gets a final edit showing the failure.
 func TestPollStreamHandlerError(t *testing.T) {
 	fake := &streamFake{updates: []Update{
-		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 13}, Text: "boom"}},
+		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 13}, Text: "boom", From: &TGUser{ID: 13}}},
 	}}
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
@@ -545,7 +563,7 @@ func TestSendChatAction(t *testing.T) {
 // wrapper over PollStream (no card, no footer).
 func TestPollWrapperStillStreams(t *testing.T) {
 	fake := &streamFake{updates: []Update{
-		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "hi"}},
+		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "hi", From: &TGUser{ID: 77}}},
 	}}
 	srv := httptest.NewServer(fake)
 	defer srv.Close()

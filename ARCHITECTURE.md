@@ -1,8 +1,8 @@
-# Orion Architecture (v0.2.0-rc2)
+# Orion Architecture (v0.2.0-rc8)
 
 ```
 cmd/orion      CLI: run, chat, config, status, tools, memory, skills,
-               subagent, telegram, daemon, version
+               subagent, agents, telegram, daemon, version
 cmd/oriond     Daemon: Telegram polling until interrupted
 internal/app   Wiring: config -> provider -> tools -> memory -> agent
                -> subagents -> skills -> audit. Built exactly once,
@@ -16,8 +16,8 @@ internal/core    Agent loop: system prompt + recent memory -> provider
                -> tool calls -> tool results -> reply. Max steps,
                per-iteration timeouts, ctx cancellation, streaming
                final turn, memory recording, graceful shutdown.
-internal/tools   Registry + 10 tools (shell, files, web, calculator,
-               datetime, process list). Shell delegates denylist
+internal/tools   Registry + 14 tools (shell, files, web, calculator,
+               datetime, process list, subagent). Shell delegates denylist
                checks to internal/security.
 internal/memory  FileStore: JSON file, atomic writes, facts + 200-msg
                conversation history, case-insensitive fact search.

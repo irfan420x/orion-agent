@@ -14,10 +14,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
 	"github.com/irfan/orion/internal/skills"
 	"github.com/irfan/orion/internal/subagent"
@@ -34,7 +36,11 @@ type App struct {
 	Subagents *subagent.Manager
 	Skills    *skills.Registry
 	Audit     *security.AuditLog
-	Logger    *log.Logger
+	// Budget is the per-chat daily token budget (P2-O9), built from
+	// config.PerChatDailyTokenBudget in Build; nil for hand-built
+	// Apps, which are then unbudgeted.
+	Budget *budget.Budget
+	Logger *log.Logger
 	// StartedAt is when the app was built (zero for a hand-built App);
 	// StatusLine reports uptime from it and omits the line when zero.
 	StartedAt time.Time
@@ -61,6 +67,16 @@ type App struct {
 	runMu sync.Mutex
 	runs  map[int64]runRegistration
 	runWG sync.WaitGroup
+	// chats holds one chatSession per Telegram chat (P1-O3
+	// isolation), guarded by chatsMu. chatsMu is always taken
+	// before mu, never after.
+	chatsMu sync.Mutex
+	chats   map[int64]*chatSession
+	// gate is the permission/confirmation gate (P1-O2), installed
+	// by the daemon via SetPermissionGate; nil means ungated (the
+	// CLI never installs one). gateMu guards it.
+	gate   *permissions.Gate
+	gateMu sync.RWMutex
 }
 
 // Build loads config (default path when path == "") and wires every module.
@@ -171,6 +187,7 @@ func Build(path string) (*App, error) {
 	app = &App{
 		Config: cfg, Provider: provider, Tools: registry, Memory: mem,
 		Agent: agent, Subagents: mgr, Skills: skillReg, Audit: audit, Logger: logger,
+		Budget:     budget.New(cfg.PerChatDailyTokenBudget),
 		StartedAt:  time.Now(),
 		typedStore: typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
 	}
@@ -260,8 +277,10 @@ func (a *App) Handle(ctx context.Context, input string) (string, error) {
 	return reply, err
 }
 
-// Close shuts the app down: subagents first, then the agent (which saves
-// and closes memory). It is safe on a zero or partially-built App: nil
+// Close shuts the app down: subagents first, then the per-chat
+// agents (P1-O3 — each saves its chat store and closes only that
+// store), then the global agent (which saves and closes the shared
+// memory). It is safe on a zero or partially-built App: nil
 // subagents/agent are skipped instead of panicking.
 func (a *App) Close() error {
 	if a == nil {
@@ -270,8 +289,15 @@ func (a *App) Close() error {
 	if a.Subagents != nil {
 		a.Subagents.Shutdown()
 	}
-	if a.Agent == nil {
-		return nil
+	var errs []error
+	if err := a.closeChatAgents(); err != nil {
+		errs = append(errs, err)
 	}
-	return a.Agent.Shutdown()
+	if a.Agent == nil {
+		return errors.Join(errs...)
+	}
+	if err := a.Agent.Shutdown(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }

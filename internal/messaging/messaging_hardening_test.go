@@ -20,8 +20,8 @@ func TestPollEnforcesAllowedChats(t *testing.T) {
 	fake := &fakeTelegram{
 		sendCh: make(chan sentMessage, 10),
 		updates: []Update{
-			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 999}, Text: "rm -rf /"}},
-			{UpdateID: 2, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 77}, Text: "hello"}},
+			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 999}, Text: "rm -rf /", From: &TGUser{ID: 999}}},
+			{UpdateID: 2, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 77}, Text: "hello", From: &TGUser{ID: 77}}},
 		},
 	}
 	srv := httptest.NewServer(fake)

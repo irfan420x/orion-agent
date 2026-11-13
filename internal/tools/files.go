@@ -4,7 +4,11 @@
 // and the OS temp directory) and sensitive directories ($HOME/.orion,
 // $HOME/.ssh, $HOME/.gnupg) are never reachable, even when they sit
 // under an allowed root. Symlinks are resolved before the check, so a
-// symlink cannot smuggle a path out of bounds. Reads are capped at 1MB;
+// symlink cannot smuggle a path out of bounds — and files are opened
+// with O_NOFOLLOW and verified against the opened descriptor, so a
+// symlink swapped in between the check and the open cannot redirect
+// the access either (P2-O7); symlinked files are refused outright.
+// Reads are capped at 1MB;
 // writes are capped at 1MB and atomic; every failure is a typed
 // ToolError. Nothing here touches the shell.
 package tools
@@ -12,12 +16,14 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -40,8 +46,21 @@ const (
 	maxFileReadTimeout = 30 * time.Second
 )
 
-// readFileBounded reads up to maxFileRead+1 bytes from path. It
-// returns promptly when ctx is cancelled or after
+// readFileBounded safely opens path and reads up to maxFileRead+1
+// bytes from it. path is the caller's absolute path BEFORE symlink
+// resolution; confined is the confinePath result for the same path.
+// The open uses path (O_NOFOLLOW), never confined: opening the
+// resolved path would follow a symlink that confinePath itself just
+// resolved, so a symlink swapped in before the check would be
+// opened as its target. Opening path refuses a final-component
+// symlink outright, and verifyFdPath then confirms the opened
+// file's true path is exactly confined, so a parent directory
+// swapped after confinePath cannot redirect the read into a
+// sensitive directory either. The returned FileInfo is fstat of
+// the opened file, so the caller's size checks describe the file
+// actually read, not the path as it was before the open.
+//
+// It returns promptly when ctx is cancelled or after
 // maxFileReadTimeout, instead of blocking forever on a fifo with no
 // writer. Reading one byte past the cap is enough to know the file
 // is over the cap; the caller truncates and marks it. A read that
@@ -49,32 +68,186 @@ const (
 // writer appears (or the process exits) — one leaked goroutine per
 // abandoned read, bounded by the number of such reads, which is
 // far better than hanging the tool call.
-func readFileBounded(ctx context.Context, path string) ([]byte, error) {
+func readFileBounded(ctx context.Context, path, confined string) ([]byte, os.FileInfo, error) {
 	type result struct {
 		data []byte
+		info os.FileInfo
 		err  error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		f, err := os.Open(path)
+		f, err := openNoFollow(path)
 		if err != nil {
-			ch <- result{nil, err}
+			ch <- result{nil, nil, err}
 			return
 		}
 		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			ch <- result{nil, nil, err}
+			return
+		}
+		if info.IsDir() {
+			ch <- result{nil, nil, fmt.Errorf("path %q is a directory, not a file", path)}
+			return
+		}
+		if err := verifyFdPath(f, confined); err != nil {
+			ch <- result{nil, nil, err}
+			return
+		}
 		data, err := io.ReadAll(io.LimitReader(f, maxFileRead+1))
-		ch <- result{data, err}
+		ch <- result{data, info, err}
 	}()
 	timer := time.NewTimer(maxFileReadTimeout)
 	defer timer.Stop()
 	select {
 	case r := <-ch:
-		return r.data, r.err
+		return r.data, r.info, r.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	case <-timer.C:
-		return nil, fmt.Errorf("timed out reading %q", path)
+		return nil, nil, fmt.Errorf("timed out reading %q", path)
 	}
+}
+
+// openNoFollow opens path for reading without following a
+// final-component symlink (O_NOFOLLOW). A symlink is refused with a
+// clear error instead of followed: the check (confinePath) and the
+// open must never be separable by a swap in between.
+func openNoFollow(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("path %q is a symlink; symlinked files are refused", path)
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
+// verifyFdPath confirms the already-opened file f is the file at
+// confined: its true on-disk path must be exactly the confined
+// path. On Linux the true path comes from /proc/self/fd, which
+// resolves through every symlink — including a parent directory
+// swapped after confinePath ran — so a swapped parent is caught
+// here even though the open itself succeeded. Where /proc is
+// unavailable (e.g. macOS) it falls back to comparing the opened
+// file's device+inode with a fresh Lstat of the path: a swap
+// between open and Lstat that swaps the inode back is not caught
+// by the fallback, which is documented here rather than assumed
+// away. A file deleted between open and the check is refused
+// (fail-closed).
+func verifyFdPath(f *os.File, confined string) error {
+	if resolved, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); err == nil {
+		resolved = strings.TrimSuffix(resolved, " (deleted)")
+		if filepath.Clean(resolved) != confined {
+			return fmt.Errorf("path %q changed during open (now %q); refusing", confined, resolved)
+		}
+		return nil
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	linfo, err := os.Lstat(confined)
+	if err != nil {
+		return fmt.Errorf("cannot verify %q after open: %w", confined, err)
+	}
+	if !sameFile(info, linfo) {
+		return fmt.Errorf("path %q changed during open; refusing", confined)
+	}
+	return nil
+}
+
+// sameFile reports whether two FileInfos describe the same file
+// (same device and inode). It returns false when the platform does
+// not expose device/inode data, so callers fail closed.
+func sameFile(a, b os.FileInfo) bool {
+	sa, okA := a.Sys().(*syscall.Stat_t)
+	sb, okB := b.Sys().(*syscall.Stat_t)
+	if !okA || !okB {
+		return false
+	}
+	return sa.Dev == sb.Dev && sa.Ino == sb.Ino
+}
+
+// checkWriteTarget refuses a write target that is an existing
+// symlink or directory, by Lstat (which never follows the final
+// component). A symlink target must never be written through: the
+// atomic rename below would replace the link itself, but refusing
+// outright is clearer and closes the swap window before any write
+// happens. A non-existent path is fine.
+func checkWriteTarget(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("path %q is a symlink; symlinked files are refused", path)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("path %q is a directory", path)
+	}
+	return nil
+}
+
+// verifyParentDir re-checks the confinement of dir's longest existing
+// ancestor immediately before creating directories or a temp file
+// under it: confinePath checked the full path earlier, but a parent
+// swapped since then would otherwise let MkdirAll / CreateTemp
+// create files under a sensitive directory. It resolves symlinks
+// the same way confinePath does, and applies the same roots and
+// sensitive-directory rules.
+func verifyParentDir(dir string, roots []string) error {
+	resolved, err := resolveSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	for _, d := range sensitiveDirs() {
+		if within(resolved, d) {
+			return fmt.Errorf("path %q is in a protected directory", dir)
+		}
+	}
+	if len(roots) == 0 {
+		roots = defaultFileRoots()
+	}
+	for _, r := range roots {
+		if within(resolved, r) {
+			return nil
+		}
+	}
+	return fmt.Errorf("path %q is outside the allowed directories (working directory and temp directory)", dir)
+}
+
+// verifyWrittenFile re-opens a just-written file (O_NOFOLLOW, on
+// the caller's unresolved path) and confirms its true path is the
+// confined path, so a parent swapped during the write is caught
+// and the misplaced file can be removed instead of left in the
+// wrong directory.
+func verifyWrittenFile(path, confined string) error {
+	f, err := openNoFollow(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return verifyFdPath(f, confined)
+}
+
+// absClean returns the absolute, cleaned form of a user-supplied
+// path — the form the filesystem operations use, BEFORE symlink
+// resolution. confinePath resolves symlinks on top of this; the
+// two forms are kept separate so opens can use the unresolved path
+// (O_NOFOLLOW) while verification compares against the resolved
+// one. See readFileBounded.
+func absClean(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve path %q: %w", p, err)
+	}
+	return filepath.Clean(abs), nil
 }
 
 // defaultFileRoots are the directories file tools may touch: the process
@@ -225,7 +398,7 @@ type fileReadTool struct {
 func (t *fileReadTool) Name() string { return "file_read" }
 
 func (t *fileReadTool) Description() string {
-	return "Read a text file (up to 1MB) and return its contents. Larger files are truncated to 1MB with a marker stating the true size. Paths are confined to the working directory and the temp directory."
+	return "Read a text file (up to 1MB) and return its contents. Larger files are truncated to 1MB with a marker stating the true size. Paths are confined to the working directory and the temp directory. Symlinked files are refused."
 }
 
 func (t *fileReadTool) Definition() model.ToolDefinition {
@@ -255,12 +428,23 @@ func (t *fileReadTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
 	}
+	// orig is the unresolved absolute path: the open below uses it,
+	// never the resolved path (see readFileBounded).
+	orig, err := absClean(a.Path)
+	if err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
+	}
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
-	info, err := os.Stat(path)
+	// The Stat and the read both describe the OPENED file now
+	// (readFileBounded opens with O_NOFOLLOW and verifies the fd):
+	// a symlink swapped in between confinePath and the open is
+	// refused instead of followed, and the size below is the size
+	// of the file actually read.
+	data, info, err := readFileBounded(ctx, orig, path)
 	if err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot stat %q: %w", path, err)}
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot read %q: %w", path, err)}
 	}
 	if info.IsDir() {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a directory, not a file", path)}
@@ -270,16 +454,12 @@ func (t *fileReadTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	// first megabyte and knows the rest was cut, instead of getting
 	// nothing. readFileBounded reads at most maxFileRead+1 bytes,
 	// so memory stays bounded whatever the file size.
-	data, err := readFileBounded(ctx, path)
-	if err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot read %q: %w", path, err)}
-	}
 	if len(data) > maxFileRead {
-		// The file grew between Stat and ReadFile: truncate and say so
+		// The file grew between fstat and read: truncate and say so
 		// instead of silently returning a partial file. Back off to a
 		// UTF-8 boundary so the cut never splits a multi-byte rune.
-		// When Stat knew the true size (a regular file over the cap),
-		// report it; for a FIFO the size is unknown (0 at Stat) and
+		// When fstat knew the true size (a regular file over the cap),
+		// report it; for a FIFO the size is unknown (0 at fstat) and
 		// the plain marker is used, as the grow-path tests expect.
 		cut := data[:maxFileRead]
 		for len(cut) > 0 && !utf8.Valid(cut) {
@@ -302,7 +482,7 @@ type fileWriteTool struct {
 func (t *fileWriteTool) Name() string { return "file_write" }
 
 func (t *fileWriteTool) Description() string {
-	return "Write content to a file (up to 1MB), creating parent directories as needed. Overwrites an existing file; refuses paths that are directories. Paths are confined to the working directory and the temp directory."
+	return "Write content to a file (up to 1MB), creating parent directories as needed. Overwrites an existing file; refuses paths that are directories. Paths are confined to the working directory and the temp directory. Symlinked files are refused."
 }
 
 func (t *fileWriteTool) Definition() model.ToolDefinition {
@@ -334,23 +514,49 @@ func (t *fileWriteTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
 	}
+	// orig is the unresolved absolute path: every filesystem
+	// operation below uses it, never the resolved path, so a
+	// symlink swapped in after confinePath is met by O_NOFOLLOW /
+	// Lstat on the real path, not resolved away first.
+	orig, err := absClean(a.Path)
+	if err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
+	}
 	if len(a.Content) > maxFileWrite {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("content is %d bytes, over the 1MB write limit", len(a.Content))}
 	}
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
-	if info, err := os.Stat(path); err == nil && info.IsDir() {
-		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a directory", path)}
+	// Refuse an existing symlink or directory before writing: the
+	// rename below would replace a symlink itself, but refusing
+	// outright closes the swap window before any write happens.
+	if err := checkWriteTarget(orig); err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
+	if dir := filepath.Dir(orig); dir != "" && dir != "." {
+		// Re-check the parent's confinement immediately before
+		// creating anything under it (see verifyParentDir): a
+		// parent swapped after confinePath must not receive the
+		// new directories or the temp file.
+		if err := verifyParentDir(dir, t.roots); err != nil {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
+		}
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot create parent directory %q: %w", dir, err)}
 		}
 	}
 	// Atomic write, 0600: agent-written files are not world-readable.
-	if err := atomicWriteFile(path, []byte(a.Content), 0o600); err != nil {
+	if err := atomicWriteFile(orig, []byte(a.Content), 0o600); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot write %q: %w", path, err)}
+	}
+	// Post-write verification: re-open the result (O_NOFOLLOW) and
+	// confirm it landed at the confined path. A parent swapped
+	// during the write is caught here; the misplaced file is
+	// removed rather than left in the wrong directory.
+	if err := verifyWrittenFile(orig, path); err != nil {
+		_ = os.Remove(orig)
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot verify %q after write: %w", path, err)}
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(a.Content), path), nil
 }
@@ -364,7 +570,7 @@ type fileEditTool struct {
 func (t *fileEditTool) Name() string { return "file_edit" }
 
 func (t *fileEditTool) Description() string {
-	return "Replace an exact text match in a file. Fails if old_text is absent or matches more than once. Paths are confined to the working directory and the temp directory."
+	return "Replace an exact text match in a file. Fails if old_text is absent or matches more than once. Paths are confined to the working directory and the temp directory. Symlinked files are refused."
 }
 
 func (t *fileEditTool) Definition() model.ToolDefinition {
@@ -398,15 +604,44 @@ func (t *fileEditTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
 	}
+	// orig is the unresolved absolute path: every filesystem
+	// operation below uses it, never the resolved path (see
+	// readFileBounded).
+	orig, err := absClean(a.Path)
+	if err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
+	}
 	if a.OldText == "" {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("old_text must not be empty")}
 	}
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
-	info, err := os.Stat(path)
+	// Fail fast on symlinks and non-regular files (fifo/socket/
+	// device): the safe open below would block on a writer-less
+	// fifo until the read timeout. This is only a fast path — the
+	// read itself still goes through the O_NOFOLLOW open + fd
+	// verification, so a swap between this check and the open
+	// cannot redirect the read; and a missing file (Lstat error)
+	// falls through to the read, which reports it.
+	if linfo, lerr := os.Lstat(orig); lerr == nil {
+		if linfo.Mode()&os.ModeSymlink != 0 {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a symlink; symlinked files are refused", path)}
+		}
+		if linfo.IsDir() {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a directory, not a file", path)}
+		}
+		if !linfo.Mode().IsRegular() {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is not a regular file", path)}
+		}
+	}
+	// The read describes the OPENED file (O_NOFOLLOW + fd-path
+	// verification inside readFileBounded): a symlink swapped in
+	// between confinePath and the open is refused, and the mode
+	// below is the opened file's mode, not the path's.
+	data, info, err := readFileBounded(ctx, orig, path)
 	if err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot stat %q: %w", path, err)}
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot read %q: %w", path, err)}
 	}
 	if info.IsDir() {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a directory, not a file", path)}
@@ -418,10 +653,6 @@ func (t *fileEditTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	}
 	if info.Size() > maxFileRead {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("file %q is over the 1MB limit", path)}
-	}
-	data, err := readFileBounded(ctx, path)
-	if err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot read %q: %w", path, err)}
 	}
 	content := string(data)
 	count := strings.Count(content, a.OldText)
@@ -440,8 +671,23 @@ func (t *fileEditTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("edited file would be %d bytes, over the 1MB write limit", len(updated))}
 	}
 	// Atomic write, preserving the file's existing permissions.
-	if err := atomicWriteFile(path, []byte(updated), info.Mode().Perm()); err != nil {
+	// Re-check the target first: the file may have been swapped
+	// for a symlink since the read (the rename would replace the
+	// link itself, but refusing outright is clearer).
+	if err := checkWriteTarget(orig); err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
+	}
+	if err := atomicWriteFile(orig, []byte(updated), info.Mode().Perm()); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot write %q: %w", path, err)}
+	}
+	// Post-write verification, as in file_write: a parent swapped
+	// during the write is caught here and the misplaced file is
+	// removed. (The original content is already replaced at this
+	// point when the check fails — the same failure mode as a
+	// crash mid-rename — but nothing is left in the wrong place.)
+	if err := verifyWrittenFile(orig, path); err != nil {
+		_ = os.Remove(orig)
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot verify %q after write: %w", path, err)}
 	}
 	return fmt.Sprintf("edited %s: replaced 1 occurrence (%d bytes -> %d bytes)", path, len(content), len(updated)), nil
 }
@@ -455,7 +701,7 @@ type fileListTool struct {
 func (t *fileListTool) Name() string { return "file_list" }
 
 func (t *fileListTool) Description() string {
-	return "List the entries of a directory, sorted by name, with type and size. Paths are confined to the working directory and the temp directory."
+	return "List the entries of a directory, sorted by name, with type and size. Paths are confined to the working directory and the temp directory. Symlinked directories are refused."
 }
 
 func (t *fileListTool) Definition() model.ToolDefinition {
@@ -481,15 +727,36 @@ func (t *fileListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
 	}
+	// orig is the unresolved absolute path: the open below uses it,
+	// never the resolved path, so a symlink swapped in after
+	// confinePath is met by O_NOFOLLOW on the real path.
+	orig, err := absClean(a.Path)
+	if err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
+	}
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
-	// Read in chunks and stop at maxListRead: a directory with
-	// millions of entries must not exhaust memory. The total is
-	// counted exactly up to that cap and reported as "more than N"
-	// beyond it; the first maxListEntries entries are shown.
-	f, err := os.Open(path)
+	// Open without following a final-component symlink (P2-O7):
+	// a symlinked directory swapped in after confinePath is
+	// refused instead of listed, and the fd-path check below
+	// catches a parent swapped since the check.
+	f, err := os.OpenFile(orig, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a symlink; symlinked directories are refused", path)}
+		}
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot list %q: %w", path, err)}
+	}
+	if info, err := f.Stat(); err != nil {
+		_ = f.Close()
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot list %q: %w", path, err)}
+	} else if !info.IsDir() {
+		_ = f.Close()
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is not a directory", path)}
+	}
+	if err := verifyFdPath(f, path); err != nil {
+		_ = f.Close()
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot list %q: %w", path, err)}
 	}
 	var entries []os.DirEntry

@@ -260,7 +260,7 @@ func TestGetUpdatesParsesAndAdvancesOffset(t *testing.T) {
 		sendCh: make(chan sentMessage, 10),
 		updates: []Update{
 			{UpdateID: 10, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 99}, Text: "first", From: &TGUser{ID: 5, Username: "alice"}}},
-			{UpdateID: 12, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 99}, Text: "second"}},
+			{UpdateID: 12, Message: &TGMessage{MessageID: 2, Chat: TGChat{ID: 99}, Text: "second", From: &TGUser{ID: 99}}},
 		},
 	}
 	srv := httptest.NewServer(fake)
@@ -306,7 +306,7 @@ func TestPollDeliversMessageAndSendsReply(t *testing.T) {
 	fake := &fakeTelegram{
 		sendCh: make(chan sentMessage, 10),
 		updates: []Update{
-			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "hi"}},
+			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "hi", From: &TGUser{ID: 77}}},
 		},
 	}
 	srv := httptest.NewServer(fake)
@@ -365,7 +365,7 @@ func TestPollHandlerError(t *testing.T) {
 	fake := &fakeTelegram{
 		sendCh: make(chan sentMessage, 10),
 		updates: []Update{
-			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 8}, Text: "boom"}},
+			{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 8}, Text: "boom", From: &TGUser{ID: 8}}},
 		},
 	}
 	srv := httptest.NewServer(fake)

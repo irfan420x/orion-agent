@@ -24,6 +24,7 @@ import (
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
 	"github.com/irfan/orion/internal/tools"
 )
@@ -45,6 +46,7 @@ const systemPrompt = `You are Orion, a model-agnostic OS agent running locally o
 	`Never issue a tool call whose arguments depend on the result of another tool call you have not seen yet — for example, do not write a computed value to a file in the same message as the calculation; first call the calculator, read its result, and only then call file_write with that number. ` +
 	`When a request is ambiguous, ask for clarification before acting. ` +
 	`When a request is destructive (deleting, overwriting, shutting down, or otherwise irreversible), confirm exactly what will happen and wait for the user to confirm before doing it. ` +
+	`Destructive and network tools need the user's explicit approval through the permission gate: when a tool call is denied, do not retry the same call — explain what was blocked and offer a safe alternative. ` +
 	`Never run a blocked or destructive command. If a tool refuses an action, explain why and offer a safe alternative. ` +
 	`If you do not know something, say so instead of inventing an answer.` +
 	`
@@ -115,6 +117,14 @@ type Agent struct {
 	// Usage.TotalTokens exactly once; a new turn starts at zero.
 	subagentMu     sync.Mutex
 	subagentTokens int
+	// gate is the permission/confirmation gate (P1-O2), installed
+	// by the daemon via SetPermissionGate. Nil means no gate: the
+	// agent runs ungated, exactly as before (local CLI runs never
+	// install one). gateMu guards it; executeTool reads it on
+	// every tool call, so a gate installed mid-run applies to the
+	// next call.
+	gate   *permissions.Gate
+	gateMu sync.RWMutex
 }
 
 // MaxStepsError is returned by Run/RunStream when the step budget is
@@ -218,6 +228,25 @@ func (a *Agent) resetSubagentUsage() {
 	a.subagentMu.Lock()
 	defer a.subagentMu.Unlock()
 	a.subagentTokens = 0
+}
+
+// SetPermissionGate installs the permission/confirmation gate
+// (P1-O2) the agent consults before executing a tool call. A nil
+// gate removes it (ungated, as before). It is safe for concurrent
+// use with a running turn: the next tool call sees the new gate.
+// The daemon installs one gate per app; local CLI runs install
+// none, so the gate applies to Telegram-driven turns only.
+func (a *Agent) SetPermissionGate(g *permissions.Gate) {
+	a.gateMu.Lock()
+	defer a.gateMu.Unlock()
+	a.gate = g
+}
+
+// permissionGate returns the installed gate, or nil.
+func (a *Agent) permissionGate() *permissions.Gate {
+	a.gateMu.RLock()
+	defer a.gateMu.RUnlock()
+	return a.gate
 }
 
 // SystemPrompt returns Orion's identity and operating rules.
@@ -957,6 +986,20 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 	if !ok {
 		a.logf("tool %q: invalid JSON arguments, feeding error back to model", tc.Name)
 		return fmt.Sprintf("Error: invalid arguments for tool %q: %q is not a JSON object", tc.Name, tc.Arguments)
+	}
+	// Permission/confirmation gate (P1-O2): consulted before the
+	// registry runs anything. A denial is returned as error text
+	// for the model — the loop continues, the model is told not to
+	// retry the same call (system prompt), and nothing crashes.
+	// The gate never runs for ungated agents (nil gate: CLI), and
+	// it can never approve a denylisted command (the gate checks
+	// the denylist itself, and the registry enforces it again
+	// underneath).
+	if g := a.permissionGate(); g != nil {
+		if allowed, reason := g.Check(ctx, tc.Name, tc.Arguments); !allowed {
+			a.logf("tool %q denied by permission gate: %s", tc.Name, reason)
+			return fmt.Sprintf("Error: permission denied for tool %q: %s", tc.Name, reason)
+		}
 	}
 	// The registry enforces the security denylist for shell tools; log
 	// denials here so they are visible in the agent log.
