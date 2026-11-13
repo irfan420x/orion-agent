@@ -4,6 +4,85 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc18] — 2026-11-14
+
+### Audit 13 fixes (v0.2.0-rc18) — see `AUDIT13_2026-11-14.md`
+
+Fixes all three P2s from the fresh-eyes audit of rc17 (0 P0, 0 P1, 3 P2).
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open, and F-A3-2 (no pprof/debug endpoint) is still open.
+Verified by the release coordinator on the final commit: **1,197
+tests pass, 0 fail, 4 skip (total 1,201), 21/21 packages, race clean
+21/21, no data race**; live DeepSeek proof `17*23+5=396` in ~3.3 s
+(rc17: 1,195 total: 1,191 pass, 0 fail, 4 skip).
+
+- **F-A13-1** — The rc17 `clauseVerbAt` predicate never required the
+  candidate itself to be verb-shaped: its following-word rules looked
+  only at what follows the candidate, so a bare noun at a clause end
+  after a plural/compound subject ("…the skill and the venv
+  documentation / handbook / manual / library / overview /
+  framework", "…the skills documentation / handbook / summary"), a
+  noun followed by a preposition/subordinator/adverb ("…the skill
+  documentation for beginners / with examples / when ready /
+  quickly", "…documentation that helps", "…handbook which explains"),
+  or a noun followed by a bare plural ("…the skill reference /
+  documentation tools", "…the venv documentation tools/settings",
+  "…the skill happy tools", "…the venv reference items") was read as
+  a verb phrase and loaded, although it rejected on rc16 (33 shapes).
+  The fix is shape-based on both sides. New helper `isVerbShaped`
+  (`internal/skills/skills.go:1033`) — a verb-form suffix, an
+  object-region verb, or a listed base-form verb — and every
+  following-word rule (article, pronoun, adverb, preposition,
+  subordinator) now requires the candidate to be verb-shaped before
+  it fires; a subordinator after an ambiguous noun ("files that
+  helps") attaches a relative clause, not a subordinate clause. The
+  clause-final plural rule now accepts only listed base-form verbs
+  (`baseFormVerbs`, `skills.go:970`, which gains "dance" and "serve"
+  for F-A12-2), never a bare word with no verb morphology. The
+  bare-plural rule does not fire when the following word is a guarded
+  noun ("tools", "items", "settings") unless the candidate is a
+  listed verb ("dance users", "serve users" — the F-A12-2 pin-down
+  still loads for the right reason); a bare plural that is itself an
+  object-region verb ("documentation runs", "running tests") is the
+  verb of the clause, with the candidate as its subject.
+- **F-A13-2** — The rc17 participle-after rule rejected verb +
+  gerund/participle clauses ("…the venv continue learning/running",
+  "…the skills stop waiting/learning", "…the venv remain
+  waiting/seated", "…the skill files running tests", "…the venv
+  waiting tests" rejected on rc17, loaded on rc16 — 13 shapes).
+  Listed base-form verbs are now exempt before a participle
+  ("continue"/"stop"/"remain" take a gerund/participle complement),
+  and a participle with an object — a bare plural ("files running
+  tests") or an article ("files running the tests") — is a verb
+  phrase whose subject is the candidate. In the compound scan
+  (`compoundSubjectStartsClause`, `skills.go:1437`) a participle is
+  a predicate only once a noun head has been seen (`subjectComplete`,
+  the new 5th parameter of `clauseVerbAt`, `skills.go:1110`): "the
+  venv waiting tests" loads, while "the running tests" still rejects
+  because the subject noun phrase is still open.
+- **F-A13-3** — The rc17 aux-after rule rejected noun-head-subject +
+  copula clauses ("…the skill files/notes/guides/reports are ready",
+  "…the skill training is ready", "…the skill files will help you /
+  have finished" rejected on rc17, loaded on rc16 — 7 shapes). When
+  the word after the candidate is an aux, the clause now exists with
+  the aux as its verb and the candidate as its subject; the same
+  shape covers any other following verb ("the skill files run",
+  "…documentation runs"). A guarded noun ("the skill tools are
+  ready") still rejects, since it returns earlier. Correction to the
+  rc17 notes: "the skill files are ready" was documented as an
+  accepted known limitation, but it LOADED on rc16, so this was a
+  regression, not a pre-existing limitation — it is fixed here, for
+  the right reason (the aux is the verb, not "files").
+- Regression tests: `internal/skills/rc18_skills_test.go` — 6 test
+  functions, 82 subtests (F-A13-1 must-reject, F-A13-2 must-load,
+  F-A13-3 must-load, following-verb must-load, and two guard
+  functions covering the F-A11-1 must-load shapes, the F-A12-1 flip
+  cases, the F-A12-2 base-form cases and the Audit 12 pin-down).
+  Negative control verified: on unmodified rc17 the four finding
+  functions fail (57 subtests) while the two guard functions pass,
+  exactly as designed; the fix was stashed and restored byte-identical
+  (diff hash 6646fbbb… verified before and after).
+
 ## [0.2.0-rc17] — 2026-11-14
 
 ### Audit 12 fixes (v0.2.0-rc17) — see `AUDIT12_2026-11-14.md`
