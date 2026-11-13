@@ -94,9 +94,14 @@ func (a *typedStoreAdapter) MarkTypedMemoryStale(name string) error {
 // into the agent. Every step is best-effort: a failure degrades to v1
 // recall rather than failing startup — the daemon must stay up even
 // if the typed layer cannot open. It returns the opened layers (nil
-// when unavailable) for the App to keep for the Telegram commands.
-func wireMemoryV2(logger *log.Logger, dataDir string, mem *memory.FileStore, agent *core.Agent) (*memory.TypedStore, *memory.SessionLog) {
+// when unavailable) for the App to keep for the Telegram commands,
+// plus the typed-store adapter the parent agent uses — subagent
+// children get a read-only view over the same adapter (see
+// readOnlyTypedSource in subagent.go), never the adapter itself,
+// because the adapter can persist stale markers.
+func wireMemoryV2(logger *log.Logger, dataDir string, mem *memory.FileStore, agent *core.Agent) (*memory.TypedStore, *memory.SessionLog, *typedStoreAdapter) {
 	var ts *memory.TypedStore
+	var typedAdapter *typedStoreAdapter
 	if store, err := memory.NewTypedStore(dataDir, memory.WithMigrateOnOpen(mem)); err != nil {
 		logger.Printf("memory: typed store with migration failed (%v); retrying without migration", err)
 		if store2, err2 := memory.NewTypedStore(dataDir); err2 != nil {
@@ -108,7 +113,8 @@ func wireMemoryV2(logger *log.Logger, dataDir string, mem *memory.FileStore, age
 		ts = store
 	}
 	if ts != nil {
-		agent.SetTypedMemorySource(newTypedStoreAdapter(ts))
+		typedAdapter = newTypedStoreAdapter(ts)
+		agent.SetTypedMemorySource(typedAdapter)
 	}
 	var slog *memory.SessionLog
 	if l, err := memory.NewSessionLog(dataDir); err != nil {
@@ -117,7 +123,7 @@ func wireMemoryV2(logger *log.Logger, dataDir string, mem *memory.FileStore, age
 		slog = l
 		agent.SetSessionMemoryAppender(slog)
 	}
-	return ts, slog
+	return ts, slog, typedAdapter
 }
 
 // TypedMemories lists the typed memories (nil store degrades to an

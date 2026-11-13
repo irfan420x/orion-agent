@@ -21,13 +21,13 @@ import (
 func TestForget(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
 		close(started)
 		select {
 		case <-release:
-			return "done:" + brief, nil
+			return "done:" + brief, Usage{}, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", Usage{}, ctx.Err()
 		}
 	})
 	defer m.Shutdown()
@@ -65,8 +65,8 @@ func TestForget(t *testing.T) {
 // daemon run cannot grow List/WaitAll without bound. Running tasks
 // are never evicted.
 func TestEvictsOldestFinished(t *testing.T) {
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
-		return "ok", nil
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
+		return "ok", Usage{}, nil
 	})
 	defer m.Shutdown()
 	const total = maxEntries + 5
@@ -97,8 +97,8 @@ func TestEvictsOldestFinished(t *testing.T) {
 // be a no-op — the task context is released on completion (defer
 // cancel in runTask) instead of living until the per-task timeout.
 func TestSpawnedTaskContextReleased(t *testing.T) {
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
-		return "fast", nil
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
+		return "fast", Usage{}, nil
 	})
 	defer m.Shutdown()
 	id, err := m.Spawn("fast", 5*time.Minute)

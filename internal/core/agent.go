@@ -98,6 +98,13 @@ type Agent struct {
 	toolCallsSinceExtract int
 	turnsSinceExtract     int
 	sessionExtractor      sessionExtractorFunc
+	// subagentMu guards subagentTokens: tokens of subagent results
+	// the parent consumed during the current turn (reported via
+	// AddSubagentUsage by the subagent_result tool). The turn's
+	// finishTurn adds the accumulated total to the turn's
+	// Usage.TotalTokens exactly once; a new turn starts at zero.
+	subagentMu     sync.Mutex
+	subagentTokens int
 }
 
 // MaxStepsError is returned by Run/RunStream when the step budget is
@@ -163,6 +170,44 @@ func NewAgent(cfg *config.Config, provider model.Provider, registry *tools.Regis
 		surfaced: map[string]struct{}{},
 		stale:    map[string]struct{}{},
 	}, nil
+}
+
+// AddSubagentUsage adds tokens from a subagent result the parent
+// consumed (first fetch of a finished result) to the current turn's
+// subagent total. It implements tools.SubagentUsageSink. It is safe
+// for concurrent use: subagent completions race each other and the
+// parent turn, so the accumulator is mutex-guarded. Non-positive
+// values are ignored. Tokens added after the current turn finished
+// (a subagent fetched late, or never fetched during a turn) are
+// dropped by the next turn's reset — usage is attributed to the turn
+// that consumed the result, never carried across turns.
+func (a *Agent) AddSubagentUsage(tokens int) {
+	if tokens <= 0 {
+		return
+	}
+	a.subagentMu.Lock()
+	defer a.subagentMu.Unlock()
+	a.subagentTokens += tokens
+}
+
+// takeSubagentUsage returns the accumulated subagent tokens for the
+// current turn and resets the accumulator to zero. Called exactly
+// once per turn, from finishTurn.
+func (a *Agent) takeSubagentUsage() int {
+	a.subagentMu.Lock()
+	defer a.subagentMu.Unlock()
+	tokens := a.subagentTokens
+	a.subagentTokens = 0
+	return tokens
+}
+
+// resetSubagentUsage drops any subagent tokens accumulated outside a
+// turn (e.g. a late subagent completion after the previous turn
+// ended) so a new turn starts at zero.
+func (a *Agent) resetSubagentUsage() {
+	a.subagentMu.Lock()
+	defer a.subagentMu.Unlock()
+	a.subagentTokens = 0
 }
 
 // SystemPrompt returns Orion's identity and operating rules.
@@ -267,6 +312,11 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		return "", fmt.Errorf("core: run cancelled before start: %w", err)
 	}
 
+	// A new turn starts with a zero subagent total: tokens from a
+	// subagent that finished after the previous turn ended must not
+	// leak into this turn's accounting (see AddSubagentUsage).
+	a.resetSubagentUsage()
+
 	// Progress-event bookkeeping. Everything below this point is a
 	// real turn, so every return from here on emits exactly one
 	// TurnFinished (guarded by turnFinished); the early validation
@@ -287,6 +337,14 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 			return
 		}
 		turnFinished = true
+		// Subagent usage is a single total: add the tokens of
+		// subagent results consumed during this turn to
+		// TotalTokens only (Prompt/Completion split is unknown
+		// for delegated work — the child reports one total).
+		// takeSubagentUsage also resets the accumulator, so a
+		// second finishTurn (impossible by the guard above)
+		// could never double-count.
+		usage.TotalTokens += a.takeSubagentUsage()
 		a.emit(ProgressEvent{
 			Kind:         EventTurnFinished,
 			Step:         lastStep,

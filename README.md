@@ -3,9 +3,14 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc4.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc6.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested. The TypeScript desktop/web UI is v0.2 only (see
+> built and tested (693 tests pass, 0 fail, 3 skip — Ollama live tests;
+> race clean). The model can now delegate to subagents (`subagent_spawn` /
+> `list` / `result` / `stop`), and the footer token count is honest
+> (the 59k-token turn was a real prompt bloat — a stale news feed in
+> history — fixed by a calibrated token estimator; same turn now costs
+> ~3.3k tokens). The TypeScript desktop/web UI is v0.2 only (see
 > [LANGUAGE_DECISION.md](LANGUAGE_DECISION.md)).
 
 ## Quick start

@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -251,6 +252,35 @@ func TestTerminalCardIgnoresNonToolEvents(t *testing.T) {
 	c.Add(core.ProgressEvent{Kind: core.EventTurnFinished, Step: 2})
 	if got := c.Render(); got != cardHeader {
 		t.Fatalf("card = %q, want just the header", got)
+	}
+}
+
+// TestFormatFooterPerTurnTokens pins the footer contract the
+// token-accounting investigation established: the footer shows the
+// PER-TURN total from TurnStats (Usage.TotalTokens of the
+// TurnFinished event, built by app.HandleStream) — never a session
+// cumulative total. The 59,635-token footer on a trivial one-question
+// turn was a real per-turn count (a ~60k-token prompt, mostly a
+// stale RSS feed in history; the provider's own usage object
+// confirmed it), not a cumulative leak — and this test pins that the
+// number rendered is exactly the per-turn value it is handed, so a
+// future change that feeds session totals into TurnStats cannot pass
+// silently: the per-turn and cumulative numbers must never be
+// confused at this layer.
+func TestFormatFooterPerTurnTokens(t *testing.T) {
+	// The turn as measured: 1 step, 59,732 tokens total (59,559
+	// prompt + 173 completion), ~4.0s.
+	turn := &core.TurnStats{Provider: "deepseek", Model: "deepseek-chat", Tokens: 59732, Steps: 1, Duration: 4 * time.Second}
+	if got, want := FormatFooter(turn), "— deepseek-chat · 59,732 tokens · 1 steps · 4.0s"; got != want {
+		t.Fatalf("FormatFooter = %q, want %q", got, want)
+	}
+	// The same turn with a much larger session cumulative total
+	// elsewhere must still render the per-turn number: the footer
+	// takes TurnStats, and TurnStats.Tokens is the per-turn total
+	// by construction (see core.TurnStats and app.HandleStream).
+	sessionCumulative := 500000
+	if got := FormatFooter(turn); strings.Contains(got, "500,000") || strings.Contains(got, strconv.Itoa(sessionCumulative)) {
+		t.Fatalf("FormatFooter = %q, must not contain the session cumulative total %d", got, sessionCumulative)
 	}
 }
 

@@ -46,6 +46,8 @@ func main() {
 		err = cmdSkills(os.Args[2:])
 	case "subagent":
 		err = cmdSubagent(ctx, os.Args[2:])
+	case "agents":
+		err = cmdAgents(ctx, os.Args[2:])
 	case "telegram":
 		err = cmdTelegram(ctx, os.Args[2:])
 	case "daemon":
@@ -116,6 +118,7 @@ Usage:
   orion skills                list loaded skills
   orion skills search <query>
   orion subagent run "brief"  run a brief as a managed child agent
+  orion agents                list subagent tasks (same view as /agents)
   orion telegram test         verify the Telegram bot token (getMe)
   orion telegram poll         start the Telegram gateway (polling)
   orion daemon                run Telegram polling until interrupted
@@ -592,6 +595,27 @@ func cmdSubagent(ctx context.Context, args []string) error {
 		return res.Err
 	}
 	fmt.Println(res.Output)
+	return nil
+}
+
+func cmdAgents(ctx context.Context, args []string) error {
+	if len(args) > 0 && isHelpArg(args[0]) {
+		fmt.Print(`Usage: orion agents
+
+List subagent tasks with status, duration, tokens and result
+summary — the same view as Telegram /agents.
+`)
+		return nil
+	}
+	if len(args) > 0 {
+		return fmt.Errorf("agents: takes no arguments")
+	}
+	a, err := buildApp()
+	if err != nil {
+		return err
+	}
+	defer a.Close()
+	fmt.Println(a.AgentsSummary())
 	return nil
 }
 

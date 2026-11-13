@@ -226,6 +226,56 @@ func TestOllamaChatNullContent(t *testing.T) {
 	}
 }
 
+// --- Footer token accounting: streaming usage is never summed ------
+//
+// A streaming provider that reports usage per chunk reports the
+// CUMULATIVE request usage on every chunk (OpenAI's
+// stream_options.include_usage does this on the final chunk; a
+// server that attaches usage to every chunk repeats the same growing
+// total). Summing those per-chunk values would multiply the real
+// count by the number of chunks — the 59,635-token footer on a
+// one-step turn was investigated for exactly this failure and ruled
+// out: Stream ignores chunk usage entirely and estimates from the
+// request/response (see TestStreamChunkUsageIsNeverSummed). The real
+// cause was the prompt itself (see CountTokens calibration), but
+// this test pins the no-summing invariant so a future chunk-usage
+// reader cannot reintroduce it.
+
+func TestStreamChunkUsageIsNeverSummed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Three content chunks, each carrying a GROWING cumulative
+		// usage object — the shape a provider sends when it
+		// reports usage per chunk. Summing them would give
+		// 1,000 + 50,000 + 59,635 = 110,635 prompt tokens; taking
+		// the last would give 59,635. Both are wrong for this
+		// tiny request: the honest number is the estimate below.
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":1,\"total_tokens\":1001}}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":50000,\"completion_tokens\":2,\"total_tokens\":50002}}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":59635,\"completion_tokens\":3,\"total_tokens\":59638}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	resp, err := mustProvider(t, "openai", srv.URL).Stream(context.Background(), sampleRequest(), func(chunk string) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	// sampleRequest: system "You are helpful." + user "What is 2+2?"
+	// = 10 estimated prompt tokens; reply "Hello" = 1 completion.
+	if resp.Usage.PromptTokens != 10 {
+		t.Fatalf("PromptTokens = %d, want 10 (estimate, not the chunk usage 59635 or the sum 110635)", resp.Usage.PromptTokens)
+	}
+	if resp.Usage.CompletionTokens != 1 {
+		t.Fatalf("CompletionTokens = %d, want 1 (estimate for \"Hello\")", resp.Usage.CompletionTokens)
+	}
+	if resp.Usage.TotalTokens != 11 {
+		t.Fatalf("TotalTokens = %d, want 11", resp.Usage.TotalTokens)
+	}
+}
+
 // --- P2-7: usage fallback only estimates zero fields --------------------
 
 func TestOpenAIUsageFallbackKeepsReportedFields(t *testing.T) {
@@ -244,11 +294,11 @@ func TestOpenAIUsageFallbackKeepsReportedFields(t *testing.T) {
 	if resp.Usage.PromptTokens != 42 {
 		t.Fatalf("PromptTokens = %d, want 42 (reported value must not be overwritten)", resp.Usage.PromptTokens)
 	}
-	if resp.Usage.CompletionTokens != 6 {
-		t.Fatalf("CompletionTokens = %d, want 6 (estimated from 27-char content)", resp.Usage.CompletionTokens)
+	if resp.Usage.CompletionTokens != 7 {
+		t.Fatalf("CompletionTokens = %d, want 7 (estimated from 27-char content: 6 words + 1 comma)", resp.Usage.CompletionTokens)
 	}
-	if resp.Usage.TotalTokens != 48 {
-		t.Fatalf("TotalTokens = %d, want 48 (42 + 6)", resp.Usage.TotalTokens)
+	if resp.Usage.TotalTokens != 49 {
+		t.Fatalf("TotalTokens = %d, want 49 (42 + 7)", resp.Usage.TotalTokens)
 	}
 }
 

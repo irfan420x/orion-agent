@@ -8,6 +8,32 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Subagent delegation — the model can now delegate** (v0.2.0-rc6):
+  the subagent engine (present since v0.1 but unreachable — no tool
+  exposed it, so the bot honestly answered "0 sub-agents") is now
+  wired into the agent loop. Four model-facing tools
+  (`internal/tools/subagent.go`): `subagent_spawn` (brief + optional
+  timeout), `subagent_list`, `subagent_result`, `subagent_stop`,
+  with schemas describing when to delegate (independent research,
+  parallel work, long-running jobs) vs doing the work directly.
+  Each spawn runs a REAL agent loop in a fresh child `core.Agent`
+  (`internal/app/subagent.go`): same provider/config/tools (minus
+  subagent tools, so no recursion), own ephemeral history, read-only
+  typed memories, no shared session writes, same denylist/sandbox
+  rules; maxConcurrent 4, timeouts, cancellation and panic recovery
+  unchanged. `/agents` (Telegram + `orion agents`) renders real
+  subagents (id, status, brief, duration, tokens, result summary).
+  Consumed results (DONE and FAILED — their tokens were genuinely
+  spent) are charged exactly once to the parent turn's usage
+  (`internal/core/agent.go` accumulator, `tools.UsageSinkFunc`
+  resolving the CURRENT agent, so a provider switch no longer
+  orphans the sink). Live proof (DeepSeek, scratch session): the
+  model spawned subagent `f3d2f2386f5a4d90`, which ran its own loop
+  (file_write attempt, 17*23+5 = 396, reasoned report) and its
+  result came back into the parent turn with id, duration and
+  tokens (5,949). 693 tests pass, 0 fail, 3 skip (Ollama live
+  tests), race clean.
+
 - **Memory v2 — Claude Code-inspired typed memories**
   (`internal/memory/typed.go`, `gate.go`, `dates.go`, `feedback.go`,
   `migrate.go`, `session.go`, `internal/core/recall_v2.go`,
@@ -167,6 +193,25 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ARCHITECTURE.md corrected.
 
 ### Fixed
+
+- **Footer token accounting — the 59,635 was real, not a counting
+  bug** (v0.2.0-rc6): a trivial one-question turn reported
+  `deepseek-chat · 59,635 tokens · 1 steps` because a 96,929-rune
+  Google News Bengali RSS feed sat in the recent-10 history window
+  and was re-sent every turn, while the old `runes/4` token estimator
+  undercounted dense content 2.34× (24,232 estimated vs 56,742 real),
+  so the 32,768-token history budget never actually bound real
+  tokens. `CountTokens` (`internal/model/types.go`) is now a
+  BPE-shaped, live-calibrated estimator (short word runs 1 token,
+  long varied runs ~1.4 runes/token, repetitive runs /4, other runes
+  1 token): validated vs DeepSeek real counts — prose 1.03×, code
+  1.06×, Bengali 1.54×, RSS feed 1.06×, conservative everywhere.
+  The footer format is unchanged (`model · tokens · steps ·
+  duration`); the number is now honest. Live before/after on the
+  same question and a frozen copy of the live session: 59,732 →
+  3,337 tokens (1 step), history trim now drops the giant feed
+  units. Streaming double-counting was ruled out (the Telegram path
+  does not stream, and `Stream` never sums chunk usage).
 
 - **Egress proxy regression caught at integration** (timeout
   rework): the first custom `http.Transport` omitted `Proxy`,

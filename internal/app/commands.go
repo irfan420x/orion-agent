@@ -125,9 +125,10 @@ func providerNeedsAPIKey(name string) bool {
 // memory and config (memory is shared, so conversation history and
 // facts survive the switch), the App's Agent/Provider pointers are
 // swapped under the write lock, and the subagent executor is
-// re-pointed at the new agent. A run already in flight keeps the old
-// agent and finishes on it. The old agent is deliberately NOT shut
-// down: Agent.Shutdown would Save+Close the shared memory store.
+// re-pointed at a child-agent factory built on the new provider.
+// A run already in flight keeps the old agent and finishes on it.
+// The old agent is deliberately NOT shut down: Agent.Shutdown would
+// Save+Close the shared memory store.
 //
 // Errors: unknown provider (lists the valid names), or a key-requiring
 // provider with no API key configured (names the missing key). No
@@ -201,10 +202,15 @@ func (a *App) SwitchProvider(name string) error {
 	a.Agent = agent
 	a.Provider = provider
 	if a.Subagents != nil {
-		newAgent := agent
-		a.Subagents.SetExecutor(func(ctx context.Context, brief string) (string, error) {
-			return newAgent.Run(ctx, brief)
-		})
+		// Re-point the subagent executor at a child-agent factory
+		// built on the NEW provider (children share the active
+		// provider). The factory builds a fresh child per spawn,
+		// so it never captures the old agent.
+		// The subagent tools' usage sink resolves the CURRENT
+		// agent on every call (see Build), so no re-pointing is
+		// needed here: tokens from consumed results accrue to
+		// this new agent automatically.
+		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger))
 	}
 	a.mu.Unlock()
 	return nil
@@ -608,6 +614,11 @@ func (a *App) ForgetFact(index int) (string, error) {
 // AgentsSummary renders the /agents view: the subagent manager's
 // tasks (count + IDs, from Manager.List — never fabricated) and the
 // currently running chat turns (the per-chat cancel registry).
+// Per task it shows a short id (first 8 chars of the 16-hex id),
+// status, brief truncated to ~80 runes, duration (elapsed for
+// running tasks, recorded total for finished ones), tokens used when
+// finished, and a result summary truncated to ~200 runes when done
+// (the error text for failed/timed-out tasks).
 func (a *App) AgentsSummary() string {
 	var b strings.Builder
 	if a == nil {
@@ -619,11 +630,37 @@ func (a *App) AgentsSummary() string {
 		tasks := a.Subagents.List()
 		fmt.Fprintf(&b, "Subagents: %d task(s)\n", len(tasks))
 		for _, t := range tasks {
-			brief := t.Brief
-			if len([]rune(brief)) > 60 {
-				brief = string([]rune(brief)[:60]) + "..."
+			brief := truncateRunes(t.Brief, 80)
+			shortID := t.ID
+			if len([]rune(shortID)) > 8 {
+				shortID = string([]rune(shortID)[:8])
 			}
-			fmt.Fprintf(&b, "  • %s [%s] %s\n", t.ID, t.Status, brief)
+			// Duration is elapsed time for running tasks and the
+			// recorded total for finished ones.
+			duration := time.Since(t.StartedAt)
+			res, finished := a.Subagents.GetResult(t.ID)
+			if finished {
+				duration = res.Duration
+			}
+			fmt.Fprintf(&b, "  • %s [%s] %s (%s)", shortID, t.Status, brief, duration.Round(time.Second))
+			if finished {
+				// Tokens are shown only when the task reported
+				// any (a failed task may report zero); the
+				// summary is the output for done tasks and the
+				// error text otherwise.
+				if res.Usage.Tokens > 0 {
+					fmt.Fprintf(&b, ", %d tokens", res.Usage.Tokens)
+				}
+				summary := res.Output
+				if res.Err != nil {
+					summary = "error: " + res.Err.Error()
+				}
+				summary = strings.TrimSpace(summary)
+				if summary != "" {
+					fmt.Fprintf(&b, "\n      ↳ %s", truncateRunes(summary, 200))
+				}
+			}
+			b.WriteString("\n")
 		}
 	}
 	chats := a.RunningChats()

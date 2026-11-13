@@ -13,12 +13,12 @@ import (
 // sleepExecutor returns an executor that waits for d (respecting ctx)
 // and then returns output, or ctx.Err() if the context ends first.
 func sleepExecutor(d time.Duration, output string) Executor {
-	return func(ctx context.Context, brief string) (string, error) {
+	return func(ctx context.Context, brief string) (string, Usage, error) {
 		select {
 		case <-time.After(d):
-			return output + ":" + brief, nil
+			return output + ":" + brief, Usage{}, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", Usage{}, ctx.Err()
 		}
 	}
 }
@@ -156,9 +156,9 @@ func TestTimeoutTask(t *testing.T) {
 
 func TestTimeoutWithUncooperativeExecutor(t *testing.T) {
 	// Executor ignores ctx entirely; the Manager must still time out.
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
 		time.Sleep(500 * time.Millisecond)
-		return "too late", nil
+		return "too late", Usage{}, nil
 	})
 	defer m.Shutdown()
 
@@ -180,8 +180,8 @@ func TestTimeoutWithUncooperativeExecutor(t *testing.T) {
 
 func TestFailingExecutor(t *testing.T) {
 	boom := errors.New("boom")
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
-		return "", boom
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
+		return "", Usage{}, boom
 	})
 	defer m.Shutdown()
 
@@ -203,12 +203,12 @@ func TestFailingExecutor(t *testing.T) {
 
 func TestAtCapacity(t *testing.T) {
 	release := make(chan struct{})
-	blocking := func(ctx context.Context, brief string) (string, error) {
+	blocking := func(ctx context.Context, brief string) (string, Usage, error) {
 		select {
 		case <-release:
-			return "released", nil
+			return "released", Usage{}, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", Usage{}, ctx.Err()
 		}
 	}
 	m := NewManagerWithExecutor(1, blocking)
@@ -274,9 +274,9 @@ func TestCancelStopsRunningTask(t *testing.T) {
 
 func TestCancelUncooperativeExecutor(t *testing.T) {
 	// Executor ignores ctx; Cancel must still end the task promptly.
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
 		time.Sleep(30 * time.Second)
-		return "too late", nil
+		return "too late", Usage{}, nil
 	})
 	defer m.Shutdown()
 
@@ -430,7 +430,7 @@ func TestShutdownCancelsRunningTasks(t *testing.T) {
 }
 
 func TestExecutorPanicBecomesFailure(t *testing.T) {
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
 		panic("boom")
 	})
 	defer m.Shutdown()
@@ -467,14 +467,59 @@ func TestSetExecutor(t *testing.T) {
 	}
 }
 
+// TestResultRecordsUsage: an executor that reports usage must have it
+// recorded on the Result, so the tools layer can charge it when the
+// parent consumes the result.
+func TestResultRecordsUsage(t *testing.T) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
+		return "used:" + brief, Usage{Tokens: 42}, nil
+	})
+	defer m.Shutdown()
+	id, err := m.Spawn("work", time.Minute)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	res, err := m.Wait(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if res.Usage.Tokens != 42 {
+		t.Fatalf("Usage.Tokens = %d, want 42", res.Usage.Tokens)
+	}
+	if got, ok := m.GetResult(id); !ok || got.Usage.Tokens != 42 {
+		t.Fatalf("GetResult usage = %+v, %v, want 42 tokens", got, ok)
+	}
+}
+
+// TestResultUsageZeroWhenExecutorNeverCompletes: a task that times out
+// (executor's late result discarded) records zero usage.
+func TestResultUsageZeroWhenExecutorNeverCompletes(t *testing.T) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
+		time.Sleep(500 * time.Millisecond)
+		return "late", Usage{Tokens: 99}, nil
+	})
+	defer m.Shutdown()
+	id, err := m.Spawn("slow", 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	res, err := m.Wait(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if res.Usage.Tokens != 0 {
+		t.Fatalf("Usage.Tokens = %d, want 0 (late result discarded)", res.Usage.Tokens)
+	}
+}
+
 // TestConcurrentSpawnAndCollect spawns many tasks from many goroutines
 // at once and collects every result. Under -race any unsynchronised
 // access to the Manager's registry, semaphore, or task entries fails.
 func TestConcurrentSpawnAndCollect(t *testing.T) {
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
 		// Vary the delay by brief so tasks finish out of order.
 		time.Sleep(time.Duration(len(brief)%5+1) * time.Millisecond)
-		return "out:" + brief, nil
+		return "out:" + brief, Usage{}, nil
 	})
 	defer m.Shutdown()
 
@@ -557,12 +602,12 @@ func TestConcurrentSpawnAndCollect(t *testing.T) {
 // The registry must stay consistent and -race must stay silent.
 func TestConcurrentObservers(t *testing.T) {
 	release := make(chan struct{})
-	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, error) {
+	m := NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, Usage, error) {
 		select {
 		case <-release:
-			return "released:" + brief, nil
+			return "released:" + brief, Usage{}, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", Usage{}, ctx.Err()
 		}
 	})
 	defer m.Shutdown()

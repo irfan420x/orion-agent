@@ -57,13 +57,24 @@ type Task struct {
 }
 
 // Result is the outcome of a finished subagent task. Err is non-nil
-// for failed and timed-out tasks.
+// for failed and timed-out tasks. Usage records what the executor
+// reported the task consumed; it is zero for tasks that never ran the
+// executor to completion (timeout, cancellation, panic).
 type Result struct {
 	TaskID     string
 	Output     string
 	Err        error
+	Usage      Usage
 	Duration   time.Duration
 	FinishedAt time.Time
+}
+
+// Usage is the resource consumption one subagent task reported. Tokens
+// is the executor's token count for the whole task (prompt + completion
+// across its own agent loop); the parent charges it when it consumes
+// the result, never at spawn time.
+type Usage struct {
+	Tokens int
 }
 
 // TaskStatus is a snapshot of one task for List.
@@ -74,13 +85,14 @@ type TaskStatus struct {
 	StartedAt time.Time
 }
 
-// Executor runs one brief and returns its output. Implementations must
-// respect ctx cancellation/timeout where possible; the Manager enforces
-// the timeout regardless, so an executor that ignores ctx is still
-// recorded as timed out on schedule (its late result is discarded).
+// Executor runs one brief and returns its output plus the usage it
+// consumed. Implementations must respect ctx cancellation/timeout
+// where possible; the Manager enforces the timeout regardless, so an
+// executor that ignores ctx is still recorded as timed out on schedule
+// (its late result — output and usage — is discarded).
 // The real agent loop is plugged in by the caller via
 // NewManagerWithExecutor or SetExecutor.
-type Executor func(ctx context.Context, brief string) (string, error)
+type Executor func(ctx context.Context, brief string) (output string, usage Usage, err error)
 
 // taskEntry is the Manager's internal record for one task. done is
 // closed exactly once, when the task finishes and result is set.
@@ -261,6 +273,7 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 
 	type outcome struct {
 		output string
+		usage  Usage
 		err    error
 	}
 	ch := make(chan outcome, 1)
@@ -270,18 +283,19 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 				ch <- outcome{err: fmt.Errorf("subagent: executor panicked: %v", r)}
 			}
 		}()
-		out, err := entry.exec(ctx, entry.task.Brief)
-		ch <- outcome{output: out, err: err}
+		out, usage, err := entry.exec(ctx, entry.task.Brief)
+		ch <- outcome{output: out, usage: usage, err: err}
 	}()
 
 	start := entry.startedAt
 	var output string
+	var usage Usage
 	var err error
 	var status Status
 
 	select {
 	case o := <-ch:
-		output, err = o.output, o.err
+		output, usage, err = o.output, o.usage, o.err
 		switch {
 		case ctx.Err() == context.DeadlineExceeded:
 			status = StatusTimeout
@@ -318,6 +332,7 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 		TaskID:     entry.task.ID,
 		Output:     output,
 		Err:        err,
+		Usage:      usage,
 		Duration:   finishedAt.Sub(start),
 		FinishedAt: finishedAt,
 	}
