@@ -78,10 +78,23 @@ func (a *Agent) EventHandler() EventHandler {
 // blocks on a running run: the handler is read under eventHandlerMu
 // at each emission, so a run in flight may or may not observe a
 // handler set mid-run, but it never deadlocks and never races.
+//
+// Prefer RunWithEventHandler for per-run handlers: SetEventHandler
+// is agent-wide, so two concurrent runs on one Agent race on it
+// (Audit 4 B P1-2). SetEventHandler stays for callers that own the
+// Agent outright (e.g. a subagent child, one run per Agent).
 func (a *Agent) SetEventHandler(h EventHandler) {
 	a.eventHandlerMu.Lock()
 	defer a.eventHandlerMu.Unlock()
 	a.eventHandler = h
+}
+
+// setRunHandler installs (or clears, with nil) the per-run handler
+// for the run currently holding runMu. Called only from run().
+func (a *Agent) setRunHandler(h EventHandler) {
+	a.runHandlerMu.Lock()
+	defer a.runHandlerMu.Unlock()
+	a.runHandler = h
 }
 
 // emit delivers one ProgressEvent to the current handler, if any. It
@@ -90,10 +103,19 @@ func (a *Agent) SetEventHandler(h EventHandler) {
 // A panicking handler is recovered and logged via a.logf; it must
 // never crash the loop. emit is called while runMu is held — that is
 // intended, and handlers must not call back into the Agent.
+//
+// Handler precedence: a per-run handler (RunWithEventHandler) wins
+// over the agent-wide handler for that run, so concurrent runs on
+// one Agent each get exactly their own events.
 func (a *Agent) emit(ev ProgressEvent) {
-	a.eventHandlerMu.RLock()
-	h := a.eventHandler
-	a.eventHandlerMu.RUnlock()
+	a.runHandlerMu.RLock()
+	h := a.runHandler
+	a.runHandlerMu.RUnlock()
+	if h == nil {
+		a.eventHandlerMu.RLock()
+		h = a.eventHandler
+		a.eventHandlerMu.RUnlock()
+	}
 	if h == nil {
 		return
 	}

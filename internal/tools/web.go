@@ -43,6 +43,14 @@ var (
 // timeout and is shared process-wide, so a hung search could stall
 // unrelated callers, and any other code mutating DefaultClient would
 // silently change search behaviour.
+//
+// NOTE (Audit 4 P1-4): search no longer uses this client for requests:
+// searchViaAPI/searchViaLite route through a fetchSession (the same
+// pinned-dialer + redirect validation web_fetch uses), so a search
+// result server cannot 302-redirect the search onto a private
+// address (SSRF). The client is kept so existing callers/tests that
+// assert a dedicated, timed-out search client keep compiling; it is
+// not used for live search traffic.
 var searchHTTPClient = &http.Client{Timeout: searchTimeout}
 
 // ipResolver is the minimal DNS interface web_fetch needs. It exists
@@ -479,7 +487,24 @@ func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 
 // ---------------------------------------------------------------- web_search
 
-type webSearchTool struct{}
+type webSearchTool struct {
+	// trusted holds the deployment's trusted egress CIDRs, parsed
+	// once at construction (see newWebSearchTool). The zero value is
+	// the strict default: no trusted ranges.
+	trusted []*net.IPNet
+}
+
+// newWebSearchTool builds a web_search tool trusting the given egress
+// CIDRs (config trusted_egress_cidrs). A malformed CIDR fails loudly
+// here, at construction, rather than being silently ignored per
+// search — mirroring newWebFetchTool.
+func newWebSearchTool(trustedCIDRs []string) (*webSearchTool, error) {
+	nets, err := parseTrustedEgressCIDRs(trustedCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("tools: web_search: %w", err)
+	}
+	return &webSearchTool{trusted: nets}, nil
+}
 
 func (t *webSearchTool) Name() string { return "web_search" }
 
@@ -535,10 +560,10 @@ func (t *webSearchTool) Execute(ctx context.Context, args json.RawMessage) (stri
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("count must be between 1 and 20")}
 	}
 
-	results, apiErr := searchViaAPI(ctx, query, count)
+	results, apiErr := t.searchViaAPI(ctx, query, count)
 	if len(results) == 0 {
 		// Fall back to the lite HTML results page.
-		liteResults, liteErr := searchViaLite(ctx, query, count)
+		liteResults, liteErr := t.searchViaLite(ctx, query, count)
 		if len(liteResults) > 0 {
 			results = liteResults
 		} else if apiErr != nil {
@@ -585,16 +610,42 @@ type ddgAPIResponse struct {
 	} `json:"Results"`
 }
 
+// searchViaAPI queries the DuckDuckGo Instant Answer API. It routes
+// through a fetchSession (pinned dialer + redirect validation, the
+// same SSRF guard web_fetch uses): the search host is resolved and
+// validated once, and every redirect hop is re-validated before it
+// is followed, so a search endpoint cannot bounce the request onto a
+// private address. The package-level wrapper keeps the old call
+// shape for tests; production code goes through the tool (which
+// carries the trusted egress CIDRs).
 func searchViaAPI(ctx context.Context, query string, count int) ([]searchResult, error) {
+	return (&webSearchTool{}).searchViaAPI(ctx, query, count)
+}
+
+func (t *webSearchTool) searchViaAPI(ctx context.Context, query string, count int) ([]searchResult, error) {
+	var trusted []*net.IPNet
+	if t != nil {
+		trusted = t.trusted
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 	u := searchAPIBase + "/?q=" + url.QueryEscape(query) + "&format=json&no_html=1"
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return nil, err
+	}
+	session := newFetchSession(trusted)
+	if err := session.resolveHost(reqCtx, parsed.Host); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", userAgent)
-	resp, err := searchHTTPClient.Do(req)
+	client := session.newClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -688,16 +739,39 @@ func hasClass(classAttr, want string) bool {
 	return false
 }
 
+// searchViaLite queries the DuckDuckGo lite HTML results page. Like
+// searchViaAPI it routes through a fetchSession (pinned dialer +
+// redirect validation), so a lite endpoint cannot bounce the request
+// onto a private address. The package-level wrapper keeps the old
+// call shape for tests; production code goes through the tool.
 func searchViaLite(ctx context.Context, query string, count int) ([]searchResult, error) {
+	return (&webSearchTool{}).searchViaLite(ctx, query, count)
+}
+
+func (t *webSearchTool) searchViaLite(ctx context.Context, query string, count int) ([]searchResult, error) {
+	var trusted []*net.IPNet
+	if t != nil {
+		trusted = t.trusted
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 	u := strings.TrimRight(searchLiteBase, "/") + "/lite/?q=" + url.QueryEscape(query)
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return nil, err
+	}
+	session := newFetchSession(trusted)
+	if err := session.resolveHost(reqCtx, parsed.Host); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", userAgent)
-	resp, err := searchHTTPClient.Do(req)
+	client := session.newClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

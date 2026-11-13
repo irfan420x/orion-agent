@@ -483,6 +483,10 @@ func TestSearchDoesNotUseDefaultClient(t *testing.T) {
 	if searchHTTPClient.Timeout <= 0 {
 		t.Fatalf("searchHTTPClient.Timeout = %v, want a positive timeout", searchHTTPClient.Timeout)
 	}
+	// The test servers are on 127.0.0.1, which the search SSRF guard
+	// blocks by default; the override is test-only.
+	allowPrivateFetchHosts = true
+	t.Cleanup(func() { allowPrivateFetchHosts = false })
 	old := http.DefaultClient
 	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("http.DefaultClient must not be used by search")
@@ -521,6 +525,8 @@ func TestSearchDoesNotUseDefaultClient(t *testing.T) {
 // class comes before href or href comes before class, and non-result
 // anchors are ignored.
 func TestSearchViaLiteAttributeOrder(t *testing.T) {
+	allowPrivateFetchHosts = true
+	t.Cleanup(func() { allowPrivateFetchHosts = false })
 	liteSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<html><body>
 			<a class="result-link" href="https://example.com/class-first">Class First</a>

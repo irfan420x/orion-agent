@@ -91,6 +91,53 @@ var (
 	ErrEmptyMemoryBody = errors.New("memory: typed memory body must not be empty")
 )
 
+// MemoryProvenance records where a typed memory came from. It is
+// the prompt-injection defence (Audit 4 A P1-3): text the model
+// produced must never be promoted to standing guidance, so every
+// memory carries its origin and recall treats non-user provenance
+// as data, never as an instruction.
+//
+//   - ProvenanceUser — written by the user (or by an explicit
+//     user-confirmed save, e.g. NewFeedbackMemory). Only these may
+//     become feedback memories.
+//   - ProvenanceMigrated — copied from the JSON facts by
+//     MigrateFacts. Always type project, never feedback.
+//   - ProvenanceModelDerived — produced by the model (session
+//     extraction, /compress summaries). Never feedback; rendered
+//     as data.
+//   - "" (empty) — legacy files written before provenance existed;
+//     treated as user-written for rendering (grandfathered), but
+//     TypedStore.Save refuses to CREATE a feedback memory with an
+//     empty provenance through any path except NewFeedbackMemory,
+//     which always sets it.
+type MemoryProvenance string
+
+const (
+	ProvenanceUser         MemoryProvenance = "user"
+	ProvenanceMigrated     MemoryProvenance = "migrated"
+	ProvenanceModelDerived MemoryProvenance = "model-derived"
+)
+
+// ValidMemoryProvenance reports whether p is a known provenance
+// (empty counts as valid: legacy files predate the field).
+func ValidMemoryProvenance(p MemoryProvenance) bool {
+	switch p {
+	case "", ProvenanceUser, ProvenanceMigrated, ProvenanceModelDerived:
+		return true
+	}
+	return false
+}
+
+// ParseMemoryProvenance parses a provenance string; anything
+// unknown is an error, never silently defaulted.
+func ParseMemoryProvenance(s string) (MemoryProvenance, error) {
+	p := MemoryProvenance(strings.TrimSpace(strings.ToLower(s)))
+	if !ValidMemoryProvenance(p) {
+		return "", fmt.Errorf("memory: unknown memory provenance %q (want one of: user, migrated, model-derived)", s)
+	}
+	return p, nil
+}
+
 // TypedMemory is one typed memory file: frontmatter plus a body.
 type TypedMemory struct {
 	// Name is the human-readable name; it is slugified for the file name.
@@ -102,6 +149,12 @@ type TypedMemory struct {
 	Type MemoryType
 	// Body is the markdown body below the frontmatter.
 	Body string
+	// Provenance records where the memory came from (user-written,
+	// migrated from JSON facts, or model-derived). See
+	// MemoryProvenance: only user provenance may be feedback, and
+	// recall renders non-user provenance as data, never as an
+	// instruction.
+	Provenance MemoryProvenance
 	// UpdatedAt is the file's modification time when loaded from disk
 	// (zero when the memory was constructed in memory and not saved).
 	UpdatedAt time.Time
@@ -275,9 +328,19 @@ func (s *TypedStore) DataDir() string { return s.dataDir }
 // slug already exists overwrites that file (same slug = same memory).
 // Project memories have relative dates in the body converted to
 // absolute dates relative to the save time before writing.
+//
+// Fail-closed provenance (Audit 4 A P1-3): a feedback memory may
+// only be saved with user provenance (written by the user, or built
+// by NewFeedbackMemory from an explicit user confirmation). A
+// migrated or model-derived feedback memory is refused outright —
+// model-derived text must never become standing guidance, however
+// it reached the store.
 func (s *TypedStore) Save(m TypedMemory) error {
 	if err := m.Validate(); err != nil {
 		return err
+	}
+	if m.Type == TypeFeedback && m.Provenance != "" && m.Provenance != ProvenanceUser {
+		return fmt.Errorf("memory: feedback memory %q has provenance %q; only user-written feedback may be saved (model-derived or migrated text must never become standing guidance)", m.Name, string(m.Provenance))
 	}
 	if m.Type == TypeProject {
 		m.Body = ConvertRelativeDates(m.Body, time.Now())
@@ -537,6 +600,13 @@ func ParseTypedMemory(data []byte) (TypedMemory, error) {
 			return TypedMemory{}, fmt.Errorf("memory: frontmatter stale value %q is not true or false", v)
 		}
 	}
+	if v, ok := fields["provenance"]; ok {
+		p, err := ParseMemoryProvenance(v)
+		if err != nil {
+			return TypedMemory{}, err
+		}
+		m.Provenance = p
+	}
 	body := strings.Trim(strings.Join(lines[end+1:], "\n"), "\n")
 	// Keep the body's internal blank lines; only the surrounding
 	// newlines are trimmed. A body that is only whitespace is empty.
@@ -559,6 +629,9 @@ func MarshalTypedMemory(m TypedMemory) ([]byte, error) {
 	fmt.Fprintf(&b, "name: %s\n", quoteValue(strings.TrimSpace(m.Name)))
 	fmt.Fprintf(&b, "description: %s\n", quoteValue(strings.TrimSpace(m.Description)))
 	fmt.Fprintf(&b, "type: %s\n", string(m.Type))
+	if m.Provenance != "" {
+		fmt.Fprintf(&b, "provenance: %s\n", string(m.Provenance))
+	}
 	if m.Stale {
 		b.WriteString("stale: true\n")
 	}

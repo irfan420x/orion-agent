@@ -288,6 +288,10 @@ func TestWebFetchMaxBytes(t *testing.T) {
 }
 
 func TestWebSearchViaAPI(t *testing.T) {
+	// The test server is on 127.0.0.1, which the search SSRF guard
+	// blocks by default; the override is test-only.
+	allowPrivateFetchHosts = true
+	t.Cleanup(func() { allowPrivateFetchHosts = false })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -317,6 +321,8 @@ func TestWebSearchViaAPI(t *testing.T) {
 }
 
 func TestWebSearchLiteFallback(t *testing.T) {
+	allowPrivateFetchHosts = true
+	t.Cleanup(func() { allowPrivateFetchHosts = false })
 	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"AbstractText": "", "RelatedTopics": []}`))

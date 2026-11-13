@@ -77,6 +77,16 @@ var flagPattern = regexp.MustCompile(`--[a-z][a-z0-9\-]*`)
 // extractReferences pulls candidate file/symbol/flag references out
 // of text (a memory body plus description). Results are deduplicated,
 // sorted for determinism, and empty when the text names nothing.
+//
+// Plausibility rule (Audit 4 B P1-3): a bare --flag or Capitalised(
+// in plain prose is NOT a tree claim on its own — flags of external
+// tools ("Deploy with --prod", "pass --no-preserve-root") and
+// ordinary prose symbols ("Call Start( to begin") are not claims
+// about this repo, and treating them as such permanently killed
+// valid guidance. Prose flags/symbols only count as claims when the
+// memory shows code context: a backticked span or a bare file path
+// in the same text. Backticked refs are always claims (backticks
+// signal code intent), as are bare file paths.
 func extractReferences(text string) []codeReference {
 	seen := map[codeReference]struct{}{}
 	add := func(kind refKind, s string) {
@@ -87,8 +97,11 @@ func extractReferences(text string) []codeReference {
 		seen[codeReference{Kind: kind, Text: s}] = struct{}{}
 	}
 
-	// Backticked spans: classify by shape.
-	for _, m := range backtickPattern.FindAllStringSubmatch(text, -1) {
+	// Backticked spans: classify by shape. Any backticked span is
+	// code context for the prose rules below.
+	backticked := backtickPattern.FindAllStringSubmatch(text, -1)
+	hasCodeContext := len(backticked) > 0
+	for _, m := range backticked {
 		inner := strings.TrimSpace(m[1])
 		switch {
 		case strings.HasPrefix(inner, "--"):
@@ -105,9 +118,18 @@ func extractReferences(text string) []codeReference {
 		}
 	}
 
-	// Bare paths in prose.
-	for _, p := range barePathPattern.FindAllString(text, -1) {
+	// Bare paths in prose. A bare path is code context too.
+	barePaths := barePathPattern.FindAllString(text, -1)
+	if len(barePaths) > 0 {
+		hasCodeContext = true
+	}
+	for _, p := range barePaths {
 		add(refFile, strings.TrimPrefix(p, "./"))
+	}
+	if !hasCodeContext {
+		// No code context: prose flags and symbols are not tree
+		// claims, so there is nothing more to extract.
+		return sortedReferences(seen)
 	}
 	// Exported function calls in prose.
 	for _, m := range funcCallPattern.FindAllStringSubmatch(text, -1) {
@@ -118,6 +140,11 @@ func extractReferences(text string) []codeReference {
 		add(refFlag, f)
 	}
 
+	return sortedReferences(seen)
+}
+
+// sortedReferences renders the deduped set as a sorted slice.
+func sortedReferences(seen map[codeReference]struct{}) []codeReference {
 	out := make([]codeReference, 0, len(seen))
 	for r := range seen {
 		out = append(out, r)

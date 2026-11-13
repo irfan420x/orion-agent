@@ -36,6 +36,10 @@ func DefaultRegistryWithSandboxAndTrustedEgress(sandboxCfg sandbox.Config, trust
 	if err != nil {
 		return nil, err
 	}
+	searchTool, err := newWebSearchTool(trustedEgressCIDRs)
+	if err != nil {
+		return nil, err
+	}
 	r := NewRegistry()
 	roots := defaultFileRoots()
 	tools := []Tool{
@@ -45,7 +49,7 @@ func DefaultRegistryWithSandboxAndTrustedEgress(sandboxCfg sandbox.Config, trust
 		&fileEditTool{roots: roots},
 		&fileListTool{roots: roots},
 		fetchTool,
-		&webSearchTool{},
+		searchTool,
 		&calculatorTool{},
 		&datetimeTool{},
 		&processListTool{},

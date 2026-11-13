@@ -6,6 +6,100 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — Audit 4 (v0.2.0-rc7)
+
+All Audit 4 P1 findings (workstreams A security, B stability, C
+install polish) are fixed and re-proven with regression tests; no
+P0s were found. 717 tests pass, 0 fail, 3 skip (Ollama live tests),
+race clean, 14/14 packages.
+
+- **A P1-1 — denylist bypass via variable/command-substitution path
+  indirection** (`internal/security/security.go`): redirect targets
+  and file-op operands (`cp`/`mv`/`ln`/`chown`/`chgrp`/`mkdir`/
+  `rmdir`, `tee`) are now expanded through the per-segment variable
+  assignments (`$var`, `${var}`, `$d/passwd`) before the destructive-
+  target check, and an unresolvable `$` expansion or a command-
+  substitution target (`> $(echo /etc/passwd)`) is refused outright.
+  `${...}` is kept as one token by the tokenizer so it can be
+  resolved. `f=/etc/passwd; echo pwned > $f`, `> ${f}`,
+  `echo x | tee $f`, `cp/mv/ln -sf … $f`, `> $d/passwd` are all
+  refused now; variable indirection to ordinary files stays allowed.
+- **A P1-2 — `chmod` of system paths** (`internal/security/
+  security.go`): any `chmod` with a system-path operand is refused
+  whatever the mode (`chmod 644 /etc/shadow`, `chmod 4755 /bin/sh`,
+  `chmod 000 /etc/passwd`, `chmod u+s /bin/bash`, `chmod g+r
+  /etc/shadow`), mirroring `chown`. Ordinary chmod is unchanged.
+- **A P1-3 — Memory v2 prompt injection** (`internal/memory/
+  typed.go`, `feedback.go`, `migrate.go`, `internal/core/recall_v2.go`,
+  `extraction.go`, `internal/app/commands.go`, `memory_v2.go`,
+  `internal/messaging/commands.go`, `cmd/oriond/main.go`): every
+  typed memory now carries frontmatter provenance (`user` |
+  `migrated` | `model-derived`; legacy files without it are
+  grandfathered as user-written). `TypedStore.Save` refuses feedback
+  with migrated/model-derived provenance; `NewFeedbackMemory`
+  (the only feedback constructor) marks user provenance.
+  `MigrateFacts` marks migrated memories `project` + `migrated` and
+  applies the what-not-to-save gate (derivable facts skipped).
+  Session extraction and `/compress` apply the gate to model-derived
+  text, and `/compress` no longer tells the summariser to "treat
+  [session memory] as established" — it is untrusted recorded text.
+  Recall demotes non-user feedback to topical (selector + surfaced
+  set, never always-on) and renders all injected memories as quoted
+  data under a header stating they are not instructions; only
+  user-provenance feedback is standing guidance. The only way to
+  create a feedback memory is the explicit user command
+  `/memory feedback <name> :: <rule> :: <why> :: <how>` (wired in
+  `buildCommandEnv`; `App.SaveFeedbackMemory`). Trade-off recorded:
+  legacy files without a provenance field are still trusted as
+  user-written — only explicitly-marked non-user provenance is
+  distrusted.
+- **A P1-4 — `web_search` SSRF guard** (`internal/tools/web.go`,
+  `tools.go`): search now routes through the same `fetchSession`
+  pinning/redirect validation as `web_fetch` (per-search session,
+  trusted egress CIDRs plumbed from config). A search endpoint that
+  302-redirects onto a private address is refused before the dial;
+  the private body never surfaces as a result. Existing search
+  tests that hit local servers now use the test-only private-host
+  override, as the `web_fetch` tests do.
+- **B P1-1 — `/model` switch dropped Memory v2**
+  (`internal/app/memory_v2.go`, `app.go`, `commands.go`): the wiring
+  (typed source, session appender, drift root) is factored into one
+  shared step used by both `Build` and `SwitchProvider`, so a switch
+  no longer silently loses typed recall/feedback/drift/extraction.
+  The drift root is now set explicitly at wiring time (nearest
+  ancestor with a `go.mod`, logged) instead of relying on the daemon
+  happening to start in the repo.
+- **B P1-2 — concurrent chats corrupted each other's cards/footers**
+  (`internal/core/agent.go`, `events.go`, `internal/app/commands.go`):
+  `Agent.RunWithEventHandler` installs a per-run handler inside
+  `run()` while `runMu` is held; `emit` prefers it over the
+  agent-wide handler. `HandleStream` uses it, so two concurrent
+  chats each receive exactly their own `TurnFinished` (1/1, proven
+  with a 300 ms slow-provider race test). Concurrency is kept —
+  chats are not serialised.
+- **B P1-3 — drift check permanently killed valid memories**
+  (`internal/core/drift.go`, `recall_v2.go`): prose `--flag` /
+  `Capitalised(` references only count as tree claims when the
+  memory shows code context (a backticked span or a bare file path);
+  `--prod`, `--verbose`, `Start(`, `--no-preserve-root` with no code
+  context are no longer stale. Defence in depth: staleness is
+  persisted only on missing-file evidence — flag/symbol-only drift
+  failures drop the memory for that turn only and are re-verified
+  next turn, so they can resurface. (One pre-existing test case,
+  "bare prose flag is stale", was updated to the new rule; the
+  backticked-flag case still expects stale.)
+- **Install polish** (`cmd/orion/main.go`, `cmd/orion/main_test.go`,
+  `oriond.service`, `README.md`): `ORION_TELEGRAM_BASE_URL` is now
+  honoured by `orion daemon` and `orion telegram poll` (and `test`),
+  not just `oriond` (F7); usage/error strings list `deepseek`
+  alongside the other providers (F8); `orion config set-api-key
+  <provider> -` reads the key from stdin so it never lands in shell
+  history or the process list (F9, documented in README and
+  `--help`); `oriond.service` Documentation URL now points at
+  `https://github.com/irfan420x/orion-agent` (F4-remainder). The
+  workstream-C doc fixes already in the tree (README quick-start,
+  install.sh) are included in this release.
+
 ### Added
 
 - **Subagent delegation — the model can now delegate** (v0.2.0-rc6):
@@ -453,4 +547,4 @@ Loop bugs found by the live Ollama end-to-end runs and fixed in
   namespaces or root; on hosts without them it falls back to the
   denylist alone with a warning. No seccomp filter yet.
 
-[0.1.0]: https://github.com/irfan/orion/releases/tag/v0.1.0
+[0.1.0]: https://github.com/irfan420x/orion-agent/releases/tag/v0.1.0

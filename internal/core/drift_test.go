@@ -91,11 +91,18 @@ func TestDriftCheckExistingVsMissing(t *testing.T) {
 		t.Errorf("driftCheck(missing symbol) stale=false, want true (missing=%v)", missing)
 	}
 
-	// Missing flag: stale.
+	// Missing flag: stale — but only when the flag is a plausible
+	// tree claim. A bare flag in plain prose with no code context
+	// is an external-tool flag, not a claim about this tree, so it
+	// is not stale (Audit 4 B P1-3); a backticked flag is a claim.
 	mem = TypedMemory{Name: "gone-flag", Body: "Pass --no-such-flag to enable it."}
+	if stale, missing := driftCheck(root, mem); stale {
+		t.Errorf("driftCheck(bare prose flag, no code context) stale=true, missing=%v, want not stale (external-tool flag, not a tree claim)", missing)
+	}
+	mem = TypedMemory{Name: "gone-flag-code", Body: "Pass `--no-such-flag` to enable it."}
 	stale, missing = driftCheck(root, mem)
 	if !stale {
-		t.Errorf("driftCheck(missing flag) stale=false, want true (missing=%v)", missing)
+		t.Errorf("driftCheck(backticked missing flag) stale=false, want true (missing=%v)", missing)
 	}
 
 	// Flag that does exist in the tree: not stale.

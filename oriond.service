@@ -36,7 +36,7 @@
 
 [Unit]
 Description=Orion daemon — model-agnostic OS agent (Telegram gateway)
-Documentation=https://github.com/irfan/orion
+Documentation=https://github.com/irfan420x/orion-agent
 After=network-online.target
 Wants=network-online.target
 # Give up (and surface the failure) instead of restarting forever on

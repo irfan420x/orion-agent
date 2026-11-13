@@ -75,8 +75,18 @@ type Agent struct {
 	// and never blocks on a running run.
 	eventHandler   EventHandler
 	eventHandlerMu sync.RWMutex // guards eventHandler
-	shutMu         sync.Mutex   // guards shutDown
-	shutDown       bool
+	// runHandler is the per-run handler installed by
+	// RunWithEventHandler for the run currently holding runMu
+	// (nil when the run came through Run/RunStream). emit prefers
+	// it over eventHandler, so two callers sharing one Agent (two
+	// Telegram chats via HandleStream) each receive exactly their
+	// own run's events instead of racing on one shared handler
+	// (Audit 4 B P1-2). It is set and cleared inside run() while
+	// runMu is held, so at most one run's handler is live.
+	runHandler   EventHandler
+	runHandlerMu sync.RWMutex // guards runHandler
+	shutMu       sync.Mutex   // guards shutDown
+	shutDown     bool
 	// Recall v2 / drift / extraction state (see recall_v2.go,
 	// drift.go, extraction.go). typedMu guards the wired sources
 	// and roots; surfaced/stale/recentTools have their own locks.
@@ -266,7 +276,17 @@ func (a *Agent) maxHistoryTokens() int {
 // directly or the step budget is exhausted. A tool failure is fed back to
 // the model as the tool result; it never aborts the loop on its own.
 func (a *Agent) Run(ctx context.Context, input string) (string, error) {
-	return a.run(ctx, input, false, nil)
+	return a.run(ctx, input, false, nil, nil)
+}
+
+// RunWithEventHandler is Run with a per-run progress-event handler:
+// events from this run (and only this run) go to h, even when other
+// callers share the Agent. A nil h behaves exactly like Run (events
+// go to the agent-wide handler set with SetEventHandler, if any).
+// This is what HandleStream uses: two concurrent chats on one Agent
+// must not steal each other's TurnFinished events (Audit 4 B P1-2).
+func (a *Agent) RunWithEventHandler(ctx context.Context, input string, h EventHandler) (string, error) {
+	return a.run(ctx, input, false, nil, h)
 }
 
 // RunStream is Run, except every step is produced through
@@ -284,13 +304,16 @@ func (a *Agent) RunStream(ctx context.Context, input string, fn func(chunk strin
 	if fn == nil {
 		return "", errors.New("core: stream callback must not be nil")
 	}
-	return a.run(ctx, input, true, fn)
+	return a.run(ctx, input, true, fn, nil)
 }
 
 // run is the shared loop for Run and RunStream. When stream is true
 // every step goes through provider.Stream (exactly one provider call
 // per step); otherwise every step goes through provider.Chat.
-func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn func(chunk string) error) (string, error) {
+// handler, when non-nil, is the per-run event handler for this run
+// only (see RunWithEventHandler); nil means "use the agent-wide
+// handler".
+func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn func(chunk string) error, handler EventHandler) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -300,6 +323,12 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
+
+	// Install the per-run handler for this run only; it is cleared
+	// before runMu is released (defer order: this runs before the
+	// unlock above), so it can never leak into the next run.
+	a.setRunHandler(handler)
+	defer a.setRunHandler(nil)
 
 	a.shutMu.Lock()
 	shutDown := a.shutDown

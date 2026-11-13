@@ -674,6 +674,89 @@ func blockedKill(seg []string) bool {
 	return false
 }
 
+// expandTarget expands $var and ${var} in a redirect target or
+// file-operation operand using the assignments recorded for this
+// command (vars). It reports ok=false when the target contains an
+// expansion that cannot be resolved statically — an unknown
+// variable, a command substitution $(...) or a backquote — because
+// the target cannot then be proven safe: callers must refuse it.
+// A resolved value is the recorded words joined with a space (an
+// assignment's value is tokenized when recorded, so a multi-word
+// value can only come from an explicit multi-word assignment).
+func expandTarget(target string, vars map[string][]string) (string, bool) {
+	if !strings.Contains(target, "$") && !strings.Contains(target, "`") {
+		return target, true
+	}
+	var b strings.Builder
+	for i := 0; i < len(target); {
+		c := target[i]
+		if c == '`' {
+			return "", false // command substitution: unresolvable
+		}
+		if c != '$' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		// '$': must be followed by a variable name, ${name}, or
+		// '(' (command substitution, refused).
+		if i+1 >= len(target) {
+			return "", false
+		}
+		switch {
+		case target[i+1] == '(':
+			return "", false
+		case target[i+1] == '{':
+			end := strings.IndexByte(target[i+2:], '}')
+			if end < 0 {
+				return "", false
+			}
+			name := target[i+2 : i+2+end]
+			if name == "" {
+				return "", false
+			}
+			for j := 0; j < len(name); j++ {
+				if !isVarNameChar(name[j]) {
+					return "", false
+				}
+			}
+			val, ok := vars[name]
+			if !ok || len(val) == 0 {
+				return "", false
+			}
+			b.WriteString(strings.Join(val, " "))
+			i += 2 + end + 1
+		case isVarNameChar(target[i+1]):
+			j := i + 1
+			for j < len(target) && isVarNameChar(target[j]) {
+				j++
+			}
+			val, ok := vars[target[i+1:j]]
+			if !ok || len(val) == 0 {
+				return "", false
+			}
+			b.WriteString(strings.Join(val, " "))
+			i = j
+		default:
+			// $$, $?, $#, $1, ... — not a resolvable variable
+			// reference; refuse rather than guess.
+			return "", false
+		}
+	}
+	return b.String(), true
+}
+
+// destructiveTarget reports whether target, after variable
+// expansion, must be refused as a write destination. An
+// unresolvable expansion is refused outright (see expandTarget).
+func destructiveTarget(target string, vars map[string][]string) bool {
+	expanded, ok := expandTarget(target, vars)
+	if !ok {
+		return true
+	}
+	return isDestructiveTarget(expanded)
+}
+
 // blockedFileOp reports whether a file operation must be refused:
 // cp/mv/ln writing to a system path, chown/chgrp/mkdir/rmdir
 // touching a system path. kind selects which operands count:
@@ -681,7 +764,10 @@ func blockedKill(seg []string) bool {
 // checks every operand (moving a system file away destroys it
 // too), "ln" checks the link path (last operand / -t value), and
 // "chown"/"chgrp"/"mkdir"/"rmdir" check every operand.
-func blockedFileOp(args []string, kind string) bool {
+// Operands are expanded through vars first: a destination reached
+// through a variable (cp /tmp/x $f with f=/etc/passwd) is checked
+// after expansion, and an unresolvable expansion is refused.
+func blockedFileOp(args []string, kind string, vars map[string][]string) bool {
 	var spec flagSpec
 	switch kind {
 	case "cp", "mv", "ln":
@@ -755,31 +841,31 @@ func blockedFileOp(args []string, kind string) bool {
 	}
 	switch kind {
 	case "cp":
-		if targetDir != "" && isDestructiveTarget(targetDir) {
+		if targetDir != "" && destructiveTarget(targetDir, vars) {
 			return true
 		}
-		if len(operands) > 0 && isDestructiveTarget(operands[len(operands)-1]) {
+		if len(operands) > 0 && destructiveTarget(operands[len(operands)-1], vars) {
 			return true
 		}
 	case "mv":
-		if targetDir != "" && isDestructiveTarget(targetDir) {
+		if targetDir != "" && destructiveTarget(targetDir, vars) {
 			return true
 		}
 		for _, op := range operands {
-			if isDestructiveTarget(op) {
+			if destructiveTarget(op, vars) {
 				return true
 			}
 		}
 	case "ln":
-		if targetDir != "" && isDestructiveTarget(targetDir) {
+		if targetDir != "" && destructiveTarget(targetDir, vars) {
 			return true
 		}
-		if len(operands) > 0 && isDestructiveTarget(operands[len(operands)-1]) {
+		if len(operands) > 0 && destructiveTarget(operands[len(operands)-1], vars) {
 			return true
 		}
 	default: // chown, chgrp, mkdir, rmdir
 		for _, op := range operands {
-			if isDestructiveTarget(op) {
+			if destructiveTarget(op, vars) {
 				return true
 			}
 		}
@@ -977,33 +1063,61 @@ func varRef(tok string) (string, bool) {
 }
 
 // blockedChmod handles chmod(1): 777/7777 (and the symbolic equivalents)
-// are refused on any target, and any recursive chmod of a system tree
-// is refused whatever the mode. Ordinary chmod of ordinary files is
-// allowed.
-func blockedChmod(args []string) bool {
+// are refused on any target, and ANY chmod of a system-path operand
+// is refused whatever the mode — chmod 644 /etc/shadow, chmod 4755
+// /bin/sh (setuid), chmod 000 /etc/passwd and chmod u+s /bin/bash
+// are all host damage, not ordinary file work (mirroring chown,
+// which refuses every system-path operand). The mode is the first
+// non-flag operand; everything after it is a target. Targets are
+// expanded through vars first, and an unresolvable expansion is
+// refused. Ordinary chmod of ordinary files is allowed.
+func blockedChmod(args []string, vars map[string][]string) bool {
 	for _, a := range args {
 		switch strings.TrimLeft(a, "0") {
 		case "777", "7777", "a+rwx", "a=rwx", "ugo+rwx", "u=rwx,g=rwx,o=rwx":
 			return true
 		}
 	}
-	recursive := false
-	for _, a := range args {
+	// Parse out the mode (first non-flag operand) and the targets.
+	var targets []string
+	modeSeen := false
+	i := 0
+	for i < len(args) {
+		a := args[i]
 		if a == "--" {
+			i++
+			targets = append(targets, args[i:]...)
 			break
 		}
-		if a == "--recursive" {
-			recursive = true
+		if strings.HasPrefix(a, "--") {
+			name := a[2:]
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				i++
+				continue
+			}
+			if name == "reference" {
+				// --reference takes a value: skip it (it is
+				// read, not modified, so it is not a target).
+				i += 2
+				continue
+			}
+			i++
+			continue
 		}
-		if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "R") {
-			recursive = true
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			i++
+			continue
 		}
+		if !modeSeen {
+			modeSeen = true
+			i++
+			continue
+		}
+		targets = append(targets, a)
+		i++
 	}
-	if !recursive {
-		return false
-	}
-	for _, a := range args {
-		if isDestructiveTarget(a) {
+	for _, t := range targets {
+		if destructiveTarget(t, vars) {
 			return true
 		}
 	}
@@ -1170,16 +1284,32 @@ func redirectTarget(tok string) (string, bool) {
 // blockedRedirect reports whether any output redirection in seg writes
 // to a destructive target (a system path or device). Redirection to
 // ordinary files, /dev/null and the standard streams is allowed.
-func blockedRedirect(seg []string) bool {
+// Targets are expanded through vars first: a target reached through
+// a variable (f=/etc/passwd; echo x > $f, > ${f}, > $d/passwd) is
+// checked after expansion, and an unresolvable $ expansion or a
+// command-substitution target (echo x > $(echo /etc/passwd), where
+// tokenize splits the substitution into its own tokens) is refused
+// outright, because the destination cannot be proven safe.
+func blockedRedirect(seg []string, vars map[string][]string) bool {
 	for i, t := range seg {
 		if target, ok := redirectTarget(t); ok && target != "" {
-			if isDestructiveTarget(target) {
+			if destructiveTarget(target, vars) {
 				return true
 			}
 			continue
 		}
 		if target, ok := redirectTarget(t); ok && target == "" {
-			if i+1 < len(seg) && isDestructiveTarget(seg[i+1]) {
+			if i+1 >= len(seg) {
+				continue
+			}
+			next := seg[i+1]
+			// A bare operator whose next token opens a command
+			// substitution (or is a bare $ left over from one)
+			// writes to whatever that substitution prints.
+			if next == "(" || next == "$" || strings.HasPrefix(next, "$(") || strings.HasPrefix(next, "`") {
+				return true
+			}
+			if destructiveTarget(next, vars) {
 				return true
 			}
 		}
@@ -1219,6 +1349,23 @@ func tokenize(cmd string) []string {
 			ansiSingle = false
 		case quote == 0 && (c == '\'' || c == '"'):
 			quote = c
+		case quote == 0 && c == '$' && i+1 < len(r) && r[i+1] == '{':
+			// ${var} expansion: keep it as one word so the
+			// denylist sees the expansion (and can resolve it
+			// through vars) instead of '{' / '}' splitting it
+			// into segment separators. Consume through the
+			// closing '}' (an unterminated ${ is left as-is and
+			// refused downstream as unresolvable).
+			cur.WriteRune(c)
+			cur.WriteRune(r[i+1])
+			i += 2
+			for i < len(r) && r[i] != '}' {
+				cur.WriteRune(r[i])
+				i++
+			}
+			if i < len(r) {
+				cur.WriteRune(r[i]) // the '}'
+			}
 		case quote == 0 && c == '$' && i+1 < len(r) && (r[i+1] == '\'' || r[i+1] == '"'):
 			// ANSI-C ($'...') and locale ($"...") quoting: the $
 			// is quoting syntax, not part of the word, so it is
@@ -1381,7 +1528,7 @@ func blockedSegment(seg []string, vars map[string][]string) bool {
 			// or configure loop devices: host administration.
 			return len(seg) > 1
 		case "cp", "mv", "ln", "chown", "chgrp", "mkdir", "rmdir":
-			return blockedFileOp(seg[1:], base)
+			return blockedFileOp(seg[1:], base, vars)
 		case "xargs":
 			rest := skipFlags(seg[1:], xargsSpec)
 			rest = skipAssignments(rest)
@@ -1405,7 +1552,14 @@ func blockedSegment(seg []string, vars map[string][]string) bool {
 			return blockedFind(seg[1:], vars)
 		case "tee":
 			for _, a := range seg[1:] {
-				if isDestructiveTarget(a) {
+				// Flags (-a) and "-" (stdout) expand to
+				// themselves and are not destructive; a
+				// variable or substitution target is expanded
+				// and refused when it cannot be proven safe.
+				if strings.HasPrefix(a, "-") || a == "-" {
+					continue
+				}
+				if destructiveTarget(a, vars) {
 					return true
 				}
 			}
@@ -1438,7 +1592,7 @@ func blockedSegment(seg []string, vars map[string][]string) bool {
 			// a disk, and there is no safe general case worth allowing.
 			return true
 		case "chmod":
-			return blockedChmod(seg[1:])
+			return blockedChmod(seg[1:], vars)
 		default:
 			// mkfs, shred, reboot, shutdown, shells, etc: always blocked.
 			return true
@@ -2190,7 +2344,7 @@ func isBlockedCommand(cmd string, outer map[string][]string) bool {
 		// it, so `x=rm; $x -rf /` resolves while an assignment in a
 		// later segment does not affect an earlier one.
 		collectSegmentAssignments(seg, vars)
-		if blockedSegment(seg, vars) || blockedRedirect(seg) {
+		if blockedSegment(seg, vars) || blockedRedirect(seg, vars) {
 			return true
 		}
 	}

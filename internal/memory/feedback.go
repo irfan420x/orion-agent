@@ -97,6 +97,11 @@ func NewFeedbackMemory(kind SaveKind, name, description, rule, why, how string) 
 		Description: strings.TrimSpace(description),
 		Type:        TypeFeedback,
 		Body:        b.String(),
+		// Explicit user confirmation/correction is the ONLY path
+		// that creates a feedback memory (Audit 4 A P1-3): the
+		// provenance marks it user-written, so recall may render
+		// it as standing guidance and TypedStore.Save accepts it.
+		Provenance: ProvenanceUser,
 	}
 	if err := m.Validate(); err != nil {
 		return TypedMemory{}, err

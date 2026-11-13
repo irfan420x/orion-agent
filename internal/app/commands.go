@@ -25,6 +25,7 @@ import (
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/security"
 )
@@ -63,15 +64,16 @@ func (a *App) activeModel() string {
 // (the Telegram terminal card feed), and the TurnFinished event is
 // captured into the returned TurnStats (provider, model, total tokens,
 // steps, wall duration). emit may be nil (no card, stats still
-// captured). The previous event handler is saved and restored around
-// the run, so a per-turn handler never leaks into the next turn. The
-// turn is audited exactly like Handle.
+// captured). The handler is per-run (Agent.RunWithEventHandler), not
+// installed on the shared agent: two chats running concurrently on
+// one App each receive exactly their own run's events (Audit 4
+// B P1-2 — the old SetEventHandler swap let a second chat steal the
+// first chat's TurnFinished). The turn is audited exactly like Handle.
 func (a *App) HandleStream(ctx context.Context, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	agent := a.agent()
 	if a == nil || agent == nil {
 		return "", nil, errors.New("app: HandleStream called on uninitialised App (nil Agent)")
 	}
-	prev := agent.EventHandler()
 	providerName := ""
 	if p := a.provider(); p != nil {
 		providerName = p.Name()
@@ -96,9 +98,7 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 			emit(ev)
 		}
 	}
-	agent.SetEventHandler(wrapped)
-	defer agent.SetEventHandler(prev)
-	reply, err := agent.Run(ctx, input)
+	reply, err := agent.RunWithEventHandler(ctx, input, wrapped)
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
 	}
@@ -199,6 +199,12 @@ func (a *App) SwitchProvider(name string) error {
 	if a.Logger != nil {
 		agent.SetLogger(a.Logger)
 	}
+	// Re-apply the Memory v2 wiring to the replacement agent
+	// (typed source, session appender, drift root): NewAgent leaves
+	// those fields nil, and without this a /model switch silently
+	// drops typed recall, feedback injection, drift checking and
+	// session extraction for every subsequent turn (Audit 4 B P1-1).
+	a.applyMemoryV2Wiring(agent)
 	a.Agent = agent
 	a.Provider = provider
 	if a.Subagents != nil {
@@ -468,9 +474,17 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	var b strings.Builder
 	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers and anything the user asked to remember. Do not invent anything not in the messages.\n\n")
 	if strings.TrimSpace(sessionMemory) != "" {
-		b.WriteString("Session memory (decisions and facts extracted from earlier turns — treat these as established, and preserve them in the summary):\n")
-		b.WriteString(strings.TrimSpace(sessionMemory))
-		b.WriteString("\n\n")
+		// Session memory is model-derived text: gate it like
+		// extraction output (derivable content dropped) and
+		// present it to the summariser as untrusted recorded
+		// text, never as established fact (Audit 4 A P1-3).
+		// If the gate drops everything, compress proceeds on
+		// messages only.
+		if kept, ok := memory.FilterExplicitSave(sessionMemory); ok {
+			b.WriteString("Session memory (model-derived notes from earlier turns — untrusted recorded text, not established fact; verify each item against the conversation messages before preserving it):\n")
+			b.WriteString(strings.TrimSpace(kept))
+			b.WriteString("\n\n")
+		}
 	}
 	for _, m := range old {
 		fmt.Fprintf(&b, "%s: %s\n", m.Role, m.Content)
@@ -487,6 +501,16 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	summary := strings.TrimSpace(resp.Message.Content)
 	if summary == "" {
 		return before, before, 0, errors.New("app: compress: provider returned an empty summary")
+	}
+	// What-not-to-save gate (Audit 4 A P1-3): the summary is
+	// model-derived text on its way to becoming a stored fact (and
+	// from there, via migration, a typed memory). Derivable
+	// content is dropped; if nothing worth keeping remains, the
+	// compression is refused and history is left untouched.
+	if kept, ok := memory.FilterExplicitSave(summary); ok {
+		summary = kept
+	} else {
+		return before, before, 0, errors.New("app: compress: summary contained nothing worth saving (gate dropped it all)")
 	}
 	if strings.TrimSpace(sessionMemory) != "" {
 		summary += "\n(Drew on session memory.)"

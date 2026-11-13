@@ -105,9 +105,10 @@ Usage:
   orion run "prompt"          run one prompt through the agent
   orion chat                  interactive CLI chat (same agent, same memory)
   orion config show           show config (secrets masked)
-  orion config set-provider <openai|anthropic|ollama>
+  orion config set-provider <openai|anthropic|ollama|deepseek>
   orion config set-model <model>
-  orion config set-api-key <openai|anthropic|ollama> <key>
+  orion config set-api-key <openai|anthropic|ollama|deepseek> <key>
+  orion config set-api-key <provider> -   read the key from stdin (avoids shell history / process list)
   orion status                provider, memory, tools, telegram status
   orion tools                 list tools
   orion tools exec <name> '<json args>'
@@ -130,6 +131,17 @@ Usage:
 func isHelpArg(s string) bool { return s == "--help" || s == "-h" }
 
 func buildApp() (*app.App, error) { return app.Build("") }
+
+// applyTelegramBaseURL honours ORION_TELEGRAM_BASE_URL for the CLI's
+// Telegram paths (test, poll and daemon), exactly as oriond does:
+// it points the Bot API client at a self-hosted Bot API server (or a
+// local fake for testing) instead of api.telegram.org. It never
+// carries a secret — only the endpoint.
+func applyTelegramBaseURL() {
+	if baseURL := os.Getenv("ORION_TELEGRAM_BASE_URL"); baseURL != "" {
+		messaging.SetDefaultBaseURL(baseURL)
+	}
+}
 
 // localState is the provider-free slice of the app (see app.Local).
 // Local commands build it through the single shared wiring in
@@ -211,9 +223,10 @@ Type /quit to exit. Takes no arguments.
 func configUsage() {
 	fmt.Print(`Usage:
   orion config show                          show config (secrets masked)
-  orion config set-provider <openai|anthropic|ollama>
+  orion config set-provider <openai|anthropic|ollama|deepseek>
   orion config set-model <model>
-  orion config set-api-key <openai|anthropic|ollama> <key>
+  orion config set-api-key <openai|anthropic|ollama|deepseek> <key>
+  orion config set-api-key <provider> -      read the key from stdin (avoids shell history / process list)
 `)
 }
 
@@ -277,7 +290,7 @@ func cmdConfig(args []string) error {
 	switch args[0] {
 	case "set-provider":
 		if len(args) < 2 {
-			return fmt.Errorf("config set-provider: provide a provider name (openai|anthropic|ollama)")
+			return fmt.Errorf("config set-provider: provide a provider name (openai|anthropic|ollama|deepseek)")
 		}
 		if len(args) > 2 {
 			return fmt.Errorf("config set-provider: takes exactly one provider name (got %q)", strings.Join(args[1:], " "))
@@ -317,7 +330,7 @@ func cmdConfig(args []string) error {
 		// default provider, so the CLI needs a way to store a key for
 		// a provider before switching to it.
 		if len(args) < 3 {
-			return fmt.Errorf("config set-api-key: usage: orion config set-api-key <openai|anthropic|ollama> <key>")
+			return fmt.Errorf("config set-api-key: usage: orion config set-api-key <openai|anthropic|ollama|deepseek> <key>")
 		}
 		if len(args) > 3 {
 			return fmt.Errorf("config set-api-key: takes exactly a provider name and a key")
@@ -326,11 +339,24 @@ func cmdConfig(args []string) error {
 		if !ok {
 			return fmt.Errorf("config set-api-key: unknown provider %q", args[1])
 		}
+		// F9: a key passed on the command line lands in shell
+		// history and the process list. "-" reads the key from
+		// stdin instead (e.g. `orion config set-api-key deepseek -
+		// < deepseek-key.txt`); the value is trimmed and never
+		// echoed.
+		keyValue := args[2]
+		if keyValue == "-" {
+			raw, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return fmt.Errorf("config set-api-key: read key from stdin: %w", err)
+			}
+			keyValue = strings.TrimSpace(string(raw))
+		}
 		p := cfg.Providers[key]
-		if strings.TrimSpace(args[2]) == "" {
+		if strings.TrimSpace(keyValue) == "" {
 			return fmt.Errorf("config set-api-key: key must not be empty")
 		}
-		p.APIKey = args[2]
+		p.APIKey = keyValue
 		cfg.Providers[key] = p
 		if err := cfg.Save(defaultPath); err != nil {
 			return err
@@ -661,6 +687,7 @@ func cmdTelegram(ctx context.Context, args []string) error {
 		if cfg.TelegramToken == "" {
 			return fmt.Errorf("telegram: no token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
 		}
+		applyTelegramBaseURL()
 		gw, err := messaging.NewTelegramGateway(cfg.TelegramToken, messaging.WithAllowedChats(cfg.TelegramAllowedChats...))
 		if err != nil {
 			return err
@@ -680,6 +707,7 @@ func cmdTelegram(ctx context.Context, args []string) error {
 	if a.Config.TelegramToken == "" {
 		return fmt.Errorf("telegram: no token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
 	}
+	applyTelegramBaseURL()
 	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
 		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
 		// Polling-health notes and dropped-chat IDs go to stderr,
@@ -725,6 +753,7 @@ Run Telegram polling until interrupted. Takes no arguments.
 	if a.Config.TelegramToken == "" {
 		return fmt.Errorf("daemon: no telegram token configured; run `orion chat` for CLI mode instead")
 	}
+	applyTelegramBaseURL()
 	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken,
 		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
 		// Polling-health notes and dropped-chat IDs go to stderr,

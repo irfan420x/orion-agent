@@ -42,6 +42,13 @@ const migrationNote = "Migrated from JSON facts."
 // counted as AlreadyPresent and left untouched — the existing file
 // wins, so hand-edited typed memories are never overwritten by a
 // re-run. The JSON facts are only read, never written or deleted.
+//
+// Provenance and gate (Audit 4 A P1-3): migrated memories are
+// marked ProvenanceMigrated and are ALWAYS type project — model-
+// derived text (notably the "conversation-summary" fact, which is a
+// model summary) must never become feedback. Each fact value also
+// passes the what-not-to-save gate: a derivable fact is skipped
+// (counted in Skipped) rather than promoted into typed recall.
 func (s *TypedStore) MigrateFacts(store *FileStore) (MigrationResult, error) {
 	if store == nil {
 		return MigrationResult{}, fmt.Errorf("memory: MigrateFacts needs a non-nil JSON store")
@@ -69,11 +76,18 @@ func (s *TypedStore) MigrateFacts(store *FileStore) (MigrationResult, error) {
 			result.Skipped++
 			continue
 		}
+		if d := Gate(f.Value); !d.Save {
+			// Derivable content (code patterns, file structure,
+			// git history) is not worth a typed memory.
+			result.Skipped++
+			continue
+		}
 		m := TypedMemory{
 			Name:        f.Key,
 			Description: migrateDescription(f.Value),
 			Type:        TypeProject,
 			Body:        strings.TrimSpace(f.Value) + "\n\n_" + migrationNote + "_\n",
+			Provenance:  ProvenanceMigrated,
 		}
 		if err := m.Validate(); err != nil {
 			// Defensive: with the empty-value check above this

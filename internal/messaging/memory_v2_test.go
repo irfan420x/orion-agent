@@ -421,3 +421,50 @@ func TestFooterHelpDocumentsMemories(t *testing.T) {
 		t.Errorf("/footer help should document the memory segment:\n%s", reply)
 	}
 }
+
+// TestMemoryFeedbackCommand verifies /memory feedback saves standing
+// guidance only through the explicit user command: all four "::"
+// parts are required, and the save function receives them verbatim.
+// (Audit 4 A P1-3: this command is the only path that creates a
+// feedback memory; the model never calls it.)
+func TestMemoryFeedbackCommand(t *testing.T) {
+	s := newStubMemoryEnv()
+	var got []string
+	s.env.SaveFeedbackMemory = func(name, rule, why, how string) (string, error) {
+		got = []string{name, rule, why, how}
+		return name, nil
+	}
+	reply := dispatch(t, s, "/memory feedback Short replies :: Keep replies short. :: Long replies bury the answer. :: Answer first, then stop.")
+	if got == nil {
+		t.Fatalf("SaveFeedbackMemory was not called; reply=%q", reply)
+	}
+	want := []string{"Short replies", "Keep replies short.", "Long replies bury the answer.", "Answer first, then stop."}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("part %d = %q, want %q", i, got[i], w)
+		}
+	}
+	if !strings.Contains(reply, "Saved feedback memory") {
+		t.Errorf("reply = %q, want a saved confirmation", reply)
+	}
+	// Missing parts: usage, and the save function is not called.
+	got = nil
+	reply = dispatch(t, s, "/memory feedback Only a name")
+	if got != nil {
+		t.Error("SaveFeedbackMemory was called with incomplete parts")
+	}
+	if !strings.Contains(reply, "Usage: /memory feedback") {
+		t.Errorf("reply = %q, want usage", reply)
+	}
+}
+
+// TestMemoryFeedbackCommandUnwired verifies the command degrades to
+// a clear note when the save function is not wired.
+func TestMemoryFeedbackCommandUnwired(t *testing.T) {
+	s := newStubMemoryEnv()
+	s.env.SaveFeedbackMemory = nil
+	reply := dispatch(t, s, "/memory feedback X :: R :: W :: H")
+	if !strings.Contains(reply, "not wired up yet") {
+		t.Errorf("reply = %q, want an unwired note", reply)
+	}
+}

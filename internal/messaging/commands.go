@@ -127,6 +127,12 @@ type CommandEnv struct {
 	// typed-memory forgetting is unavailable, while
 	// /memory forget N keeps working for facts.
 	ForgetTypedMemory func(name string) (string, error)
+	// SaveFeedbackMemory creates a feedback memory from an explicit
+	// user confirmation (the /memory feedback command). It is the
+	// ONLY way a feedback memory enters the store: the model never
+	// calls it, and the store refuses non-user feedback. Nil until
+	// the coordinator wires it in cmd/oriond/buildCommandEnv.
+	SaveFeedbackMemory func(name, rule, why, how string) (string, error)
 	// SessionMemory returns the current session-memory.md content
 	// (workstream A: memory.SessionLog.Read, "" when there is
 	// none). The coordinator wires this in cmd/oriond; until then
@@ -644,9 +650,35 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 
 	r.Register(Command{
 		Name:        "memory",
-		Description: "Review memory: facts and typed memories; '/memory forget N' deletes a fact, '/memory forget <name>' deletes a typed memory",
+		Description: "Review memory: facts and typed memories; '/memory forget N' deletes a fact, '/memory forget <name>' deletes a typed memory, '/memory feedback <name> :: <rule> :: <why> :: <how>' saves standing guidance",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
 			fields := strings.Fields(args)
+			if len(fields) >= 2 && strings.EqualFold(fields[0], "feedback") {
+				// Explicit user confirmation is the only way a
+				// feedback memory is created (Audit 4 A P1-3):
+				// the model cannot save feedback, and the store
+				// refuses non-user feedback. Parts are separated
+				// by "::" so rules may contain spaces.
+				if env.SaveFeedbackMemory == nil {
+					return "Feedback saving is not wired up yet — the memory store does not expose it.", nil
+				}
+				rest := strings.TrimSpace(args[len(fields[0]):])
+				parts := strings.Split(rest, "::")
+				if len(parts) != 4 {
+					return "Usage: /memory feedback <name> :: <rule> :: <why> :: <how> — all four parts are required.", nil
+				}
+				for i := range parts {
+					parts[i] = strings.TrimSpace(parts[i])
+					if parts[i] == "" {
+						return "Usage: /memory feedback <name> :: <rule> :: <why> :: <how> — all four parts are required.", nil
+					}
+				}
+				name, err := env.SaveFeedbackMemory(parts[0], parts[1], parts[2], parts[3])
+				if err != nil {
+					return fmt.Sprintf("❌ %v", err), nil
+				}
+				return fmt.Sprintf("✅ Saved feedback memory %q. It will be injected as standing guidance on future turns.", name), nil
+			}
 			if len(fields) >= 2 && strings.EqualFold(fields[0], "forget") {
 				// A number always refers to the fact list (as
 				// before); anything else is a typed-memory name.
@@ -671,7 +703,7 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 				return fmt.Sprintf("🗑 Forgot typed memory %q.", deleted), nil
 			}
 			if len(fields) > 0 {
-				return "Usage: /memory — review memory; /memory forget N — delete fact N; /memory forget <name> — delete the typed memory named <name>.", nil
+				return "Usage: /memory — review memory; /memory forget N — delete fact N; /memory forget <name> — delete the typed memory named <name>; /memory feedback <name> :: <rule> :: <why> :: <how> — save standing guidance.", nil
 			}
 			info, err := env.MemoryInfo()
 			if err != nil {

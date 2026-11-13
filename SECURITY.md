@@ -26,8 +26,15 @@ non-negotiable.
      `systemctl`, `service`.
    - `dd` writing to a device (`of=/dev/...`), and `dd` without an
      explicit safe target.
-   - `chmod 777` / `chmod 7777` (any target).
+   - `chmod 777` / `chmod 7777` (any target), and any `chmod` of a
+     system path whatever the mode (`chmod 644 /etc/shadow`,
+     `chmod 4755 /bin/sh`, `chmod u+s /bin/bash` — Audit 4).
    - Empty commands.
+   - Redirect and file-operation targets reached through a variable
+     or command substitution (`f=/etc/passwd; echo x > $f`,
+     `cp /tmp/x $f`, `echo x > $(echo /etc/passwd)` — Audit 4):
+     targets are expanded through the recorded assignments and an
+     unresolvable `$` expansion or a substitution target is refused.
 5. **Shell tool enforcement.** `shell_exec` calls
    `IsBlockedCommand` before spawning anything and returns a
    `denied` ToolError. It also runs in its own process group with

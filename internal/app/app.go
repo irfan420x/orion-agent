@@ -47,6 +47,11 @@ type App struct {
 	typedStore   *memory.TypedStore
 	sessionLog   *memory.SessionLog
 	typedAdapter *typedStoreAdapter
+	// driftRoot is the repo root drift verification checks typed
+	// memories against (found by wireMemoryV2 from the working
+	// directory; "" means "process working directory"). It is kept
+	// so SwitchProvider can re-apply it to a replacement agent.
+	driftRoot string
 
 	// mu guards the Agent/Provider pair against a concurrent
 	// SwitchProvider. agent()/provider() take the read lock;
@@ -98,7 +103,7 @@ func Build(path string) (*App, error) {
 	// JSON facts), session-memory extraction, and the layers the
 	// Telegram memory commands use. Best-effort by design — see
 	// wireMemoryV2.
-	typedStore, sessionLog, typedAdapter := wireMemoryV2(logger, cfg.DataDir, mem, agent)
+	typedStore, sessionLog, typedAdapter, driftRoot := wireMemoryV2(logger, cfg.DataDir, mem, agent)
 
 	// app is declared here so the usage-sink closure below can close
 	// over it: it is assigned at the return, and the closure only runs
@@ -167,7 +172,7 @@ func Build(path string) (*App, error) {
 		Config: cfg, Provider: provider, Tools: registry, Memory: mem,
 		Agent: agent, Subagents: mgr, Skills: skillReg, Audit: audit, Logger: logger,
 		StartedAt:  time.Now(),
-		typedStore: typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter,
+		typedStore: typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
 	}
 	return app, nil
 }

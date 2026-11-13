@@ -89,7 +89,7 @@ elif [ -x "$HOME/go1.27.4/bin/go" ]; then
 elif [ -x /usr/local/go/bin/go ]; then
 	GO=/usr/local/go/bin/go
 else
-	die "go toolchain not found (need Go 1.27+). Install Go and put it on PATH, e.g. ~/go1.27.4/bin/go"
+	die "go toolchain not found (need Go 1.27+). Install Go from https://go.dev/dl and put it on PATH, e.g. ~/go1.27.4/bin/go"
 fi
 
 # Build info for `orion version`. Outside a git checkout the commit
@@ -331,7 +331,7 @@ case ":$PATH:" in
 	echo "note: $BIN_DIR is not on your PATH — add it, e.g.: export PATH=\"\$PATH:$BIN_DIR\""
 	;;
 esac
-echo "next: orion config set-api-key <openai|anthropic> <key>   (or run Ollama locally)"
+echo "next: orion config set-api-key <openai|anthropic|deepseek> <key>   (or run Ollama locally)"
 echo "      orion run \"what time is it?\""
 echo "      orion telegram test   (after setting a Telegram bot token)"
 echo "      set telegram_allowed_chats in $CONFIG_PATH to your chat ID — oriond refuses to start with an empty allowlist (send /whoami to the bot to learn it)"

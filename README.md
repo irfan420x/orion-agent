@@ -3,9 +3,9 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc6.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc7.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (693 tests pass, 0 fail, 3 skip — Ollama live tests;
+> built and tested (717 tests pass, 0 fail, 3 skip — Ollama live tests;
 > race clean). The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -15,13 +15,18 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 ## Quick start
 
-> **Go toolchain:** Go 1.27.4 lives at `~/go1.27.4/bin/go` (installed
-> under home because `/usr/local` does not survive VM/container
-> restores here). Use `export PATH=$PATH:/home/hatch/go1.27.4/bin`
-> in every shell, or `~/go1.27.4/bin/go` directly. `install.sh`
+> **Go toolchain:** Orion needs Go 1.27+ — install it from
+> https://go.dev/dl and put it on PATH. (On this VM/container Go
+> 1.27.4 lives at `~/go1.27.4/bin/go` because `/usr/local` does not
+> survive restores here; use `export PATH=$PATH:/home/hatch/go1.27.4/bin`
+> in every shell, or `~/go1.27.4/bin/go` directly.) `install.sh`
 > finds the toolchain itself (PATH, then `~/go1.27.4/bin/go`).
 
 ```sh
+# 0. Get the code (the repo is private — you need access to it):
+git clone https://github.com/irfan420x/orion-agent.git
+cd orion-agent
+
 # 1. Install — builds orion + oriond, installs to /usr/local/bin
 #    when writable, otherwise ~/.local/bin; writes a default
 #    ~/.orion/config.json only if none exists (never overwrites).
@@ -34,11 +39,16 @@ subagents — built in Go, local-first, Linux/macOS first.
 #    make build                     just build ./bin/orion{,d}
 
 # 2. Configure a provider — pick one:
-orion config set-provider ollama        # local, no key (default)
+orion config set-provider ollama        # local, no key (default;
+#    needs Ollama running with a model pulled, e.g. `ollama pull qwen2.5:0.5b`)
+orion config set-provider deepseek      # hosted, needs a key
+orion config set-api-key deepseek <YOUR_DEEPSEEK_API_KEY>
 orion config set-provider openai
 orion config set-api-key openai <YOUR_OPENAI_API_KEY>
 orion config set-provider anthropic
 orion config set-api-key anthropic <YOUR_ANTHROPIC_API_KEY>
+#    Tip: a key passed on the command line lands in shell history and
+#    the process list — prefer stdin: orion config set-api-key deepseek - < deepseek-key.txt
 orion config show                       # secrets are masked
 orion status                            # provider, tools, memory, Telegram
 
@@ -61,6 +71,10 @@ orion telegram test                     # verify the token (getMe)
 orion telegram poll                     # start the gateway (foreground)
 orion daemon                            # same, via the orion CLI
 oriond                                  # standalone daemon binary
+#    Testing without Telegram: oriond, `orion daemon` and
+#    `orion telegram poll` all honour ORION_TELEGRAM_BASE_URL to point
+#    at a self-hosted Bot API server (or a local fake for testing —
+#    see `oriond --help`).
 
 While a turn runs, the bot streams a live "💻 terminal" card into
 the chat (one message, edited in place): each tool call appears as
@@ -87,7 +101,7 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-14/14 packages, 653 tests passing, 0 failing, 3 skipped (the live
+14/14 packages, 717 tests passing, 0 failing, 3 skipped (the live
 Ollama tests, which need a running Ollama server), race clean — `go test
 -count=1 ./...`, verified 2026-11-13. Run the suite with `go test ./...` or `make test`.
 
@@ -100,10 +114,12 @@ Ollama tests, which need a running Ollama server), race clean — `go test
   "default_provider": "ollama",
   "providers": {
     "openai":    { "name": "openai",    "api_key": "", "model": "gpt-4o-mini" },
+    "deepseek":  { "name": "deepseek",  "api_key": "", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat" },
     "anthropic": { "name": "anthropic", "api_key": "", "model": "claude-sonnet-4-5" },
     "ollama":    { "name": "ollama",    "base_url": "http://localhost:11434", "model": "llama3.1" }
   },
   "telegram_token": "",
+  "telegram_allowed_chats": [],
   "data_dir": "~/.orion",
   "max_steps": 20,
   "timeout_seconds": 120,
@@ -114,7 +130,8 @@ Ollama tests, which need a running Ollama server), race clean — `go test
 ```
 
 Environment overrides: `ORION_PROVIDER`, `ORION_API_KEY`, `ORION_MODEL`,
-`ORION_TELEGRAM_TOKEN`, `ORION_DATA_DIR`, `ORION_SANDBOX` (`on`/`off`),
+`ORION_TELEGRAM_TOKEN`, `ORION_TELEGRAM_BASE_URL` (Bot API endpoint —
+honoured by `oriond`, `orion daemon` and `orion telegram poll`), `ORION_DATA_DIR`, `ORION_SANDBOX` (`on`/`off`),
 `ORION_SANDBOX_ROOT`. Secrets are never printed:
 `orion config show` masks them, and the secret scanner redacts them
 from logs and audit entries.

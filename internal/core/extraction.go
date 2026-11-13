@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 )
 
@@ -171,6 +172,18 @@ func (a *Agent) runSessionExtraction(ctx context.Context, turns []model.Message)
 	}
 	summary = strings.TrimSpace(summary)
 	if summary == "" {
+		return
+	}
+	// What-not-to-save gate (Audit 4 A P1-3): the extractor is the
+	// model, so its output is model-derived text. Derivable content
+	// (code patterns, file structure, git history) is dropped
+	// sentence by sentence; if nothing worth keeping remains,
+	// nothing is appended. The gate never rewrites the model's
+	// words — it only keeps or drops them.
+	if kept, ok := memory.FilterExplicitSave(summary); ok {
+		summary = kept
+	} else {
+		a.logf("session extraction dropped: gate found nothing worth saving")
 		return
 	}
 	if err := a.sessionAppender().Append(summary); err != nil {

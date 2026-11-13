@@ -6,6 +6,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/irfan/orion/internal/config"
+	"github.com/irfan/orion/internal/messaging"
 )
 
 // scratchHome points HOME at a fresh temp dir so tests never touch the
@@ -513,5 +516,56 @@ func TestCmdTelegramPollEmptyAllowlistRefuses(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "telegram_allowed_chats") {
 		t.Errorf("telegram poll refusal %q does not mention telegram_allowed_chats", err.Error())
+	}
+}
+
+// TestCmdConfigSetAPIKeyFromStdin verifies the "-" form reads the key
+// from stdin (Audit 4 F9): the key never appears on the command line,
+// so it cannot land in shell history or the process list.
+func TestCmdConfigSetAPIKeyFromStdin(t *testing.T) {
+	home := scratchHome(t)
+	keyFile, err := os.CreateTemp(t.TempDir(), "deepseek-key-*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keyFile.WriteString("stdin-test-key\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keyFile.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = keyFile
+	t.Cleanup(func() { os.Stdin = oldStdin })
+	if err := quiet(func() error { return cmdConfig([]string{"set-api-key", "deepseek", "-"}) }); err != nil {
+		t.Fatalf("set-api-key from stdin: %v", err)
+	}
+	path := home + "/.orion/config.json"
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load saved config: %v", err)
+	}
+	if got := cfg.Providers["deepseek"].APIKey; got != "stdin-test-key" {
+		t.Errorf("stored deepseek key = %q, want %q", got, "stdin-test-key")
+	}
+	// An empty stdin is an error, not an empty stored key.
+	empty, err := os.CreateTemp(t.TempDir(), "empty-key-*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = empty
+	if err := quiet(func() error { return cmdConfig([]string{"set-api-key", "deepseek", "-"}) }); err == nil || !strings.Contains(err.Error(), "must not be empty") {
+		t.Errorf("set-api-key from empty stdin: got err %v, want a must-not-be-empty error", err)
+	}
+}
+
+// TestApplyTelegramBaseURL verifies ORION_TELEGRAM_BASE_URL is honoured
+// by the CLI's Telegram paths (Audit 4 F7), exactly as oriond honours it.
+func TestApplyTelegramBaseURL(t *testing.T) {
+	t.Setenv("ORION_TELEGRAM_BASE_URL", "http://127.0.0.1:9/fake-bot-api")
+	t.Cleanup(func() { messaging.SetDefaultBaseURL("https://api.telegram.org") })
+	applyTelegramBaseURL()
+	if got := messaging.DefaultBaseURLValue(); got != "http://127.0.0.1:9/fake-bot-api" {
+		t.Errorf("DefaultBaseURL = %q, want the ORION_TELEGRAM_BASE_URL value", got)
 	}
 }
