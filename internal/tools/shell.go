@@ -45,7 +45,11 @@ func scrubEnv() []string {
 			strings.Contains(upper, "TOKEN") ||
 			strings.Contains(upper, "SECRET") ||
 			strings.Contains(upper, "PASSWORD") ||
-			strings.Contains(upper, "PASSWD") {
+			strings.Contains(upper, "PASSWD") ||
+			strings.Contains(upper, "KEY") ||
+			strings.Contains(upper, "CREDENTIAL") ||
+			strings.Contains(upper, "AUTH") ||
+			strings.Contains(upper, "BEARER") {
 			continue
 		}
 		out = append(out, kv)

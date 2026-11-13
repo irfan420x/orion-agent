@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
@@ -33,6 +35,18 @@ type App struct {
 	Skills    *skills.Registry
 	Audit     *security.AuditLog
 	Logger    *log.Logger
+	// StartedAt is when the app was built (zero for a hand-built App);
+	// StatusLine reports uptime from it and omits the line when zero.
+	StartedAt time.Time
+
+	// mu guards the Agent/Provider pair against a concurrent
+	// SwitchProvider. agent()/provider() take the read lock;
+	// SwitchProvider takes the write lock.
+	mu sync.RWMutex
+	// runMu guards runs; runWG counts live turns for Drain.
+	runMu sync.Mutex
+	runs  map[int64]runRegistration
+	runWG sync.WaitGroup
 }
 
 // Build loads config (default path when path == "") and wires every module.
@@ -98,6 +112,7 @@ func Build(path string) (*App, error) {
 	return &App{
 		Config: cfg, Provider: provider, Tools: registry, Memory: mem,
 		Agent: agent, Subagents: mgr, Skills: skillReg, Audit: audit, Logger: logger,
+		StartedAt: time.Now(),
 	}, nil
 }
 
@@ -174,10 +189,10 @@ func truncateRunes(s string, n int) string {
 // could cut a secret in half, leaving a fragment that no longer matches
 // any secret pattern and would land in the audit log in the clear.
 func (a *App) Handle(ctx context.Context, input string) (string, error) {
-	if a == nil || a.Agent == nil {
+	if a == nil || a.agent() == nil {
 		return "", errors.New("app: Handle called on uninitialised App (nil Agent)")
 	}
-	reply, err := a.Agent.Run(ctx, input)
+	reply, err := a.agent().Run(ctx, input)
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
 	}

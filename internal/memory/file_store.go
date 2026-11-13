@@ -283,6 +283,29 @@ func (s *FileStore) RecentMessages(n int) ([]model.Message, error) {
 	return out, nil
 }
 
+// ReplaceMessages replaces the whole retained conversation history
+// with a copy of msgs, enforcing the MaxMessages cap (oldest dropped
+// first, same as AddMessage). A nil msgs clears the history. The
+// change is persisted immediately.
+func (s *FileStore) ReplaceMessages(msgs []model.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkOpenLocked(); err != nil {
+		return err
+	}
+	cp := make([]model.Message, len(msgs))
+	copy(cp, msgs)
+	if len(cp) > MaxMessages {
+		// Copy on truncate: re-slicing would keep the dropped
+		// messages alive via the backing array.
+		trimmed := make([]model.Message, MaxMessages)
+		copy(trimmed, cp[len(cp)-MaxMessages:])
+		cp = trimmed
+	}
+	s.messages = cp
+	return s.saveLocked()
+}
+
 // ClearMessages empties conversation history. The change is persisted
 // immediately.
 func (s *FileStore) ClearMessages() error {

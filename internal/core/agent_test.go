@@ -186,6 +186,15 @@ func (s *fakeStore) RecentMessages(n int) ([]model.Message, error) {
 	return append([]model.Message(nil), s.messages[len(s.messages)-n:]...), nil
 }
 
+func (s *fakeStore) ReplaceMessages(msgs []model.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]model.Message, len(msgs))
+	copy(cp, msgs)
+	s.messages = cp
+	return nil
+}
+
 func (s *fakeStore) ClearMessages() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

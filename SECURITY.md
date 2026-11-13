@@ -108,18 +108,118 @@ between runs; `/tmp` does not.
   sandbox mode is on but unavailable — or setup fails — `shell_exec`
   falls back to the denylist alone, logs a warning, and marks the
   result `[warning: sandbox ...]` instead of failing outright.
-- The sandbox confines the **filesystem and network**, not the
-  process's own capabilities: the sandboxed process is root inside
-  its own user namespace, so it can unmount/remount things *inside*
-  its namespaces, but it holds no fd or path to anything outside
-  the chroot, so there is nothing to escape to.
+- The sandbox confines the **filesystem, network, and syscall
+  surface**, not the process's own capabilities in the abstract:
+  the sandboxed process is root inside its own user namespace, so
+  without the seccomp filter it can unmount/remount things *inside*
+  its namespaces — but after `pivot_root` it holds no fd or path to
+  anything outside the new root, so there is nothing to escape to.
+  (The pivot replaces the earlier plain chroot, which was escapable
+  via a cwd held outside it.)
+- The wrapper `pivot_root`s into the new root and detaches the old
+  (host) root. The detach cannot use the `umount` CLI: libmount
+  needs `/proc/mounts` (or `/proc/self/mountinfo`) to find the
+  mount, and `/proc` is deliberately not mounted in the sandbox
+  (strace-proven 2026-11-13: `umount` never issues the `umount2`
+  syscall, it fails opening `/proc/mounts`). It calls `umount2(2)`
+  directly via `python3` (present in the new root through the
+  `/usr` bind mount; the syscall number is arch-dependent). If
+  `python3` is unavailable the wrapper exits 126 and the sandbox
+  is unavailable rather than running with the host root visible —
+  which also makes `python3` a sandbox availability dependency.
 - A sandboxed command cannot see the agent's real working
   directory or workspace — only `<root>/work`. Point `root` at a
   project directory's parent (or copy files in) when a command
   needs project files.
-- No seccomp filter is applied (no `golang.org/x/sys` seccomp
-  helper is vendored); the namespace + chroot + read-only mounts
-  are the containment. Adding a syscall filter is future work.
+- Seccomp filter: see "Seccomp filter" below. When a usable
+  `orion-seccomp` launcher is installed, sandboxed commands run
+  under a syscall filter (default-allow + blocklist); without it
+  they run with namespace/pivot_root containment only, and a
+  warning is logged once.
+
+### Seccomp filter
+
+Feasibility (surveyed on this VM, 2026-11-13): the kernel
+supports seccomp (`Seccomp: 2` in `/proc/self/status`);
+`libseccomp2` 2.5.5 is installed but the `-dev` headers are
+absent, and the module has no Go dependencies, so neither
+`libseccomp-golang` (cgo + `libseccomp-dev`) nor
+`golang.org/x/sys/unix` is used. The filter is pure-stdlib Go: a
+hand-rolled classic-BPF program installed with raw `seccomp(2)` +
+`prctl(PR_SET_NO_NEW_PRIVS)`. No cgo, no new dependency. Proven
+live by `TestSeccompLauncherBlocksSyscalls`.
+
+Design (`internal/sandbox/seccomp.go`):
+
+- Default ALLOW with an explicit blocklist of escape-relevant
+  syscalls (46 on amd64): mounts (`mount`, `umount2`,
+  `pivot_root`, `chroot`, and the whole new mount API `fsopen`/
+  `fsconfig`/`fsmount`/`fspick`/`open_tree`/`move_mount`/
+  `mount_setattr`), host control (`reboot`, `swapon`/`swapoff`,
+  `kexec_load`, `kexec_file_load`, `init_module`/`finit_module`/
+  `delete_module`, `clock_settime`/`settimeofday`/`adjtimex`/
+  `clock_adjtime`, `sethostname`/`setdomainname` — the sandbox
+  shares the host UTS namespace and clock), keyrings (`keyctl`,
+  `add_key`, `request_key`), kernel attack surface (`ptrace`,
+  `bpf`, `perf_event_open`, `userfaultfd`, `fanotify_init`),
+  chroot escape via file handles (`open_by_handle_at`,
+  `name_to_handle_at`), namespace escape (`setns`, `unshare`),
+  host info/control (`syslog`, `iopl`, `ioperm`, `acct`,
+  `quotactl`, `vhangup`), cross-process memory
+  (`process_vm_readv`/`process_vm_writev`), and `seccomp` itself.
+  A default-deny allowlist was considered and rejected: the
+  sandbox must run arbitrary user tools, and enumerating every
+  syscall any tool might need is fragile — one missing number
+  silently breaks a legitimate command. The dangerous set is small
+  and enumerable; the namespaces + pivot_root remain the primary
+  containment.
+- `clone(2)` is allowed, but only when its flags carry no
+  namespace-creation bit (`CLONE_NEWNS`/`NEWUTS`/`NEWIPC`/
+  `NEWUSER`/`NEWPID`/`NEWNET`/`NEWCGROUP`/`NEWTIME`, checked by
+  BPF on the flags argument). `clone3` is denied with ENOSYS (not
+  EPERM): glibc's `posix_spawn` retries with `clone(2)` on ENOSYS,
+  so process-spawning tools keep working; EPERM would break them.
+  `clone3`'s flags live in a pointed-to struct BPF cannot
+  dereference, so it is denied outright. Proven by
+  `TestSeccompCloneFlagProbe` and the `posix_spawn` case in
+  `TestSeccompLauncherBlocksSyscalls`.
+- A syscall in an unexpected architecture (e.g. a 32-bit compat
+  binary, whose numbers differ) fails with ENOSYS.
+- `mknod`/`mknodat` are deliberately not blocked: the kernel
+  already refuses device-node creation inside the sandbox (EPERM
+  on both `/work` and the `/tmp` tmpfs, probed 2026-11-13), while
+  fifos (`mkfifo`) need `mknod` and are legitimate.
+- Tables are per-architecture (amd64, arm64), verified against
+  the kernel headers (`asm/unistd_64.h`, `asm-generic/unistd.h`)
+  and cross-checked against Go's `syscall` package where the
+  constants exist (`TestSeccompTableMatchesKernelHeaders`,
+  `TestSeccompTableMatchesStdlib`). Any other `GOARCH` fails
+  closed: the launcher exits 126 instead of running the command
+  unfiltered.
+
+Mechanism: Go's `os/exec` has no pre-exec hook, so the filter is
+installed by a tiny helper binary, `orion-seccomp`
+(`internal/sandbox/cmd/launcher`, built `CGO_ENABLED=0` so it is
+static and runs inside the new root), which installs the filter on
+itself and execs the target command — filters persist across
+`execve`. `Prepare` stages the helper into the new root
+(`<root>/.orion-root/orion-seccomp`, atomically) and the wrapper
+execs through it when present. Discovery: `Config.SeccompLauncher`,
+`$ORION_SECCOMP_LAUNCHER`, `orion-seccomp` next to the running
+binary, then `PATH`. Config: `seccomp_launcher` (explicit path),
+`disable_seccomp` (opt out even when a launcher is available).
+When no usable launcher is found (or the kernel probe fails), the
+command still runs — namespaces + pivot_root only — and a warning
+is logged once (`TestSeccompFallbackWithoutLauncher`).
+
+Open: `install.sh`/`Makefile` do not yet build or install
+`orion-seccomp`, so in a normal install the filter is inactive
+until that wiring lands (the sandbox package, tests, and this doc
+are ready for it). The host cell itself already runs under a
+seccomp filter that blocks a subset (`swapon`, `kexec`, `bpf`,
+`userfaultfd`, `setns`, `settimeofday`, `syslog` on this VM); the
+sandbox filter is the portable layer that blocks the rest on any
+host.
 
 ## Secret handling
 

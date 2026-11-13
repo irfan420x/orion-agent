@@ -28,6 +28,7 @@ package security
 import (
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -47,6 +48,40 @@ var blockedBinaries = map[string]bool{
 	"reboot": true, "shutdown": true, "halt": true, "poweroff": true,
 	"init": true, "systemctl": true, "service": true,
 	"chmod": true,
+	// Host administration: mounting, loop devices, swap, kernel
+	// modules, kernel parameters, device-mapper. The agent never
+	// needs these, and as root each of them can damage or take over
+	// the host (mount/umount a disk, load a module, change a sysctl).
+	// "mount" and "losetup" are handled specially in blockedSegment
+	// (bare, with no arguments, they only list mounts/devices).
+	"umount": true, "swapon": true, "swapoff": true,
+	"mkswap": true, "dmsetup": true, "modprobe": true, "insmod": true,
+	"rmmod": true, "sysctl": true,
+	// Account and credential administration: changing passwords or
+	// creating/removing users and groups is persistence, not agent
+	// work (a new root-equivalent account survives the agent run).
+	"passwd": true, "chpasswd": true,
+	"useradd": true, "userdel": true, "usermod": true,
+	"groupadd": true, "groupdel": true, "groupmod": true,
+	"visudo": true, "adduser": true, "deluser": true,
+	// Process killing by name: killall/pkill match by name and can
+	// kill the agent, the daemon, or system services. Killing by PID
+	// is handled by the "kill" case in blockedSegment (PID 1 and -1
+	// are refused); these name-based killers have no safe form.
+	"killall": true, "pkill": true,
+	// Namespace / privilege / remote-execution wrappers. Each runs
+	// an arbitrary command outside the agent's own execution
+	// context: nsenter enters another process's namespaces (the
+	// host's, as root), unshare runs a command with host filesystem
+	// access, systemd-run runs it as a transient service, setpriv
+	// and capsh change uid/capabilities, ssh/scp/sftp run commands
+	// or copy files on (possibly) another host — and ssh to
+	// localhost runs them here. expect and socat both take a
+	// command to run (Tcl / EXEC address). None of these is agent
+	// work; they are refused outright rather than parsed.
+	"nsenter": true, "unshare": true, "systemd-run": true,
+	"setpriv": true, "capsh": true, "expect": true, "socat": true,
+	"ssh": true, "scp": true, "sftp": true,
 	// Shell interpreters: refused outright (see the package comment).
 	// The tool layer invokes /bin/sh -c itself and never routes through
 	// IsBlockedCommand, so this cannot break the agent's own execution.
@@ -167,6 +202,35 @@ var (
 	pkexecSpec = flagSpec{
 		shortTakesArg: map[byte]bool{'u': true},
 		longTakesArg:  map[string]bool{"user": true},
+	}
+	// execSpec: exec(1) flags. -a takes the argv[0] name.
+	execSpec = flagSpec{
+		shortTakesArg: map[byte]bool{'a': true},
+	}
+	// chrootSpec: chroot(1) flags. --userspec and --groups take a value.
+	chrootSpec = flagSpec{
+		longTakesArg: map[string]bool{"userspec": true, "groups": true},
+	}
+	// watchSpec: watch(1) flags. -n/--interval takes the interval.
+	watchSpec = flagSpec{
+		shortTakesArg: map[byte]bool{'n': true},
+		longTakesArg:  map[string]bool{"interval": true},
+	}
+	// copySpec: cp(1)/mv(1)/ln(1) flags. -t/--target-directory takes
+	// the destination directory.
+	copySpec = flagSpec{
+		shortTakesArg: map[byte]bool{'t': true},
+		longTakesArg:  map[string]bool{"target-directory": true},
+	}
+	// chownSpec: chown(1)/chgrp(1) flags. --reference and --from
+	// take a value.
+	chownSpec = flagSpec{
+		longTakesArg: map[string]bool{"reference": true, "from": true},
+	}
+	// mkdirSpec: mkdir(1) flags. -m/--mode takes a value.
+	mkdirSpec = flagSpec{
+		shortTakesArg: map[byte]bool{'m': true},
+		longTakesArg:  map[string]bool{"mode": true},
 	}
 )
 
@@ -303,7 +367,7 @@ var envLongTakesArg = map[string]bool{
 // it is refused unless -i / --ignore-environment was given, in which
 // case the environment is empty and there is nothing to leak. Unknown
 // flags are refused rather than guessed at.
-func resolveEnv(seg []string) (rest []string, blocked bool) {
+func resolveEnv(seg []string, vars map[string][]string) (rest []string, blocked bool) {
 	toks := seg[1:]
 	ignoreEnv := false
 	for len(toks) > 0 {
@@ -315,6 +379,11 @@ func resolveEnv(seg []string) (rest []string, blocked bool) {
 		if strings.HasPrefix(t, "--") {
 			name := t[2:]
 			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				// --split-string=<value>: the value is a command
+				// line env splits and runs, so it is checked.
+				if name[:eq] == "split-string" && isBlockedCommand(name[eq+1:], vars) {
+					return nil, true
+				}
 				toks = toks[1:]
 				continue
 			}
@@ -325,6 +394,10 @@ func resolveEnv(seg []string) (rest []string, blocked bool) {
 				if len(toks) < 2 {
 					return nil, true // flag without its argument: refuse
 				}
+				// --split-string <value>: check the value.
+				if name == "split-string" && isBlockedCommand(toks[1], vars) {
+					return nil, true
+				}
 				toks = toks[2:]
 				continue
 			}
@@ -334,15 +407,28 @@ func resolveEnv(seg []string) (rest []string, blocked bool) {
 		if strings.HasPrefix(t, "-") && len(t) > 1 {
 			takesArg := false
 			unknown := false
+			splitValue := ""
+			isSplit := false
 			for j := 1; j < len(t); j++ {
 				switch t[j] {
 				case 'i':
 					ignoreEnv = true
-				case 'u', 'C', 'S':
+				case 'u', 'C':
 					if j+1 < len(t) {
 						j = len(t) // value attached, e.g. -uFOO
 					} else {
 						takesArg = true
+					}
+				case 'S':
+					// -S <string>: the string is a command line
+					// env splits and runs, so it is checked.
+					if j+1 < len(t) {
+						splitValue = t[j+1:]
+						isSplit = true
+						j = len(t)
+					} else {
+						takesArg = true
+						isSplit = true
 					}
 				case '0', 'v':
 					// No argument.
@@ -356,9 +442,15 @@ func resolveEnv(seg []string) (rest []string, blocked bool) {
 			if unknown {
 				return nil, true
 			}
+			if isSplit && splitValue != "" && isBlockedCommand(splitValue, vars) {
+				return nil, true
+			}
 			toks = toks[1:]
 			if takesArg {
 				if len(toks) == 0 {
+					return nil, true
+				}
+				if isSplit && splitValue == "" && isBlockedCommand(toks[0], vars) {
 					return nil, true
 				}
 				toks = toks[1:]
@@ -381,16 +473,16 @@ func resolveEnv(seg []string) (rest []string, blocked bool) {
 // interactive (root) shell and is refused outright. With -c, only the
 // single command string after -c is checked (extra arguments become
 // positional parameters of that shell, not part of the command).
-func blockedSu(seg []string) bool {
+func blockedSu(seg []string, vars map[string][]string) bool {
 	for i := 1; i < len(seg); i++ {
 		if seg[i] == "-c" || seg[i] == "--command" {
 			if i+1 >= len(seg) {
 				return true
 			}
-			return IsBlockedCommand(seg[i+1])
+			return isBlockedCommand(seg[i+1], vars)
 		}
 		if strings.HasPrefix(seg[i], "--command=") {
-			return IsBlockedCommand(strings.TrimPrefix(seg[i], "--command="))
+			return isBlockedCommand(strings.TrimPrefix(seg[i], "--command="), vars)
 		}
 	}
 	return true
@@ -399,18 +491,18 @@ func blockedSu(seg []string) bool {
 // blockedRunuser handles runuser(1): -c/--command/--session-command take
 // a command string (checked recursively); otherwise flags are skipped
 // and the remaining tokens are the command to run.
-func blockedRunuser(seg []string) bool {
+func blockedRunuser(seg []string, vars map[string][]string) bool {
 	for i := 1; i < len(seg); i++ {
 		switch {
 		case seg[i] == "-c" || seg[i] == "--command" || seg[i] == "--session-command":
 			if i+1 >= len(seg) {
 				return true
 			}
-			return IsBlockedCommand(seg[i+1])
+			return isBlockedCommand(seg[i+1], vars)
 		case strings.HasPrefix(seg[i], "--command="):
-			return IsBlockedCommand(strings.TrimPrefix(seg[i], "--command="))
+			return isBlockedCommand(strings.TrimPrefix(seg[i], "--command="), vars)
 		case strings.HasPrefix(seg[i], "--session-command="):
-			return IsBlockedCommand(strings.TrimPrefix(seg[i], "--session-command="))
+			return isBlockedCommand(strings.TrimPrefix(seg[i], "--session-command="), vars)
 		}
 	}
 	rest := skipFlags(seg[1:], runuserSpec)
@@ -418,14 +510,288 @@ func blockedRunuser(seg []string) bool {
 	if len(rest) == 0 {
 		return false
 	}
-	return IsBlockedCommand(strings.Join(rest, " "))
+	return isBlockedCommand(strings.Join(rest, " "), vars)
+}
+
+// blockedExec handles the exec builtin: `exec [-a name] [-c] [-l]
+// command [args...]` replaces the shell with the command, so the
+// command is checked recursively. With no command, exec only applies
+// redirections to the current shell (checked separately by
+// blockedRedirect) or is a no-op, so it is allowed.
+func blockedExec(seg []string, vars map[string][]string) bool {
+	rest := skipFlags(seg[1:], execSpec)
+	rest = skipAssignments(rest)
+	if len(rest) == 0 {
+		return false
+	}
+	return isBlockedCommand(strings.Join(rest, " "), vars)
+}
+
+// blockedChroot handles `chroot [OPTION] NEWROOT [COMMAND [ARG]...]`.
+// The command after NEWROOT is checked recursively; with no command
+// chroot runs a shell ($SHELL or /bin/sh) and is refused outright.
+func blockedChroot(seg []string, vars map[string][]string) bool {
+	rest := skipFlags(seg[1:], chrootSpec)
+	if len(rest) == 0 {
+		return true // no NEWROOT at all: refuse
+	}
+	if len(rest) == 1 {
+		return true // no command: runs a shell
+	}
+	return isBlockedCommand(strings.Join(rest[1:], " "), vars)
+}
+
+// blockedWatch handles `watch [OPTION] COMMAND`: watch runs its
+// arguments as a command (repeating it), so the command is checked
+// recursively. With no command, watch is an error and harmless.
+func blockedWatch(seg []string, vars map[string][]string) bool {
+	rest := skipFlags(seg[1:], watchSpec)
+	rest = skipAssignments(rest)
+	if len(rest) == 0 {
+		return false
+	}
+	return isBlockedCommand(strings.Join(rest, " "), vars)
+}
+
+// blockedScript handles script(1): `script -c 'command' [file]`
+// runs the command (via a shell); without -c it opens an interactive
+// shell and is refused outright. The -c argument is checked
+// recursively; a glued -c'command' is handled too.
+func blockedScript(seg []string, vars map[string][]string) bool {
+	args := seg[1:]
+	for i, a := range args {
+		if a == "--" {
+			break
+		}
+		if a == "-c" {
+			if i+1 >= len(args) {
+				return true
+			}
+			return isBlockedCommand(args[i+1], vars)
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 && !strings.HasPrefix(a, "--") {
+			// Short-flag cluster: look for 'c'; a glued value
+			// after it (-c'cmd') is the command.
+			for j := 1; j < len(a); j++ {
+				if a[j] == 'c' {
+					if j+1 < len(a) {
+						return isBlockedCommand(a[j+1:], vars)
+					}
+					if i+1 >= len(args) {
+						return true
+					}
+					return isBlockedCommand(args[i+1], vars)
+				}
+			}
+			continue
+		}
+		// First non-flag token is the typescript file; no -c seen.
+		break
+	}
+	// No -c: script opens an interactive shell.
+	return true
+}
+
+// isKillSignalArg reports whether s looks like a signal name or
+// number following `kill -l`, so it is skipped rather than read as
+// a PID.
+func isKillSignalArg(s string) bool {
+	if _, err := strconv.Atoi(s); err == nil {
+		return true
+	}
+	name := strings.TrimPrefix(strings.ToUpper(s), "SIG")
+	if len(name) == 0 {
+		return false
+	}
+	for _, r := range name {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// blockedKill handles kill(1) and the kill builtin: only killing
+// PID 1 (the container init) or a negative PID (a whole process
+// group — -1 is every process the caller can signal, and as root
+// that is everything) is refused. Other PIDs are the agent's own
+// children and are allowed. Only ONE signal spec is consumed at the
+// front (-9, -TERM, -s SIG, -n NUM, -q SIG VAL, -l [SIG]); after
+// it, a token starting with "-" is a PID, not a signal, so
+// `kill -9 -1` is refused. Signal flags are skipped so a signal
+// number is never mistaken for a PID; job specs (%1) refer to the
+// shell's own jobs and are allowed.
+func blockedKill(seg []string) bool {
+	args := seg[1:]
+	i := 0
+	signalSeen := false
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			i++
+			break
+		}
+		if a == "-l" || a == "--list" {
+			i++
+			if i < len(args) && isKillSignalArg(args[i]) {
+				i++
+			}
+			continue
+		}
+		if a == "-s" || a == "--signal" || a == "-n" {
+			i += 2
+			signalSeen = true
+			continue
+		}
+		if a == "-q" {
+			i += 3
+			signalSeen = true
+			continue
+		}
+		if strings.HasPrefix(a, "--signal=") || strings.HasPrefix(a, "--list=") {
+			i++
+			signalSeen = true
+			continue
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 && !signalSeen {
+			// A signal spec (-9, -TERM, -KILL, -sTERM, -n9):
+			// a cluster of letters/digits, never a PID.
+			i++
+			signalSeen = true
+			continue
+		}
+		break
+	}
+	for ; i < len(args); i++ {
+		pid := args[i]
+		if strings.HasPrefix(pid, "%") {
+			continue // job spec: the shell's own job
+		}
+		if n, err := strconv.Atoi(pid); err == nil && (n == 1 || n < 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// blockedFileOp reports whether a file operation must be refused:
+// cp/mv/ln writing to a system path, chown/chgrp/mkdir/rmdir
+// touching a system path. kind selects which operands count:
+// "cp" checks the destination (last operand / -t value), "mv"
+// checks every operand (moving a system file away destroys it
+// too), "ln" checks the link path (last operand / -t value), and
+// "chown"/"chgrp"/"mkdir"/"rmdir" check every operand.
+func blockedFileOp(args []string, kind string) bool {
+	var spec flagSpec
+	switch kind {
+	case "cp", "mv", "ln":
+		spec = copySpec
+	case "chown", "chgrp":
+		spec = chownSpec
+	case "mkdir":
+		spec = mkdirSpec
+	default: // rmdir: no flag takes an argument
+	}
+	var operands []string
+	var targetDir string
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			operands = append(operands, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(a, "--") {
+			name := a[2:]
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				if name[:eq] == "target-directory" {
+					targetDir = name[eq+1:]
+				}
+				i++
+				continue
+			}
+			if spec.longTakesArg[name] {
+				if name == "target-directory" {
+					if i+1 < len(args) {
+						targetDir = args[i+1]
+						i += 2
+					} else {
+						i++
+					}
+					continue
+				}
+				i += 2
+				continue
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			// Short-flag cluster.
+			consumedNext := false
+			for j := 1; j < len(a); j++ {
+				if spec.shortTakesArg[a[j]] {
+					if a[j] == 't' {
+						if j+1 < len(a) {
+							targetDir = a[j+1:]
+						} else if i+1 < len(args) {
+							targetDir = args[i+1]
+							consumedNext = true
+						}
+					} else if j+1 >= len(a) {
+						consumedNext = true
+					}
+					break
+				}
+			}
+			i++
+			if consumedNext {
+				i++
+			}
+			continue
+		}
+		operands = append(operands, a)
+		i++
+	}
+	switch kind {
+	case "cp":
+		if targetDir != "" && isDestructiveTarget(targetDir) {
+			return true
+		}
+		if len(operands) > 0 && isDestructiveTarget(operands[len(operands)-1]) {
+			return true
+		}
+	case "mv":
+		if targetDir != "" && isDestructiveTarget(targetDir) {
+			return true
+		}
+		for _, op := range operands {
+			if isDestructiveTarget(op) {
+				return true
+			}
+		}
+	case "ln":
+		if targetDir != "" && isDestructiveTarget(targetDir) {
+			return true
+		}
+		if len(operands) > 0 && isDestructiveTarget(operands[len(operands)-1]) {
+			return true
+		}
+	default: // chown, chgrp, mkdir, rmdir
+		for _, op := range operands {
+			if isDestructiveTarget(op) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // blockedFind handles find(1): -delete is a bulk delete and is refused
 // outright; -exec/-execdir/-ok/-okdir running a blocked binary (rm, dd,
 // chmod, a shell, ...) is refused, and the exec'd command is also
 // checked recursively so wrappers (sudo, ...) cannot smuggle it through.
-func blockedFind(args []string) bool {
+func blockedFind(args []string, vars map[string][]string) bool {
 	for i, a := range args {
 		switch a {
 		case "-delete":
@@ -442,12 +808,172 @@ func blockedFind(args []string) bool {
 			for end < len(args) && args[end] != ";" && args[end] != "+" {
 				end++
 			}
-			if IsBlockedCommand(strings.Join(args[i+1:end], " ")) {
+			// A wrapper around a blocked binary (sudo rm, env rm,
+			// nice rm, timeout 5 rm, ...) must also be refused:
+			// the recursive check below allows a plain rm of one
+			// file, but in -exec it runs once per file found.
+			if bin := resolveExecBinary(args[i+1:end], vars); bin != "" && (blockedBinaries[bin] || strings.HasPrefix(bin, "mkfs")) {
+				return true
+			}
+			if isBlockedCommand(strings.Join(args[i+1:end], " "), vars) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// resolveExecBinary strips assignments, shell keywords and the
+// wrapper commands (sudo/doas/env/nice/time/timeout/nohup/setsid/
+// stdbuf/command/pkexec/runuser) from the front of toks and returns
+// the basename of the real command, or "" when there is none. It
+// mirrors the wrapper-stripping loop in blockedSegment and is used
+// by blockedFind, where a wrapped rm is just as destructive as a
+// bare one. A variable expansion as the command ($x) cannot be
+// resolved here; the recursive check in blockedFind covers it.
+func resolveExecBinary(toks []string, vars map[string][]string) string {
+	seg := toks
+	for len(seg) > 0 {
+		seg = skipAssignments(seg)
+		if len(seg) == 0 {
+			return ""
+		}
+		if name, ok := varRef(seg[0]); ok {
+			if val, ok := vars[name]; ok && len(val) > 0 {
+				seg = append(append([]string{}, val...), seg[1:]...)
+				continue
+			}
+		}
+		base := filepath.Base(seg[0])
+		if shellKeywords[base] {
+			seg = seg[1:]
+			continue
+		}
+		switch base {
+		case "sudo":
+			rest, verdict := resolveSudoLike(seg[1:], sudoSpec)
+			if verdict != sudoContinue {
+				return ""
+			}
+			seg = rest
+		case "doas":
+			rest, verdict := resolveSudoLike(seg[1:], doasSpec)
+			if verdict != sudoContinue {
+				return ""
+			}
+			seg = rest
+		case "env":
+			rest, blocked := resolveEnv(seg, vars)
+			if blocked || len(rest) == 0 {
+				return ""
+			}
+			seg = rest
+		case "nice":
+			seg = skipFlags(seg[1:], niceSpec)
+		case "time":
+			seg = skipFlags(seg[1:], timeSpec)
+		case "nohup", "setsid":
+			seg = skipFlags(seg[1:], noArgSpec)
+		case "stdbuf":
+			seg = skipFlags(seg[1:], stdbufSpec)
+		case "command":
+			seg = skipFlags(seg[1:], commandSpec)
+		case "pkexec":
+			seg = skipFlags(seg[1:], pkexecSpec)
+		case "timeout":
+			rest := skipFlags(seg[1:], timeoutSpec)
+			if len(rest) == 0 {
+				return ""
+			}
+			seg = rest[1:]
+		case "runuser":
+			rest := skipFlags(seg[1:], runuserSpec)
+			rest = skipAssignments(rest)
+			if len(rest) == 0 {
+				return ""
+			}
+			seg = rest
+		default:
+			return base
+		}
+	}
+	return ""
+}
+
+// varAssignmentRe matches a VAR=value token. The value is the raw
+// text after the first '='; tokenize splits it into words when the
+// variable is later expanded as a command.
+var varAssignmentRe = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)=(.*)$`)
+
+// assignmentKeywords introduce assignments: export/declare/local/
+// readonly/typeset (and "let", which takes VAR=value too).
+var assignmentKeywords = map[string]bool{
+	"export": true, "declare": true, "local": true,
+	"readonly": true, "typeset": true, "let": true,
+}
+
+// collectSegmentAssignments records the leading VAR=value
+// assignments of seg into vars (including ones after an assignment
+// keyword like export/declare/local). It is called on each segment
+// in order, before that segment is checked, so an assignment only
+// affects the segment it precedes (and later ones), matching shell
+// semantics.
+func collectSegmentAssignments(seg []string, vars map[string][]string) {
+	toks := seg
+	if len(toks) > 0 && assignmentKeywords[filepath.Base(toks[0])] {
+		toks = toks[1:]
+		for len(toks) > 0 && strings.HasPrefix(toks[0], "-") && toks[0] != "--" {
+			toks = toks[1:]
+		}
+		if len(toks) > 0 && toks[0] == "--" {
+			toks = toks[1:]
+		}
+	}
+	for len(toks) > 0 {
+		m := varAssignmentRe.FindStringSubmatch(toks[0])
+		if m == nil {
+			break
+		}
+		vars[m[1]] = tokenize(m[2])
+		toks = toks[1:]
+	}
+}
+
+// isVarNameChar reports whether c can appear in a shell variable
+// name (after the first character).
+func isVarNameChar(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// varRef reports whether tok is a bare variable expansion ($x or
+// ${x}) and returns the variable name. Words that merely contain an
+// expansion ("${x}y", "$x.txt") are not a bare expansion: they are
+// a longer word, not a command, so they are left alone.
+func varRef(tok string) (string, bool) {
+	if !strings.HasPrefix(tok, "$") || len(tok) < 2 {
+		return "", false
+	}
+	if tok[1] == '{' {
+		i := strings.IndexByte(tok, '}')
+		if i < 3 || i != len(tok)-1 {
+			return "", false
+		}
+		name := tok[2:i]
+		for j := 0; j < len(name); j++ {
+			if !isVarNameChar(name[j]) {
+				return "", false
+			}
+		}
+		return name, true
+	}
+	i := 1
+	for i < len(tok) && isVarNameChar(tok[i]) {
+		i++
+	}
+	if i == 1 || i != len(tok) {
+		return "", false
+	}
+	return tok[1:i], true
 }
 
 // blockedChmod handles chmod(1): 777/7777 (and the symbolic equivalents)
@@ -671,36 +1197,49 @@ func tokenize(cmd string) []string {
 	var cur strings.Builder
 	var quote rune
 	escaped := false
+	ansiSingle := false // the current single quote came from $'...',
+	// where backslash is an escape (unlike plain '...')
 	flush := func() {
 		if cur.Len() > 0 {
 			tokens = append(tokens, cur.String())
 			cur.Reset()
 		}
 	}
-	for _, r := range cmd {
+	r := []rune(cmd)
+	for i := 0; i < len(r); i++ {
+		c := r[i]
 		switch {
 		case escaped:
-			cur.WriteRune(r)
+			cur.WriteRune(c)
 			escaped = false
-		case r == '\\' && quote != '\'':
+		case c == '\\' && (quote != '\'' || ansiSingle):
 			escaped = true
-		case quote != 0 && r == quote:
+		case quote != 0 && c == quote:
 			quote = 0
-		case quote == 0 && (r == '\'' || r == '"'):
-			quote = r
-		case quote == 0 && (r == ' ' || r == '\t'):
+			ansiSingle = false
+		case quote == 0 && (c == '\'' || c == '"'):
+			quote = c
+		case quote == 0 && c == '$' && i+1 < len(r) && (r[i+1] == '\'' || r[i+1] == '"'):
+			// ANSI-C ($'...') and locale ($"...") quoting: the $
+			// is quoting syntax, not part of the word, so it is
+			// dropped and the quote opens. Without this, $'rm'
+			// tokenizes as "$rm" and evades the binary check.
+			quote = r[i+1]
+			ansiSingle = quote == '\''
+			i++
+		case quote == 0 && (c == ' ' || c == '\t'):
 			flush()
-		case quote == 0 && r == '|' && strings.HasSuffix(cur.String(), ">"):
+		case quote == 0 && c == '|' && strings.HasSuffix(cur.String(), ">"):
 			// ">|" (noclobber override) is a single redirection operator,
 			// not a pipe: keep it glued to the ">" so the redirect check
 			// sees the operator and its target together.
-			cur.WriteRune(r)
-		case quote == 0 && (r == ';' || r == '|' || r == '&' || r == '\n' || r == '\r' || r == '(' || r == ')' || r == '{' || r == '}'):
+			cur.WriteRune(c)
+		case quote == 0 && (c == ';' || c == '|' || c == '&' || c == '\n' || c == '\r' || c == '(' || c == ')' || c == '{' || c == '}'):
 			// Command separator: start a new segment.
 			flush()
-			tokens = append(tokens, string(r))
+			tokens = append(tokens, string(c))
 		default:
-			cur.WriteRune(r)
+			cur.WriteRune(c)
 		}
 	}
 	flush()
@@ -734,11 +1273,28 @@ func splitSegments(tokens []string) [][]string {
 // stripped first so the real command is what gets checked; some
 // constructs (su -c, eval, xargs, busybox, find -exec) carry a nested
 // command string, which is checked recursively.
-func blockedSegment(seg []string) bool {
+func blockedSegment(seg []string, vars map[string][]string) bool {
+	resolved := 0 // guard against cyclic indirection (x=$x)
 	for len(seg) > 0 {
 		seg = skipAssignments(seg)
 		if len(seg) == 0 {
 			return false // only assignments, e.g. FOO=1
+		}
+		// Resolve a leading variable expansion ($x / ${x}) using
+		// assignments seen earlier in this command. The value is
+		// spliced in and re-checked, so `x=rm; $x -rf /` and
+		// `export x=rm; $x -rf /` are refused. An expansion with no
+		// recorded assignment cannot be resolved statically and is
+		// left to the sandbox.
+		if name, ok := varRef(seg[0]); ok {
+			if val, ok := vars[name]; ok && len(val) > 0 {
+				resolved++
+				if resolved > 8 {
+					return false // self-referential / cyclic
+				}
+				seg = append(append([]string{}, val...), seg[1:]...)
+				continue
+			}
 		}
 		base := filepath.Base(seg[0])
 		if shellKeywords[base] {
@@ -769,9 +1325,9 @@ func blockedSegment(seg []string) bool {
 				continue
 			}
 		case "su":
-			return blockedSu(seg)
+			return blockedSu(seg, vars)
 		case "env":
-			rest, blocked := resolveEnv(seg)
+			rest, blocked := resolveEnv(seg, vars)
 			if blocked {
 				return true
 			}
@@ -805,27 +1361,48 @@ func blockedSegment(seg []string) bool {
 			}
 			seg = rest[1:] // skip the duration operand
 			continue
+		case "builtin":
+			// builtin <command>: strip one level and re-check.
+			seg = seg[1:]
+			continue
+		case "exec":
+			return blockedExec(seg, vars)
+		case "chroot":
+			return blockedChroot(seg, vars)
+		case "watch":
+			return blockedWatch(seg, vars)
+		case "script":
+			return blockedScript(seg, vars)
+		case "kill":
+			return blockedKill(seg)
+		case "mount", "losetup":
+			// Bare (no arguments) they only list mounts / loop
+			// devices. With arguments they (un)mount filesystems
+			// or configure loop devices: host administration.
+			return len(seg) > 1
+		case "cp", "mv", "ln", "chown", "chgrp", "mkdir", "rmdir":
+			return blockedFileOp(seg[1:], base)
 		case "xargs":
 			rest := skipFlags(seg[1:], xargsSpec)
 			rest = skipAssignments(rest)
 			if len(rest) == 0 {
 				return false
 			}
-			return IsBlockedCommand(strings.Join(rest, " "))
+			return isBlockedCommand(strings.Join(rest, " "), vars)
 		case "eval":
 			if len(seg) == 1 {
 				return false
 			}
-			return IsBlockedCommand(strings.Join(seg[1:], " "))
+			return isBlockedCommand(strings.Join(seg[1:], " "), vars)
 		case "busybox", "toybox":
 			if len(seg) == 1 {
 				return false
 			}
-			return IsBlockedCommand(strings.Join(seg[1:], " "))
+			return isBlockedCommand(strings.Join(seg[1:], " "), vars)
 		case "runuser":
-			return blockedRunuser(seg)
+			return blockedRunuser(seg, vars)
 		case "find":
-			return blockedFind(seg[1:])
+			return blockedFind(seg[1:], vars)
 		case "tee":
 			for _, a := range seg[1:] {
 				if isDestructiveTarget(a) {
@@ -947,7 +1524,7 @@ func versionedName(base, name string) bool {
 // reports that it is not a scripting interpreter with inline code.
 func interpreterKind(base string) (string, bool) {
 	switch {
-	case versionedName(base, "python"):
+	case versionedName(base, "python") || versionedName(base, "pypy") || versionedName(base, "micropython") || versionedName(base, "jython"):
 		return "python", true
 	case versionedName(base, "perl"):
 		return "perl", true
@@ -959,8 +1536,10 @@ func interpreterKind(base string) (string, bool) {
 		return "lua", true
 	case base == "luajit":
 		return "lua", true
-	case base == "node" || base == "nodejs":
+	case base == "node" || base == "nodejs" || base == "bun":
 		return "node", true
+	case base == "deno":
+		return "deno", true
 	case base == "awk" || base == "gawk" || base == "mawk" || base == "nawk":
 		return "awk", true
 	case base == "Rscript":
@@ -1136,6 +1715,24 @@ func blockedAwk(args []string) bool {
 func blockedInterpreter(args []string, kind string) bool {
 	if kind == "awk" {
 		return blockedAwk(args)
+	}
+	if kind == "deno" {
+		// `deno eval <code>`: deno takes no -e/-c flag; the code
+		// follows the eval subcommand (possibly after global
+		// flags). Deno code is JavaScript, so it is analysed with
+		// the node rules.
+		for i, a := range args {
+			if a == "eval" {
+				for _, code := range args[i+1:] {
+					if strings.HasPrefix(code, "-") {
+						continue // a flag of eval, not the code
+					}
+					return blockedInterpreterPayload(code, "node")
+				}
+				return false
+			}
+		}
+		return false
 	}
 	spec, ok := interpreterSpecs[kind]
 	if !ok {
@@ -1338,7 +1935,8 @@ var interpreterDestructiveAPIs = []*regexp.Regexp{
 	regexp.MustCompile(`\bos\s*\.\s*(remove|unlink|rmdir|removedirs)\s*\(`),
 	regexp.MustCompile(`\bos\s*\.\s*fork\b`),
 	regexp.MustCompile(`\bshutil\s*\.\s*rmtree\s*\(`),
-	regexp.MustCompile(`\.\s*(unlink|rmdir|unlinkSync|rmSync|rmdirSync|rm)\b`),
+	regexp.MustCompile(`\.\s*(unlink|rmdir|unlinkSync|rmSync|rmdirSync|removeSync|rm)\b`),
+	regexp.MustCompile(`\bDeno\s*\.\s*remove\b`),
 	regexp.MustCompile(`\bunlink(?:\s*\(|\s+["$/@%A-Za-z_])`),
 	regexp.MustCompile(`\brmtree(?:\s*\(|\s+["$/@%A-Za-z_])`),
 	regexp.MustCompile(`\brmdir(?:\s*\(|\s+["$/@%A-Za-z_])`),
@@ -1481,6 +2079,27 @@ func writesSystemPath(skeleton string, strs []string, kind string) bool {
 	return false
 }
 
+// interpreterChmodRe matches permission/ownership-changing calls
+// (os.chmod, fs.chmodSync, File.chmod, chmod 0777, ...).
+var interpreterChmodRe = regexp.MustCompile(`\b(?:chmod|chown|lchmod|lchown|chmodSync|chownSync|fchmod|fchown)(?:\s*\(|\s+[0-9"'])`)
+
+// chmodsSystemPath reports whether the code changes permissions or
+// ownership of a system path: a system-path string literal combined
+// with a chmod/chown call. (Reading a system path, or chmod of an
+// ordinary file, stays allowed.) Like writesSystemPath this is a
+// heuristic: a system path mentioned anywhere in the one-liner plus
+// a chmod/chown call anywhere in it is refused.
+func chmodsSystemPath(skeleton string, strs []string) bool {
+	hasSystem := false
+	for _, s := range strs {
+		if isDestructiveTarget(strings.TrimSpace(s)) {
+			hasSystem = true
+			break
+		}
+	}
+	return hasSystem && interpreterChmodRe.MatchString(skeleton)
+}
+
 // blockedInterpreterPayload reports whether one interpreter code
 // argument must be refused.
 func blockedInterpreterPayload(code, kind string) bool {
@@ -1497,6 +2116,10 @@ func blockedInterpreterPayload(code, kind string) bool {
 	}
 	// Writes / truncation of system paths.
 	if writesSystemPath(a.skeleton, a.strings, kind) {
+		return true
+	}
+	// chmod / chown of system paths.
+	if chmodsSystemPath(a.skeleton, a.strings) {
 		return true
 	}
 	// Backtick execution (Perl/Ruby/PHP): the backtick string IS a
@@ -1535,6 +2158,13 @@ func blockedInterpreterPayload(code, kind string) bool {
 // stripped, command substitution is checked recursively, and destructive
 // patterns are checked per segment. Empty commands are blocked.
 func IsBlockedCommand(cmd string) bool {
+	return isBlockedCommand(cmd, nil)
+}
+
+// isBlockedCommand is IsBlockedCommand with the variable assignments
+// from an enclosing command (an eval string, a -c argument, ...).
+// outer is copied so a nested command cannot pollute its caller's map.
+func isBlockedCommand(cmd string, outer map[string][]string) bool {
 	trimmed := strings.TrimSpace(cmd)
 	if trimmed == "" {
 		return true
@@ -1548,11 +2178,19 @@ func IsBlockedCommand(cmd string) bool {
 	if len(tokens) == 0 {
 		return true
 	}
+	vars := make(map[string][]string, len(outer))
+	for k, v := range outer {
+		vars[k] = v
+	}
 	for _, seg := range splitSegments(tokens) {
 		if len(seg) == 0 {
 			continue
 		}
-		if blockedSegment(seg) || blockedRedirect(seg) {
+		// Record this segment's leading assignments before checking
+		// it, so `x=rm; $x -rf /` resolves while an assignment in a
+		// later segment does not affect an earlier one.
+		collectSegmentAssignments(seg, vars)
+		if blockedSegment(seg, vars) || blockedRedirect(seg) {
 			return true
 		}
 	}

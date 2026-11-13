@@ -22,6 +22,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/security"
 )
 
 // DefaultBaseURL is the Telegram Bot API endpoint. It is read by
@@ -108,6 +111,13 @@ type TelegramGateway struct {
 	client  *http.Client
 	offset  int64
 	mu      sync.Mutex
+	// fetchMu serialises GetUpdates calls. The offset alone is not
+	// enough: two concurrent GetUpdates calls could both read the
+	// same offset before either advanced it, and Telegram would
+	// return the same updates to both. One poller at a time also
+	// matches the Bot API's own rule (409 Conflict when a second
+	// getUpdates is in flight).
+	fetchMu sync.Mutex
 	// allowedChats is nil when no allowlist is set (all chats pass).
 	allowedChats map[int64]bool
 }
@@ -372,15 +382,78 @@ func (g *TelegramGateway) call(ctx context.Context, method string, query url.Val
 				desc = http.StatusText(resp.StatusCode)
 			}
 		}
-		if env.ErrorCode != 0 {
-			return nil, fmt.Errorf("messaging: telegram %s: HTTP %d, error %d: %s", method, resp.StatusCode, env.ErrorCode, desc)
+		// Cap the description: the raw-body fallback above can be up
+		// to the 10 MiB read cap, and an uncapped body would land in
+		// the returned error (and from there in stderr, logs, or a
+		// reply sent back to the chat). The message shape is
+		// unchanged — apiError formats exactly like the old
+		// fmt.Errorf calls did.
+		apiErr := &apiError{
+			Method:      method,
+			StatusCode:  resp.StatusCode,
+			Code:        env.ErrorCode,
+			Description: truncateErrorDescription(desc),
 		}
-		return nil, fmt.Errorf("messaging: telegram %s: HTTP %d: %s", method, resp.StatusCode, desc)
+		return nil, g.redact(fmt.Errorf("messaging: telegram %s: %w", method, apiErr))
 	}
 	return env.Result, nil
 }
 
-// getMeResult is the subset of the Bot API User object GetMe needs.
+// apiError is a Bot API error: either a non-2xx HTTP status, a
+// response with "ok": false, or both. Code is Telegram's error_code
+// (0 when the response carried none); Description is Telegram's
+// description, capped so a large error body can never produce a
+// multi-megabyte error string (see maxErrorDescriptionRunes).
+//
+// Poll treats 401/403/409 as fatal (revoked token, blocked bot,
+// another poller holding the connection): retrying those forever at
+// the backoff cadence looks alive while being dead.
+type apiError struct {
+	Method      string
+	StatusCode  int
+	Code        int
+	Description string
+}
+
+func (e *apiError) Error() string {
+	if e.Code != 0 {
+		return fmt.Sprintf("HTTP %d, error %d: %s", e.StatusCode, e.Code, e.Description)
+	}
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Description)
+}
+
+// isFatalForPoll reports whether this error can never heal by
+// retrying: an unauthorised/forbidden token or a conflicting
+// getUpdates (another instance polling with the same token). The
+// Telegram error_code is checked first; when the response carried
+// none (e.g. a proxy error page) the HTTP status decides.
+func (e *apiError) isFatalForPoll() bool {
+	for _, c := range []int{e.Code, e.StatusCode} {
+		if c == http.StatusUnauthorized || c == http.StatusForbidden || c == http.StatusConflict {
+			return true
+		}
+	}
+	return false
+}
+
+// maxErrorDescriptionRunes caps an error description taken from a Bot
+// API failure. The raw body fallback in call can be up to the 10 MiB
+// read cap; without a cap that whole body lands in the returned
+// error, which callers print to stderr (orion telegram test, oriond)
+// or send back to the chat (Poll's handler-error reply).
+const maxErrorDescriptionRunes = 512
+
+// truncateErrorDescription shortens s to at most
+// maxErrorDescriptionRunes runes, appending "..." when it truncates.
+// Rune-based so the result stays valid UTF-8.
+func truncateErrorDescription(s string) string {
+	runes := []rune(s)
+	if len(runes) <= maxErrorDescriptionRunes {
+		return s
+	}
+	return string(runes[:maxErrorDescriptionRunes]) + "..."
+}
+
 type getMeResult struct {
 	ID        int64  `json:"id"`
 	Username  string `json:"username"`
@@ -404,13 +477,87 @@ func (g *TelegramGateway) GetMe(ctx context.Context) (string, error) {
 
 // sendMessageRequest is the JSON body for sendMessage.
 type sendMessageRequest struct {
-	ChatID int64  `json:"chat_id"`
-	Text   string `json:"text"`
+	ChatID    int64  `json:"chat_id"`
+	Text      string `json:"text"`
+	ParseMode string `json:"parse_mode,omitempty"`
+}
+
+// sendMessageResult is the message object sendMessage returns.
+type sendMessageResult struct {
+	MessageID int64 `json:"message_id"`
+}
+
+// sendMessageRaw posts one sendMessage call and returns the new
+// message's id. parseMode is "" for plain text or "HTML" for the
+// terminal card.
+func (g *TelegramGateway) sendMessageRaw(ctx context.Context, chatID int64, text, parseMode string) (int64, error) {
+	result, err := g.call(ctx, "sendMessage", nil, sendMessageRequest{ChatID: chatID, Text: text, ParseMode: parseMode})
+	if err != nil {
+		return 0, err
+	}
+	var msg sendMessageResult
+	if err := json.Unmarshal(result, &msg); err != nil {
+		return 0, fmt.Errorf("messaging: telegram sendMessage: decode result: %w", err)
+	}
+	return msg.MessageID, nil
 }
 
 // sendMessageOnce sends a single message of at most MaxMessageLength runes.
 func (g *TelegramGateway) sendMessageOnce(ctx context.Context, chatID int64, text string) error {
-	_, err := g.call(ctx, "sendMessage", nil, sendMessageRequest{ChatID: chatID, Text: text})
+	_, err := g.sendMessageRaw(ctx, chatID, text, "")
+	return err
+}
+
+// SendMessageHTML sends one HTML message to chatID and returns the new
+// message's id, so the caller can edit it in place later. Unlike
+// SendMessage it does not split: card HTML is already capped at 4000
+// runes by TerminalCard.Render.
+func (g *TelegramGateway) SendMessageHTML(ctx context.Context, chatID int64, htmlText string) (int64, error) {
+	return g.sendMessageRaw(ctx, chatID, htmlText, "HTML")
+}
+
+// SendChatAction sends a chat action (e.g. "typing") to chatID, so the
+// user sees the bot working while a turn runs.
+func (g *TelegramGateway) SendChatAction(ctx context.Context, chatID int64, action string) error {
+	_, err := g.call(ctx, "sendChatAction", nil, struct {
+		ChatID int64  `json:"chat_id"`
+		Action string `json:"action"`
+	}{ChatID: chatID, Action: action})
+	return err
+}
+
+// EditMessageText edits messageID in chatID in place with new HTML
+// text. Telegram's "message is not modified" error (the new text is
+// identical to the current text) is treated as success: it must not
+// fail the turn.
+func (g *TelegramGateway) EditMessageText(ctx context.Context, chatID, messageID int64, htmlText string) error {
+	_, err := g.call(ctx, "editMessageText", nil, struct {
+		ChatID    int64  `json:"chat_id"`
+		MessageID int64  `json:"message_id"`
+		Text      string `json:"text"`
+		ParseMode string `json:"parse_mode"`
+	}{ChatID: chatID, MessageID: messageID, Text: htmlText, ParseMode: "HTML"})
+	if err != nil && strings.Contains(err.Error(), "message is not modified") {
+		return nil
+	}
+	return err
+}
+
+// BotCommand is one entry of the bot's /commands menu.
+type BotCommand struct {
+	Name        string `json:"command"`
+	Description string `json:"description"`
+}
+
+// SetMyCommands replaces the bot's command menu (the list shown when
+// the user types "/" in Telegram).
+func (g *TelegramGateway) SetMyCommands(ctx context.Context, cmds []BotCommand) error {
+	if cmds == nil {
+		cmds = []BotCommand{}
+	}
+	_, err := g.call(ctx, "setMyCommands", nil, struct {
+		Commands []BotCommand `json:"commands"`
+	}{Commands: cmds})
 	return err
 }
 
@@ -456,6 +603,14 @@ func (g *TelegramGateway) GetUpdates(ctx context.Context) ([]Update, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Serialise whole polls (see fetchMu): the offset read, the
+	// request, and the offset advance are one atomic step, so two
+	// concurrent callers can never fetch the same offset and deliver
+	// the same updates twice. A second caller waits here for the
+	// in-flight long poll (up to ~35s) instead of duplicating it.
+	g.fetchMu.Lock()
+	defer g.fetchMu.Unlock()
+
 	// Bound the long poll even if the caller supplied a client without a
 	// timeout. WithTimeout never extends a shorter caller deadline: the
 	// earliest deadline wins.
@@ -504,29 +659,51 @@ func (g *TelegramGateway) GetUpdates(ctx context.Context) ([]Update, error) {
 // balance.
 const maxPollHandlers = 8
 
-// Poll loops on GetUpdates until ctx is cancelled, delivering each
-// incoming message with non-empty text to handler and sending the
-// handler's reply back to the same chat.
+// cardEditThrottle is the minimum interval between in-place edits of
+// the terminal card: Telegram rate-limits edits, so bursts of tool
+// events are coalesced and only the latest render is sent.
+const cardEditThrottle = time.Second
+
+// typingResendInterval re-sends the "typing" chat action this often
+// while a turn runs: Telegram shows it for only a few seconds.
+const typingResendInterval = 4 * time.Second
+
+// PollStream loops on GetUpdates until ctx is cancelled, delivering
+// each incoming message with non-empty text to handler and sending the
+// handler's reply back to the same chat, with a live Hermes-style
+// terminal card rendered from the handler's progress events.
 //
+//   - Before the handler runs, a "typing" chat action is sent and
+//     re-sent every 4s until the handler returns.
+//   - The terminal card is created lazily on the first ToolCallStarted
+//     event and edited in place on later events, throttled to at most
+//     one edit per second (bursts coalesce; a final edit is always
+//     done when the handler returns, if the render changed since the
+//     last successful edit). A failed edit falls back to sending a
+//     fresh card message and editing that one instead. A turn with no
+//     tool calls sends no card at all.
 //   - A handler error is reported to the user as
-//     "Sorry, I hit an error: <err>" (split/capped by SendMessage);
-//     polling continues.
-//   - An empty handler reply sends nothing.
+//     "Sorry, I hit an error: <err>" (redacted, split/capped by
+//     SendMessage); polling continues. If a card exists, it gets a
+//     final edit first so the card shows the failed state.
+//   - When the handler returns stats != nil, the footer from
+//     FormatFooter(stats) is appended to the reply; nil stats means
+//     no footer. An empty reply sends nothing.
 //   - A transient GetUpdates error backs off (1s, doubling to a 5s max)
-//     and polling continues.
+//     and polling continues. A fatal one (401/403/409: revoked token,
+//     blocked bot, another poller) returns an error instead.
 //   - ctx cancellation returns nil cleanly.
+//   - A handler panic is reported to the chat like a handler error
+//     and polling continues; it never kills the daemon.
 //
-// Updates are handled concurrently, bounded by maxPollHandlers, so a
-// slow handler for one chat does not stall polling or handling for
-// other chats. Ordering is preserved best-effort per chat: handlers
-// for the same chat run one at a time (striped locks), in dispatch
-// order as far as goroutine scheduling allows. When ctx is cancelled
-// Poll returns nil promptly; handlers already running are left to
-// finish (their reply sends use the cancelled ctx and fail
+// Updates are handled concurrently, bounded by maxPollHandlers, with
+// best-effort per-chat ordering (striped locks). When ctx is cancelled
+// PollStream returns nil promptly; handlers already running are left
+// to finish (their reply sends use the cancelled ctx and fail
 // best-effort, as before).
-func (g *TelegramGateway) Poll(ctx context.Context, handler func(ctx context.Context, chatID int64, text string) (string, error)) error {
+func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) error {
 	if handler == nil {
-		return errors.New("messaging: telegram Poll: handler must not be nil")
+		return errors.New("messaging: telegram PollStream: handler must not be nil")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -543,21 +720,129 @@ func (g *TelegramGateway) Poll(ctx context.Context, handler func(ctx context.Con
 	}
 	handle := func(upd Update) {
 		defer func() { <-sem }()
+		// A panic in the handler (the agent loop) must not kill the
+		// daemon: report it to the chat like any other handler error
+		// and keep polling. This defer is registered after the
+		// semaphore release, so on a panic it runs first (LIFO) and
+		// the slot is still released.
+		defer func() {
+			if r := recover(); r != nil {
+				msg := fmt.Sprintf("Sorry, I hit an error: %v", r)
+				// Redact before sending: a handler panic value
+				// could carry a provider/config error with a key.
+				msg = security.RedactSecrets(msg)
+				// Best effort: a failed apology must not kill polling.
+				_ = g.SendMessage(ctx, upd.Message.Chat.ID, msg)
+			}
+		}()
 		lock := chatLock(upd.Message.Chat.ID)
 		lock.Lock()
 		defer lock.Unlock()
-		reply, herr := handler(ctx, upd.Message.Chat.ID, upd.Message.Text)
+
+		chatID := upd.Message.Chat.ID
+
+		// --- terminal card state (this turn only) ---
+		var cardMu sync.Mutex
+		card := &TerminalCard{}
+		var cardMsgID int64 // 0 until the card is created
+		var lastSent string // last rendered text successfully shown
+		var lastEdit time.Time
+		// syncCard renders the card and, when it changed since the
+		// last successful show, pushes it to Telegram: creating the
+		// card on first use, editing it in place otherwise, and
+		// sending a fresh card when an edit fails. force ignores the
+		// throttle (used for the final edit when the handler
+		// returns). It is best-effort: every failure is swallowed
+		// so a card problem never fails the turn.
+		syncCard := func(force bool) {
+			cardMu.Lock()
+			defer cardMu.Unlock()
+			rendered := card.Render()
+			if rendered == lastSent {
+				return
+			}
+			// Never create a card for a turn with no tool calls:
+			// the final sync after the handler returns would
+			// otherwise send a bare header (lastSent starts as ""
+			// and differs from the header).
+			if cardMsgID == 0 && card.IsEmpty() {
+				return
+			}
+			if !force && !lastEdit.IsZero() && time.Since(lastEdit) < cardEditThrottle {
+				return // coalesce bursts; the final edit catches up
+			}
+			if cardMsgID == 0 {
+				id, err := g.SendMessageHTML(ctx, chatID, rendered)
+				if err != nil {
+					return
+				}
+				cardMsgID = id
+			} else if err := g.EditMessageText(ctx, chatID, cardMsgID, rendered); err != nil {
+				// The message may have been deleted: send a fresh
+				// card and keep editing that one instead.
+				id, err2 := g.SendMessageHTML(ctx, chatID, rendered)
+				if err2 != nil {
+					return
+				}
+				cardMsgID = id
+			}
+			lastSent = rendered
+			lastEdit = time.Now()
+		}
+		emit := func(ev core.ProgressEvent) {
+			cardMu.Lock()
+			card.Add(ev)
+			cardMu.Unlock()
+			// Only tool-call events can change the card; other kinds
+			// (step/turn) are ignored by TerminalCard.Add anyway.
+			if ev.Kind == core.EventToolCallStarted || ev.Kind == core.EventToolCallFinished {
+				syncCard(false)
+			}
+		}
+
+		// "typing" while the turn runs, re-sent every 4s: Telegram
+		// shows a chat action for only a few seconds.
+		typingDone := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(typingResendInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-typingDone:
+					return
+				case <-ticker.C:
+					_ = g.SendChatAction(ctx, chatID, "typing")
+				}
+			}
+		}()
+		_ = g.SendChatAction(ctx, chatID, "typing")
+
+		reply, stats, herr := handler(ctx, chatID, upd.Message.Text, emit)
+		close(typingDone)
+
+		// Final card edit: show the finished state (including any
+		// failed tool call) even if the last event was inside the
+		// throttle window. syncCard is a no-op when the card was
+		// never created or nothing changed.
+		syncCard(true)
+
 		if herr != nil {
 			msg := fmt.Sprintf("Sorry, I hit an error: %v", herr)
+			// Redact before sending: a raw provider/config error
+			// could carry an API key or token.
+			msg = security.RedactSecrets(msg)
 			// Best effort: a failed apology must not kill polling.
-			_ = g.SendMessage(ctx, upd.Message.Chat.ID, msg)
+			_ = g.SendMessage(ctx, chatID, msg)
 			return
 		}
 		if reply == "" {
 			return
 		}
+		if stats != nil {
+			reply += "\n\n" + FormatFooter(stats)
+		}
 		// Best effort: a failed reply must not kill polling.
-		_ = g.SendMessage(ctx, upd.Message.Chat.ID, reply)
+		_ = g.SendMessage(ctx, chatID, reply)
 	}
 
 	for {
@@ -571,6 +856,15 @@ func (g *TelegramGateway) Poll(ctx context.Context, handler func(ctx context.Con
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			// A revoked token, a blocked bot, or a second poller
+			// holding the connection (401/403/409) can never heal
+			// by retrying: fail loudly so the daemon exits (and
+			// systemd / the operator notices) instead of looking
+			// alive while polling a dead token every few seconds.
+			var apiErr *apiError
+			if errors.As(err, &apiErr) && apiErr.isFatalForPoll() {
+				return fmt.Errorf("messaging: telegram poll: unrecoverable Bot API error: %w", apiErr)
 			}
 			select {
 			case <-ctx.Done():
@@ -609,4 +903,21 @@ func (g *TelegramGateway) Poll(ctx context.Context, handler func(ctx context.Con
 			go handle(upd)
 		}
 	}
+}
+
+// Poll loops on GetUpdates until ctx is cancelled, delivering each
+// incoming message with non-empty text to handler and sending the
+// handler's reply back to the same chat. It is a thin wrapper over
+// PollStream: the handler receives no progress events and no footer
+// is appended (stats nil). All PollStream semantics apply — backoff
+// on transient GetUpdates errors, fatal 401/403/409, allowlist,
+// per-chat ordering, panic recovery, and nil on ctx cancellation.
+func (g *TelegramGateway) Poll(ctx context.Context, handler func(ctx context.Context, chatID int64, text string) (string, error)) error {
+	if handler == nil {
+		return errors.New("messaging: telegram Poll: handler must not be nil")
+	}
+	return g.PollStream(ctx, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		reply, err := handler(ctx, chatID, text)
+		return reply, nil, err
+	})
 }

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -89,6 +90,12 @@ type anthropicResponse struct {
 // result would produce consecutive user turns and an HTTP 400 on the
 // next Chat whenever a turn called two or more tools.
 //
+// Consecutive same-role messages are merged in general, for the same
+// reason: the agent loop can append a plain user message (the
+// deferred-call reminder) right after a tool_result user turn, and
+// memory can hold two adjacent user turns; either would be a 400
+// without the merge. Assistant turns merge the same way.
+//
 // An error is returned when a tool call's arguments are not valid JSON
 // (or are an empty string): silently substituting {} would mask a
 // malformed turn and send the model a call it never made.
@@ -110,10 +117,10 @@ func toAnthropicMessages(msgs []Message) (system string, out []anthropicMessage,
 				i++
 			}
 			i-- // outer loop's i++ moves to the first non-tool message
-			out = append(out, anthropicMessage{Role: "user", Content: blocks})
+			out = appendAnthropicMessage(out, anthropicMessage{Role: "user", Content: blocks})
 		case "assistant":
 			if len(m.ToolCalls) == 0 {
-				out = append(out, anthropicMessage{Role: "assistant", Content: m.Content})
+				out = appendAnthropicMessage(out, anthropicMessage{Role: "assistant", Content: m.Content})
 				continue
 			}
 			blocks := make([]anthropicContentBlock, 0, len(m.ToolCalls)+1)
@@ -136,16 +143,63 @@ func toAnthropicMessages(msgs []Message) (system string, out []anthropicMessage,
 					Input: input,
 				})
 			}
-			out = append(out, anthropicMessage{Role: "assistant", Content: blocks})
+			out = appendAnthropicMessage(out, anthropicMessage{Role: "assistant", Content: blocks})
 		default:
 			// "user" is passed through as a user turn. Any unknown role
 			// is also mapped to user: Anthropic only accepts
 			// user/assistant (plus extracted system), so passing an
 			// unknown role verbatim would produce a 400.
-			out = append(out, anthropicMessage{Role: "user", Content: m.Content})
+			out = appendAnthropicMessage(out, anthropicMessage{Role: "user", Content: m.Content})
 		}
 	}
 	return strings.Join(systemParts, "\n"), out, nil
+}
+
+// appendAnthropicMessage appends a turn, merging it into the previous
+// turn when both have the same role, so the converted conversation
+// always strictly alternates user/assistant as Anthropic requires.
+func appendAnthropicMessage(out []anthropicMessage, m anthropicMessage) []anthropicMessage {
+	if n := len(out); n > 0 && out[n-1].Role == m.Role {
+		out[n-1].Content = mergeAnthropicContent(out[n-1].Content, m.Content)
+		return out
+	}
+	return append(out, m)
+}
+
+// mergeAnthropicContent concatenates the content of two same-role
+// turns. String + string joins with a newline; block content gains
+// the other's text as a text block (a tool_result turn followed by a
+// plain reminder becomes one user turn with a tool_result block and
+// a text block). Content here is only ever a string or a
+// []anthropicContentBlock.
+func mergeAnthropicContent(a, b any) any {
+	aStr, aIsStr := a.(string)
+	bStr, bIsStr := b.(string)
+	switch {
+	case aIsStr && bIsStr:
+		if aStr == "" {
+			return bStr
+		}
+		if bStr == "" {
+			return aStr
+		}
+		return aStr + "\n" + bStr
+	case aIsStr:
+		blocks := []anthropicContentBlock{}
+		if aStr != "" {
+			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: aStr})
+		}
+		return append(blocks, b.([]anthropicContentBlock)...)
+	default:
+		blocks := a.([]anthropicContentBlock)
+		if bIsStr {
+			if bStr == "" {
+				return blocks
+			}
+			return append(blocks, anthropicContentBlock{Type: "text", Text: bStr})
+		}
+		return append(blocks, b.([]anthropicContentBlock)...)
+	}
 }
 
 func toAnthropicTools(tools []ToolDefinition) []anthropicTool {
@@ -199,6 +253,12 @@ func (p *anthropicProvider) buildRequest(req ChatRequest, stream bool) (anthropi
 	system, messages, err := toAnthropicMessages(req.Messages)
 	if err != nil {
 		return anthropicRequest{}, err
+	}
+	if len(messages) == 0 {
+		// A system prompt alone is not a conversation: Anthropic
+		// rejects an empty messages array with a 400, so fail
+		// here with a clear error instead of sending it.
+		return anthropicRequest{}, errors.New("anthropic: request has no messages (a system prompt alone is not a conversation)")
 	}
 	r := anthropicRequest{
 		Model:     p.cfg.Model,
@@ -333,6 +393,13 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 	event := ""
 	for scanner.Scan() {
 		line := scanner.Text()
+		if line == "" {
+			// A blank line ends one SSE event: the event type
+			// must not leak into the next block, or a data-only
+			// line would be misrouted to the previous event.
+			event = ""
+			continue
+		}
 		if strings.HasPrefix(line, "event:") {
 			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 			continue

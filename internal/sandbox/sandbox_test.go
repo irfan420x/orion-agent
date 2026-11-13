@@ -20,14 +20,38 @@ import (
 // shell_exec does, then hands it to the sandbox.
 func runSandboxed(t *testing.T, root string, command string, allowNetwork bool) (string, int) {
 	t.Helper()
+	cfg := Config{Enabled: true, Root: root, AllowNetwork: allowNetwork}
+	return runSandboxedCfg(t, cfg, command)
+}
+
+// runSandboxedCfg is runSandboxed with an explicit Config.
+func runSandboxedCfg(t *testing.T, cfg Config, command string) (string, int) {
+	t.Helper()
+	return runPrepared(t, prepareSandboxed(t, cfg, command))
+}
+
+// prepareSandboxed builds the sandboxed /bin/sh -c invocation and
+// returns the prepared cmd, not yet started, so a test can stage
+// extra files into the chroot (under <root>/.orion-root, or into
+// <root>/work, which is /work inside) before running it.
+func prepareSandboxed(t *testing.T, cfg Config, command string) *exec.Cmd {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// The context must outlive the returned cmd's Run; cancel when
+	// the test ends rather than when this helper returns.
+	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	cmd.Env = os.Environ()
-	cfg := Config{Enabled: true, Root: root, AllowNetwork: allowNetwork}
 	if err := cfg.Prepare(cmd, command); err != nil {
 		t.Fatalf("Prepare(%q): %v", command, err)
 	}
+	return cmd
+}
+
+// runPrepared runs a cmd from prepareSandboxed and returns combined
+// output and exit code.
+func runPrepared(t *testing.T, cmd *exec.Cmd) (string, int) {
+	t.Helper()
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -37,7 +61,7 @@ func runSandboxed(t *testing.T, root string, command string, allowNetwork bool) 
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			code = exitErr.ExitCode()
 		} else {
-			t.Fatalf("run %q: %v", command, err)
+			t.Fatalf("run %v: %v", cmd.Args, err)
 		}
 	}
 	return buf.String(), code
@@ -229,5 +253,54 @@ func TestSandboxConcurrentRuns(t *testing.T) {
 	close(errs)
 	for e := range errs {
 		t.Error(e)
+	}
+}
+
+// TestSandboxChrootEscapeBlocked is the regression test for the
+// chroot-escape hole (audit 2, P0). A plain chroot is escapable: a
+// process with CAP_SYS_CHROOT can chroot to a subdirectory while
+// its cwd is outside it, walk up past the old root, and chroot
+// again onto the host filesystem. The sandbox pivot_roots into the
+// new root and lazily unmounts the old root, so the walk-up stops
+// at the new root and the host file stays unreachable. The escape
+// below is the full classic sequence (it read the canary before
+// the pivot fix). Everything happens inside t.TempDir().
+func TestSandboxChrootEscapeBlocked(t *testing.T) {
+	requireSandbox(t)
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	outside := filepath.Join(base, "outside.txt")
+	if err := os.WriteFile(outside, []byte("OUTSIDE-SECRET\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Double chroot: chroot to /work/sub while cwd is /work (outside
+	// the new root), walk up as far as possible, chroot again to
+	// wherever that lands, then read the host canary by absolute
+	// path. Before the pivot fix this printed OUTSIDE-SECRET.
+	esc := fmt.Sprintf(`python3 -c "import os; os.mkdir('/work/sub'); os.chroot('/work/sub'); [os.chdir('..') for _ in range(12)]; os.chroot('.'); os.chdir('/'); print('CANARY:'+open('%s').read())"`, outside)
+	out, _ := runSandboxed(t, root, esc, false)
+	if strings.Contains(out, "OUTSIDE-SECRET") {
+		t.Errorf("chroot escape read the outside canary:\n%s", out)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "OUTSIDE-SECRET\n" {
+		t.Errorf("outside canary: got %q, err %v; want untouched", got, err)
+	}
+}
+
+// TestSandboxNoDevTTY proves /dev/tty is not present inside: it is
+// the process's controlling terminal, and a sandboxed command with
+// access to it could inject input into it (TIOCSTI) when the agent
+// runs attached to a tty.
+func TestSandboxNoDevTTY(t *testing.T) {
+	requireSandbox(t)
+	root := filepath.Join(t.TempDir(), "root")
+	out, _ := runSandboxed(t, root, "ls /dev/tty 2>&1; test -e /dev/null && echo NULL-OK; test -e /dev/urandom && echo URANDOM-OK", false)
+	if !strings.Contains(out, "No such file or directory") {
+		t.Errorf("/dev/tty exists inside the sandbox, output:\n%s", out)
+	}
+	for _, want := range []string{"NULL-OK", "URANDOM-OK"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q (harmless device nodes must still work):\n%s", want, out)
+		}
 	}
 }

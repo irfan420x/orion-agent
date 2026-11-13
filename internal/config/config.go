@@ -41,6 +41,7 @@ func KnownProviderNames() []string {
 
 var knownProviders = map[string]bool{
 	"openai":    true,
+	"deepseek":  true,
 	"anthropic": true,
 	"ollama":    true,
 }
@@ -49,7 +50,7 @@ var knownProviders = map[string]bool{
 // run without an API key. Ollama is local and needs none.
 func providerNeedsAPIKey(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "openai", "anthropic":
+	case "openai", "deepseek", "anthropic":
 		return true
 	default:
 		return false
@@ -96,6 +97,14 @@ type Config struct {
 	// (used by the live-model E2E test); the valid range is 0-2.
 	Temperature *float64 `json:"temperature,omitempty"`
 
+	// TelegramFooter, when set, is the default for the per-chat
+	// runtime footer on final Telegram replies (see
+	// internal/messaging.FormatFooter and the /footer command). Nil
+	// means ON (the footer is shown unless a chat turns it off with
+	// /footer off). A per-chat override in the session store wins
+	// over this default.
+	TelegramFooter *bool `json:"telegram_footer,omitempty"`
+
 	// Sandbox configures sandbox mode for shell_exec (user+mount
 	// namespace chroot; see internal/sandbox). Disabled by default:
 	// when off, shell_exec behaves exactly as before, protected
@@ -128,6 +137,7 @@ func defaultConfig(dataDir string) *Config {
 		DefaultProvider: "ollama",
 		Providers: map[string]ProviderConfig{
 			"openai":    {Name: "openai", Model: "gpt-4o-mini"},
+			"deepseek":  {Name: "deepseek", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"},
 			"anthropic": {Name: "anthropic", Model: "claude-sonnet-4-5"},
 			"ollama":    {Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.1"},
 		},
@@ -475,10 +485,56 @@ func (c *Config) Save(path string) error {
 	if err != nil {
 		return fmt.Errorf("config: marshal: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("config: write %s: %w", path, err)
+	// Atomic write, like memory's FileStore: temp file in the same
+	// directory (0600), fsync, rename over the destination, fsync
+	// the directory. A plain os.WriteFile can leave a torn
+	// config.json behind on a crash mid-write (Load then fails to
+	// parse and Orion will not start), and it never changes the
+	// mode of a pre-existing file — a config.json created with
+	// 0644 would stay world-readable, leaking the API keys and
+	// Telegram token it holds. The rename replaces any such file
+	// with a 0600 one.
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("config: create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup on any failure path; after a successful
+	// rename the temp path no longer exists and Remove is a no-op.
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("config: chmod temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("config: write temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("config: sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("config: close temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("config: rename temp file to %q: %w", path, err)
+	}
+	if err := syncConfigDir(dir); err != nil {
+		return fmt.Errorf("config: sync data dir %q: %w", dir, err)
 	}
 	return nil
+}
+
+// syncConfigDir fsyncs a directory so renames into it survive a crash.
+func syncConfigDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // ActiveProvider returns the configured default provider entry and the

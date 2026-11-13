@@ -11,9 +11,12 @@
 //     those work: unshare -rm and unshare -rmn both succeed as root.
 //   - So the sandbox is built from namespaces directly, with no new
 //     dependency: the child is started with CLONE_NEWUSER (uid/gid 0
-//     mapped to the agent's own uid/gid), CLONE_NEWNS, and — unless
-//     AllowNetwork is set — CLONE_NEWNET (a network namespace whose
-//     only interface is a down loopback: no network at all).
+//     mapped to the agent's own uid/gid), CLONE_NEWNS, CLONE_NEWIPC
+//     (its own SysV IPC namespace: no host shared memory, semaphores
+//     or message queues are visible) and CLONE_NEWUTS (its own
+//     hostname), and — unless AllowNetwork is set — CLONE_NEWNET (a
+//     network namespace whose only interface is a down loopback: no
+//     network at all).
 //   - Inside the namespaces a small shell wrapper (run before any
 //     user code) makes mounts private, then builds a chroot root
 //     under <root>/.orion-root: /usr bind-mounted read-only, a
@@ -21,17 +24,43 @@
 //     the host /etc contains runtime submounts, including a
 //     credentials tmpfs, and bind-mounting it is refused in a nested
 //     user namespace), the harmless device nodes (/dev/null, zero,
-//     full, random, urandom, tty) bind-mounted individually, a tmpfs
-//     on /tmp, and <root>/work bind-mounted read-write as /work.
-//     The chroot root itself is remounted read-only (via --rbind,
-//     which replicates the submounts — a plain self-bind drops them).
-//     The command then runs as /bin/sh -c inside the chroot with cwd
-//     /work, HOME=/work, TMPDIR=/tmp, and the agent's scrubbed env.
+//     full, random, urandom) bind-mounted individually, a tmpfs on
+//     /tmp, and <root>/work bind-mounted read-write as /work. The
+//     chroot root itself is remounted read-only (via --rbind, which
+//     replicates the submounts — a plain self-bind drops them), and
+//     /work is remounted nodev+nosuid so no device node created
+//     there can ever be opened. The command then runs as /bin/sh -c
+//     inside the chroot with cwd /work, HOME=/work, TMPDIR=/tmp, and
+//     the agent's scrubbed env.
+//   - A plain chroot is escapable on its own: a process with
+//     CAP_SYS_CHROOT (uid 0 in its user namespace) can chroot to a
+//     subdirectory while its cwd is outside it, walk up past the
+//     old root, and chroot again onto the host filesystem (proven by
+//     TestSandboxChrootEscapeBlocked). So the wrapper does not
+//     chroot at all: it pivot_roots into the new root and then
+//     lazily unmounts the old (host) root with umount2(MNT_DETACH)
+//     via python3 ctypes — umount(8) cannot do it, because libmount
+//     needs /proc/mounts and /proc is deliberately not mounted.
+//     After the pivot and detach, the process root IS the new root
+//     and there is no host mount left to walk to, so the escape is
+//     structurally closed. (An earlier setpriv capability-dropping
+//     plan was abandoned once the pivot was proven to work.) The
+//     seccomp filter, when its launcher is installed, blocks
+//     chroot/mount as a further layer.
 //   - The only writable places inside are /work (which persists on
 //     the host at <root>/work) and /tmp (a per-run tmpfs that
 //     vanishes with the namespace). /home, /etc, /usr and every other
 //     host path are either absent or read-only, so even `rm -rf /`
 //     inside can only destroy the sandbox's own contents.
+//   - On top of the namespaces, a seccomp filter (see seccomp.go)
+//     denies escape-relevant syscalls — mounts, namespace creation,
+//     kernel modules, reboot, keyrings, BPF, host clock/hostname
+//     changes, cross-process memory access — to the sandboxed
+//     command. It is applied by a tiny helper binary, orion-seccomp,
+//     exec'd by the wrapper after the pivot_root; when the helper is
+//     unavailable the command still runs (namespaces + pivot_root
+//     only) and a warning is logged once. Seccomp is a second layer
+//     on top of the namespaces, never a replacement for them.
 //
 // Limits (see SECURITY.md for the full list):
 //
@@ -75,6 +104,16 @@ type Config struct {
 	// AllowNetwork, when true, keeps the host network namespace
 	// instead of creating an empty one. Default false: no network.
 	AllowNetwork bool `json:"allow_network"`
+	// SeccompLauncher is an explicit path to the orion-seccomp
+	// helper binary (internal/sandbox/cmd/launcher). Empty means
+	// auto-discovery: $ORION_SECCOMP_LAUNCHER, then orion-seccomp
+	// next to the running binary, then PATH.
+	SeccompLauncher string `json:"seccomp_launcher"`
+	// DisableSeccomp turns the seccomp filter off even when the
+	// helper is available. Default false: the filter is applied
+	// whenever a usable launcher is found, and the command runs
+	// without it (with a warning logged once) when none is.
+	DisableSeccomp bool `json:"disable_seccomp"`
 }
 
 // DefaultRoot returns the default sandbox root under dataDir.
@@ -144,8 +183,11 @@ var etcAllowlist = []string{
 // devAllowlist is the set of device nodes bind-mounted individually
 // into the sandbox's /dev. /dev itself is never bind-mounted: it is
 // a tmpfs with submounts (pts, shm) that refuse the same way.
+// /dev/tty is deliberately absent: it is the process's controlling
+// terminal, and a sandboxed command with access to it could inject
+// input into it (TIOCSTI) when the agent runs attached to a tty.
 var devAllowlist = []string{
-	"null", "zero", "full", "random", "urandom", "tty",
+	"null", "zero", "full", "random", "urandom",
 }
 
 // wrapperScript runs inside the new namespaces, before any user
@@ -159,10 +201,10 @@ ROOT=$1
 CMD=$2
 mount --make-rprivate / || exit 126
 NEWROOT="$ROOT/.orion-root"
-mkdir -p "$NEWROOT/usr" "$NEWROOT/etc" "$NEWROOT/dev" "$NEWROOT/tmp" "$NEWROOT/proc" "$NEWROOT/work" || exit 126
+mkdir -p "$NEWROOT/usr" "$NEWROOT/etc" "$NEWROOT/dev" "$NEWROOT/tmp" "$NEWROOT/proc" "$NEWROOT/work" "$NEWROOT/.old-root" || exit 126
 mount --bind /usr "$NEWROOT/usr" || exit 126
 mount -o remount,bind,ro,nosuid,nodev "$NEWROOT/usr" || exit 126
-for d in null zero full random urandom tty; do
+for d in null zero full random urandom; do
   if [ -e "/dev/$d" ]; then
     touch "$NEWROOT/dev/$d" || exit 126
     mount --bind "/dev/$d" "$NEWROOT/dev/$d" || exit 126
@@ -170,9 +212,46 @@ for d in null zero full random urandom tty; do
 done
 mount -t tmpfs -o nosuid,nodev,noexec tmpfs "$NEWROOT/tmp" || exit 126
 mount --bind "$ROOT/work" "$NEWROOT/work" || exit 126
+mount -o remount,bind,rw,nodev,nosuid "$NEWROOT/work" || exit 126
 mount --rbind "$NEWROOT" "$NEWROOT" || exit 126
 mount -o remount,bind,ro,nosuid,nodev "$NEWROOT" || exit 126
-exec chroot "$NEWROOT" /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
+# Pivot into the new root and detach the old (host) root. A plain
+# chroot is escapable: a process with CAP_SYS_CHROOT (uid 0 in its
+# user namespace) can chroot to a subdirectory while its cwd is
+# outside it, walk up past the old root, and chroot again onto the
+# host filesystem. After pivot_root the process root IS the new
+# root, and the lazy unmount removes the old root mount from this
+# mount namespace entirely, so there is nothing outside left to
+# walk to. The pivot must come after the mounts above (the new
+# root has to be a mount point) and the unmount after cd / (the
+# shell's cwd must not be inside the old root, or it stays busy).
+cd "$NEWROOT" || exit 126
+pivot_root . .old-root || exit 126
+cd / || exit 126
+# Detach the old (host) root. The umount(8) CLI cannot do this:
+# libmount needs /proc/mounts (or /proc/self/mountinfo) to find the
+# mount, and /proc is deliberately not mounted in the sandbox —
+# proven by strace (2026-11-13): umount never issues the umount2
+# syscall, it fails opening /proc/mounts. So call umount2(2)
+# directly via python3 (present in the chroot through the /usr bind
+# mount; the number is arch-dependent). If python3 or the arch is
+# unavailable, refuse to run: leaving the host root mounted at
+# /.old-root would defeat the pivot.
+case "$(uname -m)" in
+  x86_64) UMOUNT2=166 ;;
+  aarch64) UMOUNT2=39 ;;
+  *) exit 126 ;;
+esac
+python3 -c "import ctypes,sys; libc=ctypes.CDLL('libc.so.6', use_errno=True); sys.exit(0 if libc.syscall($UMOUNT2, b'/.old-root', 2)==0 else 1)" || exit 126
+# Seccomp: when Prepare staged the helper into the root, run the
+# command through it (it installs the filter, then execs /bin/sh).
+# Otherwise run the command directly; the missing filter was
+# already warned about on the host side. (The root is already the
+# new root after the pivot, so no chroot is needed here.)
+if [ -x /orion-seccomp ]; then
+  exec /orion-seccomp /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
+fi
+exec /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
 `
 
 var (
@@ -222,11 +301,12 @@ func runProbe() {
 
 // Prepare rewrites cmd (a /bin/sh -c <command> invocation) to run
 // inside the sandbox: new user, mount and (unless AllowNetwork)
-// network namespaces, then the wrapper builds the chroot and runs
-// the command there. It creates the sandbox root, its work dir, the
-// chroot tree, the minimal /etc copies and the merged-/usr symlinks
-// on the host first; those are plain directories and idempotent, so
-// concurrent sandboxed commands can share one root safely.
+// network namespaces, then the wrapper builds the root and
+// pivot_roots into it (see wrapperScript). It creates the sandbox
+// root, its work dir, the root tree, the minimal /etc copies and the
+// merged-/usr symlinks on the host first; those are plain directories
+// and idempotent, so concurrent sandboxed commands can share one root
+// safely.
 //
 // cmd.Env should already hold the caller's scrubbed environment when
 // Prepare is called; Prepare overrides HOME, TMPDIR and PATH to the
@@ -253,11 +333,27 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 		filepath.Join(newRoot, "tmp"),
 		filepath.Join(newRoot, "proc"),
 		filepath.Join(newRoot, "work"),
+		filepath.Join(newRoot, ".old-root"),
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("sandbox: create %s: %w", d, err)
 		}
+	}
+	// Resolve the root through symlinks and re-validate the real
+	// path: a root like /tmp/link where the link points at /etc
+	// would otherwise pass the lexical Validate check and put
+	// sandbox state (and the chroot tree) inside a system tree.
+	// The wrapper is handed the resolved root so $ROOT/work and
+	// $ROOT/.orion-root name the same directories it just created.
+	if resolved, err := filepath.EvalSymlinks(root); err != nil {
+		return fmt.Errorf("sandbox: resolve root %s: %w", root, err)
+	} else if resolved != root {
+		if err := (Config{Root: resolved}).Validate(); err != nil {
+			return err
+		}
+		root = resolved
+		newRoot = filepath.Join(root, ".orion-root")
 	}
 	// Minimal /etc, copied once when missing (see etcAllowlist).
 	for _, name := range etcAllowlist {
@@ -295,7 +391,13 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 		}
 	}
 
-	cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS)
+	// Seccomp filter: stage the helper binary into the chroot when
+	// one is usable. The wrapper execs through it when present;
+	// when absent (or disabled) the command runs without the
+	// filter, with a warning logged once by setupSeccomp.
+	cfg.setupSeccomp(newRoot)
+
+	cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS)
 	if !cfg.AllowNetwork {
 		cloneFlags |= uintptr(syscall.CLONE_NEWNET)
 	}

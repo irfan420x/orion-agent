@@ -14,6 +14,15 @@
 # `orion version` reports the real build.
 
 GO ?= go
+# Fall back to the per-user Go installs this VM/container setup is
+# known to use when `go` is not on PATH (/usr/local/go does not
+# survive restores here, so it is only a last resort).
+ifeq ($(shell command -v $(GO) 2>/dev/null),)
+GO := $(HOME)/go1.27.4/bin/go
+endif
+ifeq ($(shell command -v $(GO) 2>/dev/null),)
+GO := /usr/local/go/bin/go
+endif
 VERSION_PKG := github.com/irfan/orion/internal/version
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -26,6 +35,7 @@ BIN_DIR ?= bin
 build:
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orion ./cmd/orion
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/oriond ./cmd/oriond
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orion-seccomp ./internal/sandbox/cmd/launcher
 
 install:
 	./install.sh

@@ -13,10 +13,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/irfan/orion/internal/model"
@@ -26,7 +28,54 @@ const (
 	maxFileRead    = 1 * 1024 * 1024 // 1MB
 	maxFileWrite   = 1 * 1024 * 1024 // 1MB
 	maxListEntries = 200
+	// maxListRead caps how many directory entries file_list reads
+	// into memory. A directory with millions of entries must not
+	// exhaust memory; the total is counted exactly up to this cap
+	// and reported as "more than N" beyond it.
+	maxListRead = 10000
+	// maxFileReadTimeout bounds how long a file read may block when
+	// the caller's context has no deadline. A fifo with no writer
+	// blocks forever on read, and os.ReadFile does not watch the
+	// context, so a read is abandoned after this long.
+	maxFileReadTimeout = 30 * time.Second
 )
+
+// readFileBounded reads up to maxFileRead+1 bytes from path. It
+// returns promptly when ctx is cancelled or after
+// maxFileReadTimeout, instead of blocking forever on a fifo with no
+// writer. Reading one byte past the cap is enough to know the file
+// is over the cap; the caller truncates and marks it. A read that
+// is abandoned leaves its goroutine blocked on the file until a
+// writer appears (or the process exits) — one leaked goroutine per
+// abandoned read, bounded by the number of such reads, which is
+// far better than hanging the tool call.
+func readFileBounded(ctx context.Context, path string) ([]byte, error) {
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := os.Open(path)
+		if err != nil {
+			ch <- result{nil, err}
+			return
+		}
+		defer f.Close()
+		data, err := io.ReadAll(io.LimitReader(f, maxFileRead+1))
+		ch <- result{data, err}
+	}()
+	timer := time.NewTimer(maxFileReadTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, fmt.Errorf("timed out reading %q", path)
+	}
+}
 
 // defaultFileRoots are the directories file tools may touch: the process
 // working directory and the OS temp directory. Everything else — /etc,
@@ -219,7 +268,7 @@ func (t *fileReadTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if info.Size() > maxFileRead {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("file %q is %d bytes, over the 1MB read limit", path, info.Size())}
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileBounded(ctx, path)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot read %q: %w", path, err)}
 	}
@@ -354,10 +403,15 @@ func (t *fileEditTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if info.IsDir() {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a directory, not a file", path)}
 	}
+	if !info.Mode().IsRegular() {
+		// A fifo, socket or device would block (or never terminate)
+		// on read; only regular files are editable here.
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is not a regular file", path)}
+	}
 	if info.Size() > maxFileRead {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("file %q is over the 1MB limit", path)}
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileBounded(ctx, path)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot read %q: %w", path, err)}
 	}
@@ -422,12 +476,43 @@ func (t *fileListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
-	entries, err := os.ReadDir(path)
+	// Read in chunks and stop at maxListRead: a directory with
+	// millions of entries must not exhaust memory. The total is
+	// counted exactly up to that cap and reported as "more than N"
+	// beyond it; the first maxListEntries entries are shown.
+	f, err := os.Open(path)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot list %q: %w", path, err)}
 	}
+	var entries []os.DirEntry
+	total := 0
+	moreThanCap := false
+	for {
+		chunk, err := f.ReadDir(512)
+		if err != nil && err != io.EOF {
+			_ = f.Close()
+			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot list %q: %w", path, err)}
+		}
+		// ReadDir may return a final partial chunk together with
+		// io.EOF; count it before stopping.
+		total += len(chunk)
+		if total > maxListRead {
+			moreThanCap = true
+			// Keep only the first maxListRead entries; the rest
+			// are counted, not stored.
+			entries = append(entries, chunk[:max(0, maxListRead-(total-len(chunk)))]...)
+			break
+		}
+		entries = append(entries, chunk...)
+		if err == io.EOF || len(chunk) == 0 {
+			break
+		}
+	}
+	if err := f.Close(); err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot list %q: %w", path, err)}
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	if len(entries) == 0 {
+	if total == 0 {
 		return fmt.Sprintf("%s: (empty directory)", path), nil
 	}
 	var sb strings.Builder
@@ -451,8 +536,10 @@ func (t *fileListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		}
 		fmt.Fprintf(&sb, "%s\t%s\t%d bytes\n", e.Name(), kind, size)
 	}
-	if truncated {
-		fmt.Fprintf(&sb, "... (%d total entries, showing first %d)\n", len(entries), maxListEntries)
+	if moreThanCap {
+		fmt.Fprintf(&sb, "... (more than %d entries, showing first %d)\n", maxListRead, maxListEntries)
+	} else if truncated {
+		fmt.Fprintf(&sb, "... (%d total entries, showing first %d)\n", total, maxListEntries)
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
 }

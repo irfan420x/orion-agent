@@ -51,6 +51,18 @@ orion telegram poll                     # start the gateway (foreground)
 orion daemon                            # same, via the orion CLI
 oriond                                  # standalone daemon binary
 
+While a turn runs, the bot streams a live "💻 terminal" card into
+the chat (one message, edited in place): each tool call appears as
+a block with its command, file writes as ✍️ lines, repeats collapse
+to (×N). Displayed commands are redacted, so secrets never leak
+into the chat. The final reply is a structured message in your
+language, with a runtime footer (model, tokens, steps, duration)
+you can toggle with `/footer`. The `/` menu offers 17 commands
+(`/help`, `/new`, `/stop`, `/status`, `/model`, `/usage`, `/undo`,
+`/retry`, `/pause`, `/agents`, `/title`, `/compress`, `/save`,
+`/restart`, `/whoami`, `/footer`, `/memory`); sessions persist in
+`~/.orion/sessions.json`.
+
 # Run oriond as a service (systemd user unit, oriond.service):
 ./install.sh --systemd                  # installs + enables the unit
 systemctl --user start oriond
@@ -64,7 +76,7 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-14/14 packages, 341 tests passing, 3 skipped (the live Ollama and
+14/14 packages, 441 tests passing, 3 skipped (the live Ollama and
 live Telegram tests, which need a running Ollama server and a bot
 chat respectively), race detector clean — `go test ./... -race
 -count=1` passes, verified 2026-11-13 (includes 15 fact-recall

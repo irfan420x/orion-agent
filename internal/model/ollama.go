@@ -246,7 +246,11 @@ func (p *ollamaProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 		}
 		var chunk ollamaChatResponse
 		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			return nil, fmt.Errorf("ollama: decoding stream line: %w (line: %s)", err, bodyExcerpt([]byte(line)))
+			// A single malformed line must not kill a stream that
+			// is otherwise flowing (cf. OpenAI, which skips bad
+			// SSE chunks): skip it and keep reading. A stream of
+			// nothing but garbage still falls back to Chat below.
+			continue
 		}
 		if chunk.Error != "" {
 			return nil, fmt.Errorf("ollama: API error: %s", chunk.Error)
@@ -262,10 +266,26 @@ func (p *ollamaProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 			}
 		}
 		for _, tc := range chunk.Message.ToolCalls {
-			toolCalls = append(toolCalls, ToolCall{
+			call := ToolCall{
 				Name:      tc.Function.Name,
 				Arguments: ollamaToolArguments(tc.Function.Arguments),
-			})
+			}
+			// Ollama may repeat the full tool-call list in the
+			// final done chunk: an identical (name, arguments)
+			// call already recorded is the same call, not a
+			// second one. Without the dedupe the agent defers a
+			// phantom duplicate and later reminds the model to
+			// perform a call it already executed.
+			dup := false
+			for _, have := range toolCalls {
+				if have.Name == call.Name && have.Arguments == call.Arguments {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				toolCalls = append(toolCalls, call)
+			}
 		}
 		if chunk.PromptEvalCount != 0 {
 			promptEval = chunk.PromptEvalCount

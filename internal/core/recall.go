@@ -78,13 +78,14 @@ var recallStopwords = map[string]struct{}{
 	"our": {}, "conversation": {},
 }
 
-// instructionPhrases marks a sentence as an instruction or tool
-// direction rather than a statement of fact. Any sentence containing
-// one of these (case-insensitive) is excluded from message recall.
-var instructionPhrases = []string{
-	"use the", "call the", "you must", "write", "read the file",
-	"compute", "tell me", "do not",
-}
+// instructionPattern matches instruction/tool-direction sentences.
+// The phrases are matched on word boundaries (\b), not as raw
+// substrings: a substring match drops legitimate fact sentences —
+// "write" matches "writer" ("My favourite writer is Asimov.") and
+// "compute" matches "computer" ("My computer runs Linux."). With
+// boundaries, "Write a poem ..." and "Compute my favourite number
+// ..." are still dropped, while the fact sentences survive.
+var instructionPattern = regexp.MustCompile(`\b(?:use the|call the|you must|write|read the file|compute|tell me|do not)\b`)
 
 // sentencePattern splits a message into sentences, keeping the
 // terminator so questions (ending in "?") can be recognised and
@@ -263,15 +264,9 @@ func declarativeSentences(text string) []string {
 		if strings.HasSuffix(s, "?") {
 			continue
 		}
-		lower := strings.ToLower(s)
-		instruction := false
-		for _, phrase := range instructionPhrases {
-			if strings.Contains(lower, phrase) {
-				instruction = true
-				break
-			}
-		}
-		if instruction {
+		// Sentences are lowercased before matching (the pattern is
+		// lowercase), so "Write ..." and "write ..." match alike.
+		if instructionPattern.MatchString(strings.ToLower(s)) {
 			continue
 		}
 		out = append(out, s)

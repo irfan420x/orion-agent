@@ -5,7 +5,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sort"
@@ -62,17 +64,40 @@ func main() {
 		usage()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
-		usage()
+		usageTo(os.Stderr)
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "orion: %v\n", err)
-		os.Exit(1)
+		// A command interrupted by SIGINT/SIGTERM is a clean exit:
+		// the user asked to stop, so there is nothing to report and
+		// the exit code matches the daemon, which already returns 0
+		// on cancel. Anything else is printed and exits 1.
+		if exitCodeFor(err) != 0 {
+			fmt.Fprintf(os.Stderr, "orion: %v\n", err)
+		}
+		os.Exit(exitCodeFor(err))
 	}
 }
 
-func usage() {
-	fmt.Printf(`orion — model-agnostic OS agent (v%s)
+// exitCodeFor maps a command error to a process exit code. A nil error
+// is 0; an interruption (context.Canceled, e.g. Ctrl-C during chat, a
+// run, or a subagent wait) is also 0 and silent; any other error is 1.
+func exitCodeFor(err error) int {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, context.Canceled) {
+		return 0
+	}
+	return 1
+}
+
+func usage() { usageTo(os.Stdout) }
+
+// usageTo writes the top-level usage text to w: stdout for --help,
+// stderr when it follows an error (unknown command).
+func usageTo(w io.Writer) {
+	fmt.Fprintf(w, `orion — model-agnostic OS agent (v%s)
 
 Usage:
   orion run "prompt"          run one prompt through the agent
@@ -273,6 +298,9 @@ func cmdConfig(args []string) error {
 		}
 		if len(args) > 2 {
 			return fmt.Errorf("config set-model: takes exactly one model name (got %q)", strings.Join(args[1:], " "))
+		}
+		if strings.TrimSpace(args[1]) == "" {
+			return fmt.Errorf("config set-model: model name must not be empty")
 		}
 		cfg.Model = args[1]
 		if err := cfg.Save(defaultPath); err != nil {
@@ -593,6 +621,33 @@ func cmdTelegram(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("telegram: unknown subcommand %q (try: test, poll)", args[0])
 	}
+	if args[0] == "test" {
+		// Token verification needs config + token only: it must not
+		// build the full app (provider, tools, memory, agent), or an
+		// unrelated failure — a corrupt memory store, an agent that
+		// cannot be constructed — would make a token check fail with
+		// the wrong error. (Config load still validates the config
+		// file, including the default provider; fully decoupling the
+		// token check from provider validation is a config-layer
+		// follow-up.)
+		cfg, err := config.Load("")
+		if err != nil {
+			return err
+		}
+		if cfg.TelegramToken == "" {
+			return fmt.Errorf("telegram: no token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
+		}
+		gw, err := messaging.NewTelegramGateway(cfg.TelegramToken, messaging.WithAllowedChats(cfg.TelegramAllowedChats...))
+		if err != nil {
+			return err
+		}
+		username, err := gw.GetMe(ctx)
+		if err != nil {
+			return fmt.Errorf("telegram test: %w", err)
+		}
+		fmt.Printf("telegram: token valid, bot @%s\n", username)
+		return nil
+	}
 	a, err := buildApp()
 	if err != nil {
 		return err
@@ -606,13 +661,6 @@ func cmdTelegram(ctx context.Context, args []string) error {
 		return err
 	}
 	switch args[0] {
-	case "test":
-		username, err := gw.GetMe(ctx)
-		if err != nil {
-			return fmt.Errorf("telegram test: %w", err)
-		}
-		fmt.Printf("telegram: token valid, bot @%s\n", username)
-		return nil
 	case "poll":
 		if len(a.Config.TelegramAllowedChats) == 0 {
 			fmt.Fprintln(os.Stderr, "telegram: WARNING: telegram_allowed_chats is empty — any Telegram chat can drive the agent; set telegram_allowed_chats in config to restrict it")

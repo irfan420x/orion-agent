@@ -34,6 +34,8 @@ type Skill struct {
 	// Content is the full text of the skill file.
 	Content string
 	// Tools lists the tool names from the "## Tools" section, if any.
+	// Both bulleted ("- exec", "* exec") and numbered ("1. exec",
+	// "1) exec") items are recognised.
 	Tools []string
 }
 
@@ -66,8 +68,11 @@ func (s Skill) clone() Skill {
 // with the same name is already registered. The registry is unchanged
 // on error. The skill is copied on entry, so later mutation of the
 // caller's Skill (in particular its Tools slice) cannot corrupt the
-// registry.
+// registry. A nil Registry is an error, not a panic.
 func (r *Registry) Register(s Skill) error {
+	if r == nil {
+		return errors.New("skills: Register on nil Registry")
+	}
 	if strings.TrimSpace(s.Name) == "" {
 		return errors.New("skills: cannot register skill with empty name")
 	}
@@ -82,8 +87,11 @@ func (r *Registry) Register(s Skill) error {
 
 // Get returns the skill with the given name and whether it was found.
 // The returned Skill is a copy: mutating its Tools slice does not
-// affect the registry.
+// affect the registry. A nil Registry reports every name missing.
 func (r *Registry) Get(name string) (Skill, bool) {
+	if r == nil {
+		return Skill{}, false
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	s, ok := r.skills[name]
@@ -94,8 +102,11 @@ func (r *Registry) Get(name string) (Skill, bool) {
 }
 
 // List returns all registered skills sorted by name. Each returned
-// Skill is a copy (see Get).
+// Skill is a copy (see Get). A nil Registry lists nothing.
 func (r *Registry) List() []Skill {
+	if r == nil {
+		return nil
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]Skill, 0, len(r.skills))
@@ -108,8 +119,11 @@ func (r *Registry) List() []Skill {
 
 // Search returns skills whose name or description contains query as a
 // case-insensitive substring. An empty query matches every skill.
-// Results are sorted by name.
+// Results are sorted by name. A nil Registry matches nothing.
 func (r *Registry) Search(query string) []Skill {
+	if r == nil {
+		return nil
+	}
 	q := strings.ToLower(strings.TrimSpace(query))
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -245,49 +259,69 @@ func parseSkill(path, content string) Skill {
 
 	// Description: first non-empty, non-heading, non-bullet paragraph
 	// line after the name heading (or from the top when there is no
-	// heading). Scanning stops at the first "## " section heading, so a
+	// heading). Scanning stops at the first section heading, so a
 	// file that jumps straight to a section has no description.
+	// Fenced code blocks and list items are not prose: a file that
+	// opens with a code fence used to take the fence marker itself
+	// ("```go") as its description, and a numbered list ("1. ...")
+	// the same way.
+	inFence := false
 	for i := headingIdx + 1; i < len(lines); i++ {
 		trimmed := strings.TrimSpace(lines[i])
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "#") {
+		if isFenceLine(trimmed) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if headingLevel(trimmed) > 0 {
 			break
 		}
-		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+		if isBulletLine(trimmed) {
+			continue
+		}
+		if _, ok := numberedItem(trimmed); ok {
 			continue
 		}
 		skill.Description = trimmed
 		break
 	}
 
-	// Tools: bulleted items under the "## Tools" section, up to the next
-	// "## " (or "# ") heading.
+	// Tools: bulleted (or numbered) items under the "## Tools"
+	// section, up to the next heading. Any ATX heading ends the
+	// section unless it is a new "## " section header: a "### "
+	// sub-heading inside Tools used to leave the section open, so
+	// bullets under a "### Notes" subsection were parsed as tools.
 	inTools := false
 	seenTools := map[string]bool{}
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "## ") {
-			title := strings.TrimSpace(strings.TrimPrefix(trimmed, "## "))
-			inTools = strings.EqualFold(title, "Tools")
-			continue
-		}
-		if strings.HasPrefix(trimmed, "# ") {
-			inTools = false
+		if lvl := headingLevel(trimmed); lvl > 0 {
+			if lvl == 2 {
+				title := strings.TrimSpace(strings.TrimPrefix(trimmed, "## "))
+				inTools = strings.EqualFold(title, "Tools")
+			} else {
+				inTools = false
+			}
 			continue
 		}
 		if !inTools {
 			continue
 		}
-		var item string
-		switch {
-		case strings.HasPrefix(trimmed, "- "):
-			item = strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
-		case strings.HasPrefix(trimmed, "* "):
-			item = strings.TrimSpace(strings.TrimPrefix(trimmed, "* "))
-		default:
-			continue
+		item, numbered := numberedItem(trimmed)
+		if !numbered {
+			switch {
+			case strings.HasPrefix(trimmed, "- "):
+				item = strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
+			case strings.HasPrefix(trimmed, "* "):
+				item = strings.TrimSpace(strings.TrimPrefix(trimmed, "* "))
+			default:
+				continue
+			}
 		}
 		if item == "" {
 			continue
@@ -313,4 +347,56 @@ func parseSkill(path, content string) Skill {
 	}
 
 	return skill
+}
+
+// headingLevel returns the ATX heading level (1-6) of line, or 0 when
+// line is not an ATX heading ("# " ... "###### "). A line like
+// "#hashtag" (no space after the hashes) is not a heading, and
+// neither is a run of more than six hashes.
+func headingLevel(line string) int {
+	n := 0
+	for n < len(line) && line[n] == '#' {
+		n++
+	}
+	if n == 0 || n > 6 {
+		return 0
+	}
+	if n < len(line) && line[n] != ' ' && line[n] != '\t' {
+		return 0
+	}
+	return n
+}
+
+// isFenceLine reports whether line opens or closes a fenced code block
+// ("```" or "~~~", optionally followed by an info string like "go").
+func isFenceLine(line string) bool {
+	return strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~")
+}
+
+// isBulletLine reports whether line is a bulleted list item ("- " or
+// "* ").
+func isBulletLine(line string) bool {
+	return strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ")
+}
+
+// numberedItem parses a numbered list item ("1. exec", "1) exec") and
+// returns the item text. The second result is false when line is not
+// a numbered item: no leading digits, no "." or ")" after them, or no
+// space after the marker ("1.exec" is not a list item).
+func numberedItem(line string) (string, bool) {
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(line) {
+		return "", false
+	}
+	if line[i] != '.' && line[i] != ')' {
+		return "", false
+	}
+	rest := line[i+1:]
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
 }

@@ -4,6 +4,95 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Telegram response style — live terminal card + command menu**
+  (`internal/core/events.go`, `internal/messaging/render.go`,
+  `redact.go`, `commands.go`, `session.go`): the gateway now streams
+  a Hermes-style "💻 terminal" card per turn — one message, edited
+  in place as tool calls accumulate (blockquote Shell blocks,
+  ✍️ file writes, `(×N)` dedupe, 4000-rune budget, HTML escaping),
+  typing indicator while the turn runs, and a structured final reply
+  in the user's language with an optional runtime footer (model,
+  tokens, steps, duration; `/footer` toggles it). A slash-command
+  registry + `setMyCommands` menu ships 17 real commands
+  (`/help`, `/new`, `/stop`, `/status`, `/model`, `/usage`,
+  `/undo`, `/retry`, `/pause`, `/agents`, `/title`, `/compress`,
+  `/save`, `/restart`, `/whoami`, `/footer`, `/memory`) backed by a
+  persistent per-chat session store. Better than the Hermes
+  reference in one place that matters: displayed commands are
+  passed through `RedactDisplayText`, so credential paths and
+  secret-looking values (e.g. `$(cat ~/.hermes/tokens/…)`) render
+  as `[redacted]` and never leak into the chat. Live-verified:
+  441 tests pass, race clean.
+- **DeepSeek provider** (`internal/model`, `internal/config`): a
+  first-class provider reusing the OpenAI-compatible client
+  (defaults `https://api.deepseek.com/v1` + `deepseek-chat`), now the
+  default provider. Live-verified: `TestLiveDeepSeek` PASS
+  (17*23+5=396 in 1.57s) and `orion run` answers 396.
+- **Seccomp filter for the sandbox** (`internal/sandbox`): a
+  pure-stdlib classic-BPF filter (no cgo/libseccomp) applied by the
+  `orion-seccomp` helper — 46 syscalls EPERM, flag-checked `clone`,
+  `clone3` denied with ENOSYS so glibc falls back to `clone(2)`.
+  `install.sh` and `Makefile` now build and install
+  `orion-seccomp` next to `orion`/`oriond`, so the filter engages
+  on a normal install. See `SECURITY.md`.
+- **Fact-aware memory recall** (`internal/core/recall.go`): relevant
+  stored facts and older-turn statements are injected into the
+  system prompt (top 3 facts, word-boundary matching), so the agent
+  recalls facts even when they have fallen out of the 10-message
+  window. Multi-turn live E2E run 4 was the first full pass
+  (recall turns T4/T7 went 0/2 → 2/2).
+
+### Fixed
+
+- **Audit 2 (fresh-eyes, 2026-11-13)** — full report in
+  `AUDIT2_2026-11-13.md`: 2 P0s, 18 P1s, 25 P2s fixed
+  (404 tests pass, race clean). Highlights: sandbox chroot escape
+  closed with `pivot_root` + `umount2` detach; 44 denylist bypass
+  cases (wrappers, `env -S`, `$'...'` quoting, variable
+  indirection, `find -exec` wrappers, system-path file ops,
+  interpreter payloads); dangling tool-call history no longer
+  poisons later runs (400s); deferred tool calls no longer silently
+  lost; Anthropic consecutive user turns merged; `Config.Save`
+  atomic with 0600; audit head-failure resync; `file_read` fifo
+  hang fixed; SSRF range gaps; Telegram Poll exits on fatal
+  401/403/409; handler panics recovered in Poll; handler-error
+  replies redacted before reaching the chat; DeepSeek errors
+  correctly labelled (were "openai:"); `orion-seccomp` install
+  wiring; Anthropic default model aligned (`claude-sonnet-4-5`).
+
+### Known limitations
+
+- **Telegram round-trip: tested live 2026-11-13.** Irfan messaged
+  @Magi420x_bot — DeepSeek replied in proper Bengali, and a weather
+  question ran `shell_exec curl wttr.in` with a Bengali summary.
+  Full agentic loop with tool use works. (Replies are only as good
+  as the model: the 0.5B local model's replies were generic/confused;
+  DeepSeek's were proper Bengali.)
+- **Small local models recall unreliably.** The multi-turn live
+  E2E test against `qwen2.5-0.5b-local` (0.5 B parameters) scored
+  **0/2 full passes** before fact-aware recall; after recall
+  injection, run 4 passed fully (T4/T7 recall 2/2). Tool turns are
+  reliable (calculator, file_write, file_read: 2/2 each). See
+  `docs/E2E_LIVE_OLLAMA.md`.
+- **A real Hermes model needs a bigger machine.** `hermes3:3b` needs
+  ~8 GB RAM and `hermes3:8b` needs ~16 GB; this VM has ~700 MiB free
+  (~7.7 GiB total), so no Hermes model can run here. The loop was
+  proven with the smallest viable instruct model instead, and the
+  provider interface is unchanged — a Hermes model works the same
+  way on a host with enough RAM (`ollama pull hermes3:8b`).
+- **TypeScript UI is v0.2.** v0.1 is Go only (core, daemon, CLI);
+  the desktop/web UI is out of scope for this release.
+- **Sandbox is host-dependent.** It needs unprivileged user
+  namespaces or root; on hosts without them it falls back to the
+  denylist alone with a warning. The seccomp filter needs the
+  `orion-seccomp` binary next to `orion` (installed by
+  `install.sh`/`make build`); the arm64 filter table is
+  header-checked but unrun on arm64 hardware.
+
 ## [0.1.0] — 2026-11-13
 
 First release: a model-agnostic, local-first OS agent in Go, with a
@@ -110,17 +199,14 @@ Loop bugs found by the live Ollama end-to-end runs and fixed in
   instead of the stored favourite number "17"). Persistence, crash
   survival, restart reload, and every tool execution passed in both
   runs — the failures are the model's, not the loop's or the
-  memory's. See `docs/E2E_LIVE_OLLAMA.md`. Fact-aware recall
-  injection is in progress.
+  memory's. See `docs/E2E_LIVE_OLLAMA.md`. (Superseded by the
+  fact-aware recall in [Unreleased], which passed a full run.)
 - **A real Hermes model needs a bigger machine.** `hermes3:3b` needs
   ~8 GB RAM and `hermes3:8b` needs ~16 GB; this VM has ~700 MiB free
   (~7.7 GiB total), so no Hermes model can run here. The loop was
   proven with the smallest viable instruct model instead, and the
   provider interface is unchanged — a Hermes model works the same
   way on a host with enough RAM (`ollama pull hermes3:8b`).
-- **Telegram round-trip untested.** The gateway verifies the token
-  (`getMe`) but no chat has messaged the bot yet, so the full
-  message → agent → reply round-trip has not been exercised live.
 - **TypeScript UI is v0.2.** v0.1 is Go only (core, daemon, CLI);
   the desktop/web UI is out of scope for this release.
 - **Sandbox is host-dependent.** It needs unprivileged user

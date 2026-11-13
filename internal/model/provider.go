@@ -20,11 +20,13 @@ import (
 
 const (
 	defaultOpenAIBaseURL    = "https://api.openai.com/v1"
+	defaultDeepSeekBaseURL  = "https://api.deepseek.com/v1"
 	defaultAnthropicBaseURL = "https://api.anthropic.com/v1"
 	defaultOllamaBaseURL    = "http://localhost:11434"
 
 	defaultOpenAIModel    = "gpt-4o-mini"
-	defaultAnthropicModel = "claude-sonnet-4-20250514"
+	defaultDeepSeekModel  = "deepseek-chat"
+	defaultAnthropicModel = "claude-sonnet-4-5"
 	defaultOllamaModel    = "llama3.1"
 
 	maxAttempts    = 3
@@ -59,6 +61,21 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 			cfg.Model = defaultOpenAIModel
 		}
 		return &openAIProvider{cfg: cfg, client: sharedHTTPClient}, nil
+	case "deepseek":
+		// DeepSeek's API is OpenAI-compatible: same /chat/completions
+		// wire format, reached at its own base URL. It reuses the
+		// OpenAI-compatible client with DeepSeek's name so errors and
+		// Name() are labelled correctly.
+		if strings.TrimSpace(cfg.APIKey) == "" {
+			return nil, fmt.Errorf("deepseek: API key is required (set ProviderConfig.APIKey)")
+		}
+		if strings.TrimSpace(cfg.BaseURL) == "" {
+			cfg.BaseURL = defaultDeepSeekBaseURL
+		}
+		if strings.TrimSpace(cfg.Model) == "" {
+			cfg.Model = defaultDeepSeekModel
+		}
+		return &openAIProvider{name: "deepseek", cfg: cfg, client: sharedHTTPClient}, nil
 	case "anthropic":
 		if strings.TrimSpace(cfg.APIKey) == "" {
 			return nil, fmt.Errorf("anthropic: API key is required (set ProviderConfig.APIKey)")
@@ -80,7 +97,7 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 		}
 		return &ollamaProvider{cfg: cfg, client: sharedHTTPClient}, nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q: supported providers are openai, anthropic, ollama", cfg.Name)
+		return nil, fmt.Errorf("unknown provider %q: supported providers are openai, deepseek, anthropic, ollama", cfg.Name)
 	}
 }
 

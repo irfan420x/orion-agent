@@ -389,7 +389,10 @@ func readHead(path string, key []byte) (head auditHead, ok bool, err error) {
 // checkpoint it is detected as truncation (see above); without a
 // head (legacy log never opened by a v2 build) it is undetectable,
 // which is exactly the weakness the v2 head exists to close.
-func (a *AuditLog) readAndVerify(tolerateTornTail bool) ([]Entry, error) {
+// readLogEntries reads the log file and verifies the hash chain
+// (sequence numbers, PrevHash linkage, per-entry hash), returning
+// the entries. It does not consult the head checkpoint.
+func (a *AuditLog) readLogEntries(tolerateTornTail bool) ([]Entry, error) {
 	path := a.path
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -437,19 +440,31 @@ func (a *AuditLog) readAndVerify(tolerateTornTail bool) ([]Entry, error) {
 		prevHash = e.Hash
 		expectedSeq++
 	}
+	return entries, nil
+}
+
+// readAndVerify re-reads the log file from disk and verifies the
+// whole chain, then checks the log against the signed head
+// checkpoint: a log truncated behind the head, or an entry
+// rewritten at the head's sequence, fails.
+func (a *AuditLog) readAndVerify(tolerateTornTail bool) ([]Entry, error) {
+	entries, err := a.readLogEntries(tolerateTornTail)
+	if err != nil {
+		return nil, err
+	}
 	// Head checkpoint: the log must reach at least the head's entry,
 	// and that entry must still hash as the head records. A shorter
 	// log lost its tail; a mismatching entry was rewritten.
 	head, ok, err := readHead(a.headPath, a.key)
 	if err != nil {
-		return nil, fmt.Errorf("security: audit log %s: %w", path, err)
+		return nil, fmt.Errorf("security: audit log %s: %w", a.path, err)
 	}
 	if ok {
 		if head.Seq > len(entries) {
-			return nil, fmt.Errorf("security: audit log %s: truncated: signed head records seq %d but the log ends at seq %d", path, head.Seq, len(entries))
+			return nil, fmt.Errorf("security: audit log %s: truncated: signed head records seq %d but the log ends at seq %d", a.path, head.Seq, len(entries))
 		}
 		if entries[head.Seq-1].Hash != head.Hash {
-			return nil, fmt.Errorf("security: audit log %s: head checkpoint mismatch at seq %d (entry rewritten or log replaced)", path, head.Seq)
+			return nil, fmt.Errorf("security: audit log %s: head checkpoint mismatch at seq %d (entry rewritten or log replaced)", a.path, head.Seq)
 		}
 	}
 	return entries, nil
@@ -539,6 +554,17 @@ func (a *AuditLog) Append(actor, action, detail string) (Entry, error) {
 		return Entry{}, fmt.Errorf("security: close audit log %s: %w", a.path, err)
 	}
 	if err := writeHead(a.headPath, a.key, e.Seq, e.Hash); err != nil {
+		// The entry is durable in the log but the head checkpoint
+		// did not advance: resync the in-memory tip from the log
+		// before returning, so the next Append does not reuse this
+		// entry's sequence number (which would corrupt the chain).
+		// If the resync itself fails, the tip is left stale and
+		// the next Append will fail loudly on verification rather
+		// than silently reusing a sequence number.
+		if entries, rerr := a.readLogEntries(false); rerr == nil && len(entries) > 0 {
+			a.lastSeq = entries[len(entries)-1].Seq
+			a.lastHash = entries[len(entries)-1].Hash
+		}
 		return Entry{}, err
 	}
 	a.lastSeq = e.Seq

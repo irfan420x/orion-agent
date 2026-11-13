@@ -49,10 +49,12 @@ const systemPrompt = `You are Orion, a model-agnostic OS agent running locally o
 	`If you do not know something, say so instead of inventing an answer.`
 
 // Agent is the core agent loop. Run/RunStream calls are serialised with
-// runMu so at most one run executes at a time; SetLogger and Shutdown
-// use their own locks and never block on a running run. Shutdown does
-// not interrupt a run already in flight — it only prevents new runs
-// from starting and persists memory. Create it with NewAgent.
+// runMu so at most one run executes at a time; SetLogger,
+// SetEventHandler and Shutdown use their own locks and never block on
+// a running run. Shutdown does not interrupt a run already in flight —
+// it only prevents new runs from starting and persists memory.
+// Progress events (see events.go) are emitted synchronously while
+// runMu is held. Create it with NewAgent.
 type Agent struct {
 	provider model.Provider
 	tools    *tools.Registry
@@ -61,8 +63,13 @@ type Agent struct {
 	logger   *log.Logger
 	runMu    sync.Mutex   // serialises Run/RunStream
 	loggerMu sync.RWMutex // guards logger
-	shutMu   sync.Mutex   // guards shutDown
-	shutDown bool
+	// eventHandler is read at each emission and set via
+	// SetEventHandler; it has its own lock like logger/loggerMu
+	// and never blocks on a running run.
+	eventHandler   EventHandler
+	eventHandlerMu sync.RWMutex // guards eventHandler
+	shutMu         sync.Mutex   // guards shutDown
+	shutDown       bool
 }
 
 // MaxStepsError is returned by Run/RunStream when the step budget is
@@ -210,6 +217,31 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		return "", fmt.Errorf("core: run cancelled before start: %w", err)
 	}
 
+	// Progress-event bookkeeping. Everything below this point is a
+	// real turn, so every return from here on emits exactly one
+	// TurnFinished (guarded by turnFinished); the early validation
+	// returns above emit nothing. usage accumulates resp.Usage
+	// across the turn's provider calls, verbatim — a provider that
+	// reports zero usage leaves it zero, it is never estimated here.
+	// lastStep tracks the most recent step for TurnFinished.
+	turnStart := time.Now()
+	var usage model.Usage
+	lastStep := 0
+	turnFinished := false
+	finishTurn := func(err error) {
+		if turnFinished {
+			return
+		}
+		turnFinished = true
+		a.emit(ProgressEvent{
+			Kind:     EventTurnFinished,
+			Step:     lastStep,
+			Duration: time.Since(turnStart),
+			Err:      err,
+			Usage:    usage,
+		})
+	}
+
 	// Build the conversation: system prompt, recent memory, user input.
 	messages := []model.Message{{Role: "system", Content: systemPrompt}}
 	var recent []model.Message
@@ -217,7 +249,21 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		a.logf("memory RecentMessages failed (continuing without history): %v", err)
 	} else {
 		recent = r
-		messages = append(messages, recent...)
+		// Repair the window before it is sent: an earlier run that
+		// ended after storing an assistant tool-call message but
+		// before its tool result (cancelled in between, crashed,
+		// or a failed persist) leaves a dangling tool call, and a
+		// tool result whose assistant message aged out of the
+		// window is an orphan. OpenAI and Anthropic both reject
+		// such a transcript with a 400, on every run until the
+		// entry ages out — so strip the calls (or drop the message
+		// when nothing is left to say) here. The raw window is
+		// still what recall uses below.
+		history, repaired := repairHistory(recent)
+		if repaired > 0 {
+			a.logf("repaired recent history: %d dangling message(s) dropped or stripped", repaired)
+		}
+		messages = append(messages, history...)
 	}
 	userMsg := model.Message{Role: "user", Content: input}
 	messages = append(messages, userMsg)
@@ -240,8 +286,12 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 	var deferred []model.ToolCall
 
 	for step := 0; step < a.maxSteps(); step++ {
+		lastStep = step + 1
+		a.emit(ProgressEvent{Kind: EventStepStarted, Step: step + 1, Usage: usage})
 		if err := ctx.Err(); err != nil {
-			return "", fmt.Errorf("core: run cancelled at step %d: %w", step+1, err)
+			rerr := fmt.Errorf("core: run cancelled at step %d: %w", step+1, err)
+			finishTurn(rerr)
+			return "", rerr
 		}
 
 		// One provider call per step, under its own timeout. The
@@ -264,14 +314,25 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		}
 		cancel()
 		if err != nil {
+			var perr error
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return "", fmt.Errorf("core: provider call cancelled at step %d: %w", step+1, err)
+				perr = fmt.Errorf("core: provider call cancelled at step %d: %w", step+1, err)
+			} else {
+				perr = fmt.Errorf("core: provider call at step %d: %w", step+1, err)
 			}
-			return "", fmt.Errorf("core: provider call at step %d: %w", step+1, err)
+			finishTurn(perr)
+			return "", perr
 		}
 		if resp == nil {
-			return "", fmt.Errorf("core: provider returned nil response at step %d", step+1)
+			nerr := fmt.Errorf("core: provider returned nil response at step %d", step+1)
+			finishTurn(nerr)
+			return "", nerr
 		}
+		// Accumulate this step's reported usage verbatim; a zero
+		// report leaves the totals unchanged.
+		usage.PromptTokens += resp.Usage.PromptTokens
+		usage.CompletionTokens += resp.Usage.CompletionTokens
+		usage.TotalTokens += resp.Usage.TotalTokens
 
 		if len(resp.Message.ToolCalls) == 0 {
 			// Final answer — unless tool calls were deferred
@@ -304,6 +365,7 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 			if err := a.memory.AddMessage(assistantMsg); err != nil {
 				a.logf("memory AddMessage (assistant) failed: %v", err)
 			}
+			finishTurn(nil)
 			return resp.Message.Content, nil
 		}
 
@@ -331,11 +393,21 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		// tool-result linkage stays complete for every provider.
 		if len(toolCalls) > 1 {
 			a.logf("step %d: model requested %d tool calls; executing only %q this turn, the rest will be re-planned", step+1, len(toolCalls), toolCalls[0].Name)
-			deferred = append([]model.ToolCall(nil), toolCalls[1:]...)
+			// Append, never overwrite: calls deferred on an earlier
+			// turn are still pending, and a later multi-call turn
+			// must not silently drop them. A call the model
+			// re-issues on a later turn is collapsed by name and
+			// arguments instead of being listed twice.
+			deferred = appendDeferred(deferred, toolCalls[1:]...)
 			toolCalls = toolCalls[:1]
-		} else {
-			deferred = nil
 		}
+		// The executed call may be one the model re-planned from an
+		// earlier turn: it is no longer pending. Anything else stays
+		// deferred until the model answers directly, when the loop
+		// reminds it once (see above) — a single-call turn must not
+		// clear the list, or a pending call the model never
+		// re-planned is silently lost.
+		deferred = removeDeferred(deferred, toolCalls[0])
 		assistantMsg := model.Message{
 			Role:      "assistant",
 			Content:   resp.Message.Content,
@@ -348,14 +420,25 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 
 		for _, tc := range toolCalls {
 			if err := ctx.Err(); err != nil {
-				return "", fmt.Errorf("core: run cancelled during tool calls at step %d: %w", step+1, err)
+				rerr := fmt.Errorf("core: run cancelled during tool calls at step %d: %w", step+1, err)
+				finishTurn(rerr)
+				return "", rerr
 			}
 			// Each tool run gets its own timeout from the parent
 			// ctx, not the step ctx that also covered the provider
 			// call, so a slow provider reply cannot starve the tools.
 			toolCtx, toolCancel := context.WithTimeout(ctx, a.timeout())
+			toolStart := time.Now()
+			a.emit(ProgressEvent{Kind: EventToolCallStarted, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Usage: usage})
 			result := a.executeTool(toolCtx, tc)
 			toolCancel()
+			// Tool "errors" returned as result text (executeTool
+			// returns "Error: ..." strings) count as Err here too.
+			var toolErr error
+			if strings.HasPrefix(result, "Error") {
+				toolErr = errors.New(result)
+			}
+			a.emit(ProgressEvent{Kind: EventToolCallFinished, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Duration: time.Since(toolStart), Err: toolErr, Usage: usage})
 			toolMsg := model.Message{Role: "tool", Content: result, ToolCallID: tc.ID}
 			messages = append(messages, toolMsg)
 			if err := a.memory.AddMessage(toolMsg); err != nil {
@@ -364,7 +447,119 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		}
 	}
 
-	return "", &MaxStepsError{Messages: append([]model.Message(nil), messages...)}
+	merr := &MaxStepsError{Messages: append([]model.Message(nil), messages...)}
+	finishTurn(merr)
+	return "", merr
+}
+
+// appendDeferred adds calls to the pending list, skipping any call
+// already pending with the same name and arguments (the model
+// re-issuing the same plan on a later turn).
+func appendDeferred(deferred []model.ToolCall, calls ...model.ToolCall) []model.ToolCall {
+	for _, c := range calls {
+		dup := false
+		for _, d := range deferred {
+			if d.Name == c.Name && d.Arguments == c.Arguments {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			deferred = append(deferred, c)
+		}
+	}
+	return deferred
+}
+
+// removeDeferred drops the pending call the model just executed
+// (matched by name and arguments), if it was pending.
+func removeDeferred(deferred []model.ToolCall, executed model.ToolCall) []model.ToolCall {
+	for i, d := range deferred {
+		if d.Name == executed.Name && d.Arguments == executed.Arguments {
+			return append(deferred[:i], deferred[i+1:]...)
+		}
+	}
+	return deferred
+}
+
+// repairHistory removes history entries that would make the next
+// provider call fail outright, and returns how many messages were
+// dropped or stripped:
+//
+//   - an assistant message whose tool calls have no tool result
+//     immediately following them (a dangling call, left by a run
+//     that ended between storing the assistant message and storing
+//     its result) has those calls stripped; the message itself is
+//     dropped when stripping leaves it empty;
+//   - a tool result whose ID no assistant message in the window
+//     requested — or a tool message with no assistant message before
+//     it at all (its turn aged out of the window, or the assistant
+//     message was never stored) — is dropped.
+//
+// Satisfaction is positional (a result only satisfies the assistant
+// message it immediately follows), because IDs are not globally
+// unique: Ollama synthesises call-1, call-2, ... per turn, so the
+// same ID can appear in several turns. Well-formed history passes
+// through byte-identical.
+func repairHistory(msgs []model.Message) ([]model.Message, int) {
+	out := make([]model.Message, 0, len(msgs))
+	repaired := 0
+	for i := 0; i < len(msgs); {
+		m := msgs[i]
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			// Tool results immediately following this message.
+			j := i + 1
+			following := map[string]bool{}
+			for j < len(msgs) && msgs[j].Role == "tool" {
+				following[msgs[j].ToolCallID] = true
+				j++
+			}
+			requested := map[string]bool{}
+			for _, tc := range m.ToolCalls {
+				requested[tc.ID] = true
+			}
+			var kept []model.ToolCall
+			for _, tc := range m.ToolCalls {
+				if following[tc.ID] {
+					kept = append(kept, tc)
+				}
+			}
+			switch {
+			case len(kept) == len(m.ToolCalls):
+				out = append(out, m)
+			case len(kept) > 0 || strings.TrimSpace(m.Content) != "":
+				repaired++
+				m2 := m
+				m2.ToolCalls = kept
+				out = append(out, m2)
+			default:
+				// Dropped: an empty assistant message whose tool
+				// calls never got results.
+				repaired++
+			}
+			// Keep only the following results this message
+			// requested; anything else is an orphan.
+			for k := i + 1; k < j; k++ {
+				if requested[msgs[k].ToolCallID] {
+					out = append(out, msgs[k])
+				} else {
+					repaired++
+				}
+			}
+			i = j
+			continue
+		}
+		if m.Role == "tool" {
+			// A tool result with no assistant message before it
+			// in this window.
+			repaired++
+			i++
+			continue
+		}
+		out = append(out, m)
+		i++
+	}
+	return out, repaired
 }
 
 // executeTool runs one tool call. Arguments must be a JSON object string;

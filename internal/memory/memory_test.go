@@ -388,14 +388,15 @@ func TestOperationsAfterCloseError(t *testing.T) {
 		t.Fatalf("GetFact after Close: err=%v, want ErrClosed", err)
 	}
 	for name, fn := range map[string]func() error{
-		"AddFact":        func() error { return s.AddFact("k", "v") },
-		"DeleteFact":     func() error { return s.DeleteFact("k") },
-		"SearchFacts":    func() error { _, err := s.SearchFacts("k"); return err },
-		"ListFacts":      func() error { _, err := s.ListFacts(); return err },
-		"AddMessage":     func() error { return s.AddMessage(model.Message{Role: "user", Content: "x"}) },
-		"RecentMessages": func() error { _, err := s.RecentMessages(1); return err },
-		"ClearMessages":  func() error { return s.ClearMessages() },
-		"Save":           func() error { return s.Save() },
+		"AddFact":         func() error { return s.AddFact("k", "v") },
+		"DeleteFact":      func() error { return s.DeleteFact("k") },
+		"SearchFacts":     func() error { _, err := s.SearchFacts("k"); return err },
+		"ListFacts":       func() error { _, err := s.ListFacts(); return err },
+		"AddMessage":      func() error { return s.AddMessage(model.Message{Role: "user", Content: "x"}) },
+		"RecentMessages":  func() error { _, err := s.RecentMessages(1); return err },
+		"ReplaceMessages": func() error { return s.ReplaceMessages(nil) },
+		"ClearMessages":   func() error { return s.ClearMessages() },
+		"Save":            func() error { return s.Save() },
 	} {
 		if err := fn(); !errors.Is(err, ErrClosed) {
 			t.Fatalf("%s after Close: err=%v, want ErrClosed", name, err)

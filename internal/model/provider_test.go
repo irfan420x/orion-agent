@@ -25,6 +25,9 @@ func TestNewProviderErrors(t *testing.T) {
 	if _, err := NewProvider(ProviderConfig{Name: "anthropic"}); err == nil {
 		t.Fatal("expected error for anthropic without API key, got nil")
 	}
+	if _, err := NewProvider(ProviderConfig{Name: "deepseek"}); err == nil {
+		t.Fatal("expected error for deepseek without API key, got nil")
+	}
 	if _, err := NewProvider(ProviderConfig{Name: ""}); err == nil {
 		t.Fatal("expected error for empty provider name, got nil")
 	}
@@ -48,6 +51,22 @@ func TestNewProviderDefaults(t *testing.T) {
 	}
 	if got := p.(*anthropicProvider).cfg.BaseURL; got != defaultAnthropicBaseURL {
 		t.Fatalf("anthropic BaseURL = %q, want %q", got, defaultAnthropicBaseURL)
+	}
+
+	// DeepSeek is OpenAI-compatible: same client, its own endpoint,
+	// model and name.
+	p, err = NewProvider(ProviderConfig{Name: "deepseek", APIKey: testKey})
+	if err != nil {
+		t.Fatalf("deepseek NewProvider: %v", err)
+	}
+	if p.Name() != "deepseek" {
+		t.Fatalf("Name() = %q, want deepseek", p.Name())
+	}
+	if got := p.(*openAIProvider).cfg.BaseURL; got != defaultDeepSeekBaseURL {
+		t.Fatalf("deepseek BaseURL = %q, want %q", got, defaultDeepSeekBaseURL)
+	}
+	if got := p.(*openAIProvider).cfg.Model; got != defaultDeepSeekModel {
+		t.Fatalf("deepseek Model = %q, want %q", got, defaultDeepSeekModel)
 	}
 
 	// Ollama needs no API key and gets a local default.

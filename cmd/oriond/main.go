@@ -4,12 +4,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/irfan/orion/internal/app"
+	"github.com/irfan/orion/internal/config"
+	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/version"
 )
@@ -88,11 +93,210 @@ func run(args []string) int {
 	}
 	fmt.Printf("oriond running as @%s (provider %s, model %s). Ctrl+C to stop.\n",
 		username, a.Provider.Name(), active.Model)
-	if err := gw.Poll(ctx, func(c context.Context, chatID int64, text string) (string, error) {
-		return a.Handle(c, text)
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
-		return 1
+
+	// --- Phase C: slash-command framework -------------------------
+	// Sessions persist under the data dir; the footer default comes
+	// from config (telegram_footer nil = on).
+	footerDefault := true
+	if a.Config.TelegramFooter != nil {
+		footerDefault = *a.Config.TelegramFooter
 	}
-	return 0
+	store := messaging.NewSessionStore(filepath.Join(a.Config.DataDir, "sessions.json"), footerDefault)
+	if err := store.LoadError(); err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: sessions file unusable, starting with defaults: %v\n", err)
+	}
+
+	// /restart signals here (buffered, so the signal is never lost
+	// when nothing is selecting yet). The signal is delayed 500ms so
+	// PollStream can send the "Restarting…" reply before the run
+	// loop exits and cancels the polling context.
+	restartCh := make(chan struct{}, 1)
+	restart := func() {
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			select {
+			case restartCh <- struct{}{}:
+			default:
+			}
+		}()
+	}
+
+	allowed := make(map[int64]bool, len(a.Config.TelegramAllowedChats))
+	for _, id := range a.Config.TelegramAllowedChats {
+		allowed[id] = true
+	}
+	retry := func(ctx context.Context, chatID int64) (string, *core.TurnStats, error) {
+		last := store.Get(chatID).LastUserInput
+		if last == "" {
+			return "", nil, errors.New("nothing to retry yet — send a message first")
+		}
+		return runTurn(a, store, ctx, chatID, last, nil)
+	}
+	env := buildCommandEnv(a, store, username, allowed, restart, retry)
+	registry := messaging.DefaultRegistry(env)
+	// A menu failure must not kill the daemon: log and keep polling.
+	if err := gw.SetMyCommands(ctx, registry.BotCommands()); err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: warning: setMyCommands failed (the / menu will be stale): %v\n", err)
+	}
+	turnFn := buildTurnHandler(a, store, registry, env)
+
+	pollErr := make(chan error, 1)
+	go func() { pollErr <- gw.PollStream(ctx, turnFn) }()
+	select {
+	case err := <-pollErr:
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
+			return 1
+		}
+		return 0
+	case <-restartCh:
+		fmt.Fprintln(os.Stderr, "oriond: restart requested; draining active runs (up to 10s)...")
+		if !a.Drain(10 * time.Second) {
+			fmt.Fprintln(os.Stderr, "oriond: restart: some runs still active after 10s; exiting anyway")
+		}
+		// Exit 0 so a supervisor (systemd, oriond.service with
+		// Restart=on-success) restarts the daemon. Without a
+		// supervisor the daemon simply exits and must be started
+		// manually — see /restart's reply and ARCHITECTURE.md.
+		return 0
+	case <-ctx.Done():
+		return 0
+	}
+}
+
+// runTurn runs one real agent turn for a chat: it records the input
+// for /retry, registers the turn's cancel function so /stop can
+// cancel it, runs HandleStream (the emit is the terminal-card feed),
+// and records the turn's token usage in the session — including on
+// error, since a failed turn still consumed tokens.
+func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	if a == nil {
+		return "", nil, errors.New("oriond: app is nil")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	registered := a.RegisterRun(chatID, runCtx, cancel)
+	if registered {
+		defer a.UnregisterRun(chatID, runCtx)
+	}
+	defer cancel()
+	if store != nil {
+		store.SetLastInput(chatID, text)
+	}
+	reply, stats, err := a.HandleStream(runCtx, text, emit)
+	if stats != nil && store != nil {
+		// Best effort: a failed usage write must never fail the
+		// turn that just completed.
+		_ = store.AddUsage(chatID, stats.Tokens)
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return reply, stats, nil
+}
+
+// buildTurnHandler builds the PollStream TurnFunc: slash commands are
+// dispatched (no agent run, no footer, no usage recorded); paused
+// daemons answer non-command messages with the paused reply; anything
+// else runs the agent with the footer gated on the chat's preference
+// (read once at turn start). A turn cancelled by /stop returns no
+// reply at all — the /stop command already told the chat — instead
+// of a second "Sorry, I hit an error" message.
+func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messaging.Registry, env *messaging.CommandEnv) messaging.TurnFunc {
+	return func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		if registry != nil && env != nil {
+			// Per-turn copy of the env with this chat's ID: the
+			// shared env must never carry mutable per-chat state
+			// (PollStream handles chats concurrently).
+			turnEnv := *env
+			turnEnv.ChatID = chatID
+			if reply, handled, err := registry.Dispatch(ctx, &turnEnv, text); handled {
+				return reply, nil, err
+			}
+		}
+		if store != nil && store.IsPaused() {
+			return "⏸ Orion is paused. Send /pause off to resume.", nil, nil
+		}
+		footerOn := true
+		if store != nil {
+			footerOn = store.Get(chatID).FooterEnabled
+		}
+		reply, stats, err := runTurn(a, store, ctx, chatID, text, emit)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return "", nil, nil
+			}
+			return "", nil, err
+		}
+		if !footerOn {
+			stats = nil
+		}
+		return reply, stats, nil
+	}
+}
+
+// buildCommandEnv wires every CommandEnv field to its real
+// implementation. No field is left nil: a command that calls a nil
+// field would panic (recovered by PollStream as a handler error),
+// and a silently missing capability would be a stub.
+func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername string, allowed map[int64]bool, restart func(), retry func(context.Context, int64) (string, *core.TurnStats, error)) *messaging.CommandEnv {
+	return &messaging.CommandEnv{
+		Status: a.StatusLine,
+		ModelInfo: func() (string, string, []string) {
+			return a.ProviderName(), a.ActiveModel(), config.KnownProviderNames()
+		},
+		Limits: func() (int, int) {
+			if a.Config == nil {
+				return 0, 0
+			}
+			return a.Config.MaxSteps, a.Config.TimeoutSeconds
+		},
+		SwitchProvider: a.SwitchProvider,
+		Usage: func() (int, int) {
+			return store.Totals()
+		},
+		Session: store.Get,
+		NewSession: func(chatID int64) error {
+			if err := a.NewSession(); err != nil {
+				return err
+			}
+			store.Reset(chatID)
+			return nil
+		},
+		StopRun: a.StopRun,
+		Undo: func(chatID int64, n int) ([]string, error) {
+			undone, err := a.UndoLastTurns(n)
+			if err != nil {
+				return nil, err
+			}
+			store.PushUndo(chatID, undone...)
+			return undone, nil
+		},
+		Retry:    retry,
+		Pause:    func(on bool) { _ = store.SetPaused(on) },
+		IsPaused: store.IsPaused,
+		Agents:   a.AgentsSummary,
+		SetTitle: store.SetTitle,
+		Compress: func(ctx context.Context, chatID int64, keepRecent int) (int, int, int, error) {
+			return a.Compress(ctx, keepRecent)
+		},
+		SaveConversation: func(chatID int64) (string, int, error) {
+			sess := store.Get(chatID)
+			return a.ExportConversation(chatID, sess.Title, sess.TotalTokens, sess.Turns)
+		},
+		Restart: restart,
+		Whoami: func(chatID int64) string {
+			role, allowlisted := "user", "no"
+			if allowed[chatID] {
+				role, allowlisted = "admin", "yes"
+			}
+			name := botUsername
+			if name == "" {
+				name = "unknown"
+			}
+			return fmt.Sprintf("Chat ID: %d\nBot: @%s\nAllowlisted: %s\nRole: %s", chatID, name, allowlisted, role)
+		},
+		SetFooter:  store.SetFooter,
+		MemoryInfo: a.MemorySummary,
+		ForgetFact: a.ForgetFact,
+	}
 }

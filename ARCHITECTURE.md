@@ -21,11 +21,13 @@ internal/tools   Registry + 10 tools (shell, files, web, calculator,
                checks to internal/security.
 internal/memory  FileStore: JSON file, atomic writes, facts + 200-msg
                conversation history, case-insensitive fact search.
-internal/sandbox  Namespace + chroot sandbox for shell_exec
+internal/sandbox  Namespace + pivot_root sandbox for shell_exec
                (opt-in via config; user/mount/net namespaces,
-               read-only /usr, minimal /etc copy, writable /work).
-               Falls back to the denylist alone, with a warning,
-               when the host cannot create namespaces.
+               read-only /usr, minimal /etc copy, writable /work),
+               with a seccomp syscall filter (orion-seccomp helper)
+               when the helper is installed. Falls back to the
+               denylist alone, with a warning, when the host cannot
+               create namespaces.
 internal/security  Canonical token-based IsBlockedCommand (ONE copy),
                secret scanner/redactor, SHA-256 hash-chained audit log.
 internal/messaging Telegram gateway (Bot API over HTTP, long polling)
@@ -67,6 +69,12 @@ Telegram update / CLI line
 - Sandbox mode is a second layer, never a replacement: the
   denylist still runs first, and when the sandbox is unavailable
   shell_exec falls back to the denylist alone with a warning.
+- Seccomp is a second layer on the sandbox, never a replacement
+  for it: sandboxed commands run under a default-allow syscall
+  blocklist (orion-seccomp helper, `internal/sandbox/seccomp.go`)
+  when a usable launcher is installed, and with namespace /
+  pivot_root containment only — plus a logged warning — when it
+  is not.
 - Every network call has a timeout; every tool output is capped;
   every agent run has a max-step budget.
 - Secrets never appear in logs, config dumps, audit entries, or

@@ -405,11 +405,18 @@ func TestAnthropicEmptyRoleMapsToUser(t *testing.T) {
 		t.Fatalf("Chat: %v", err)
 	}
 	msgs, _ := gotBody["messages"].([]any)
-	if len(msgs) != 2 {
-		t.Fatalf("messages = %d, want 2", len(msgs))
+	// The empty role maps to user, and the two adjacent user turns
+	// merge into one: Anthropic rejects consecutive same-role turns
+	// with a 400, so sending two user turns would fail.
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1 merged user turn", len(msgs))
 	}
-	if msgs[1].(map[string]any)["role"] != "user" {
-		t.Fatalf("empty role mapped to %v, want user", msgs[1].(map[string]any)["role"])
+	merged := msgs[0].(map[string]any)
+	if merged["role"] != "user" {
+		t.Fatalf("empty role mapped to %v, want user", merged["role"])
+	}
+	if merged["content"] != "hi\nstray empty role" {
+		t.Fatalf("merged content = %v, want both texts joined", merged["content"])
 	}
 }
 

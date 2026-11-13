@@ -126,6 +126,16 @@ fi
 chmod 0755 "$BIN_DIR/orion"
 [ "$HAS_ORIOND" -eq 1 ] && chmod 0755 "$BIN_DIR/oriond"
 
+# Seccomp launcher: the sandbox's orion-seccomp helper is discovered
+# next to the orion binary, so install it alongside when present in
+# the tree. Without it the sandbox still works (namespaces +
+# pivot_root) but the seccomp filter stays inactive.
+if [ -d internal/sandbox/cmd/launcher ]; then
+	"$GO" build -trimpath -ldflags "$LDFLAGS" -o "$BIN_DIR/orion-seccomp" ./internal/sandbox/cmd/launcher
+	chmod 0755 "$BIN_DIR/orion-seccomp"
+	echo "installed seccomp launcher: $BIN_DIR/orion-seccomp"
+fi
+
 # Default config, first install only. Never overwrite an existing
 # config: it may hold API keys and a Telegram token. This matches
 # config.Default() (default provider ollama, local-first) and is
@@ -146,6 +156,12 @@ else
       "api_key": "",
       "base_url": "",
       "model": "gpt-4o-mini"
+    },
+    "deepseek": {
+      "name": "deepseek",
+      "api_key": "",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat"
     },
     "anthropic": {
       "name": "anthropic",
@@ -173,9 +189,11 @@ EOF
 fi
 
 # Sanity check: the installed binary must at least report its version
-# and read the config we just installed (or left alone).
+# (needs no config, so a broken config cannot fail the install).
 "$BIN_DIR/orion" version
-"$BIN_DIR/orion" config show >/dev/null || die "installed orion cannot read $CONFIG_PATH"
+if ! "$BIN_DIR/orion" config show >/dev/null 2>&1; then
+	echo "warning: installed orion cannot read $CONFIG_PATH — check the config (e.g. a key-less default provider) before running" >&2
+fi
 
 # Optional systemd user unit for the oriond daemon.
 if [ "$WITH_SYSTEMD" -eq 1 ]; then
@@ -184,8 +202,10 @@ if [ "$WITH_SYSTEMD" -eq 1 ]; then
 	UNIT_DIR="$HOME/.config/systemd/user"
 	mkdir -p "$UNIT_DIR"
 	# Point ExecStart at the binary we actually installed (the unit
-	# file defaults to ~/.local/bin/oriond).
-	sed "s|^ExecStart=.*|ExecStart=$BIN_DIR/oriond|" "$REPO_ROOT/oriond.service" >"$UNIT_DIR/oriond.service"
+	# file defaults to ~/.local/bin/oriond). Escape sed-special
+	# characters in the path first (|, & and backslash).
+	ESCAPED_BIN_DIR="$(printf '%s' "$BIN_DIR" | sed -e 's/[|&\\]/\\&/g')"
+	sed "s|^ExecStart=.*|ExecStart=$ESCAPED_BIN_DIR/oriond|" "$REPO_ROOT/oriond.service" >"$UNIT_DIR/oriond.service"
 	chmod 0644 "$UNIT_DIR/oriond.service"
 	echo "installed systemd user unit to $UNIT_DIR/oriond.service"
 	if command -v systemctl >/dev/null 2>&1; then
@@ -204,6 +224,7 @@ echo
 echo "installed:"
 echo "  $BIN_DIR/orion"
 [ "$HAS_ORIOND" -eq 1 ] && echo "  $BIN_DIR/oriond"
+[ -x "$BIN_DIR/orion-seccomp" ] && echo "  $BIN_DIR/orion-seccomp"
 echo "config: $CONFIG_PATH"
 case ":$PATH:" in
 *":$BIN_DIR:"*) ;;

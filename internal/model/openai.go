@@ -17,11 +17,23 @@ import (
 )
 
 type openAIProvider struct {
+	// name is the provider name reported by Name() and used in error
+	// labels. Empty means "openai" (the default); the DeepSeek case in
+	// NewProvider sets it to "deepseek" so a DeepSeek endpoint is
+	// never mislabelled as OpenAI.
+	name   string
 	cfg    ProviderConfig
 	client *http.Client
 }
 
-func (p *openAIProvider) Name() string { return "openai" }
+// Name reports the provider name: "openai" by default, "deepseek"
+// when this client was built for a DeepSeek endpoint.
+func (p *openAIProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "openai"
+}
 
 // --- wire types ---
 
@@ -205,7 +217,7 @@ func (p *openAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	}
 	payload, err := json.Marshal(p.buildRequest(req, false))
 	if err != nil {
-		return nil, fmt.Errorf("openai: encoding request: %w", err)
+		return nil, fmt.Errorf("%s: encoding request: %w", p.Name(), err)
 	}
 	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/chat/completions"
 	status, body, err := doWithRetry(ctx, p.client, http.MethodPost, url, p.headers(), payload)
@@ -213,17 +225,17 @@ func (p *openAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, apiError("openai", status, body)
+		return nil, apiError(p.Name(), status, body)
 	}
 	var resp openAIChatResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("openai: decoding response: %w (body: %s)", err, bodyExcerpt(body))
+		return nil, fmt.Errorf("%s: decoding response: %w (body: %s)", p.Name(), err, bodyExcerpt(body))
 	}
 	if resp.Error != nil && resp.Error.Message != "" {
-		return nil, fmt.Errorf("openai: API error: %s", resp.Error.Message)
+		return nil, fmt.Errorf("%s: API error: %s", p.Name(), resp.Error.Message)
 	}
 	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("openai: response contained no choices")
+		return nil, fmt.Errorf("%s: response contained no choices", p.Name())
 	}
 	choice := resp.Choices[0]
 	msg := Message{Role: choice.Message.Role, Content: choice.Message.Content}
@@ -257,26 +269,26 @@ func (p *openAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 // never gets an empty reply with a nil error.
 func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(chunk string) error) (*ChatResponse, error) {
 	if fn == nil {
-		return nil, fmt.Errorf("openai: Stream requires a non-nil chunk callback")
+		return nil, fmt.Errorf("%s: Stream requires a non-nil chunk callback", p.Name())
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	payload, err := json.Marshal(p.buildRequest(req, true))
 	if err != nil {
-		return nil, fmt.Errorf("openai: encoding stream request: %w", err)
+		return nil, fmt.Errorf("%s: encoding stream request: %w", p.Name(), err)
 	}
 	url := strings.TrimSuffix(p.cfg.BaseURL, "/") + "/chat/completions"
 	headers := p.headers()
 	headers["Accept"] = "text/event-stream"
 	resp, err := doStreamRequest(ctx, p.client, http.MethodPost, url, headers, payload)
 	if err != nil {
-		return nil, fmt.Errorf("openai: stream request failed: %w", err)
+		return nil, fmt.Errorf("%s: stream request failed: %w", p.Name(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-		return nil, apiError("openai", resp.StatusCode, body)
+		return nil, apiError(p.Name(), resp.StatusCode, body)
 	}
 
 	var content strings.Builder
@@ -317,28 +329,36 @@ func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		// A truncated stream with usable chunks already delivered is not
-		// a failure; only fall back when nothing was delivered.
-		if emitted == 0 && len(toolCalls) == 0 {
-			return p.streamFallback(ctx, req, fn)
-		}
-		return nil, fmt.Errorf("openai: reading stream: %w", err)
-	}
-	if emitted == 0 && len(toolCalls) == 0 {
-		// Nothing usable was streamed — including a valid SSE stream
-		// of role-only (empty) deltas, which previously returned nil
-		// having delivered nothing. Fall back to a plain Chat so the
-		// caller still gets an answer instead of an empty reply.
-		return p.streamFallback(ctx, req, fn)
-	}
+	// Filter the merged calls before deciding whether anything
+	// usable arrived: mergeStreamToolCalls pads the list when a
+	// delta index jumps, and a padded entry has no name and can
+	// never execute — it must not count as a tool call here, nor
+	// reach the agent as a nameless call.
 	msg := Message{Role: "assistant", Content: content.String()}
 	for _, tc := range toolCalls {
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			continue
+		}
 		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
 			ID:        tc.ID,
 			Name:      tc.Function.Name,
 			Arguments: tc.Function.Arguments,
 		})
+	}
+	if err := scanner.Err(); err != nil {
+		// A truncated stream with usable chunks already delivered is not
+		// a failure; only fall back when nothing was delivered.
+		if emitted == 0 && len(msg.ToolCalls) == 0 {
+			return p.streamFallback(ctx, req, fn)
+		}
+		return nil, fmt.Errorf("%s: reading stream: %w", p.Name(), err)
+	}
+	if emitted == 0 && len(msg.ToolCalls) == 0 {
+		// Nothing usable was streamed — including a valid SSE stream
+		// of role-only (empty) deltas, which previously returned nil
+		// having delivered nothing. Fall back to a plain Chat so the
+		// caller still gets an answer instead of an empty reply.
+		return p.streamFallback(ctx, req, fn)
 	}
 	if finishReason == "" {
 		if len(msg.ToolCalls) > 0 {
@@ -382,7 +402,7 @@ func mergeStreamToolCalls(dst *[]openAIToolCall, deltas []openAIToolCall) {
 func (p *openAIProvider) streamFallback(ctx context.Context, req ChatRequest, fn func(chunk string) error) (*ChatResponse, error) {
 	resp, err := p.Chat(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("openai: stream fallback failed: %w", err)
+		return nil, fmt.Errorf("%s: stream fallback failed: %w", p.Name(), err)
 	}
 	if resp.Message.Content != "" {
 		if err := fn(resp.Message.Content); err != nil {

@@ -519,7 +519,9 @@ func listProcsFromProc() ([]procInfo, error) {
 func listProcsViaPS(ctx context.Context) ([]procInfo, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(timeoutCtx, "ps", "-eo", "pid,comm,args")
+	// Only pid, command name and state: `args` would leak the full
+	// command line (and any secret passed in it) to the model.
+	cmd := exec.CommandContext(timeoutCtx, "ps", "-eo", "pid,comm,stat")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("ps failed: %w", err)
@@ -538,7 +540,11 @@ func listProcsViaPS(ctx context.Context) ([]procInfo, error) {
 		if err != nil {
 			continue
 		}
-		procs = append(procs, procInfo{pid: pid, comm: fields[1], state: ""})
+		state := ""
+		if len(fields) > 2 {
+			state = fields[2]
+		}
+		procs = append(procs, procInfo{pid: pid, comm: fields[1], state: state})
 	}
 	return procs, nil
 }

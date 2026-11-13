@@ -27,6 +27,13 @@ type Store interface {
 	// Conversation (short-term)
 	AddMessage(msg model.Message) error
 	RecentMessages(n int) ([]model.Message, error)
+	// ReplaceMessages replaces the whole retained conversation history
+	// with msgs (a defensive copy is stored), enforcing the same cap
+	// as AddMessage (oldest dropped first). It is the primitive
+	// behind /undo (drop the last turns) and /compress (drop the
+	// summarised prefix); both need to rewrite history, not just
+	// append to it or clear it entirely.
+	ReplaceMessages(msgs []model.Message) error
 	ClearMessages() error
 	// Lifecycle
 	Save() error

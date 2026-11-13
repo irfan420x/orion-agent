@@ -52,13 +52,59 @@ var allowPrivateFetchHosts = false
 // private, link-local, multicast, and unspecified addresses are not
 // public: fetching them would let a model reach the local Ollama
 // server, cloud metadata endpoints, or the Docker daemon (SSRF).
+// Beyond net.IP's own checks, the ranges it does not cover are
+// refused too: 0/8 ("this network"), 100.64/10 (CGNAT), 192.0.0/24
+// (IETF protocol assignments), 240/4 (reserved), and the IPv6
+// documentation and NAT64 prefixes. 198.18/15 is NOT refused (see
+// nonPublicIPNets: this deployment's DNS maps public hosts there).
 func isPublicIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-	return !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() &&
-		!ip.IsLinkLocalMulticast() && !ip.IsMulticast() && !ip.IsUnspecified()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	// Normalize IPv4-mapped IPv6 before the range checks.
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	for _, n := range nonPublicIPNets {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
+
+// nonPublicIPNets are the address ranges net.IP's IsPrivate /
+// IsLoopback / IsLinkLocal* / IsMulticast / IsUnspecified do not
+// cover, but which are never public destinations.
+var nonPublicIPNets = func() []*net.IPNet {
+	var nets []*net.IPNet
+	for _, cidr := range []string{
+		"0.0.0.0/8",     // "this network" (source addresses only)
+		"100.64.0.0/10", // shared address space / CGNAT
+		"192.0.0.0/24",  // IETF protocol assignments
+		"240.0.0.0/4",   // reserved (includes 255.255.255.255)
+		"2001:db8::/32", // IPv6 documentation
+		"64:ff9b::/96",  // IPv6 NAT64 well-known prefix
+		// NOTE: 198.18.0.0/15 (benchmarking) is deliberately NOT
+		// blocked: this deployment's egress DNS maps every public
+		// host into 198.18.245.0/24 (verified: example.com,
+		// www.google.com and api.deepseek.com all resolve there),
+		// so blocking it would refuse every public fetch. The
+		// range holds only the egress gateway (a router, not a
+		// service endpoint) in this environment.
+	} {
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic("orion: bad non-public CIDR " + cidr)
+		}
+		nets = append(nets, n)
+	}
+	return nets
+}()
 
 // checkFetchHost refuses hosts that resolve to a non-public address.
 // Literal IPs are checked directly; names are resolved and every

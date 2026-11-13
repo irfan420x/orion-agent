@@ -202,7 +202,7 @@ func TestValidateEmptyModel(t *testing.T) {
 }
 
 func TestValidateAPIKeyRequired(t *testing.T) {
-	for _, provider := range []string{"openai", "anthropic"} {
+	for _, provider := range []string{"openai", "deepseek", "anthropic"} {
 		cfg := Default()
 		cfg.DefaultProvider = provider
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "API key") {
@@ -502,7 +502,7 @@ func TestDefaultHomeUnset(t *testing.T) {
 // through helpers, case-insensitively, and the name list is a fresh
 // copy that callers cannot use to mutate the set.
 func TestKnownProviderHelpers(t *testing.T) {
-	for _, name := range []string{"openai", "OpenAI", "OPENAI", " anthropic ", "ollama"} {
+	for _, name := range []string{"openai", "OpenAI", "OPENAI", " anthropic ", "ollama", "deepseek", "DeepSeek"} {
 		if !KnownProvider(name) {
 			t.Errorf("KnownProvider(%q) = false, want true", name)
 		}
@@ -511,7 +511,7 @@ func TestKnownProviderHelpers(t *testing.T) {
 		t.Error("KnownProvider must reject unknown/empty names")
 	}
 	names := KnownProviderNames()
-	want := []string{"anthropic", "ollama", "openai"}
+	want := []string{"anthropic", "deepseek", "ollama", "openai"}
 	if len(names) != len(want) {
 		t.Fatalf("KnownProviderNames() = %v, want %v", names, want)
 	}
