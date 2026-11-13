@@ -16,6 +16,7 @@ import (
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/version"
@@ -131,6 +132,30 @@ func run(args []string) int {
 	}
 	fmt.Printf("oriond running as @%s (provider %s, model %s). Ctrl+C to stop.\n",
 		username, a.Provider.Name(), active.Model)
+
+	// F-A3-2: optional localhost-only pprof/debug endpoint. Off by
+	// default (config debug.pprof_enabled); when enabled it binds
+	// 127.0.0.1 only and serves only the standard pprof handlers —
+	// goroutine count, heap and GC become observable on a running
+	// daemon without exposing config or secrets. A bind failure is
+	// a loud warning, not a startup failure: the endpoint is
+	// observability, and a port conflict must not kill the bot. An
+	// invalid port never reaches here — Config.Validate rejects it
+	// at load. The deferred Close runs on every exit path (poll
+	// error, /restart, SIGTERM).
+	var dbg *debug.Server
+	if a.Config.Debug.PprofEnabled {
+		srv, err := debug.Start(debug.Config{Enabled: true, Port: a.Config.DebugPprofPort()})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "oriond: warning: debug pprof endpoint unavailable: %v (continuing without it)\n", err)
+		} else {
+			dbg = srv
+			fmt.Fprintf(os.Stderr, "oriond: debug pprof listening on %s\n", srv.Addr)
+		}
+	}
+	if dbg != nil {
+		defer dbg.Close()
+	}
 
 	// --- Phase C: slash-command framework -------------------------
 	// Sessions persist under the data dir; the footer default comes

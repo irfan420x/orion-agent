@@ -3,11 +3,11 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc20.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc21.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,213 tests total — 1,209 pass, 0 fail, 4 skip;
-> counts verified by the rc20 release coordinator on the final commit,
-> see `AUDIT15_2026-11-14.md`). The model can now delegate to subagents (`subagent_spawn` /
+> built and tested (1,227 tests total — 1,223 pass, 0 fail, 4 skip;
+> counts verified by the rc21 release coordinator on the final commit).
+> The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
 > history — fixed by a calibrated token estimator; same turn now costs
@@ -118,9 +118,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-21/21 packages, 1,213 tests total (1,209 passing, 0 failing, 4 skipped)
-(counts verified by the rc20 release coordinator, 2026-11-14,
-`AUDIT15_2026-11-14.md`). Run the suite with
+22/22 packages, 1,227 tests total (1,223 passing, 0 failing, 4 skipped)
+(counts verified by the rc21 release coordinator, 2026-11-14).
+Run the suite with
 `go test ./...` or `make test`.
 
 ## Configuration
@@ -208,6 +208,40 @@ needs ~8 GB RAM and `hermes3:8b` needs ~16 GB. On a host with enough
 RAM: `ollama pull hermes3:8b`, then set the model in config. See
 [docs/E2E_LIVE_OLLAMA.md](docs/E2E_LIVE_OLLAMA.md) for the measured
 evidence (this VM has ~700 MiB free, so no Hermes model runs here).
+
+### Debug endpoint (pprof)
+
+The daemon exposes an optional pprof/debug endpoint (F-A3-2) so
+goroutine count, heap allocation and GC behaviour are observable on
+a running daemon — before rc21 these were only measurable in
+scratch benchmarks. It is **off by default** and opt-in only:
+
+```json
+"debug": { "pprof_enabled": true, "pprof_port": 6060 }
+```
+
+- `pprof_enabled` (default `false`): when off, the daemon listens
+  on nothing extra — behaviour is exactly as before.
+- `pprof_port` (default `6060`, allowed 0–65535): `0` means the
+  6060 default; an out-of-range port fails config validation at
+  startup. A port that is already in use logs a loud warning and
+  the daemon keeps polling without the endpoint.
+- The endpoint binds **127.0.0.1 only** — never `0.0.0.0` — and
+  serves only the standard `net/http/pprof` handlers under
+  `/debug/pprof/` (index, `goroutine`, `heap`, `threadcreate`,
+  `block`, `mutex`, `cmdline`, `profile`, `symbol`, `trace`).
+  Anything outside `/debug/pprof/` gets 404. It serves no config,
+  no secret, and no application data, and enabling it does not
+  weaken the sandbox. The daemon logs the listen address on
+  startup (`oriond: debug pprof listening on 127.0.0.1:6060`).
+  Both `oriond` and `orion daemon` honour the same setting.
+
+```sh
+curl http://127.0.0.1:6060/debug/pprof/              # index
+curl http://127.0.0.1:6060/debug/pprof/goroutine?debug=1
+curl http://127.0.0.1:6060/debug/pprof/heap
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+```
 
 ## Sandbox (shell_exec)
 

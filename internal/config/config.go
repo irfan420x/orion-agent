@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/sandbox"
 )
 
@@ -216,7 +217,6 @@ type Config struct {
 	// list ranges the deployment actually controls: anything listed
 	// here becomes fetchable by the model.
 	TrustedEgressCIDRs []string `json:"trusted_egress_cidrs"`
-
 	// fileSecrets snapshots the secrets as loaded from the config
 	// file, before environment overrides are applied. envSecrets
 	// records the values the environment supplied. Save restores the
@@ -230,6 +230,23 @@ type Config struct {
 	envAPIKeys     map[string]string
 	envTelegram    string
 	envTelegramSet bool
+
+	// Debug configures the optional pprof/debug endpoint (F-A3-2).
+	// Disabled by default: the daemon listens on nothing extra
+	// unless the operator opts in. When enabled, the endpoint binds
+	// 127.0.0.1 only — never 0.0.0.0 — and serves only the standard
+	// net/http/pprof handlers (goroutine, heap, ...). It serves no
+	// config, no secret, and no application data. See
+	// internal/debug.
+	Debug DebugConfig `json:"debug"`
+}
+
+// DebugConfig is the debug/pprof endpoint configuration (see
+// Config.Debug). PprofEnabled opts in; PprofPort is the TCP port
+// (0 means the 6060 default — see Config.DebugPprofPort).
+type DebugConfig struct {
+	PprofEnabled bool `json:"pprof_enabled"`
+	PprofPort    int  `json:"pprof_port"`
 }
 
 // defaultConfig builds the default configuration with the given data
@@ -318,6 +335,16 @@ func (c *Config) AllowAllTelegramWarning() string {
 		c.AllowAllWindow())
 }
 
+// DebugPprofPort returns the effective pprof port (F-A3-2): the
+// configured port, or debug.DefaultPprofPort (6060) when the field
+// is unset (0).
+func (c *Config) DebugPprofPort() int {
+	if c.Debug.PprofPort == 0 {
+		return debug.DefaultPprofPort
+	}
+	return c.Debug.PprofPort
+}
+
 // DefaultPath returns the default config file path
 // (~/.orion/config.json). It fails with a clear error when the home
 // directory cannot be determined, instead of building a relative path
@@ -370,6 +397,13 @@ func (c *Config) Validate() error {
 	// tuning choice, and is rejected rather than silently clamped.
 	if c.PerChatDailyTokenBudget != 0 && (c.PerChatDailyTokenBudget < 1000 || c.PerChatDailyTokenBudget > 10000000) {
 		return errors.New("config: per_chat_daily_token_budget must be 0 (unlimited) or between 1000 and 10000000")
+	}
+	// F-A3-2: the pprof port is 0 (the 6060 default) or a valid TCP
+	// port. A typo here must fail startup, not silently bind a
+	// different port or leave the endpoint off that the operator
+	// asked for.
+	if c.Debug.PprofPort < 0 || c.Debug.PprofPort > 65535 {
+		return errors.New("config: debug.pprof_port must be between 0 and 65535 (0 means the 6060 default)")
 	}
 	if strings.TrimSpace(c.DataDir) == "" {
 		return errors.New("config: data_dir must not be empty")

@@ -4,6 +4,42 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc21] — 2026-11-14
+
+### F-A3-2 fix (v0.2.0-rc21) — debug/pprof endpoint
+
+Closes the open observability gap from Audit 3 (F-A3-2, P2):
+the daemon had no debug endpoint, so goroutine count, heap
+allocation and GC behaviour were not observable on a running
+daemon. **Verdict: NOT production-ready** — the 24–72 h daemon
+soak (F-A3-4) is still open. Verified by the release
+coordinator on the final commit: **1,223 tests pass, 0 fail,
+4 skip (total 1,227), 22/22 packages, race clean 22/22, no data
+race** (rc20: 1,213 total: 1,209 pass, 0 fail, 4 skip).
+New regression tests: `internal/debug/debug_test.go` (7
+functions), `internal/config/debug_test.go` (3 functions),
+`cmd/oriond/main_rc21_test.go` and `cmd/orion/rc21_debug_test.go`
+(2 functions each) — 14 new top-level test functions. Negative
+control: both end-to-end "enabled" tests fail on the unwired
+code (endpoint never starts) and pass with the fix.
+
+- **Debug endpoint (F-A3-2)** — new `internal/debug` package
+  serving only the standard `net/http/pprof` handlers under
+  `/debug/pprof/` (index, goroutine, heap, threadcreate, block,
+  mutex, cmdline, profile, symbol, trace). Opt-in via config
+  `debug.pprof_enabled` (default off — when off, the daemon
+  listens on nothing extra and behaves exactly as before);
+  `debug.pprof_port` (default 6060, 0 means the default, out of
+  range rejected by `Config.Validate` at load). Binds
+  **127.0.0.1 only** (a constant, not a config value — no
+  configuration can make it listen on 0.0.0.0); serves no config,
+  no secret, and no application data (anything outside
+  `/debug/pprof/` gets 404); does not weaken the sandbox. A bind
+  failure logs a loud warning and the daemon keeps polling. Wired
+  into both daemon entrypoints (`oriond` and `orion daemon`);
+  the daemon logs the listen address on startup. See README
+  "Debug endpoint (pprof)".
+
 ## [0.2.0-rc20] — 2026-11-14
 
 ### Audit 15 fixes (v0.2.0-rc20) — see `AUDIT15_2026-11-14.md`

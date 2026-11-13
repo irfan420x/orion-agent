@@ -18,6 +18,7 @@ import (
 	"github.com/irfan/orion/internal/app"
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
+	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/version"
@@ -849,6 +850,23 @@ Run Telegram polling until interrupted. Takes no arguments.
 	}
 	fmt.Printf("orion daemon running as @%s (provider %s, model %s). Ctrl+C to stop.\n",
 		username, a.Provider.Name(), active.Model)
+	// F-A3-2: the same localhost-only pprof endpoint as oriond
+	// (see cmd/oriond/main.go): off by default, opt-in via config
+	// debug.pprof_enabled, binds 127.0.0.1 only. A bind failure is
+	// a warning, not a startup failure.
+	var dbg *debug.Server
+	if a.Config.Debug.PprofEnabled {
+		srv, err := debug.Start(debug.Config{Enabled: true, Port: a.Config.DebugPprofPort()})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "orion: warning: debug pprof endpoint unavailable: %v (continuing without it)\n", err)
+		} else {
+			dbg = srv
+			fmt.Fprintf(os.Stderr, "orion: debug pprof listening on %s\n", srv.Addr)
+		}
+	}
+	if dbg != nil {
+		defer dbg.Close()
+	}
 	return pollTelegram(a, gw, ctx)
 }
 
