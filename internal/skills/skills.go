@@ -737,12 +737,114 @@ func isActivateOccurrenceDirective(lower string, loc []int, segment string) bool
 // field, punctuation included) can continue the direct-object
 // region after a comma: only a conjunction or the elision "then"
 // ("Activate the tool, then the skill"). A comma before anything
-// else ends the region: "Activate the tool, the skill is ready"
-// names the skill as the subject of a new clause, not as an
-// object of "activate".
+// else ends the region — UNLESS what follows is a comma-separated
+// object list naming the skill (F-A10-3): "Activate the tool, the
+// skill" lists the skill as another object of the same "activate",
+// so commaListNamesSkill keeps the region open for exactly that
+// shape. A comma before a new clause does not: "Activate the tool,
+// the skill is ready" names the skill as the subject of a new
+// clause, not as an object of "activate".
 func isObjectContinuationWord(raw string) bool {
 	w := strings.Trim(raw, ".,;:()[]\"'`!?")
 	return w == "then" || w == "and" || w == "or"
+}
+
+// clauseVerbAux are the copula/auxiliary forms that start a new
+// clause when they follow a skill subject ("the skill is ready",
+// "the skill has finished"): the skill is the subject of that
+// clause, not an object of "activate" (F-A10-3).
+var clauseVerbAux = map[string]bool{
+	"is": true, "are": true, "was": true, "were": true,
+	"be": true, "been": true, "being": true,
+	"has": true, "have": true, "had": true,
+	"do": true, "does": true, "did": true,
+	"will": true, "would": true, "can": true, "could": true,
+	"shall": true, "should": true, "may": true, "might": true, "must": true,
+}
+
+// objectCloserNonVerbs are the activateObjectClosers entries that
+// are prepositions or subordinating conjunctions, not verbs: they
+// head a phrase modifying a noun ("the skill for beginners"),
+// they do not start a new clause (F-A10-3).
+var objectCloserNonVerbs = map[string]bool{
+	// Prepositions / instrumental heads.
+	"using": true, "with": true, "via": true, "by": true, "through": true,
+	"for": true, "to": true, "of": true, "in": true, "on": true, "at": true,
+	"from": true, "into": true, "over": true, "under": true, "per": true,
+	// Subordinating conjunctions.
+	"when": true, "while": true, "if": true, "because": true, "before": true,
+	"after": true, "unless": true, "although": true, "though": true,
+	"since": true, "that": true, "which": true, "who": true, "as": true,
+}
+
+// isClauseVerb reports whether word can start a new clause with a
+// skill as its subject: a copula/auxiliary, or a verb that closes
+// the object region (see activateObjectClosers) — but not a
+// preposition or subordinating conjunction, which only modifies
+// the noun phrase ("the skill for beginners" is still an object
+// of "activate", not a new clause).
+func isClauseVerb(word string) bool {
+	if clauseVerbAux[word] {
+		return true
+	}
+	return activateObjectClosers[word] && !objectCloserNonVerbs[word]
+}
+
+// commaListNamesSkill reports whether the fields after a comma
+// (starting at index i+1) name the skill as another object of
+// the same "activate" — a comma-separated object list (F-A10-3):
+// "Activate the tool, the skill" and "Activate the tool, the
+// skill, and the venv" list the skill alongside the tool, so the
+// skill is an object of "activate" and the line is a directive.
+// The words between the comma and the skill are list-item
+// modifiers (articles, adjectives, further commas and
+// conjunctions); the scan stops at the first word that is a verb,
+// an object closer, or a sentence terminator. A skill found this
+// way is a list object UNLESS the word after it starts a new
+// clause with the skill as subject ("Activate the tool, the skill
+// is ready" — "is" makes the skill the subject of a new clause,
+// not an object), in which case it is not.
+func commaListNamesSkill(fields []string, i int) bool {
+	for j := i + 1; j < len(fields); j++ {
+		raw := fields[j]
+		word := strings.Trim(raw, ".,;:()[]\"'`!?")
+		if word == "" {
+			// A punctuation-only field: a sentence terminator
+			// ends the scan (no list object here); a comma
+			// just separates two more list items.
+			if strings.ContainsAny(raw, ".!?;:") {
+				return false
+			}
+			continue
+		}
+		if word == "skill" || word == "skills" {
+			// The skill, named as a list item. It is an object
+			// of "activate" unless the next word starts a new
+			// clause with it as the subject.
+			if j+1 >= len(fields) {
+				return true
+			}
+			next := strings.Trim(fields[j+1], ".,;:()[]\"'`!?")
+			if next == "" {
+				// Punctuation only after the skill — a
+				// terminator ("the skill.") or another comma
+				// ("the skill, and ...") — keeps it a list
+				// object.
+				return true
+			}
+			if isClauseVerb(next) {
+				return false
+			}
+			return true
+		}
+		if activateObjectClosers[word] {
+			return false
+		}
+		if strings.ContainsAny(raw, ".!?;:") {
+			return false
+		}
+	}
+	return false
 }
 
 // segmentNamesSkillAsActivateObject reports whether seg — the text
@@ -759,8 +861,12 @@ func isObjectContinuationWord(raw string) bool {
 // so both still load. The object region runs from the occurrence
 // through articles, adjectives, and the conjunctions "and"/"or"
 // and the elision "then"; a comma keeps it open only before
-// "then"/"and"/"or", and a sentence terminator (".", "!", "?",
-// ";", ":") closes it.
+// "then"/"and"/"or" — or before a comma-separated object list
+// naming the skill ("Activate the tool, the skill", F-A10-3),
+// which is still an object of the occurrence unless the word
+// after the skill starts a new clause with the skill as its
+// subject ("Activate the tool, the skill is ready"); and a
+// sentence terminator (".", "!", "?", ";", ":") closes it.
 func segmentNamesSkillAsActivateObject(seg string) bool {
 	fields := strings.Fields(seg)
 	for i, raw := range fields {
@@ -768,13 +874,18 @@ func segmentNamesSkillAsActivateObject(seg string) bool {
 		if word == "" {
 			// A standalone punctuation field: a sentence
 			// terminator closes the region; a comma keeps it
-			// open only before "then"/"and"/"or".
+			// open only before "then"/"and"/"or" — or before a
+			// comma-separated object list naming the skill
+			// (F-A10-3: "Activate the tool, the skill").
 			if strings.ContainsAny(raw, ".!?;:") {
 				return false
 			}
 			if strings.Contains(raw, ",") {
 				if i+1 < len(fields) && isObjectContinuationWord(fields[i+1]) {
 					continue
+				}
+				if commaListNamesSkill(fields, i) {
+					return true
 				}
 				return false
 			}
@@ -795,6 +906,13 @@ func segmentNamesSkillAsActivateObject(seg string) bool {
 		if strings.HasSuffix(raw, ",") {
 			if i+1 < len(fields) && isObjectContinuationWord(fields[i+1]) {
 				continue
+			}
+			// A comma-separated object list naming the skill
+			// ("Activate the tool, the skill") is still an
+			// object of this "activate" (F-A10-3); anything
+			// else after the comma ends the region.
+			if commaListNamesSkill(fields, i) {
+				return true
 			}
 			return false
 		}

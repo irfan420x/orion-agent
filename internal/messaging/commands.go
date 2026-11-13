@@ -83,6 +83,18 @@ type CommandEnv struct {
 	// hand-built envs, where /usage shows the daemon-wide totals
 	// only, exactly as before.
 	UsageForChat func(chatID int64) string
+	// DeadLetter returns the subagent dead-letter ledger's
+	// contents (F-A10-2): the tokens and task count of finished
+	// subagent tasks that left the registry through eviction
+	// WITHOUT ever being charged (see subagent.Manager).
+	// The ledger is daemon-wide and unattributed to any chat, so
+	// /usage renders it as its own daemon-wide line, never folded
+	// into a chat's totals. The read is non-draining: /usage
+	// must never consume the ledger (a future charge consumer
+	// drains it with DrainDeadLetter), so the counts stay stable
+	// across /usage calls. Nil in hand-built envs, where the
+	// line is omitted, exactly as before.
+	DeadLetter func() (tokens, tasks int)
 	// Session returns a copy of the chat's session state.
 	Session func(chatID int64) *Session
 	// NewSession drops the conversation history (facts survive) and
@@ -591,6 +603,22 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			}
 			fmt.Fprintf(&b, "Tokens this chat (all time): %d (%d turn(s))\nTokens (all chats): %d (%d turn(s))\nMax steps per turn: %d\nTimeout per step: %ds\nRate limits are set by the provider — Orion does not impose its own.",
 				sess.TotalTokens, sess.Turns, tokens, turns, maxSteps, timeout)
+			// Dead-letter ledger (F-A10-2): the charged/uncharged
+			// split. The per-chat block above shows the tokens
+			// that WERE charged to this chat (incl. its subagent
+			// sweep); this line shows the subagent tokens that
+			// were NEVER charged — finished tasks evicted from
+			// the registry before any sweep saw them. It is
+			// daemon-wide and unattributed, so it is rendered
+			// as its own line, never added to any chat's total,
+			// and only when the ledger holds something: an
+			// empty ledger is the normal case and needs no line.
+			// The read is non-draining (see DeadLetter).
+			if env.DeadLetter != nil {
+				if dlTokens, dlTasks := env.DeadLetter(); dlTokens > 0 || dlTasks > 0 {
+					fmt.Fprintf(&b, "\nEvicted subagent tasks (never charged, daemon-wide): %d task(s), %d tokens — evicted before any sweep charged them; shown separately so they are neither lost nor double-counted.", dlTasks, dlTokens)
+				}
+			}
 			return b.String(), nil
 		},
 	})

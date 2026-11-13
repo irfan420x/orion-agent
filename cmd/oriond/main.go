@@ -447,7 +447,17 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 			return store.Totals()
 		},
 		UsageForChat: a.UsageLineForChat,
-		Session:      store.Get,
+		// Dead-letter ledger (F-A10-2): the subagent Manager's
+		// evicted-never-charged tokens, surfaced in /usage as
+		// a daemon-wide line. Nil-safe: a hand-built App with
+		// no Manager reports an empty ledger.
+		DeadLetter: func() (int, int) {
+			if a.Subagents == nil {
+				return 0, 0
+			}
+			return a.Subagents.DeadLetterTokens(), a.Subagents.DeadLetterTasks()
+		},
+		Session: store.Get,
 		NewSession: func(chatID int64) error {
 			if err := a.NewSessionForChat(chatID); err != nil {
 				return err

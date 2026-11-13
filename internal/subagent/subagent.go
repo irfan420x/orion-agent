@@ -385,6 +385,14 @@ func (m *Manager) MarkCharged(id string) bool {
 // design: a second call returns 0 until further evictions occur.
 // The total is daemon-wide and unattributed to any chat, so it
 // must NOT be added to a single chat's per-chat usage line.
+//
+// The ledger's production consumer for VISIBILITY (F-A10-2) is
+// the /usage command (messaging.CommandEnv.DeadLetter, wired in
+// cmd/oriond to DeadLetterTokens/DeadLetterTasks): it surfaces
+// the ledger as its own daemon-wide line, the charged/uncharged
+// split, without draining it — so the counts stay stable across
+// /usage calls and DrainDeadLetter remains available for a
+// future charge path.
 func (m *Manager) DrainDeadLetter() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

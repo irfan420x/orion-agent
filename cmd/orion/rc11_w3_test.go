@@ -538,6 +538,17 @@ func TestW3DaemonAndTelegramPollGatePrompts(t *testing.T) {
 			case <-time.After(15 * time.Second):
 				t.Fatal("command did not return after cancelling its context")
 			}
+			// F-A10-5: the command returning is the daemon
+			// exiting — cmdDaemon/cmdTelegram poll now drain
+			// in-flight turns after Poll returns (pollTelegram),
+			// so no turn goroutine can still be writing its
+			// transcript/memory into the scratch home when this
+			// subtest returns and t.TempDir() cleans the dir up.
+			// (Waiting for the turn's apology message does NOT
+			// work as the signal: the apology is sent on the
+			// cancelled poll context, so it never reaches the
+			// fake bot — the drain is the guarantee, not a
+			// message.)
 			// The card must name the tool call it is gating.
 			bot.mu.Lock()
 			var cardText string

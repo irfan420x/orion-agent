@@ -1280,9 +1280,12 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 // hooks (a denied or blocked call never ran, so it is re-decided on
 // every delivery, never replayed) and before anything executes. A
 // call that executes is recorded durably before its result is
-// returned. Subagent lifecycle tools are excluded (see
-// journalExcludedTools): their results reference in-process Manager
-// state that does not survive a restart.
+// returned. Subagent lifecycle tools and the "skill" tool are
+// excluded (see journalExcludedTools): subagent results reference
+// in-process Manager state that does not survive a restart, and a
+// skill invoke's effect is agent-loop activation state — replaying
+// it would never fire setActiveSkill, so the skill restriction
+// would drop on a re-delivered turn (F-A10-1).
 func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 	args, ok := parseToolArguments(tc)
 	if !ok {
@@ -1410,9 +1413,24 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 // them against the live Manager is always honest state, and the
 // run-1 child is dead with the old process, so re-running a
 // spawn cannot duplicate work.
+//
+// The "skill" tool is excluded for the same structural reason
+// (F-A10-1), but about activation state, not a return value:
+// invoking a skill is agent-loop state (setActiveSkill), not a
+// tool result. A replayed skill invoke returns its recorded
+// body before the skill branch runs, so setActiveSkill never
+// fires on the re-delivered turn — and a tool call the
+// restriction refused in run 1 is then re-decided with no skill
+// active, executes, and gets journalled as if it had been
+// allowed. Excluding the skill tool makes every delivery
+// re-execute the invoke (a cheap, idempotent registry read) and
+// re-activate the skill, so the restriction holds on every
+// delivery. The recorded result of a skill invoke is just the
+// skill body text, so nothing is lost by re-reading it.
 var journalExcludedTools = map[string]bool{
 	"subagent_spawn": true, "subagent_list": true,
 	"subagent_result": true, "subagent_stop": true,
+	"skill": true,
 }
 
 // journalExcludedTool reports whether name is excluded from the

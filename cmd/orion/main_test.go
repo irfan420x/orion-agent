@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -76,6 +77,91 @@ func TestCmdRunValidation(t *testing.T) {
 	}
 	if err := quiet(func() error { return cmdRun(ctx, []string{"-h"}) }); err != nil {
 		t.Errorf("-h: got err %v", err)
+	}
+	// --config without a value, or with an empty value, is a usage
+	// error — never a silent run against the default config.
+	if err := quiet(func() error { return cmdRun(ctx, []string{"--config"}) }); err == nil || !strings.Contains(err.Error(), "--config needs a path") {
+		t.Errorf("--config no value: got err %v, want an error mentioning the missing path", err)
+	}
+	if err := quiet(func() error { return cmdRun(ctx, []string{"--config="}) }); err == nil || !strings.Contains(err.Error(), "--config needs a path") {
+		t.Errorf("--config= empty: got err %v, want an error mentioning the missing path", err)
+	}
+	// --config consumes the next argument as its value, whatever
+	// it is — so --config followed by --help leaves no prompt.
+	if err := quiet(func() error { return cmdRun(ctx, []string{"--config", "--help"}) }); err == nil || !strings.Contains(err.Error(), "provide a prompt") {
+		t.Errorf("--config then --help: got err %v, want a provide-a-prompt error (the flag consumed --help as its value)", err)
+	}
+}
+
+// TestCmdRunConfigFlag proves `orion run --config <path>` loads
+// the named config (Audit 10 W4 observation i): a scratch config
+// pointing at a fake provider and a scratch data dir runs the
+// prompt against that provider — never the live config — and a
+// named config file that does not exist is an error, not a silent
+// fall back to the defaults (which would resolve to the live
+// ~/.orion/config.json).
+func TestCmdRunConfigFlag(t *testing.T) {
+	home := scratchHome(t)
+	// A config file that does not exist must fail, not fall back.
+	ctx := context.Background()
+	if err := quiet(func() error {
+		return cmdRun(ctx, []string{"--config", home + "/no-such-config.json", "hello"})
+	}); err == nil || !strings.Contains(err.Error(), "--config") {
+		t.Errorf("--config missing file: got err %v, want an error naming --config", err)
+	}
+	// A real scratch config: fake OpenAI-compatible provider,
+	// scratch data dir, sandbox off (the turn's shell_exec is a
+	// plain echo; the sandbox launcher is not part of this test).
+	provider := &rc11FakeProvider{}
+	provSrv := httptest.NewServer(provider)
+	defer provSrv.Close()
+	dataDir := home + "/.orion"
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := home + "/scratch-config.json"
+	cfgJSON := `{
+  "default_provider": "openai",
+  "providers": {"openai": {"name": "openai", "api_key": "test-placeholder-key", "base_url": "` + provSrv.URL + `", "model": "test-model"}},
+  "telegram_token": "",
+  "data_dir": "` + dataDir + `",
+  "max_steps": 20,
+  "timeout_seconds": 120,
+  "sandbox": {"enabled": false}
+}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// --config <path> form.
+	out, err := capture(func() error {
+		return cmdRun(ctx, []string{"--config", cfgPath, "please run echo proof-hi"})
+	})
+	if err != nil {
+		t.Fatalf("--config path form: %v", err)
+	}
+	if !strings.Contains(out, "done") {
+		t.Errorf("--config path form output = %q, want it to contain the provider's final answer", out)
+	}
+	if provider.Calls() == 0 {
+		t.Error("--config path form: provider was never called (the scratch config was not used)")
+	}
+	// --config=<path> form.
+	callsBefore := provider.Calls()
+	out, err = capture(func() error {
+		return cmdRun(ctx, []string{"--config=" + cfgPath, "please run echo proof-hi"})
+	})
+	if err != nil {
+		t.Fatalf("--config=path form: %v", err)
+	}
+	if !strings.Contains(out, "done") {
+		t.Errorf("--config=path form output = %q, want it to contain the provider's final answer", out)
+	}
+	if provider.Calls() <= callsBefore {
+		t.Error("--config=path form: provider was never called (the scratch config was not used)")
+	}
+	// --config with no prompt left is still a prompt error.
+	if err := quiet(func() error { return cmdRun(ctx, []string{"--config", cfgPath}) }); err == nil || !strings.Contains(err.Error(), "provide a prompt") {
+		t.Errorf("--config with no prompt: got err %v, want a provide-a-prompt error", err)
 	}
 }
 

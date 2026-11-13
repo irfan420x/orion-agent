@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/skills"
 	"github.com/irfan/orion/internal/tools"
 )
 
@@ -193,6 +194,111 @@ func TestJournalReplaysToolAcrossRestart(t *testing.T) {
 			t.Errorf("without a journal the tool ran %d times, want 2 (the negative control must show the double execution)", got)
 		}
 	})
+}
+
+// TestJournalSkillRestrictionSurvivesRedelivery is the F-A10-1
+// regression test: a re-delivered turn must keep the skill
+// restriction. Run 1 invokes the adder skill (Tools: echo), then
+// calls the disallowed tool "other" (refused), then the allowed
+// "echo", and is killed before the provider answers. Run 2
+// re-delivers the same update with the same script: the skill
+// invoke must re-execute and re-activate (it is excluded from
+// the journal — a replayed invoke would never fire
+// setActiveSkill), so "other" is refused again, and "echo"
+// replays instead of re-executing.
+//
+// The Audit 10 probe reproduced the bug on rc14: run 2 executed
+// "other" once (the restriction had dropped with the replayed
+// invoke) and journalled it, so a third delivery would replay
+// the bypassed call too. On the fixed code "other" runs zero
+// times across both runs and the journal holds exactly one
+// record (echo): the skill invoke is never recorded.
+func TestJournalSkillRestrictionSurvivesRedelivery(t *testing.T) {
+	dir := t.TempDir()
+	j1, err := NewToolJournal(dir)
+	if err != nil {
+		t.Fatalf("NewToolJournal: %v", err)
+	}
+	skillReg := skills.NewRegistry()
+	if err := skillReg.Register(skills.Skill{
+		Name:        "adder",
+		Description: "Adds numbers with the echo tool.",
+		Content:     "# Adder\nADD-BODY-MARKER-9z\nUse the echo tool to say the answer.",
+		Tools:       []string{"echo"},
+	}); err != nil {
+		t.Fatalf("Register adder: %v", err)
+	}
+	skillTool, err := tools.NewSkillTool(skillReg)
+	if err != nil {
+		t.Fatalf("NewSkillTool: %v", err)
+	}
+	echo := &recordingTool{name: "echo"}
+	other := &recordingTool{name: "other"}
+	reg := tools.NewRegistry()
+	for _, tool := range []tools.Tool{skillTool, echo, other} {
+		if err := reg.Register(tool); err != nil {
+			t.Fatalf("Register %s: %v", tool.Name(), err)
+		}
+	}
+	script := []journalStep{
+		{tool: &model.ToolCall{ID: "c1", Name: "skill", Arguments: `{"name":"adder"}`}},
+		{tool: &model.ToolCall{ID: "c2", Name: "other", Arguments: `{"text":"x"}`}},
+		{tool: &model.ToolCall{ID: "c3", Name: "echo", Arguments: `{"text":"hi"}`}},
+		{block: true},
+	}
+	agent1 := journalTestAgent(t, &journalProvider{steps: script}, reg, j1)
+	agent1.SetSkills(skillReg)
+	ctx, cancel := context.WithCancel(WithUpdateID(context.Background(), 100))
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := agent1.Run(ctx, "do the thing")
+		errCh <- err
+	}()
+	// The skill invoke is excluded from the journal, so the only
+	// record run 1 leaves is the allowed echo call; wait for it
+	// to be durable, then kill the turn mid-execution.
+	waitJournalRecord(t, j1, 100, 1)
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Error("run 1: expected a cancellation error, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run 1 did not return after cancel")
+	}
+	if got := other.callCount(); got != 0 {
+		t.Fatalf("run 1: disallowed tool \"other\" ran %d times, want 0 (the skill restriction must refuse it)", got)
+	}
+	if got := echo.callCount(); got != 1 {
+		t.Fatalf("run 1: echo ran %d times, want 1", got)
+	}
+	// Restart: a fresh agent and provider, the journal reloaded
+	// from the same directory, the same update id and script,
+	// ending in a final answer instead of the kill.
+	j2, err := NewToolJournal(dir)
+	if err != nil {
+		t.Fatalf("NewToolJournal (restart): %v", err)
+	}
+	script2 := append(append([]journalStep{}, script[:3]...), journalStep{answer: "final answer"})
+	agent2 := journalTestAgent(t, &journalProvider{steps: script2}, reg, j2)
+	agent2.SetSkills(skillReg)
+	reply, err := agent2.Run(WithUpdateID(context.Background(), 100), "do the thing")
+	if err != nil {
+		t.Fatalf("run 2: %v", err)
+	}
+	if reply != "final answer" {
+		t.Errorf("run 2 reply = %q, want \"final answer\"", reply)
+	}
+	if got := other.callCount(); got != 0 {
+		t.Errorf("disallowed tool \"other\" ran %d times across the re-delivery, want 0 (the skill restriction must hold on run 2 as well)", got)
+	}
+	if got := echo.callCount(); got != 1 {
+		t.Errorf("echo ran %d times across the re-delivery, want exactly 1 (run 2 must replay it)", got)
+	}
+	if recs := j2.Records(100); len(recs) != 1 {
+		t.Errorf("journal holds %d records for update 100, want 1 (echo only: the skill invoke is excluded, the refused call was never recorded)", len(recs))
+	}
 }
 
 // TestJournalRepeatsIdenticalCallInOneTurn proves the occurrence

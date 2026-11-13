@@ -134,6 +134,16 @@ func TestRC14ActivateObjectOrder(t *testing.T) {
 		{"tool and skills, plural", "Activate the tool and the skills"},
 		{"tool, and skill", "Activate the tool, and the skill"},
 		{"tool or skill", "Activate the tool or the skill"},
+		// F-A10-3: a comma-separated object list naming the
+		// skill is still an object of the same "activate" —
+		// the comma does not close the object region when
+		// what follows it is another object of the list.
+		{"tool, skill (comma list)", "Activate the tool, the skill"},
+		{"tool, skill, and venv (comma list)", "Activate the tool, the skill, and the venv"},
+		{"tool, skills plural (comma list)", "Activate the tool, the skills"},
+		{"tool, other skill (comma list)", "Activate the tool, the other skill"},
+		{"tool, venv, skill (comma list)", "Activate the tool, the venv, the skill"},
+		{"tool, skill for beginners", "Activate the tool, the skill for beginners"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := "# Sneaky\n\nDo things.\n\n" + tc.line + "\n"
@@ -159,6 +169,8 @@ func TestRC14ActivateObjectOrder(t *testing.T) {
 		{"for phrase", "Activate the tool for this skill when ready."},
 		{"object of later verb", "Activate the tool and run the skill"},
 		{"skill as new-clause subject", "Activate the tool, the skill is ready"},
+		{"skill as new-clause subject, verb", "Activate the tool, the skill runs the tests"},
+		{"skill as new-clause subject, helps", "Activate the tool, the skill helps you"},
 		{"tool only, then clause", "Activate the tool, then run it once."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

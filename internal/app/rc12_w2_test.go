@@ -116,7 +116,7 @@ func TestSweepChargesLateUsageFromIgnoringExecutor(t *testing.T) {
 //
 // Constructing a mid-sweep finish needs a controlled interleaving:
 // the sweep's loop is microseconds long, so the test stretches it
-// with 80 instant filler tasks (whose marking the loop must work
+// with 200 instant filler tasks (whose marking the loop must work
 // through) and blocks the sweep mid-loop on chatsMu while the
 // blocked task finishes. Whether the interleaving landed is
 // VERIFIED (the sweep was still running when the task finished,
@@ -139,7 +139,18 @@ func TestSweepChargesLateUsageFromIgnoringExecutor(t *testing.T) {
 // passed the blocked task (first in List order) — only then is
 // the blocked task released, so it can only finish mid-sweep.
 func TestSweepChargesTaskFinishingDuringSweep(t *testing.T) {
-	const maxAttempts = 10
+	// F-A10-4: the 10-attempt budget flaked once under plain
+	// full-suite load on this 1.5-CPU VM — the lock-step dance
+	// needs the test goroutine scheduled inside the sweep's
+	// microsecond loop, and under parallel load the test can be
+	// descheduled for milliseconds while the sweep runs away,
+	// so every attempt in the run misses. 30 attempts (each a
+	// fast miss when the sweep runs away, a slow one only when
+	// the sweep is starved) gives the construction far more
+	// chances without changing what it proves: an attempt that
+	// misses retries, and only a constructed mid-sweep finish
+	// asserts.
+	const maxAttempts = 30
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if tryMidSweepFinish(t, attempt) {
 			return
@@ -159,7 +170,7 @@ func tryMidSweepFinish(t *testing.T, attempt int) bool {
 	t.Helper()
 	a := testApp(t)
 	release := make(chan struct{})
-	// Wide concurrency so all 80 fillers can be spawned without
+	// Wide concurrency so all 200 fillers can be spawned without
 	// hitting the at-capacity error while earlier ones drain.
 	mgr := subagent.NewManagerWithExecutor(256, func(ctx context.Context, brief string) (string, subagent.Usage, error) {
 		if brief == "blocked" {
@@ -177,22 +188,25 @@ func tryMidSweepFinish(t *testing.T, attempt int) bool {
 	// A gap in StartedAt so the blocked task is unambiguously
 	// first in the sweep's List order.
 	time.Sleep(2 * time.Millisecond)
-	// 80 fillers: enough to stretch the sweep's loop (each
+	// 200 fillers: enough to stretch the sweep's loop (each
 	// iteration takes a chatsMu round-trip) while staying well
-	// under the Manager's maxEntries=100 registry cap — past
-	// 100 finished entries the Manager evicts the oldest, so a
+	// under the Manager's maxEntries=1000 registry cap — past
+	// 1000 finished entries the Manager evicts the oldest, so a
 	// larger filler count could never all be visible to the sweep.
-	// 80 (rather than the original 50) also widens the window in
+	// 200 (rather than the original 80) also widens the window in
 	// which the sweep is mid-loop, so the lock-step dance below
-	// has more chances to catch it there.
-	const fillers = 80
+	// has more chances to catch it there — under plain full-suite
+	// load the test goroutine can be descheduled for milliseconds
+	// while the sweep marks fillers, and a wider window is what
+	// survives that (F-A10-4).
+	const fillers = 200
 	for i := 0; i < fillers; i++ {
 		if _, err := mgr.SpawnForChat(111, "filler", time.Minute); err != nil {
 			t.Fatalf("SpawnForChat filler %d: %v", i, err)
 		}
 	}
 	// Wait for every filler to finish (the blocked task stays
-	// running); the sweep's loop then has 80 settled tasks to
+	// running); the sweep's loop then has 200 settled tasks to
 	// mark after it passes the blocked one.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -226,7 +240,7 @@ func tryMidSweepFinish(t *testing.T, attempt int) bool {
 	// point (F-A9-P2-9): a Gosched or sleep slice lets the
 	// sweep run away — on a multicore machine it runs on
 	// another P for a whole scheduling quantum and marks all
-	// 80 fillers before the test is rescheduled to re-lock,
+	// 200 fillers before the test is rescheduled to re-lock,
 	// so the attempt misses (measured: ~half the attempts
 	// under -race with Gosched slices). With the spin, the
 	// test re-takes the free lock within nanoseconds of the

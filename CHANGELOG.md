@@ -4,6 +4,70 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc15] — 2026-11-14
+
+### Audit 10 fixes (v0.2.0-rc15) — see `AUDIT10_2026-11-14.md`
+
+Fixes all 5 P2s from the fresh-eyes audit of rc14 (0 P0, 0 P1, 5 P2).
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open, and F-A3-2 (no pprof/debug endpoint) is still open.
+Verified by the release coordinator on the final commit: **1,181
+tests pass, 0 fail, 4 skip (total 1,185), 21/21 packages, race clean
+21/21, no data race**; live DeepSeek proof `17*23+5=396` (rc14: 1,181
+total: 1,177 pass, 0 fail, 4 skip).
+
+- **F-A10-1** — A re-delivered turn no longer drops the skill
+  restriction: the `skill` tool is now excluded from the tool journal
+  (like the subagent lifecycle tools), so every delivery re-executes
+  the invoke and re-activates the skill instead of replaying a
+  recorded body that never fired `setActiveSkill`. A tool call the
+  restriction refused in run 1 is refused again in run 2, and is
+  never journalled. Regression test
+  `TestJournalSkillRestrictionSurvivesRedelivery`
+  (`internal/core/agent_journal_test.go`) — verified sensitive: with
+  the exclusion reverted it fails exactly as the Audit 10 probe did
+  (disallowed tool runs once on re-delivery, journal grows to 3
+  records). Journal files written by rc14 may still hold a recorded
+  skill invoke; it is ignored (the exclusion skips the lookup) and
+  pruned with the rest of the file after 24 h.
+- **F-A10-2** — The dead-letter ledger now has a production consumer:
+  `/usage` surfaces it as its own daemon-wide line — "Evicted
+  subagent tasks (never charged, daemon-wide): N task(s), M tokens" —
+  the charged/uncharged split, rendered only when the ledger holds
+  something. The read is non-draining (via
+  `messaging.CommandEnv.DeadLetter`, wired in `cmd/oriond` to
+  `DeadLetterTokens`/`DeadLetterTasks`), so the counts stay stable
+  across `/usage` calls and `DrainDeadLetter` remains available for a
+  future charge path; the ledger tokens are never folded into any
+  chat's totals. Tests in `internal/messaging/usage_cost_test.go`.
+- **F-A10-3** — A comma-separated object list naming the skill now
+  rejects: "Activate the tool, the skill" and "Activate the tool, the
+  skill, and the venv" are directives, not prose. The object-region
+  logic (`internal/skills/skills.go`, `commaListNamesSkill`) treats a
+  comma-separated list as objects of the same `activate`, unless the
+  word after the skill starts a new clause with the skill as its
+  subject ("Activate the tool, the skill is ready" still loads — as
+  do "the skill runs the tests" and "the skill helps you").
+- **F-A10-4** — The sweep test no longer flakes under plain
+  full-suite load: `TestSweepChargesTaskFinishingDuringSweep` now
+  retries up to 30 attempts (was 10) with 200 filler tasks (was 80)
+  widening the mid-sweep window. 10/10 plain and 3/3 `-race` runs.
+- **F-A10-5** — The `orion daemon` / `orion telegram poll` commands
+  no longer return while a turn is still writing: the turn handler
+  now registers the run with the App (mirroring oriond's `runTurn`),
+  and both commands drain registered turns after `Poll` returns
+  (`pollTelegram`, 30 s bound) before exiting — so the data dir is
+  never torn down under a live turn. Note: waiting for the turn's
+  apology message does NOT work as the completion signal (it is sent
+  on the cancelled poll context, so it never reaches the bot); the
+  drain is the guarantee.
+- **`orion run --config <path>`** (Audit 10 W4 observation i): the
+  CLI can now load a named config file instead of
+  `~/.orion/config.json`, so scratch-config runs work as written
+  (both `--config <path>` and `--config=<path>`). A named file that
+  does not exist is an error, not a silent fall back to the defaults
+  (which would resolve to the live config).
+
 ## [0.2.0-rc14] — 2026-11-13
 
 ### Audit 9 fixes (v0.2.0-rc14) — see `AUDIT9_2026-11-13.md`

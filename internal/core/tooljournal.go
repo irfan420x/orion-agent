@@ -58,7 +58,14 @@ import (
 // anything else); and tools whose results reference in-process
 // state that does not survive a restart are excluded from the
 // journal entirely (see journalExcludedTools in agent.go), so
-// they always re-execute against live state.
+// they always re-execute against live state. The "skill" tool
+// is excluded for the same structural reason: its effect is
+// agent-loop activation state (setActiveSkill), and a replayed
+// invoke would never re-activate, dropping the skill's tool
+// restriction on a re-delivered turn (F-A10-1). A journal file
+// written by rc14 may still hold a recorded skill invoke; it is
+// ignored (the exclusion skips the lookup) and pruned with the
+// rest of the file after journalRetention.
 type ToolJournal struct {
 	mu        sync.RWMutex
 	dir       string

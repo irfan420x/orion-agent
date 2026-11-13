@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/irfan/orion/internal/app"
 	"github.com/irfan/orion/internal/budget"
@@ -106,7 +107,7 @@ func usageTo(w io.Writer) {
 	fmt.Fprintf(w, `orion — model-agnostic OS agent (v%s)
 
 Usage:
-  orion run "prompt"          run one prompt through the agent
+  orion run [--config <path>] "prompt"   run one prompt through the agent
   orion chat                  interactive CLI chat (same agent, same memory)
   orion config show           show config (secrets masked)
   orion config set-provider <openai|anthropic|ollama|deepseek>
@@ -181,17 +182,55 @@ func providerKey(cfg *config.Config, name string) (string, bool) {
 
 func cmdRun(ctx context.Context, args []string) error {
 	if len(args) > 0 && isHelpArg(args[0]) {
-		fmt.Print(`Usage: orion run "prompt"
+		fmt.Print(`Usage: orion run [--config <path>] "prompt"
 
 Run one prompt through the agent and print the reply. All arguments
-are joined with spaces into a single prompt.
+after the flags are joined with spaces into a single prompt.
+  --config <path>   load config from <path> instead of ~/.orion/config.json
 `)
 		return nil
+	}
+	// --config flag (Audit 10 W4 observation i): the config loads
+	// only via $HOME/.orion/config.json by default, so a scratch
+	// config needed a scratch HOME. --config makes scratch-config
+	// runs work as written. Only leading flags are parsed; the
+	// prompt is everything after them. A missing value is a usage
+	// error, not a silent default.
+	configPath := ""
+	for len(args) > 0 {
+		if args[0] == "--config" {
+			if len(args) < 2 {
+				return fmt.Errorf("run: --config needs a path, e.g. orion run --config /tmp/orion-test.json \"prompt\"")
+			}
+			configPath = args[1]
+			args = args[2:]
+			continue
+		}
+		if strings.HasPrefix(args[0], "--config=") {
+			configPath = strings.TrimPrefix(args[0], "--config=")
+			if configPath == "" {
+				return fmt.Errorf("run: --config needs a path, e.g. orion run --config=/tmp/orion-test.json \"prompt\"")
+			}
+			args = args[1:]
+			continue
+		}
+		break
 	}
 	if len(args) == 0 {
 		return fmt.Errorf("run: provide a prompt, e.g. orion run \"what time is it?\"")
 	}
-	a, err := buildApp()
+	// An explicitly named config file must exist: config.Load
+	// treats a missing file as "use the defaults", which is the
+	// right first-run behaviour for the default path — but for an
+	// explicit --config it would silently run the LIVE config
+	// (defaults resolve to ~/.orion/config.json) when the user
+	// meant a scratch one, defeating the flag's whole purpose.
+	if configPath != "" {
+		if _, err := os.Stat(configPath); err != nil {
+			return fmt.Errorf("run: --config %s: %w", configPath, err)
+		}
+	}
+	a, err := app.Build(configPath)
 	if err != nil {
 		return err
 	}
@@ -754,7 +793,7 @@ func cmdTelegram(ctx context.Context, args []string) error {
 			return err
 		}
 		fmt.Println("telegram: polling for messages (Ctrl+C to stop)...")
-		return gw.Poll(ctx, daemonTurnHandler(a))
+		return pollTelegram(a, gw, ctx)
 	}
 	return nil
 }
@@ -810,7 +849,7 @@ Run Telegram polling until interrupted. Takes no arguments.
 	}
 	fmt.Printf("orion daemon running as @%s (provider %s, model %s). Ctrl+C to stop.\n",
 		username, a.Provider.Name(), active.Model)
-	return gw.Poll(ctx, daemonTurnHandler(a))
+	return pollTelegram(a, gw, ctx)
 }
 
 // daemonTurnHandler is the turn function for `orion daemon` AND
@@ -847,16 +886,45 @@ Run Telegram polling until interrupted. Takes no arguments.
 // the turn was refused on purpose, and the message names the usage,
 // the limit and the UTC-midnight reset. Other errors stay errors
 // (the gateway reports them as "Sorry, I hit an error: ...").
+//
+// The turn is registered with the App (F-A10-5, mirroring oriond's
+// runTurn): pollTelegram drains registered turns after Poll
+// returns, so the command does not exit while a turn is still
+// writing its transcript/memory into the data dir.
 func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string, error) {
 	return func(c context.Context, chatID int64, text string) (string, error) {
+		runCtx, cancel := context.WithCancel(c)
+		registered := a.RegisterRun(chatID, runCtx, cancel)
+		if registered {
+			defer a.UnregisterRun(chatID, runCtx)
+		}
+		defer cancel()
 		senderID, _ := messaging.SenderIDFromContext(c)
-		c = permissions.WithApprovalContext(c, chatID, senderID)
+		c = permissions.WithApprovalContext(runCtx, chatID, senderID)
 		reply, err := a.HandleForChat(c, chatID, text)
 		if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
 			return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil
 		}
 		return reply, err
 	}
+}
+
+// pollTelegram runs the Telegram gateway until ctx is cancelled,
+// then drains in-flight turns before returning (F-A10-5): Poll
+// returns on ctx cancellation without waiting for the turn
+// handlers it spawned, so without the drain the command returns
+// while a turn is still writing its transcript/memory into the
+// data dir — and a caller that tears the data dir down (a test's
+// TempDir cleanup, a supervisor restarting the daemon) races the
+// write. The drain is bounded: a turn that ignores its
+// (cancelled) context cannot hold shutdown forever, and the
+// command then exits anyway, as it did before the drain.
+func pollTelegram(a *app.App, gw *messaging.TelegramGateway, ctx context.Context) error {
+	err := gw.Poll(ctx, daemonTurnHandler(a))
+	if !a.Drain(30 * time.Second) {
+		fmt.Fprintln(os.Stderr, "orion: poll stopped with turns still in flight after 30s; exiting anyway")
+	}
+	return err
 }
 
 // newTelegramGateway builds the Telegram gateway for the CLI's
