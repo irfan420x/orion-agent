@@ -889,6 +889,54 @@ var baseFormNonVerbs = map[string]bool{
 	"active": true, "simple": true, "easy": true,
 }
 
+// neverVerbWords are words that are only ever nouns or adjectives,
+// never verbs in any form (F-A14-4): pure -s/-ing nouns ("analysis",
+// "status", "news", "physics", "morning", "evening", "mathematics",
+// "economics", "chaos", "virus", "campus") and pure nouns from the
+// rc18 guards ("documentation", "handbook", "manual", "summary",
+// "library", "overview", "framework"), plus common adjectives that
+// are never verbs ("happy", "sad", "glad", "good", "bad", "great",
+// "big", "small"). They end in a verb-form suffix (-s/-ing) or sit
+// bare after a plural subject, so morphology and the plural
+// base-form rule would otherwise read them as verbs — but they
+// have no verb reading at all. A word here is never verb-shaped
+// (see isVerbShaped): no following-word rule and no clause-final
+// rule can read it as a verb. It can still be the SUBJECT of a
+// clause ("…the skill analysis is ready" loads — the aux is the
+// verb, F-A13-3), because the aux and following-verb rules do not
+// consult verb shape. Words that ARE also verbs are deliberately
+// absent: "reference" (to reference), "report" (to report),
+// "setting" (an object-region verb, R3) and the ambiguous nouns
+// ("files", "notes", "guides", "training", "learning",
+// "building") are verbs too, so they stay out.
+var neverVerbWords = map[string]bool{
+	// Pure -s/-ing nouns (F-A14-4).
+	"analysis": true, "status": true, "news": true,
+	"physics": true, "morning": true, "evening": true,
+	"mathematics": true, "economics": true, "chaos": true,
+	"virus": true, "campus": true,
+	// Pure nouns from the rc18 guards (F-A13-1).
+	"documentation": true, "handbook": true, "manual": true,
+	"summary": true, "library": true, "overview": true,
+	"framework": true,
+	// Common adjectives that are never verbs.
+	"happy": true, "sad": true, "glad": true, "good": true,
+	"bad": true, "great": true, "big": true, "small": true,
+}
+
+// adjectiveVerbs are verbs that are also common adjectives in
+// skill-doc noun phrases (F-A14-2): "open" heads "the open tools"
+// and "the open venv" — an adjective + noun, not a verb + object.
+// A word here never takes a guarded noun as its bare plural object,
+// so the guarded-plural rejection still fires for it ("…the skill
+// and the open tools" rejects, Audit 13 §7 D2). The list is
+// deliberately tiny: only "open" is documented as an adjective in
+// this position; the other object-region verbs ("make", "create",
+// "use", "run", "help") are never adjectives.
+var adjectiveVerbs = map[string]bool{
+	"open": true,
+}
+
 // subjectModifiers are determiners and adjectives that can sit
 // inside a subject noun phrase ("the other venv", "the same skill")
 // but are never the clause verb (F-A12-2): when the clause test
@@ -964,9 +1012,13 @@ var clausePronouns = map[string]bool{
 // activating it that the line errs toward rejection. "dance" and
 // "serve" join the list for F-A12-2: they are the base-form verbs
 // of "the skills dance" and "the skill and the venv serve the
-// team" (Audit 12), and the clause-final plural rule (see
-// clauseVerbAt) now accepts only listed base-form verbs, so they
-// must be listed to keep those clauses loading.
+// team" (Audit 12). The list is now only a fallback: after a
+// plural or compound subject ANY bare word is a verb by shape
+// (see isVerbShapedAt, F-A14-1), so the list matters on the
+// singular path (a listed base-form verb after "the skill" is
+// still recognised where an unlisted one is not — "the skill
+// work" rejects) and in the participle rule (a listed base-form
+// verb takes a gerund/participle complement, F-A13-2).
 var baseFormVerbs = map[string]bool{
 	"wait": true, "work": true, "explain": true,
 	"finish": true, "complete": true, "happen": true,
@@ -1024,14 +1076,93 @@ func hasVerbSuffix(word string) bool {
 // isVerbShaped reports whether word looks like a verb by shape:
 // a verb-form suffix (-s/-ed/-ing), an object-region verb (see
 // isClauseVerb), or a listed base-form verb (see baseFormVerbs).
-// A bare noun ("documentation", "handbook", "manual") is not
-// verb-shaped. The following-word rules in clauseVerbAt (F-A13-1)
-// require the candidate itself to be verb-shaped before they fire:
-// a noun followed by an article, pronoun, adverb, preposition,
-// subordinating conjunction or bare plural is a noun phrase, not a
-// verb phrase.
+// A bare noun ("handbook") is not verb-shaped, and neither is a
+// never-verb word ("analysis", "documentation", "happy" — see
+// neverVerbWords): the suffix alone must not make a word that has
+// no verb reading at all verb-shaped (F-A14-4). The following-word
+// rules in clauseVerbAt (F-A13-1) require the candidate itself to
+// be verb-shaped before they fire: a noun followed by an article,
+// pronoun, adverb, preposition, subordinating conjunction or bare
+// plural is a noun phrase, not a verb phrase.
 func isVerbShaped(word string) bool {
+	if neverVerbWords[word] {
+		return false
+	}
 	return hasVerbSuffix(word) || isClauseVerb(word) || baseFormVerbs[word]
+}
+
+// isVerbShapedAt reports whether word is a verb by shape in a
+// clause whose subject is plural (plural true) or singular (plural
+// false). After a plural or compound subject a bare word in verb
+// position is a verb by shape (F-A14-1, F-A12-2): the subject is
+// plural, so a base form is grammatical, and a bare word there is
+// the verb, not a noun modifier — unless it is a never-verb word
+// (F-A14-4). After a singular subject a bare word is not a verb by
+// shape ("the skill build the plan" is ungrammatical), so only
+// verb morphology, an object-region verb or a listed base-form
+// verb counts. Words that can never be verbs are excluded in both
+// positions. Callers only ever pass words that have already passed
+// the early returns in clauseVerbAt (not a pure noun head, not a
+// known non-verb, not a subject modifier or adverb), so a bare
+// word reaching here is a genuine verb candidate.
+func isVerbShapedAt(word string, plural bool) bool {
+	if neverVerbWords[word] {
+		return false
+	}
+	if plural {
+		return true
+	}
+	return hasVerbSuffix(word) || isClauseVerb(word) || baseFormVerbs[word]
+}
+
+// verbTakesGuardedObject reports whether word can take a guarded
+// noun ("tools", "items", "settings", "users", "meetings",
+// "examples" — see verbFormNonVerbs) as its bare plural object
+// (F-A14-2): a finite verb form does — an -s/-ed verb ("makes
+// users", "trained users"), an object-region verb ("make users",
+// "create tools", "use settings") or a listed base-form verb
+// ("serve tools", "dance settings"). A never-verb word
+// ("analysis", "documentation") never does (F-A14-4, F-A13-1),
+// and neither does a verb that is also a common adjective ("open":
+// "the open tools" is an adjective + noun, Audit 13 §7 D2). A
+// participle in subject position ("running tools") does not
+// either: -ing is never a finite verb form, so the participle is
+// an attributive adjective and the guarded noun is the head of the
+// noun phrase (F-A12-1) — in predicate position ("the skill
+// running tools") the same participle does take the object, so the
+// exclusion applies only while inSubject.
+func verbTakesGuardedObject(word string, inSubject bool) bool {
+	if adjectiveVerbs[word] {
+		return false
+	}
+	if inSubject && strings.HasSuffix(word, "ing") && len(word) > 4 {
+		return false
+	}
+	return isVerbShaped(word)
+}
+
+// isNounHead reports whether word is a genuine noun head of the
+// (compound) subject (F-A14-3): a pure noun head
+// (verbFormNonVerbs), an ambiguous noun head
+// (verbFormAmbiguousNouns), a named non-skill object noun ("venv",
+// "tool", "mode" — nonSkillObjectWords plus "tool"), or a bare
+// plural ("reports", "answers", "analysis"). Adjectives ("new",
+// "ready", "happy") and adverbs ("quickly") are not noun heads,
+// even when they sit inside the subject noun phrase: only a noun
+// head completes the phrase, so a participle after an adjective
+// ("the new running tests") is still a modifier, not the
+// predicate.
+func isNounHead(word string) bool {
+	if verbFormNonVerbs[word] || verbFormAmbiguousNouns[word] {
+		return true
+	}
+	if nonSkillObjectWords[word] || word == "tool" {
+		return true
+	}
+	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 {
+		return true
+	}
+	return false
 }
 
 // clauseVerbAt reports whether the word at fields[p] is the verb of
@@ -1060,8 +1191,12 @@ func isVerbShaped(word string) bool {
 //     "running tests") — unless the following word is a guarded
 //     noun ("tools", "items", "settings"), in which case it is a
 //     noun compound ("documentation tools"), not a verb phrase,
-//     unless the candidate is a listed verb ("dance users",
-//     "serve users", F-A13-1). A word followed by a bare plural
+//     unless the candidate can take a guarded noun as its object
+//     (a finite verb form — "makes users", "make users",
+//     "trained users", F-A14-2; "dance users", "serve users",
+//     F-A13-1, F-A12-2 pin-down). A participle in subject position
+//     ("running tools") and an adjective-verb ("open tools")
+//     never can. A word followed by a bare plural
 //     that is itself an object-region verb ("documentation runs",
 //     "running tests") is a subject with that verb, so the clause
 //     exists either way. This rule, and the participle rule below,
@@ -1084,10 +1219,12 @@ func isVerbShaped(word string) bool {
 //     ("tools") still rejects, since it returns earlier;
 //   - a word at a clause end is a verb by morphology (-s/-ed/-ing,
 //     or an object-region verb), or — after a plural or compound
-//     subject — by base form, but only when it is a listed
-//     base-form verb ("the skills dance", "the skill and the
-//     venv dance", F-A12-2; F-A13-1): a bare word with no verb
-//     morphology ("the venv documentation") is a noun;
+//     subject — by base form ("the skills dance", "the skills
+//     build", "the skill and the venv dance", F-A12-2; F-A14-1):
+//     a bare word with no verb morphology is a verb by shape
+//     there, unless it is a never-verb word ("the venv
+//     documentation", F-A13-1; F-A14-4); after a singular subject
+//     a bare word ("the skill work") is a noun;
 //   - a word followed by a bare singular noun is a modifier, not a
 //     verb ("running venv", "open venv", "tired venv", "work plan"
 //     are noun phrases) — except an -s verb ("tests code" is verb
@@ -1149,13 +1286,19 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 	}
 	if after == "" {
 		// Clause-final: an ambiguous noun ("files") is still a
-		// noun; a verb form or an object-region verb is a verb;
-		// a base form is a verb only after a plural or compound
-		// subject (F-A12-2), and only when it is a listed
-		// base-form verb — a bare word with no verb morphology
-		// ("the venv documentation", "the skills handbook") is
-		// a noun (F-A13-1).
+		// noun, and so is a never-verb word ("analysis",
+		// "documentation") whatever its suffix (F-A14-4); a
+		// verb form or an object-region verb is a verb; a bare
+		// word is a verb by shape after a plural or compound
+		// subject (F-A14-1, F-A12-2) — the subject is plural,
+		// so a base form is grammatical — but a bare word after
+		// a singular subject ("the skill work") is a noun.
+		// Known non-verbs never reach here (verbFormNonVerbs,
+		// baseFormNonVerbs and subjectModifiers return earlier).
 		if verbFormAmbiguousNouns[word] {
+			return false, false
+		}
+		if neverVerbWords[word] {
 			return false, false
 		}
 		if hasVerbSuffix(word) {
@@ -1164,7 +1307,7 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		if isClauseVerb(word) {
 			return true, false
 		}
-		if plural && baseFormVerbs[word] {
+		if plural {
 			return true, false
 		}
 		return false, false
@@ -1175,23 +1318,30 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// decisive, even for an ambiguous noun ("files") — but
 		// only when the candidate is itself verb-shaped; a bare
 		// noun before an article ("documentation the plan") is a
-		// noun phrase, not a verb phrase (F-A13-1).
-		return isVerbShaped(word), false
+		// noun phrase, not a verb phrase (F-A13-1). After a
+		// plural or compound subject a bare word is a verb by
+		// shape ("the skills build the plan", F-A14-1), and a
+		// never-verb word is never one.
+		return isVerbShapedAt(word, plural), false
 	}
 	if clausePronouns[after] {
 		// A transitive verb and its object ("helps you",
 		// "explains it", "explains its purpose") — but only
 		// when the candidate is itself verb-shaped; a bare noun
 		// before a pronoun ("documentation you") is a noun
-		// phrase, not a verb phrase (F-A13-1).
-		return isVerbShaped(word), false
+		// phrase, not a verb phrase (F-A13-1). After a plural
+		// or compound subject a bare word is a verb by shape
+		// ("the skills build you", F-A14-1).
+		return isVerbShapedAt(word, plural), false
 	}
 	if clauseAdverbs[after] || (strings.HasSuffix(after, "ly") && len(after) > 4 && !baseFormVerbs[after]) {
 		// A verb and its adverb ("waits quietly") — but only
 		// when the candidate is itself verb-shaped; a bare noun
 		// before an adverb ("documentation quickly") is a noun
-		// phrase, not a verb phrase (F-A13-1).
-		return isVerbShaped(word), false
+		// phrase, not a verb phrase (F-A13-1). After a plural
+		// or compound subject a bare word is a verb by shape
+		// ("the skills build quickly", F-A14-1).
+		return isVerbShapedAt(word, plural), false
 	}
 	if clausePrepositions[after] {
 		// A verb and its prepositional phrase ("waits for the
@@ -1199,11 +1349,13 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// for beginners") is still a noun — and a bare noun
 		// before a preposition ("documentation for beginners")
 		// is a noun phrase too, because it is not verb-shaped
-		// (F-A13-1).
+		// (F-A13-1). After a plural or compound subject a bare
+		// word is a verb by shape ("the skills build for
+		// beginners", F-A14-1).
 		if verbFormAmbiguousNouns[word] {
 			return false, false
 		}
-		return isVerbShaped(word), false
+		return isVerbShapedAt(word, plural), false
 	}
 	if clauseSubordinators[after] {
 		// A verb and its subordinate clause ("waits when
@@ -1213,10 +1365,13 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// (F-A13-1). A subordinator after an ambiguous noun
 		// ("files that helps") attaches a relative clause, not
 		// a subordinate clause, so it is a noun phrase too.
+		// After a plural or compound subject a bare word is a
+		// verb by shape ("the skills build when ready",
+		// F-A14-1).
 		if verbFormAmbiguousNouns[word] {
 			return false, false
 		}
-		return isVerbShaped(word), false
+		return isVerbShapedAt(word, plural), false
 	}
 	if clauseVerbAux[after] {
 		// The word after the candidate is the verb ("files are
@@ -1231,10 +1386,14 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// verb — unless the following word is a guarded noun
 		// ("tools", "items", "settings"), in which case it is a
 		// noun compound ("reference tools", "documentation
-		// tools"), not a verb phrase, unless the candidate is a
-		// listed verb whose object it can be ("dance users",
-		// "serve users", F-A13-1, F-A12-2 pin-down). A participle
-		// in subject position ("running tools") is an attributive
+		// tools"), not a verb phrase, unless the candidate can
+		// take a guarded noun as its object (see
+		// verbTakesGuardedObject: a finite verb form — "makes
+		// users", "make users", "trained users", "files tools",
+		// F-A14-2 — but not a never-verb word, not an
+		// adjective-verb like "open", and not a participle in
+		// subject position, F-A12-1/F-A13-1). A participle in
+		// subject position ("running tools") is an attributive
 		// adjective (F-A12-1) — but only while the subject noun
 		// phrase is still open ("the running tests"); once a noun
 		// head has been seen ("the venv waiting tests") it is the
@@ -1250,7 +1409,7 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// checking it as a verb first would misread the candidate
 		// as a subject word and then misread "tests" itself as
 		// the clause verb.
-		if verbFormNonVerbs[after] && !baseFormVerbs[word] {
+		if verbFormNonVerbs[after] && !verbTakesGuardedObject(word, inSubject) {
 			return false, false
 		}
 		if inSubject && (strings.HasSuffix(word, "ing") && len(word) > 4 || strings.HasSuffix(word, "ed") && len(word) > 3) {
@@ -1262,7 +1421,7 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		if isClauseVerb(after) {
 			return true, false
 		}
-		return isVerbShaped(word), false
+		return isVerbShapedAt(word, plural), false
 	}
 	if strings.HasSuffix(after, "ing") && len(after) > 4 || strings.HasSuffix(after, "ed") && len(after) > 3 {
 		// A participle after the candidate ("dance waiting"): the
@@ -1313,9 +1472,21 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		if verbFormAmbiguousNouns[word] {
 			return false, true
 		}
+		if neverVerbWords[word] {
+			// A never-verb word ("analysis") is a noun
+			// modifier ("analysis plan"), not a verb
+			// (F-A14-4).
+			return false, true
+		}
 		return true, false
 	}
 	if strings.HasSuffix(word, "ing") && len(word) > 4 || strings.HasSuffix(word, "ed") && len(word) > 3 {
+		if neverVerbWords[word] {
+			// A never-verb word ("morning") is a noun
+			// modifier ("morning code"), not a verb
+			// (F-A14-4).
+			return false, true
+		}
 		if inSubject {
 			return false, true
 		}
@@ -1482,10 +1653,13 @@ func compoundSubjectStartsClause(fields []string, k int) bool {
 			return false
 		}
 		// Otherwise a subject word (an article, an adjective,
-		// or a noun): keep scanning for the verb. A noun head
-		// completes the subject noun phrase; an article, a
-		// subject modifier or an adverb does not.
-		if word != "the" && word != "a" && word != "an" && !subjectModifiers[word] && !clauseAdverbs[word] {
+		// or a noun): keep scanning for the verb. Only a
+		// genuine noun head completes the subject noun phrase
+		// (F-A14-3): an article, a subject modifier, an adverb
+		// or an adjective ("new", "ready", "quickly") is a
+		// subject word, not a noun head, so "the new running
+		// tests" stays a noun phrase.
+		if isNounHead(word) {
 			sawNoun = true
 		}
 	}

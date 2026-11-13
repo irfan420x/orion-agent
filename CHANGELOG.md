@@ -4,6 +4,86 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc19] — 2026-11-14
+
+### Audit 14 fixes (v0.2.0-rc19) — see `AUDIT14_2026-11-14.md`
+
+Fixes all four P2s from the fresh-eyes audit of rc18 (0 P0, 0 P1, 4 P2).
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open, and F-A3-2 (no pprof/debug endpoint) is still open.
+Verified by the release coordinator on the final commit: **1,203
+tests pass, 0 fail, 4 skip (total 1,207), 21/21 packages, race clean
+21/21, no data race**; live DeepSeek proof `17*23+5=396` in 3.0 s
+(rc18: 1,201 total: 1,197 pass, 0 fail, 4 skip).
+
+- **F-A14-1** — rc18 closed the verb lists in both directions, so an
+  unlisted base-form verb after a plural or compound subject lost
+  every position: "…the skills build/design/develop/study/watch/code/
+  sing/jump/paint/draw/cook/drive/fly/swim/sleep/walk/eat/laugh",
+  "…the skill and the venv build", "…the skills build the plan /
+  guides / you / quickly / for beginners / when ready" all rejected
+  on rc18 although they loaded on rc17 (40 shapes). The fix is
+  shape-based, not more list entries: new helper `isVerbShapedAt`
+  (`internal/skills/skills.go`) — after a plural or compound subject
+  a bare word in verb position is a verb by shape, in every
+  following-word position (article, pronoun, adverb, preposition,
+  subordinator, bare plural) and at a clause end; after a singular
+  subject a bare word is still not a verb ("the skill build the
+  plan" still rejects). The clause-final plural rule no longer
+  requires `baseFormVerbs` membership — the list is now only a
+  fallback for the singular path and the participle rule.
+- **F-A14-2** — The bare-plural rule fired before any verb-shape
+  check and exempted only `baseFormVerbs`, so genuine verbs before a
+  guarded plural object rejected: "…the skill makes/creates/runs/
+  tests/checks/helps/explains/provides users/tools/meetings/settings/
+  examples", "…the skill trained users / files tools / notes
+  settings / guides items", "…the skills make/create/use/run/help
+  users/tools/settings/meetings", "…the skill running tools" (21
+  shapes). The guarded-plural rejection now exempts verb-shaped
+  candidates (new helper `verbTakesGuardedObject`): an -s/-ed verb,
+  an object-region verb or a listed base-form verb takes the guarded
+  noun as its object. A participle in subject position ("running
+  tools") still does not — -ing is never a finite verb form — and
+  neither does a verb that is also a common adjective ("open":
+  "the open tools" is an adjective + noun, Audit 13 §7 D2).
+- **F-A14-3** — `compoundSubjectStartsClause` set `sawNoun=true` for
+  any word that is not an article, a subject modifier or a clause
+  adverb — including words `clauseVerbAt` had just early-returned as
+  non-verbs (the adjectives in `baseFormNonVerbs`: new/ready/
+  available/online/old/simple/easy/active; -ly adverbs: quickly) —
+  so the participle+bare-plural branch read the participle as the
+  predicate instead of a modifier: "…the skill and the new/ready/
+  quickly/available/online/old/simple/easy/active running/waiting
+  tests" loaded on rc18 although they rejected on rc17 (12 shapes).
+  Only a genuine noun head now sets `sawNoun` (new helper
+  `isNounHead`: a pure or ambiguous noun head, a named non-skill
+  object noun — "venv", "tool", "mode" — or a bare plural), so "the
+  new running tests" stays a noun phrase while "the venv running
+  tests" still loads (the noun head completes the phrase).
+- **F-A14-4** — Pure -s/-ing nouns were read as verbs by suffix:
+  `hasVerbSuffix` made never-verbs verb-shaped, so `isVerbShaped`
+  passed every rule: "…the skill analysis / status / news / physics
+  / morning / evening / mathematics / economics / chaos / virus /
+  campus", in clause-final, article, preposition, subordinator,
+  bare-plural and pronoun positions (31 shapes, loading on both rc17
+  and rc18 — pre-existing). New list `neverVerbWords` (pure nouns
+  plus common adjectives that are never verbs: "happy", "sad",
+  "glad", "good", "bad", "great", "big", "small"): a word here is
+  never verb-shaped, so no following-word rule, no clause-final rule
+  and no bare-singular rule can read it as a verb. It can still be
+  the subject of a clause ("…the skill analysis is ready" still
+  loads — the aux is the verb, F-A13-3). Words that ARE also verbs
+  are deliberately absent: "reference", "report", "setting" (R3).
+- Regression tests: `internal/skills/rc19_skills_test.go` — 6 test
+  functions, 204 subtests (F-A14-1 must-load, F-A14-2 must-load,
+  F-A14-3 must-reject, F-A14-4 must-reject, and two guard functions
+  covering the F-A13-1/2/3 behaviours, the F-A12-1 flip cases, the
+  F-A12-2 base-form cases, the Audit 12 pin-down and the Audit 13 §7
+  residuals). Negative control verified: on unmodified rc18 the
+  four finding functions fail (104 subtests) while the two guard
+  functions pass, exactly as designed; the fix was stashed and
+  restored byte-identical (diff hash 050c3f7a… verified before and after).
+
 ## [0.2.0-rc18] — 2026-11-14
 
 ### Audit 13 fixes (v0.2.0-rc18) — see `AUDIT13_2026-11-14.md`
