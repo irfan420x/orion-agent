@@ -4,6 +4,76 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc17] — 2026-11-14
+
+### Audit 12 fixes (v0.2.0-rc17) — see `AUDIT12_2026-11-14.md`
+
+Fixes both P2s from the fresh-eyes audit of rc16 (0 P0, 0 P1, 2 P2).
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open, and F-A3-2 (no pprof/debug endpoint) is still open.
+Verified by the release coordinator on the final commit: **1,191
+tests pass, 0 fail, 4 skip (total 1,195), 21/21 packages, race clean
+21/21, no data race**; live DeepSeek proof `17*23+5=396` in ~4.0 s
+(rc16: 1,190 total: 1,186 pass, 0 fail, 4 skip).
+
+- **F-A12-1** — The rc16 clause-verb recogniser read `-s`/`-ed`/`-ing`
+  nouns and adjectives as clause verbs ("Activate the tool, the skill
+  files / training / notes / meetings" and "…the skill and the
+  running/open/tired venv" loaded on rc16, rejected on rc15). The
+  fix is shape-based on both sides. `isVerbForm` is replaced by
+  `clauseVerbAt` (`internal/skills/skills.go:1059`), a context-aware
+  predicate that looks at the word after the candidate: a pure noun
+  head is never a verb (`verbFormNonVerbs`, extended with the common
+  skill-doc noun heads — meetings, recordings, tutorials, manuals,
+  resources, materials, templates, summaries, sessions, conversations,
+  responses, problems, decisions, discussions, jobs, tickets, users,
+  members, teams, goals, customers, clients, editors, developers,
+  managers, students, teachers, owners, admins, events, policies,
+  procedures, workflows, warnings — `skills.go:826`); a word that is
+  both a noun and a verb form (`verbFormAmbiguousNouns`: files,
+  notes, guides, training, learning, building — `skills.go:869`) is
+  a noun at a clause end, before a singular noun, or before a
+  preposition, and a verb when followed by an article, a pronoun, a
+  bare plural object, an adverb, or a prepositional phrase ("the
+  skill files the report", "the skill training the users" still
+  load). In the compound scan (`compoundSubjectStartsClause`,
+  `skills.go:1314`) a participle, object-region verb or base-form
+  word immediately before a noun is a modifier, not the verb, and
+  the scan skips its head noun too, so the head noun is never
+  misread as the verb ("the skill and the running tests" rejects).
+  A bare plural object is checked before the object-region verb
+  rule, because a word like "tests" is both a plural noun and an
+  object-region verb, and as the word after a candidate it is the
+  object ("the skill running tests" loads). An unlisted adverb
+  ("quickly") still rejects, as on rc15/rc16, and the pre-existing
+  "the skill setting" load (via `activateObjectClosers`, already
+  loading on rc15) is unchanged — it is not part of F-A12-1.
+- **F-A12-2** — Base-form verbs outside the finite `baseFormVerbs`
+  list ("dance", "serve") were missed, so "the skills dance" and
+  "…the skill and the venv serve the team" rejected. A base-form word
+  is now a verb by shape too: after a plural or compound subject it
+  is a verb when followed by an object/complement ("serve the team",
+  "serve users", "dance users") or by nothing at a clause end ("the
+  skills dance", "the skill and the venv dance"), while a base-form
+  word followed by a bare singular noun is a modifier ("the skill
+  and the venv work plan", "…dance plan" reject). The Audit 12
+  pin-down is covered: "…and the venv dance users" loads because
+  "dance" is the verb, not because the trailing "users" is misread
+  as one. After a singular subject a base form is still a noun
+  ("the skill work" is work about skills). Known limitation,
+  accepted: "the skill files are ready" still rejects (the singular
+  path does not forward-scan for a verb after a noun head) — fail
+  closed, and the audit did not require it.
+- Regression tests: `internal/skills/rc17_skills_test.go` — 5 test
+  functions, 53 subtests (F-A12-1 must-reject on the comma and
+  compound paths, F-A12-2 must-load, verb-reading preservation,
+  adverb guards). Negative control verified: on unmodified rc16 the
+  three F-A12-1/F-A12-2 functions fail (27 subtests) while the two
+  guard functions pass, exactly as designed. The Audit 12 W2
+  asserting probe (188 cases) passes in full and the W3 probe shows
+  only the three documented pre-existing mismatches (L6/L11 adverb
+  rejects, R3 "setting" loads).
+
 ## [0.2.0-rc16] — 2026-11-14
 
 ### Audit 11 fix (v0.2.0-rc16) — see `AUDIT11_2026-11-14.md`

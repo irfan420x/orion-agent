@@ -12,7 +12,7 @@ package version
 // still reports a sane version, never "dev" and never a stale tag
 // from an earlier release. Release checklist (CHANGELOG.md):
 // `orion version` must match the tag before any push.
-var Version = "0.2.0-rc16"
+var Version = "0.2.0-rc17"
 
 // Commit and BuildDate are set at build time with -ldflags -X
 // (install.sh and the Makefile do this). Built without ldflags they

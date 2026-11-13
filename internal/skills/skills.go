@@ -797,12 +797,17 @@ func isClauseVerb(word string) bool {
 }
 
 // verbFormNonVerbs are words that look like a verb form by suffix
-// (-s, -ed, -ing) but are not verbs in the position after a skill
-// subject, so isVerbForm must not read them as a new clause
-// (F-A11-1):
+// (-s, -ed, -ing) but are never verbs in the position after a skill
+// subject, so the clause test must not read them as a new clause
+// (F-A11-1, F-A12-1):
 //   - nouns that form a noun-noun compound with "skill" ("the
-//     skill tools", "the skill settings") — the compound is still
-//     a list object of "activate", not a clause;
+//     skill tools", "the skill settings", "the skill files") — the
+//     compound is still a list object of "activate", not a clause;
+//     F-A12-1 extends this to the common skill-doc noun heads
+//     ("files", "notes", "guides", "meetings", "recordings",
+//     "tutorials", "manuals", "users", ...) — these are pure nouns
+//     here, so they override every following-word rule (a "tools"
+//     is never a verb, even before "the");
 //   - the subject noun itself ("skill", "skills"), pronouns and
 //     demonstratives ("this", "its", "his");
 //   - prepositions and preposition-like participles that head a
@@ -812,10 +817,30 @@ func isClauseVerb(word string) bool {
 //     skill is still an object);
 //   - the noun "speed" (ends in -ed but is not a past-tense verb
 //     here).
+//
+// Words that are BOTH common nouns and common verb forms ("files",
+// "notes", "guides", "training", "learning", "building") are NOT
+// here — they live in verbFormAmbiguousNouns, where the word after
+// them decides (an article or object makes them a verb, a clause
+// end or a preposition leaves them a noun).
 var verbFormNonVerbs = map[string]bool{
 	// Noun-noun compounds with "skill".
 	"items": true, "options": true, "settings": true,
 	"examples": true, "parts": true, "tools": true,
+	// Common skill-doc noun heads (F-A12-1): pure nouns, never
+	// verbs in this position.
+	"meetings": true, "recordings": true, "tutorials": true,
+	"manuals": true, "resources": true, "materials": true,
+	"templates": true, "summaries": true, "sessions": true,
+	"conversations": true, "responses": true, "problems": true,
+	"decisions": true, "discussions": true, "jobs": true,
+	"tickets": true, "users": true, "members": true,
+	"teams": true, "goals": true, "customers": true,
+	"clients": true, "editors": true, "developers": true,
+	"managers": true, "students": true, "teachers": true,
+	"owners": true, "admins": true, "events": true,
+	"policies": true, "procedures": true, "workflows": true,
+	"warnings": true,
 	// The subject noun itself, pronouns, demonstratives.
 	"skill": true, "skills": true,
 	"this": true, "its": true, "his": true, "hers": true,
@@ -829,6 +854,100 @@ var verbFormNonVerbs = map[string]bool{
 	// -ing nouns/pronouns.
 	"thing": true, "something": true, "anything": true,
 	"nothing": true, "everything": true,
+}
+
+// verbFormAmbiguousNouns are words that are common skill-doc noun
+// heads AND common verb forms (F-A12-1): "files", "notes" and
+// "guides" are third-person singular verbs as well as plural nouns,
+// "training", "learning" and "building" are progressives as well as
+// (mass) nouns. They are nouns at a clause end ("the skill files"),
+// before a singular noun ("files report") or before a preposition
+// ("files for beginners"), but verbs when followed by an object or
+// complement ("files the report", "training the users", "notes
+// the time"). clauseVerbAt applies the following-word rule; a pure
+// noun in verbFormNonVerbs never becomes a verb.
+var verbFormAmbiguousNouns = map[string]bool{
+	"files": true, "notes": true, "guides": true,
+	"training": true, "learning": true, "building": true,
+}
+
+// baseFormNonVerbs are bare words that are never base-form verbs
+// after a plural or compound subject (F-A12-2): named non-skill
+// objects ("mode", "venv", "environment", ... — see
+// nonSkillObjectWords), the object noun "tool", and common
+// adjectives ("ready", "available", "new", ...) that can sit at a
+// clause end after a plural subject ("the skills ready" is missing
+// its copula, not a clause). A base-form word at a clause end is
+// otherwise a verb by shape — the audit's F-A12-2 direction — so
+// this set is deliberately small: only words that are plainly not
+// verbs.
+var baseFormNonVerbs = map[string]bool{
+	"mode": true, "venv": true, "virtualenv": true,
+	"environment": true, "conda": true, "profile": true,
+	"tool": true, "ready": true, "available": true,
+	"new": true, "old": true, "online": true, "offline": true,
+	"active": true, "simple": true, "easy": true,
+}
+
+// subjectModifiers are determiners and adjectives that can sit
+// inside a subject noun phrase ("the other venv", "the same skill")
+// but are never the clause verb (F-A12-2): when the clause test
+// meets one while scanning a compound subject, it is a subject
+// word, not a verb — so "the skill and the other skills" (no verb
+// after it) stays a list of objects.
+var subjectModifiers = map[string]bool{
+	"the": true, "a": true, "an": true,
+	"other": true, "another": true, "same": true,
+	"next": true, "first": true, "last": true,
+	"main": true, "each": true, "every": true,
+	"all": true, "both": true, "own": true,
+	"different": true, "several": true, "various": true,
+	"multiple": true, "single": true, "entire": true,
+	"whole": true, "total": true, "these": true, "those": true,
+	"only": true, "such": true, "certain": true,
+}
+
+// clausePrepositions are the prepositions in objectCloserNonVerbs,
+// split out so the clause test can tell a verb's prepositional
+// phrase ("waits for the team") from a subordinating conjunction
+// ("waits when ready"): both follow a verb, but only a preposition
+// can also head a phrase modifying a noun ("files for beginners"
+// is a noun phrase, so an ambiguous noun before a preposition
+// stays a noun — F-A12-1).
+var clausePrepositions = map[string]bool{
+	"using": true, "with": true, "via": true, "by": true,
+	"through": true, "for": true, "to": true, "of": true,
+	"in": true, "on": true, "at": true, "from": true,
+	"into": true, "over": true, "under": true, "per": true,
+}
+
+// clauseSubordinators are the subordinating conjunctions in
+// objectCloserNonVerbs: what follows a verb here is a subordinate
+// clause ("waits when ready"), never a noun phrase, so a candidate
+// before one is always a verb (F-A12-1).
+var clauseSubordinators = map[string]bool{
+	"when": true, "while": true, "if": true, "because": true,
+	"before": true, "after": true, "unless": true,
+	"although": true, "though": true, "since": true,
+	"that": true, "which": true, "who": true, "as": true,
+}
+
+// clausePronouns are pronouns, demonstratives and possessives that
+// can be a verb's object ("helps you", "explains it", "explains
+// its purpose"): a candidate before one is a transitive verb
+// (F-A12-2).
+var clausePronouns = map[string]bool{
+	"it": true, "them": true, "us": true, "him": true,
+	"her": true, "me": true, "you": true,
+	"this": true, "that": true, "these": true, "those": true,
+	"its": true, "their": true, "his": true, "my": true,
+	"our": true, "your": true, "theirs": true, "ours": true,
+	"yours": true, "mine": true, "himself": true,
+	"herself": true, "itself": true, "themselves": true,
+	"ourselves": true, "yourself": true, "yourselves": true,
+	"one": true, "ones": true, "all": true, "none": true,
+	"some": true, "any": true, "each": true, "both": true,
+	"either": true, "neither": true,
 }
 
 // baseFormVerbs are common verbs in their base form, recognised
@@ -879,61 +998,240 @@ var clauseAdverbs = map[string]bool{
 	"eventually": true,
 }
 
-// isVerbForm reports whether word looks like a verb form, by shape
-// rather than by a finite verb list (F-A11-1): a copula/auxiliary
-// or an object-region verb (see isClauseVerb), a third-person
-// singular present (-s), a past tense (-ed), or a progressive
-// participle (-ing). After a singular skill subject, the verb of
-// its clause must be one of these shapes, so any of them after
-// "the skill" starts a new clause ("the skill waits / works /
-// explains the plan", "the skill finished", "the skill waiting").
-// The plural flag is for a plural or compound subject, whose verb
-// is a base form ("the skills wait", "the skill and the venv
-// wait") — recognised from baseFormVerbs, because a base form has
-// no distinctive suffix. A small set of words that end in -s/-ed/
-// -ing but are nouns or prepositions in this position (see
-// verbFormNonVerbs) is excluded, so a noun-noun compound ("the
-// skill tools") is still read as a list object.
-func isVerbForm(word string, plural bool) bool {
-	if isClauseVerb(word) {
-		return true
-	}
-	if verbFormNonVerbs[word] {
-		return false
-	}
-	// Progressive participle ("the skill waiting").
+// hasVerbSuffix reports whether word has a verb-form suffix:
+// third-person singular present (-s, not -ss, which is a noun
+// like "class"), past tense (-ed) or progressive participle
+// (-ing). Used by clauseVerbAt for the morphology check.
+func hasVerbSuffix(word string) bool {
 	if strings.HasSuffix(word, "ing") && len(word) > 4 {
 		return true
 	}
-	// Past tense ("the skill finished").
 	if strings.HasSuffix(word, "ed") && len(word) > 3 {
 		return true
 	}
-	// Third-person singular present ("the skill waits"). A
-	// trailing "ss" is a noun ("class"), not a verb.
 	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 {
-		return true
-	}
-	// Base form, only for a plural/compound subject.
-	if plural && baseFormVerbs[word] {
 		return true
 	}
 	return false
 }
 
+// clauseVerbAt reports whether the word at fields[p] is the verb of
+// a new clause with the (compound) skill subject, and whether it is
+// instead a modifier of the following noun (F-A12-1, F-A12-2). A
+// verb is recognised by shape — what follows it — not by a finite
+// verb list:
+//   - a copula/auxiliary is always a verb ("is ready");
+//   - a word followed by an article, pronoun, adverb, preposition
+//     or subordinating conjunction is a verb ("explains the plan",
+//     "helps you", "waits for the team", "waits when ready") — a
+//     transitive verb and its object, or a verb and its complement;
+//     an ambiguous noun before a preposition stays a noun ("files
+//     for beginners" is a noun phrase, not a clause);
+//   - a word followed by a bare plural noun is a verb with a bare
+//     plural object ("serve users", "dance users", "files notes",
+//     "running tests"). This rule, and the participle rule below,
+//     come BEFORE the following-verb rule on purpose: a word like
+//     "tests" is both a plural noun and an object-region verb, and
+//     as the word after a candidate it is the object ("running
+//     tests"), not the verb — checking it as a verb first would
+//     misread the candidate as a subject word and then misread
+//     "tests" itself as the clause verb.
+//   - a word at a clause end is a verb by morphology (-s/-ed/-ing,
+//     or an object-region verb), or — after a plural or compound
+//     subject — by base form ("the skills dance", "the skill and
+//     the venv dance" are verbs by shape, F-A12-2), unless it is a
+//     known non-verb (see baseFormNonVerbs); after a singular
+//     subject a base form is a noun ("the skill work" is work about
+//     skills), as before.
+//   - a word followed by a bare singular noun is a modifier, not a
+//     verb ("running venv", "open venv", "tired venv", "work plan"
+//     are noun phrases) — except an -s verb ("tests code" is verb
+//     plus object), and except in predicate position (inSubject
+//     false: "the skill running tests" has the participle as its
+//     verb, because there is nothing else it could be).
+//
+// A pure noun in verbFormNonVerbs ("tools", "users") is never a
+// verb, whatever follows it. An adverb ("quickly") is never a verb
+// either, so unlisted adverbs still reject as on rc15/rc16. A
+// participle in subject position ("running tools") is a modifier:
+// the scan must skip its head noun too, so the modifier flag tells
+// compoundSubjectStartsClause to advance an extra word.
+func clauseVerbAt(fields []string, p int, plural bool, inSubject bool) (isVerb bool, isModifier bool) {
+	raw := fields[p]
+	word := strings.Trim(raw, ".,;:()[]\"'`!?")
+	if word == "" {
+		return false, false
+	}
+	if clauseVerbAux[word] {
+		return true, false
+	}
+	if objectCloserNonVerbs[word] {
+		return false, false
+	}
+	if clauseAdverbs[word] {
+		return false, false
+	}
+	if strings.HasSuffix(word, "ly") && len(word) > 4 && !baseFormVerbs[word] {
+		// An adverb ("quickly"), not a verb.
+		return false, false
+	}
+	if subjectModifiers[word] {
+		return false, false
+	}
+	if verbFormNonVerbs[word] {
+		// A pure noun head ("tools", "users") — never a verb here.
+		return false, false
+	}
+	if baseFormNonVerbs[word] {
+		// A known non-verb ("tool", "venv", "ready") — a subject
+		// word, never the clause verb: "the skill and the tool
+		// wait" still finds "wait", and "the tool for beginners"
+		// still ends the scan at the preposition.
+		return false, false
+	}
+	// The word after the candidate: "" when the candidate's field
+	// ends the clause with a comma or sentence terminator, or when
+	// there is no next field.
+	after := ""
+	if !strings.ContainsAny(raw, ",.!?;:") && p+1 < len(fields) {
+		after = strings.Trim(fields[p+1], ".,;:()[]\"'`!?")
+	}
+	if after == "" {
+		// Clause-final: an ambiguous noun ("files") is still a
+		// noun; a verb form or an object-region verb is a verb;
+		// a base form is a verb only after a plural or compound
+		// subject (F-A12-2), and only when it is not a known
+		// non-verb ("tool", "ready", ...).
+		if verbFormAmbiguousNouns[word] {
+			return false, false
+		}
+		if hasVerbSuffix(word) {
+			return true, false
+		}
+		if isClauseVerb(word) {
+			return true, false
+		}
+		if plural && !baseFormNonVerbs[word] {
+			return true, false
+		}
+		return false, false
+	}
+	if after == "the" || after == "a" || after == "an" {
+		// A transitive verb and its object ("explains the plan",
+		// "serve the team", "files the report"): the article is
+		// decisive, even for an ambiguous noun ("files").
+		return true, false
+	}
+	if clausePronouns[after] {
+		// A transitive verb and its object ("helps you",
+		// "explains it", "explains its purpose").
+		return true, false
+	}
+	if clauseAdverbs[after] || (strings.HasSuffix(after, "ly") && len(after) > 4 && !baseFormVerbs[after]) {
+		// A verb and its adverb ("waits quietly").
+		return true, false
+	}
+	if clausePrepositions[after] {
+		// A verb and its prepositional phrase ("waits for the
+		// team"); an ambiguous noun with a PP modifier ("files
+		// for beginners") is still a noun.
+		if verbFormAmbiguousNouns[word] {
+			return false, false
+		}
+		return true, false
+	}
+	if clauseSubordinators[after] {
+		// A verb and its subordinate clause ("waits when ready").
+		return true, false
+	}
+	if clauseVerbAux[after] {
+		// The word after the candidate is the verb ("users are
+		// ready"): the candidate is a subject word, not the verb.
+		return false, false
+	}
+	if strings.HasSuffix(after, "s") && !strings.HasSuffix(after, "ss") && len(after) > 2 {
+		// A bare plural object ("serve users", "dance users",
+		// "files notes", "running tests"): the candidate is its
+		// verb — unless it is a participle in subject position
+		// ("running tools"), where it is an attributive adjective
+		// (F-A12-1). This rule comes before the object-region
+		// verb check below on purpose: a word like "tests" is
+		// both a plural noun and an object-region verb, and as
+		// the word after a candidate it is the object ("running
+		// tests"), not the verb.
+		if inSubject && (strings.HasSuffix(word, "ing") && len(word) > 4 || strings.HasSuffix(word, "ed") && len(word) > 3) {
+			return false, true
+		}
+		return true, false
+	}
+	if strings.HasSuffix(after, "ing") && len(after) > 4 || strings.HasSuffix(after, "ed") && len(after) > 3 {
+		// A participle after the candidate ("dance waiting"): the
+		// candidate modifies it, unless it is an -s verb
+		// ("tests waiting"). This also comes before the
+		// object-region verb check: a participle like "running"
+		// is a noun phrase head here, not the clause verb.
+		if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 && !verbFormAmbiguousNouns[word] {
+			return true, false
+		}
+		return false, true
+	}
+	if isClauseVerb(after) {
+		// The word after the candidate is a verb ("users run"):
+		// the candidate is a subject word, not the verb.
+		return false, false
+	}
+	// A bare singular word after the candidate ("venv", "plan",
+	// "code", "team"): the candidate modifies it ("running venv",
+	// "open venv", "tired venv", "work plan") — unless the
+	// candidate is an -s verb ("tests code"), or (outside the
+	// subject) a participle or object-region verb in predicate
+	// position ("the skill running tests", "the skill open venv").
+	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 {
+		if verbFormAmbiguousNouns[word] {
+			return false, true
+		}
+		return true, false
+	}
+	if strings.HasSuffix(word, "ing") && len(word) > 4 || strings.HasSuffix(word, "ed") && len(word) > 3 {
+		if inSubject {
+			return false, true
+		}
+		return true, false
+	}
+	if isClauseVerb(word) {
+		if inSubject {
+			return false, true
+		}
+		return true, false
+	}
+	// A base-form word followed by a singular noun is a modifier
+	// ("work plan"); anything else here is a subject word. (A
+	// known non-verb — "tool", "venv", "ready" — already returned
+	// above, so it never reaches this branch and never hides the
+	// real verb: "the skill and the tool wait" still loads.)
+	if inSubject {
+		return false, true
+	}
+	return false, false
+}
+
 // skillStartsNewClause reports whether the skill at fields[j] is
 // the subject of a new clause, so it is not an object of
-// "activate" (F-A11-1). A new clause starts when the word after
-// the skill is a verb (see isVerbForm — a copula/auxiliary, an
-// object-region verb, or any other verb form recognised by shape),
-// possibly after an adverb ("the skill then waits") or after a
-// parenthetical comma ("the skill, is ready"), or when the skill
-// is the first part of a compound subject ("the skill and the
-// venv are ready"). Anything else after the skill — the end of
-// the line, punctuation, a preposition or subordinating
+// "activate" (F-A11-1, F-A12-1, F-A12-2). A new clause starts when
+// the word after the skill is a verb (see clauseVerbAt — a
+// copula/auxiliary, an object-region verb, or any other verb form
+// recognised by shape, including a base form after a plural or
+// compound subject), possibly after an adverb ("the skill then
+// waits") or after a parenthetical comma ("the skill, is ready"),
+// or when the skill is the first part of a compound subject ("the
+// skill and the venv are ready"). Anything else after the skill —
+// the end of the line, punctuation, a preposition or subordinating
 // conjunction ("the skill for beginners"), another noun ("the
 // skill the tool"), or a further list item ("the skill and the
 // venv", with no verb after it) — leaves the skill a list object.
+// A noun head after the skill ("the skill files") is a list
+// object, not a clause (F-A12-1); a verb and its object ("the
+// skill files the report") is a clause (F-A12-2).
 func skillStartsNewClause(fields []string, j int) bool {
 	// A plural subject ("the skills ...") takes a base-form verb
 	// ("the skills wait"), a singular one an -s/-ed/-ing form.
@@ -980,9 +1278,11 @@ func skillStartsNewClause(fields []string, j int) bool {
 		if after == "" {
 			return false
 		}
-		return isVerbForm(after, plural)
+		isVerb, _ := clauseVerbAt(fields, k+1, plural, false)
+		return isVerb
 	}
-	return isVerbForm(next, plural)
+	isVerb, _ := clauseVerbAt(fields, k, plural, false)
+	return isVerb
 }
 
 // compoundSubjectStartsClause reports whether the "and"/"or" at
@@ -997,7 +1297,20 @@ func skillStartsNewClause(fields []string, j int) bool {
 // continues the compound subject ("the skill and the venv and the
 // tool are ready"). The compound subject is plural, so a verb may
 // be a base form ("the skill and the venv wait") as well as an
-// -s/-ed/-ing form or an auxiliary.
+// -s/-ed/-ing form or an auxiliary — and, since F-A12-2, a base
+// form is recognised by shape (followed by an object/complement,
+// or at a clause end), not only from baseFormVerbs.
+// A word that modifies the following noun is not the verb
+// (F-A12-1): an -ing/-ed participle, an object-region verb or a
+// base-form word immediately before a noun ("the running venv",
+// "the open venv", "the tired venv", "work plan") is an
+// attributive adjective or noun compound, so the scan skips it
+// AND its head noun — otherwise the head noun itself ("tests" in
+// "the running tests") would be misread as the verb. The scan
+// never accepts a word in object position as the verb: once a
+// verb is found ("dance" in "the skill and the venv dance
+// users"), the scan stops there and never reaches its object
+// ("users").
 func compoundSubjectStartsClause(fields []string, k int) bool {
 	for j := k + 1; j < len(fields); j++ {
 		raw := fields[j]
@@ -1016,8 +1329,16 @@ func compoundSubjectStartsClause(fields []string, k int) bool {
 			// Another part of the compound subject.
 			continue
 		}
-		if isVerbForm(word, true) {
+		isVerb, isModifier := clauseVerbAt(fields, j, true, true)
+		if isVerb {
 			return true
+		}
+		if isModifier {
+			// A modifier and its head noun are both part of
+			// the subject ("the running venv"): skip both,
+			// so the head noun is never misread as the verb.
+			j++
+			continue
 		}
 		if strings.ContainsAny(raw, ".,!?;:") {
 			// A comma or sentence terminator attached to a
