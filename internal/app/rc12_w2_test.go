@@ -241,10 +241,22 @@ func tryMidSweepFinish(t *testing.T, attempt int) bool {
 	}
 	a.chatsMu.Unlock()
 	swept1 := <-sweepDone
-	// The sweep charged all 200 fillers. The blocked task must
-	// have been left unmarked: if the sweep charged it, it
-	// finished before the loop reached it, and the state was not
-	// constructed — retry.
+	// The sweep charged all fillers. The blocked task must have
+	// been left unmarked: if the sweep charged it, it finished
+	// before the loop reached it, and the state was not
+	// constructed — retry. (rc13: under -race + full-suite load
+	// the sweep goroutine is not always scheduled inside the
+	// window, so it starts after the blocked task finished and
+	// correctly charges it: swept1 = fillers + 250. That is a
+	// missed interleaving, not a lost token — the task WAS
+	// charged — so it retries like the sweep-already-returned
+	// miss above, instead of asserting on a state it did not
+	// build. Any other total is unexpected and stays a hard
+	// failure.)
+	if swept1 == fillers+250 {
+		_ = a.Close()
+		return false
+	}
 	if swept1 != fillers {
 		_ = a.Close()
 		t.Errorf("attempt %d: first sweep = %d, want %d (all fillers)", attempt, swept1, fillers)

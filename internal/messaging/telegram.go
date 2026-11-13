@@ -972,11 +972,19 @@ func ApprovalPromptText(req permissions.ApprovalRequest) string {
 // prompt. A send failure is returned so the gate can treat the
 // prompt as undelivered.
 func ApprovalPrompter(gw *TelegramGateway, cards *ApprovalCards, logPrefix string) permissions.Prompter {
+	// Capture stderr once, here: the prompter runs on turn
+	// goroutines, and reading the os.Stderr global on every
+	// prompt races with any test (or embedder) that swaps it
+	// while the daemon runs (data race found by -race in
+	// TestW3DaemonAndTelegramPollGatePrompts, pre-existing on
+	// rc12). The captured writer is the same destination in
+	// production; only the read moves to setup time.
+	stderr := os.Stderr
 	return func(ctx context.Context, req permissions.ApprovalRequest) error {
 		msgID, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, ApprovalPromptText(req), ApprovalKeyboard(req.ID))
 		if err == nil {
 			cards.Note(req.ID, msgID)
-			fmt.Fprintf(os.Stderr, "%s: approval prompt: tool %q request %s chat %d card %d\n", logPrefix, req.Tool, req.ID, req.ChatID, msgID)
+			fmt.Fprintf(stderr, "%s: approval prompt: tool %q request %s chat %d card %d\n", logPrefix, req.Tool, req.ID, req.ChatID, msgID)
 		}
 		return err
 	}
@@ -990,12 +998,21 @@ func ApprovalPrompter(gw *TelegramGateway, cards *ApprovalCards, logPrefix strin
 // cancelled, which is exactly why the request expired.
 // Best-effort: a failed edit is logged, never fatal.
 func InstallApprovalExpiry(gate *permissions.Gate, gw *TelegramGateway, cards *ApprovalCards, logPrefix string) {
+	// Capture stderr once, here: the hook and its edit goroutine
+	// run on background goroutines, and reading the os.Stderr
+	// global there races with any test (or embedder) that swaps
+	// it while the daemon runs (data race found by -race in
+	// TestW3DaemonAndTelegramPollGatePrompts, pre-existing on
+	// rc12: the expiry goroutine's Fprintf read os.Stderr while
+	// the test's capture helper restored it). The captured
+	// writer is the same destination in production.
+	stderr := os.Stderr
 	gate.SetOnExpire(func(req permissions.ApprovalRequest) {
 		msgID, ok := cards.Take(req.ID)
 		if !ok {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "%s: approval expired: request %s chat %d card %d\n", logPrefix, req.ID, req.ChatID, msgID)
+		fmt.Fprintf(stderr, "%s: approval expired: request %s chat %d card %d\n", logPrefix, req.ID, req.ChatID, msgID)
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -1003,7 +1020,7 @@ func InstallApprovalExpiry(gate *permissions.Gate, gw *TelegramGateway, cards *A
 			// message deleted) must leave a trace instead of
 			// being swallowed.
 			if err := gw.EditMessageTextMarkup(ctx, req.ChatID, msgID, "⚠️ Approval request: ⏰ Expired — no answer within the approval window. Send the request again to retry.", InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
-				fmt.Fprintf(os.Stderr, "%s: approval expired: request %s card %d edit failed: %v\n", logPrefix, req.ID, msgID, err)
+				fmt.Fprintf(stderr, "%s: approval expired: request %s card %d edit failed: %v\n", logPrefix, req.ID, msgID, err)
 			}
 		}()
 	})
@@ -1022,6 +1039,15 @@ func InstallApprovalExpiry(gate *permissions.Gate, gw *TelegramGateway, cards *A
 // a tap that never arrives and a tap on a dead card must be
 // distinguishable in the log.
 func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *permissions.Gate, ownerID int64, q TGCallbackQuery, cards *ApprovalCards, logPrefix string) error {
+	// Capture stderr once, here: this runs on callback-handler
+	// goroutines, and reading the os.Stderr global on every tap
+	// races with any test (or embedder) that swaps it while the
+	// daemon runs (same class as the InstallApprovalExpiry race
+	// found by -race in TestW3DaemonAndTelegramPollGatePrompts).
+	// The capture is race-free for this flow: no new handler
+	// starts after the poll loop exits, so the entry read can
+	// never overlap the swap-back that follows it.
+	stderr := os.Stderr
 	decision, id, ok := ParsePermissionCallback(q.Data)
 	if !ok {
 		// Log the unparseable tap: without this a tap the
@@ -1029,21 +1055,21 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 		// button looks exactly like a dead one. The data is a
 		// short callback payload (perm:<decision>:<id>), never
 		// free user text, so logging it is safe.
-		fmt.Fprintf(os.Stderr, "%s: approval tap: unparseable callback data %q (query %s)\n", logPrefix, q.Data, q.ID)
+		fmt.Fprintf(stderr, "%s: approval tap: unparseable callback data %q (query %s)\n", logPrefix, q.Data, q.ID)
 		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
 	}
 	senderID := int64(0)
 	if q.From != nil {
 		senderID = q.From.ID
 	}
-	fmt.Fprintf(os.Stderr, "%s: approval tap: %s request %s from %d\n", logPrefix, decision, id, senderID)
+	fmt.Fprintf(stderr, "%s: approval tap: %s request %s from %d\n", logPrefix, decision, id, senderID)
 	req, found := gate.Pending(id)
 	if !found {
-		fmt.Fprintf(os.Stderr, "%s: approval tap: request %s expired (no longer pending)\n", logPrefix, id)
+		fmt.Fprintf(stderr, "%s: approval tap: request %s expired (no longer pending)\n", logPrefix, id)
 		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
 	}
 	if senderID != req.SenderID && senderID != ownerID {
-		fmt.Fprintf(os.Stderr, "%s: approval tap: request %s refused for sender %d (requester %d, owner %d)\n", logPrefix, id, senderID, req.SenderID, ownerID)
+		fmt.Fprintf(stderr, "%s: approval tap: request %s refused for sender %d (requester %d, owner %d)\n", logPrefix, id, senderID, req.SenderID, ownerID)
 		return gw.AnswerCallbackQuery(ctx, q.ID, "Only the person who asked can approve this.")
 	}
 	var persist *permissions.Action
@@ -1062,10 +1088,10 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool."
 	}
 	if !gate.Resolve(id, approved, persist) {
-		fmt.Fprintf(os.Stderr, "%s: approval tap: request %s expired during resolve\n", logPrefix, id)
+		fmt.Fprintf(stderr, "%s: approval tap: request %s expired during resolve\n", logPrefix, id)
 		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
 	}
-	fmt.Fprintf(os.Stderr, "%s: approval tap: request %s resolved approved=%v\n", logPrefix, id, approved)
+	fmt.Fprintf(stderr, "%s: approval tap: request %s resolved approved=%v\n", logPrefix, id, approved)
 	cards.Forget(id)
 	// Edit the prompt in place so the chat shows the outcome. The
 	// edit carries the outcome only (no tool arguments): the
@@ -1077,7 +1103,7 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 	// buttons. An edit failure is logged, never swallowed.
 	if q.Message != nil {
 		if err := gw.EditMessageTextMarkup(ctx, q.Message.Chat.ID, q.Message.MessageID, "⚠️ Approval request: "+outcome, InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: approval tap: request %s outcome edit failed: %v\n", logPrefix, id, err)
+			fmt.Fprintf(stderr, "%s: approval tap: request %s outcome edit failed: %v\n", logPrefix, id, err)
 		}
 	}
 	return gw.AnswerCallbackQuery(ctx, q.ID, outcome)
@@ -1201,9 +1227,10 @@ func (g *TelegramGateway) SendMessage(ctx context.Context, chatID int64, text st
 // fetchUpdatesLocked long-polls for new updates (timeout=30s on the
 // server side, 35s client timeout) and returns them WITHOUT
 // advancing the offset. The caller holds fetchMu and must advance
-// the offset for every update it has decided (dispatched, dropped,
-// or skipped) — see advanceOffsetTo and PollStream's contiguous
-// confirmation. It honours ctx cancellation.
+// the offset for every update it has decided (completed, dropped,
+// or skipped — F-A8-2: completion, not dispatch) — see
+// advanceOffsetTo and PollStream's contiguous confirmation. It
+// honours ctx cancellation.
 //
 // Splitting the fetch from the advance is what closes the
 // crash-window loss (F-A7-P2-3): GetUpdates used to advance the
@@ -1356,10 +1383,12 @@ const typingResendInterval = 4 * time.Second
 // Each batch is dispatched in two passes (F-A7-P2-3): all callback
 // queries first, then messages. A message earlier in a batch must
 // never delay a tap later in that batch behind a turn slot.
-// The getUpdates offset advances only as updates are dispatched,
-// dropped, or skipped — and only past the longest contiguous run
-// of decided updates — so a crash mid-batch re-delivers the
-// undispatched suffix instead of confirming and losing it.
+// The getUpdates offset advances only as updates complete,
+// are dropped, or are skipped — and only past the longest
+// contiguous run of decided updates — so a crash mid-turn
+// re-delivers the in-flight update instead of confirming and
+// losing it (F-A8-2: confirmation happens on handler
+// completion, never at spawn).
 func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) error {
 	if handler == nil {
 		return errors.New("messaging: telegram PollStream: handler must not be nil")
@@ -1388,7 +1417,178 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	chatLock := func(chatID int64) *sync.Mutex {
 		return &chatLocks[uint64(chatID)%uint64(len(chatLocks))]
 	}
+
+	// Offset confirmation tracker (F-A8-2). The offset is a single
+	// watermark and advances ONLY when a handler COMPLETES — never
+	// at spawn. rc12 confirmed an update the moment its handler
+	// goroutine was spawned, so the next getUpdates re-issued with
+	// the advanced offset confirmed the in-flight turn
+	// server-side; a crash/restart any time during a minutes-long
+	// turn then lost the update permanently (never re-delivered,
+	// no reply). Four silent VM reboots happened on 2026-11-13,
+	// so this was live risk, not theory.
+	//
+	// Semantics (at-least-once):
+	//   - "Decided" means the handler finished (reply sent, or
+	//     callback answered, or panic recovered and apology
+	//     sent) or the update was deliberately dropped/skipped
+	//     (non-allowlisted sender/chat, empty text). An update
+	//     whose handler is still running is NOT decided, and the
+	//     watermark stays behind it — and behind every later
+	//     update too, because the watermark only advances past
+	//     the longest contiguous run of decided updates.
+	//   - A re-delivered update (after a crash mid-turn Telegram
+	//     re-delivers every unconfirmed update for 24h) is
+	//     re-dispatched and the turn runs again from scratch.
+	//     That re-run is NOT guaranteed idempotent at the tool
+	//     level: tools the killed turn already ran may run a
+	//     second time, and the user may get a second reply. That
+	//     is the safe direction — a duplicate beats silence —
+	//     and the window for it is small (a turn that already
+	//     finished is confirmed microseconds after its reply),
+	//     but it is real, and operators should prefer
+	//     idempotent tools. What IS guaranteed: a turn is never
+	//     dispatched twice CONCURRENTLY — inFlight dedupes
+	//     re-fetched updates while their handler is still
+	//     running, and the per-chat lock serialises a re-run
+	//     against any turn for the same chat.
+	//   - If a handler blocks forever, the watermark stays
+	//     behind it forever: later updates are still fetched
+	//     and dispatched (the poll loop does not stall behind
+	//     one turn), but they are never confirmed past it. The
+	//     loop re-fetches the in-flight update on every poll;
+	//     when a fetch makes no progress at all (every update
+	//     in it was already in-flight) the loop waits for a
+	//     completion signal (up to 1s) instead of spinning a
+	//     tight re-fetch loop. This is the at-least-once price,
+	//     and it is bounded: at most one extra getUpdates per
+	//     second per stuck turn.
+	//   - The offset is in-memory, so on daemon restart it
+	//     starts from 0 and Telegram re-delivers everything
+	//     unconfirmed within its 24h window. A re-delivered
+	//     turn that had already completed before the crash is
+	//     confirmed again only after its re-run completes —
+	//     same semantics as above, no special case.
+	var confirmMu sync.Mutex
+	nextConfirm := g.Offset()
+	decided := make(map[int64]bool)
+	inFlight := make(map[int64]bool)
+	// completed is signalled (non-blocking, depth 1) on every
+	// markDecided, so the poll loop can wake promptly from its
+	// no-progress wait when a handler finishes.
+	completed := make(chan struct{}, 1)
+	notifyCompleted := func() {
+		select {
+		case completed <- struct{}{}:
+		default:
+		}
+	}
+	// markDecided records update id as finished and advances the
+	// watermark past the longest contiguous run of decided
+	// updates starting at nextConfirm. It is called only from a
+	// handler's defer (on completion) or synchronously for a
+	// deliberately dropped/skipped update — never at spawn.
+	//
+	// NOTE: markDecided deliberately does NOT delete decided
+	// entries as the watermark passes them. A getUpdates call
+	// issued with an older offset can still be in flight (a
+	// long poll lasts up to 30s) while handlers complete and
+	// the watermark advances; when that stale batch returns,
+	// it still contains the already-decided updates, and the
+	// dispatch loop must recognise them as decided to skip
+	// them instead of running those turns a second time. The
+	// entries are pruned only in the poll loop, against the
+	// offset the batch being processed was fetched with (see
+	// below): an id below that offset can never be returned
+	// again, by this batch or any later one.
+	markDecided := func(id int64) {
+		confirmMu.Lock()
+		decided[id] = true
+		delete(inFlight, id)
+		for decided[nextConfirm] {
+			nextConfirm++
+		}
+		next := nextConfirm
+		confirmMu.Unlock()
+		g.advanceOffsetTo(next)
+		notifyCompleted()
+	}
+	// isDecided reports whether update id already finished (or
+	// was deliberately dropped/skipped) but is still waiting
+	// behind the watermark for an earlier in-flight update.
+	// Such an update is re-fetched on every poll until the
+	// watermark passes it — it must be skipped, not dispatched
+	// again, or a fast turn behind a slow one would re-run on
+	// every poll cycle.
+	isDecided := func(id int64) bool {
+		confirmMu.Lock()
+		defer confirmMu.Unlock()
+		return decided[id]
+	}
+	// markInFlight claims update id for a handler that is about
+	// to be spawned; it returns false when a handler for id is
+	// already running (a re-fetch of an in-flight update), in
+	// which case the caller must NOT dispatch it again.
+	markInFlight := func(id int64) bool {
+		confirmMu.Lock()
+		defer confirmMu.Unlock()
+		if inFlight[id] {
+			return false
+		}
+		inFlight[id] = true
+		return true
+	}
+	// unmarkInFlight releases a claim made by markInFlight when
+	// the handler was never spawned (semaphore acquisition lost
+	// to ctx cancellation), so the update can be dispatched on
+	// the next poll instead of staying claimed forever.
+	unmarkInFlight := func(id int64) {
+		confirmMu.Lock()
+		defer confirmMu.Unlock()
+		delete(inFlight, id)
+	}
+	// noteBatchStart handles the first update of a fetched batch
+	// starting above the watermark (a gap that cannot occur on
+	// the real API, where update_ids are contiguous): the run
+	// starts at that update instead of stalling forever below
+	// it — unless an in-flight update sits below it, in which
+	// case the watermark must stay behind that update.
+	noteBatchStart := func(firstID int64) {
+		confirmMu.Lock()
+		jumped := false
+		if firstID > nextConfirm {
+			jumped = true
+			for id := range inFlight {
+				if id < firstID {
+					jumped = false
+					break
+				}
+			}
+			if jumped {
+				nextConfirm = firstID
+			}
+		}
+		next := nextConfirm
+		confirmMu.Unlock()
+		// Advancing the offset to nextConfirm is safe: the
+		// offset is inclusive (getUpdates returns updates with
+		// id >= offset), so pointing it at the lowest undecided
+		// update still re-delivers that update — it confirms
+		// nothing. It keeps Offset() meaningful (the next
+		// unconfirmed update id) while a turn is in-flight,
+		// instead of leaving it at its pre-batch value.
+		if jumped {
+			g.advanceOffsetTo(next)
+		}
+	}
+
 	handle := func(upd Update) {
+		// Registered first, so it runs LAST (LIFO): after the
+		// reply/apology is sent, after the panic recovery, and
+		// after the semaphore slot is released. The update is
+		// confirmed only once this handler has fully completed
+		// (F-A8-2) — never at spawn.
+		defer markDecided(upd.UpdateID)
 		defer func() { <-sem }()
 		// A panic in the handler (the agent loop) must not kill the
 		// daemon: report it to the chat like any other handler error
@@ -1539,7 +1739,13 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// logged and polling continues; the query is always answered
 	// (even when no handler is installed) so the button's spinner
 	// clears instead of hanging.
-	handleCallback := func(q TGCallbackQuery) {
+	handleCallback := func(q TGCallbackQuery, updateID int64) {
+		// Registered first, so it runs LAST (LIFO): after the
+		// query is answered (or the tap failed and was logged),
+		// after the panic recovery, and after the cbSem slot is
+		// released. The update is confirmed only once this
+		// handler has fully completed (F-A8-2) — never at spawn.
+		defer markDecided(updateID)
 		defer func() { <-cbSem }()
 		defer func() {
 			if r := recover(); r != nil {
@@ -1574,10 +1780,11 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		default:
 		}
 
-		// Fetch WITHOUT advancing the offset (F-A7-P2-3): the offset
-		// advances only as updates are dispatched below (see
-		// markDecided), so a crash mid-batch cannot confirm
-		// updates this loop never reached. fetchMu is held only
+		// Fetch WITHOUT advancing the offset (F-A7-P2-3, F-A8-2):
+		// the offset advances only as updates complete below
+		// (see markDecided), so a crash mid-batch or mid-turn
+		// cannot confirm updates this loop never finished.
+		// fetchMu is held only
 		// for the fetch itself: the dispatch loop below can block
 		// on the turn semaphore, and holding the fetch lock across
 		// it would stall any concurrent GetUpdates caller for the
@@ -1585,9 +1792,34 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// fetcher can observe the un-advanced offset mid-batch;
 		// GetUpdates callers keep their own atomic
 		// fetch-and-advance (see GetUpdates).
+		// fetchOffset is the offset this batch was requested
+		// with (fetchUpdatesLocked reads the same offset
+		// immediately after, so the request's offset is >=
+		// this value). It bounds the decided-set pruning
+		// below: any decided id below it can never be
+		// returned again, by this batch or any later one,
+		// because the offset only ever moves forward.
+		fetchOffset := g.Offset()
 		g.fetchMu.Lock()
 		updates, err := g.fetchUpdatesLocked(ctx)
 		g.fetchMu.Unlock()
+		// Prune decided entries that can never be re-fetched
+		// (F-A8-2 stale-batch hole): a getUpdates issued with
+		// an older offset can return after the watermark has
+		// already advanced past some of its updates, so those
+		// updates must stay recognisable as decided until a
+		// batch fetched with a newer offset is processed —
+		// pruning against this batch's own fetch offset is
+		// exactly that point. Pruning earlier (e.g. in
+		// markDecided as the watermark passed them) let a
+		// stale batch re-dispatch already-finished turns.
+		confirmMu.Lock()
+		for id := range decided {
+			if id < fetchOffset {
+				delete(decided, id)
+			}
+		}
+		confirmMu.Unlock()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -1638,40 +1870,41 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			g.logReceivedUpdate(upd)
 		}
 
-		// markDecided confirms one update and advances the offset
-		// past the longest contiguous run of decided updates,
-		// starting at the offset this batch was fetched from
-		// (F-A7-P2-3, crash window). The offset is a single
-		// watermark, so it may only pass an update once every
-		// earlier update is decided too: a callback later in the
-		// batch is dispatched (and decided) while an earlier
-		// message is still waiting on a turn slot, but the
-		// watermark stays behind that message — a crash now
-		// re-delivers the suffix instead of losing it. A decided
-		// update is one this loop dispatched, dropped, or skipped
-		// on purpose; an undecided one is re-fetched on the next
-		// poll. That is at-least-once: a turn killed mid-flight
-		// by the crash runs again, which is the safe direction —
-		// the user gets a second reply rather than silence.
-		// Telegram delivers update_ids contiguously, so the run
-		// always reaches the batch end once every update is
-		// decided; defensively, if the batch starts above the
-		// watermark (a gap that cannot occur on the real API),
-		// the run starts at the first update instead of stalling
-		// forever below it.
-		nextConfirm := g.Offset()
-		if len(updates) > 0 && updates[0].UpdateID > nextConfirm {
-			nextConfirm = updates[0].UpdateID
+		// Confirmation state (F-A8-2, see the tracker above
+		// handle): markDecided runs only when a handler
+		// COMPLETES, never at spawn. The old comment here
+		// claimed the safe direction held generally — "a turn
+		// killed mid-flight by the crash runs again" — but the
+		// probe in Audit 8 falsified that: the offset was
+		// confirmed at dispatch, so a turn killed mid-flight
+		// was NEVER re-delivered. What is true now: a decided
+		// update is one whose handler finished, or one this
+		// loop dropped or skipped on purpose; an in-flight
+		// update is undecided and is re-fetched on the next
+		// poll (deduped, not re-dispatched — see
+		// markInFlight). A DECIDED update behind the watermark
+		// is re-fetched too, and is likewise skipped, not
+		// re-dispatched (see isDecided): without that, a fast
+		// turn behind a slow one would re-run on every poll.
+		// The offset is a single watermark, so
+		// it may only pass an update once every earlier update
+		// is decided too: a callback later in the batch may
+		// complete while an earlier message's turn is still
+		// running, but the watermark stays behind that message
+		// — a crash now re-delivers the suffix instead of
+		// losing it. Telegram delivers update_ids
+		// contiguously, so the run always reaches the batch
+		// end once every update is decided.
+		if len(updates) > 0 {
+			noteBatchStart(updates[0].UpdateID)
 		}
-		decided := make(map[int64]bool, len(updates))
-		markDecided := func(id int64) {
-			decided[id] = true
-			for decided[nextConfirm] {
-				delete(decided, nextConfirm)
-				nextConfirm++
-			}
-			g.advanceOffsetTo(nextConfirm)
-		}
+		// progress counts updates this batch newly decided or
+		// newly dispatched. Zero progress with a non-empty batch
+		// means every update in it was already in-flight: the
+		// loop waits for a completion (below) instead of
+		// re-fetching the same in-flight updates in a tight
+		// loop.
+		progress := 0
 
 		// Pass 1 — callbacks first (F-A7-P2-3, in-batch ordering).
 		// Callback queries (inline-keyboard taps) are handled on
@@ -1695,6 +1928,11 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// block on sem without delaying a tap.
 		dispatchCallback := func(upd Update) bool {
 			q := upd.CallbackQuery
+			// Already finished but still behind the watermark:
+			// re-fetched, not new — skip without re-answering.
+			if isDecided(upd.UpdateID) {
+				return true
+			}
 			if !g.IsSenderAllowed(q.From) {
 				if q.From != nil {
 					g.logf("telegram poll: dropped callback query from non-allowlisted user %d", q.From.ID)
@@ -1702,18 +1940,30 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 					g.logf("telegram poll: dropped callback query with no sender")
 				}
 				markDecided(upd.UpdateID)
+				progress++
 				return true
 			}
 			if ctx.Err() != nil {
 				return false
 			}
+			// In-flight dedup (F-A8-2): the offset stays behind
+			// a running callback handler, so the next fetch
+			// re-delivers it — skip it instead of answering
+			// the same tap twice. Not progress: the loop must
+			// still wait for this handler to finish.
+			if !markInFlight(upd.UpdateID) {
+				return true
+			}
 			select {
 			case cbSem <- struct{}{}:
 			case <-ctx.Done():
+				unmarkInFlight(upd.UpdateID)
 				return false
 			}
-			go handleCallback(*q)
-			markDecided(upd.UpdateID)
+			go handleCallback(*q, upd.UpdateID)
+			// No markDecided here: the update is confirmed
+			// only when handleCallback completes (its defer).
+			progress++
 			return true
 		}
 
@@ -1723,11 +1973,19 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// that blocks when all slots are held. Blocking here is
 		// safe now: every callback in the batch is already
 		// dispatched, and the offset still sits behind any
-		// undispatched message (see markDecided), so a crash or a
-		// shutdown mid-pass re-delivers the rest.
+		// undispatched or in-flight message (see markDecided),
+		// so a crash or a shutdown mid-pass re-delivers the rest.
 		dispatchMessage := func(upd Update) bool {
+			// Already finished but still behind the watermark:
+			// re-fetched, not new — skip without re-running the
+			// turn (a fast turn behind a slow one would
+			// otherwise re-run on every poll cycle).
+			if isDecided(upd.UpdateID) {
+				return true
+			}
 			if upd.Message == nil || strings.TrimSpace(upd.Message.Text) == "" {
 				markDecided(upd.UpdateID)
+				progress++
 				return true
 			}
 			// Sender authorisation: drop messages from chats outside
@@ -1740,6 +1998,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			if !g.IsChatAllowed(upd.Message.Chat.ID) {
 				g.logf("telegram poll: dropped message from non-allowlisted chat %d (add it to telegram_allowed_chats to allow it)", upd.Message.Chat.ID)
 				markDecided(upd.UpdateID)
+				progress++
 				return true
 			}
 			// Sender check (P1-O4): the chat being allowlisted is
@@ -1754,10 +2013,19 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 					g.logf("telegram poll: dropped message with no sender in chat %d", upd.Message.Chat.ID)
 				}
 				markDecided(upd.UpdateID)
+				progress++
 				return true
 			}
 			if ctx.Err() != nil {
 				return false
+			}
+			// In-flight dedup (F-A8-2): the offset stays behind
+			// a running turn, so the next fetch re-delivers it
+			// — skip it instead of running the same turn twice
+			// concurrently. Not progress: the loop must still
+			// wait for this handler to finish.
+			if !markInFlight(upd.UpdateID) {
+				return true
 			}
 			// Acquire a handler slot (or stop if cancelled) before
 			// dispatching, so the number of in-flight handlers is
@@ -1765,10 +2033,13 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
+				unmarkInFlight(upd.UpdateID)
 				return false
 			}
 			go handle(upd)
-			markDecided(upd.UpdateID)
+			// No markDecided here: the update is confirmed only
+			// when handle completes (its defer, F-A8-2).
+			progress++
 			return true
 		}
 
@@ -1785,6 +2056,25 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				continue
 			}
 			if !dispatchMessage(upd) {
+				return nil
+			}
+		}
+
+		// No-progress wait (F-A8-2): every update in this batch
+		// was already in-flight, so the next fetch would return
+		// the same updates immediately and the loop would spin.
+		// Wait for a handler to complete (waking promptly on
+		// the completion signal) or up to 1s, whichever comes
+		// first, before polling again. A handler that blocks
+		// forever holds the watermark behind it — that is the
+		// at-least-once semantics — but it costs at most one
+		// extra getUpdates per second, and later updates are
+		// still fetched and dispatched on each cycle.
+		if len(updates) > 0 && progress == 0 {
+			select {
+			case <-completed:
+			case <-time.After(time.Second):
+			case <-ctx.Done():
 				return nil
 			}
 		}

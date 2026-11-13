@@ -3,12 +3,11 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc12.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc13.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,130 tests total — 1,126 pass, 0 fail, 4 skip —
-> Ollama live tests plus one MCP process test that needs a live server;
-> race clean; counts verified by the rc12 release coordinator on the
-> final commit, see `AUDIT7_2026-11-13.md`). The model can now delegate to subagents (`subagent_spawn` /
+> built and tested (1,151 tests total — 1,147 pass, 0 fail, 4 skip;
+> counts verified by the rc13 release coordinator on the final commit,
+> see `AUDIT8_2026-11-13.md`). The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
 > history — fixed by a calibrated token estimator; same turn now costs
@@ -119,11 +118,10 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-21/21 packages, 1,130 tests total (1,126 passing, 0 failing, 4 skipped —
-the live Ollama tests, which need a running Ollama server, plus one MCP test
-that needs a live server process), race clean — `go test
--count=1 ./...`, verified by the rc12 release coordinator, 2026-11-13
-(`AUDIT7_2026-11-13.md`). Run the suite with `go test ./...` or `make test`.
+21/21 packages, 1,151 tests total (1,147 passing, 0 failing, 4 skipped)
+(counts verified by the rc13 release coordinator, 2026-11-13,
+`AUDIT8_2026-11-13.md`). Run the suite with
+`go test ./...` or `make test`.
 
 ## Configuration
 

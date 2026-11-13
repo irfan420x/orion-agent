@@ -1,4 +1,4 @@
-# Orion Architecture (v0.2.0-rc11)
+# Orion Architecture (v0.2.0-rc13)
 
 Orion is MIT-licensed (see [LICENSE](LICENSE)); the repository is
 public at https://github.com/irfan420x/orion-agent.

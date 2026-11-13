@@ -32,11 +32,12 @@ import (
 //
 // Usage accounting rule (see subagentResultTool.Execute): tokens are
 // counted in the parent turn when the parent consumes the result —
-// i.e. on the first subagent_result fetch of a finished (DONE or
-// FAILED) task. A result that is never fetched is charged instead by
-// the per-chat turn-end sweep (app.runChatTurn, F-A5-7), so
-// spawn-and-never-fetch spend is no longer invisible; fetching the
-// same result twice counts it once in either path.
+// i.e. on the first subagent_result fetch of a finished (DONE,
+// FAILED or TIMED-OUT) task, once its usage has settled. A result
+// that is never fetched is charged instead by the per-chat turn-end
+// sweep (app.runChatTurn, F-A5-7), so spawn-and-never-fetch spend
+// is no longer invisible; fetching the same result twice counts it
+// once in either path.
 type SubagentUsageSink interface {
 	AddSubagentUsage(tokens int)
 }
@@ -336,25 +337,51 @@ func (t *subagentResultTool) Execute(ctx context.Context, args json.RawMessage) 
 		return string(out), nil
 	}
 
-	// Finished: charge the usage exactly once, for DONE and FAILED
-	// tasks — tokens are counted in the parent turn when the parent
-	// consumes the result; a second fetch of the same result must
-	// not double-count. A result never fetched is charged instead
-	// by the per-chat turn-end sweep (app.runChatTurn, F-A5-7).
+	// Finished: charge the usage exactly once, for DONE, FAILED
+	// and TIMED-OUT tasks — tokens are counted in the parent turn
+	// when the parent consumes the result; a second fetch of the
+	// same result must not double-count. A result never fetched is
+	// charged instead by the per-chat turn-end sweep (app.runChatTurn,
+	// F-A5-7).
 	// Failed tasks count too: their tokens were genuinely spent
 	// (the executor did work before failing) and the parent is told
 	// about them, so hiding them would undercount the turn.
-	// Timed-out tasks record zero usage (a late result is discarded),
-	// so there is nothing to charge for them.
-	if status == subagent.StatusDone || status == subagent.StatusFailed {
-		t.set.mu.Lock()
-		already := t.set.delivered[id]
-		if !already {
-			t.set.delivered[id] = true
-		}
-		t.set.mu.Unlock()
-		if !already {
-			t.set.sink.AddSubagentUsage(res.Usage.Tokens)
+	// Timed-out tasks count too (F-A8-P2-2): a task that timed out
+	// still spent provider tokens, and when its executor ignored
+	// the deadline the Manager records the late usage on the entry
+	// (F-A7-2a) — the old claim that timed-out tasks record zero
+	// usage was false post-rc12. Charging them on fetch is what
+	// saves the CLI path, which has no sweep: without it the late
+	// tokens vanish even though the payload reports them.
+	// The charge happens only once the usage is SETTLED. Fetching
+	// a timed-out (or cancellation-failed) task while its executor
+	// is still running reports the provisional zero and charges
+	// nothing — and, crucially, does NOT mark the result
+	// delivered, so a later fetch still charges the late usage
+	// once it arrives. Marking on an unsettled fetch would burn
+	// the single charge on zero and lose the late tokens forever
+	// (the same trap the sweep avoids by skipping unsettled
+	// tasks without marking them swept).
+	// Exactly-once across fetch AND sweep (chat path): the two
+	// chargers write to separate buckets — the fetch sink resolves
+	// to the global agent (app.go), while the sweep charges the
+	// chat's stats/budget — and each has its own guard (the
+	// delivered set here, the swept set in the sweep), exactly as
+	// DONE and FAILED tasks already do today. Adding TIMEOUT to
+	// the fetch set introduces no new double-count: within each
+	// bucket the task is charged once, and the fetch touches no
+	// Manager state the sweep depends on.
+	if status == subagent.StatusDone || status == subagent.StatusFailed || status == subagent.StatusTimeout {
+		if res.UsageSettled {
+			t.set.mu.Lock()
+			already := t.set.delivered[id]
+			if !already {
+				t.set.delivered[id] = true
+			}
+			t.set.mu.Unlock()
+			if !already {
+				t.set.sink.AddSubagentUsage(res.Usage.Tokens)
+			}
 		}
 	}
 

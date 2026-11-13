@@ -514,13 +514,28 @@ func (t *Transcript) recordsLocked() ([]Record, int, error) {
 // keeps every turn forever, so a pasted key or token must never
 // land in it verbatim. Message content and tool-call arguments are
 // scrubbed; roles, tool names and ids are not secret-bearing.
+//
+// The ToolCalls slice is COPIED before scrubbing (rc13): the
+// caller's Message shares its backing array with the agent history
+// and the memory store, and scrubbing the arguments in place
+// mutated the caller's data — racing with a concurrent FileStore
+// Save marshal of that same array (data race found by -race in
+// TestApprovalCallbackWhileTurnSlotsFull: Shutdown saves while a
+// turn is still appending; the race is pre-existing, it reproduces
+// on rc12 at 3/10 runs). Content is assigned on the caller's local
+// struct copy, so it needs no copy; the slice elements do.
 func scrubRecord(r *Record) {
 	switch r.Kind {
 	case KindMessage:
 		if r.Message != nil {
 			r.Message.Content = security.RedactSecrets(r.Message.Content)
-			for i := range r.Message.ToolCalls {
-				r.Message.ToolCalls[i].Arguments = security.RedactSecrets(r.Message.ToolCalls[i].Arguments)
+			if len(r.Message.ToolCalls) > 0 {
+				tc := make([]model.ToolCall, len(r.Message.ToolCalls))
+				copy(tc, r.Message.ToolCalls)
+				r.Message.ToolCalls = tc
+				for i := range tc {
+					tc[i].Arguments = security.RedactSecrets(tc[i].Arguments)
+				}
 			}
 		}
 	case KindSummary, KindDropped:

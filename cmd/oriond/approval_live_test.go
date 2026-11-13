@@ -511,6 +511,20 @@ func TestApprovalCallbackWhileTurnSlotsFull(t *testing.T) {
 		t.Fatal("PollStream did not return after cancel")
 	}
 
+	// Drain the queued turns (2-8) before returning: they are
+	// denied on cancellation and complete shortly after, but
+	// PollStream returns promptly without waiting for them
+	// (handlers are left to finish). Returning while they still
+	// run lets them create files under the test's TempDir after
+	// cleanup starts, failing the test with "directory not
+	// empty" (flaky under -race + full-suite load; seen in the
+	// rc13 release-check run). The offset is a completion
+	// watermark (F-A8-2): it reaches 10 only once every handler
+	// for updates 1-9 has finished.
+	waitFor("all turn handlers drained", func() bool {
+		return gw.Offset() == 10
+	})
+
 	fake.mu.Lock()
 	answered := append([]string(nil), fake.answered...)
 	fake.mu.Unlock()

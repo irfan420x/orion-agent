@@ -124,12 +124,12 @@ func TestCallbackDispatchedBeforeMessageInSameBatchWhileTurnSlotsFull(t *testing
 }
 
 // TestOffsetNotAdvancedPastUndispatchedMessage: with all 8 turn
-// slots held, a batch [message 9, callback 10] must advance the
-// offset past the dispatched callback only in the sense that the
-// callback is decided — the offset watermark itself must stay
-// behind the undispatched message 9, so a crash now re-delivers
-// the suffix instead of confirming and losing it. Once the
-// message is dispatched the watermark passes the whole batch.
+// slots held, a batch [message 9, callback 10] must not advance the
+// offset past any in-flight turn: the watermark is a *completion*
+// watermark (F-A8-2), so it stays at 1 while turns 1-8 are still
+// running, and stays behind the undispatched message 9, so a crash
+// now re-delivers the suffix instead of confirming and losing it.
+// Once the message completes the watermark passes the whole batch.
 func TestOffsetNotAdvancedPastUndispatchedMessage(t *testing.T) {
 	fake := newQueueFake()
 	srv := httptest.NewServer(fake)
@@ -150,8 +150,8 @@ func TestOffsetNotAdvancedPastUndispatchedMessage(t *testing.T) {
 		stopPollStream(t, cancel, errCh)
 	}()
 
-	if got := g.Offset(); got != 9 {
-		t.Fatalf("offset after filling turn slots = %d, want 9 (past the 8 dispatched messages)", got)
+	if got := g.Offset(); got != 1 {
+		t.Fatalf("offset after filling turn slots = %d, want 1 (the watermark must stay behind the 8 in-flight turns, F-A8-2)", got)
 	}
 	fake.enqueue(Update{UpdateID: 9, Message: &TGMessage{
 		MessageID: 9, Chat: TGChat{ID: 77},
@@ -168,12 +168,13 @@ func TestOffsetNotAdvancedPastUndispatchedMessage(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("callback in the batch never reached the handler")
 	}
-	// The callback is dispatched, but message 9 is still waiting
-	// on a turn slot — the watermark must not pass it. On rc11 the
-	// offset jumped to 11 at fetch time, confirming message 9
-	// before it was ever dispatched.
-	if got := g.Offset(); got != 9 {
-		t.Fatalf("offset while message 9 is undispatched = %d, want 9 (the watermark must stay behind the undispatched message)", got)
+	// The callback completed, but turns 1-8 are still in flight
+	// and message 9 is still waiting on a turn slot — the
+	// watermark must not pass any of them. On rc12 the offset
+	// jumped to 9 at dispatch time, confirming turns 1-8 before
+	// they had completed; on rc11 it jumped to 11 at fetch time.
+	if got := g.Offset(); got != 1 {
+		t.Fatalf("offset while message 9 is undispatched = %d, want 1 (the watermark must stay behind the in-flight turns and the undispatched message)", got)
 	}
 
 	releaseAll()

@@ -8,9 +8,12 @@
 #   make vet       go vet ./...
 #   make fmt       gofmt -l (fails if any file needs formatting)
 #   make version   print the version the next build will report
-#   make release-check  release gate (Audit 7, F-A7-P2-7): build orion,
-#                  assert `orion version` matches the exact-match git
-#                  tag, assert CHANGELOG.md has a heading for the tag,
+#   make release-check  release gate (Audit 7, F-A7-P2-7; Audit 8,
+#                  F-A8-P2-4): build orion, assert `orion version`
+#                  matches the exact-match git tag, assert a plain
+#                  build without ldflags reports the release in
+#                  preparation (the fallback in internal/version),
+#                  assert CHANGELOG.md has a heading for the tag,
 #                  and assert the README test counts match the suite
 #                  (it runs the full suite itself). Fails loudly
 #                  otherwise; do not push when it fails.
@@ -48,18 +51,30 @@ LDFLAGS := -X $(VERSION_PKG).Commit=$(COMMIT) -X $(VERSION_PKG).BuildDate=$(DATE
 
 BIN_DIR ?= bin
 
-.PHONY: build install test vet fmt version clean release-check check-version check-changelog check-readme-counts
+.PHONY: build install test vet fmt version clean release-check check-version check-version-fallback check-changelog check-readme-counts
 
-# Release gate (Audit 7, F-A7-P2-7). The version-vs-tag check used to
-# be a doc-only checklist item in CHANGELOG.md, and the rc10 binary
-# reported rc9 because of it. `make release-check` automates the
-# mechanically checkable parts: `orion version` == the exact-match
-# git tag, CHANGELOG.md has a heading for the tag, and the README
-# test counts match the suite (check-readme-counts runs the full
-# suite itself, with TMPDIR=/tmp — the sandbox tests assume TMPDIR
-# is under /tmp; see Audit 7 §1.1). It does NOT check: -race,
-# gofmt, go vet, or the live DeepSeek proof — those stay manual
-# checklist items in CHANGELOG.md. CHECK_BIN overrides which binary
+# Release gate (Audit 7, F-A7-P2-7; Audit 8, F-A8-P2-4). The
+# version-vs-tag check used to be a doc-only checklist item in
+# CHANGELOG.md, and the rc10 binary reported rc9 because of it.
+# `make release-check` automates the mechanically checkable parts:
+# `orion version` == the exact-match git tag, CHANGELOG.md has a
+# heading for the tag, and the README test counts match the suite
+# (check-readme-counts runs the full suite itself, with TMPDIR=/tmp —
+# the sandbox tests assume TMPDIR is under /tmp; see Audit 7 §1.1).
+# It also builds orion WITHOUT ldflags and asserts the plain build
+# reports the release this tree is working towards (the top
+# `## [x.y.z]` heading of CHANGELOG.md) — the fallback in
+# internal/version/version.go. The fallback is the version of the
+# release in preparation, so it is compared against the top
+# CHANGELOG heading, not the git tag: between tags the fallback is
+# already the next release (rc13 while HEAD is still tagged rc12),
+# and a tag comparison would fail for that whole window — which is
+# exactly when the bump lands and exactly how the rc11 fallback
+# survived the rc12 tag unnoticed. At gate time the top heading IS
+# the tag (check-changelog enforces a heading for the tag), so the
+# two comparisons coincide. It does NOT check: -race, gofmt, go
+# vet, or the live DeepSeek proof — those stay manual checklist
+# items in CHANGELOG.md. CHECK_BIN overrides which binary
 # check-version runs against (default: the freshly built
 # ./bin/orion); it exists so the check can be proven to fail on a
 # deliberately mismatched binary.
@@ -67,8 +82,8 @@ RELEASE_TAG := $(shell git describe --tags --exact-match 2>/dev/null)
 RELEASE_VERSION := $(RELEASE_TAG:v%=%)
 CHECK_BIN ?= $(BIN_DIR)/orion
 
-release-check: build check-version check-changelog check-readme-counts
-	@echo "release-check: PASS — orion version matches $(RELEASE_TAG), CHANGELOG has the tag heading, README counts match the suite"
+release-check: build check-version check-version-fallback check-changelog check-readme-counts
+	@echo "release-check: PASS — orion version matches $(RELEASE_TAG), plain build reports the fallback release, CHANGELOG has the tag heading, README counts match the suite"
 
 check-version:
 	@test -n "$(RELEASE_TAG)" || { echo "release-check: FAIL — HEAD is not exactly on a git tag (git describe --tags --exact-match failed); tag the commit before release-check"; exit 1; }
@@ -77,6 +92,28 @@ check-version:
 	got="$$($$bin version | awk '{print $$2}')"; \
 	test "$$got" = "$(RELEASE_VERSION)" || { echo "release-check: FAIL — orion version reports '$$got' but the tag is '$(RELEASE_TAG)' (expected '$(RELEASE_VERSION)'); do not push"; exit 1; }; \
 	echo "release-check: orion version '$$got' matches tag '$(RELEASE_TAG)'"
+
+# check-version-fallback (Audit 8, F-A8-P2-4): the fallback in
+# internal/version/version.go was still 0.2.0-rc11 at the rc12 tag,
+# so a plain `go build` binary misreported the version — and
+# release-check never saw it, because it only ever ran the
+# Makefile-built (ldflags) binary. This builds orion with NO ldflags
+# and asserts the binary reports the release this tree is working
+# towards: the version in the top `## [x.y.z]` heading of
+# CHANGELOG.md. It must FAIL on a stale fallback (e.g. fallback
+# rc11 under an rc13 heading) and PASS once the fallback is bumped.
+# (Do NOT put `#` comment lines inside the recipe below: a comment
+# line has no trailing backslash, so it splits the backslash-
+# continued recipe into two shells and the second shell loses $tmp.)
+check-version-fallback:
+	@tmp="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
+	$(GO) build -trimpath -o "$$tmp/orion-plain" ./cmd/orion || { echo "release-check: FAIL — plain build without ldflags failed"; exit 1; }; \
+	got="$$("$$tmp/orion-plain" version | awk '{print $$2}')"; \
+	want="$$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' CHANGELOG.md | head -1)"; \
+	test -n "$$want" || { echo "release-check: FAIL — no '## [x.y.z]' heading found in CHANGELOG.md"; exit 1; }; \
+	test "$$got" = "$$want" || { echo "release-check: FAIL — plain build (no ldflags) reports '$$got' but the top CHANGELOG heading is '[$$want]'; bump the fallback in internal/version/version.go to $$want; do not push"; exit 1; }; \
+	echo "release-check: plain build (no ldflags) reports '$$got', matching the top CHANGELOG heading '[$$want]'"
 
 check-changelog:
 	@test -n "$(RELEASE_TAG)" || { echo "release-check: FAIL — HEAD is not exactly on a git tag; tag the commit before release-check"; exit 1; }

@@ -132,6 +132,10 @@ type outcome struct {
 
 // taskEntry is the Manager's internal record for one task. done is
 // closed exactly once, when the task finishes and result is set.
+// detached is set when the entry leaves m.entries (evicted or
+// forgotten) while a late-arrival waiter may still write to it: the
+// waiter then folds the late usage into the dead-letter ledger
+// instead of writing onto an entry no reader can reach (F-A8-P2-1).
 type taskEntry struct {
 	task      Task
 	exec      Executor
@@ -141,6 +145,7 @@ type taskEntry struct {
 	done      chan struct{}
 	result    Result
 	finished  bool
+	detached  bool
 }
 
 // Manager runs subagent tasks with bounded concurrency.
@@ -152,6 +157,25 @@ type Manager struct {
 	sem           chan struct{}
 	wg            sync.WaitGroup
 	shutdown      bool
+	// deadLetterTokens / deadLetterTasks are the dead-letter ledger
+	// (F-A8-P2-1): tokens of finished tasks that left the registry
+	// through eviction, and how many such tasks there were. Eviction
+	// is involuntary — unlike Forget, nobody decided these results
+	// were consumed — so their recorded usage is folded here at
+	// eviction time instead of silently voided. A task evicted
+	// while its usage was still unsettled contributes its late
+	// usage to the ledger when the executor eventually returns (see
+	// awaitLateOutcome). The ledger is diagnostic / recovery
+	// accounting: the Manager cannot see the app-side swept set or
+	// the tools-side delivered set, so a consumer adding this total
+	// to a charged total must first reconcile it against tasks it
+	// knows were already charged elsewhere (fetch / sweep). In
+	// practice the ledger is nearly unreachable — the per-chat
+	// sweep charges finished tasks at the end of every turn, and
+	// the cap below is 10x the old one — but no evicted token is
+	// ever silently lost again.
+	deadLetterTokens int
+	deadLetterTasks  int
 }
 
 // NewManager returns a Manager with the given concurrency limit.
@@ -252,9 +276,13 @@ func (m *Manager) SpawnForChat(chatID int64, brief string, timeout time.Duration
 	}
 	m.entries[id] = entry
 	m.wg.Add(1)
-	// Bound memory: evict the oldest finished tasks once the registry
-	// grows past maxEntries, so a long daemon run cannot grow List /
-	// WaitAll without bound.
+	// Bound memory: evict the oldest finished tasks once the
+	// registry grows past maxEntries, so a long daemon run cannot
+	// grow List / WaitAll without bound. Eviction preserves token
+	// accounting (F-A8-P2-1): it skips unsettled finished tasks
+	// while any settled finished task can be evicted instead, and
+	// folds every evicted task's recorded usage into the
+	// dead-letter ledger (see DeadLetterTokens).
 	m.evictFinishedLocked()
 	m.mu.Unlock()
 
@@ -262,12 +290,57 @@ func (m *Manager) SpawnForChat(chatID int64, brief string, timeout time.Duration
 	return id, nil
 }
 
-// maxEntries bounds the task registry. Finished tasks beyond this are
-// evicted oldest-first; running tasks are never evicted.
-const maxEntries = 100
+// maxEntries bounds the task registry. Finished tasks beyond this
+// are evicted oldest-first; running tasks are never evicted. Raised
+// from 100 to 1000 in rc13 (F-A8-P2-1): the old cap was daemon-wide
+// while sweeps run per turn, so a single busy turn could flood the
+// registry and void finished tasks' tokens before any sweep saw
+// them. At 1000 entries the registry is still small (each entry is
+// one struct plus its output/brief strings), and eviction below
+// preserves the tokens anyway — the cap is a memory bound now, not
+// an accounting cliff.
+const maxEntries = 1000
+
+// DeadLetterTokens returns the tokens folded into the dead-letter
+// ledger by eviction (F-A8-P2-1): the recorded usage of finished
+// tasks that left the registry through eviction, including late
+// usage that arrived after an unsettled task was evicted. It is 0
+// until the first eviction. See the Manager field comment for the
+// reconciliation caveat before adding this to a charged total.
+func (m *Manager) DeadLetterTokens() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.deadLetterTokens
+}
+
+// DeadLetterTasks returns how many finished tasks were evicted from
+// the registry (F-A8-P2-1). It counts evicted tasks, not ledger
+// contributions: a task evicted while unsettled is counted at
+// eviction time, and its late tokens join DeadLetterTokens when
+// they arrive.
+func (m *Manager) DeadLetterTasks() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.deadLetterTasks
+}
 
 // evictFinishedLocked deletes the oldest finished entries until the
 // registry is at most maxEntries. Callers must hold m.mu.
+//
+// Token accounting (F-A8-P2-1) is preserved two ways. First,
+// eviction prefers settled finished tasks: an unsettled task's
+// usage is not final yet (its executor is still running past the
+// timeout), so evicting it would strand the late usage the
+// F-A7-2(a) waiter exists to recover — the task is skipped while
+// any settled finished task can be evicted instead. Second, every
+// evicted task's recorded usage is folded into the dead-letter
+// ledger, so no evicted token is silently voided. Only when every
+// finished entry is unsettled and room is still needed does
+// eviction take the oldest unsettled ones — the registry must not
+// grow unboundedly — and those entries are marked detached, so
+// their late usage still lands in the ledger when it arrives
+// (see awaitLateOutcome) instead of on an entry no reader can
+// reach.
 func (m *Manager) evictFinishedLocked() {
 	if len(m.entries) <= maxEntries {
 		return
@@ -284,16 +357,51 @@ func (m *Manager) evictFinishedLocked() {
 		}
 		return finished[i].startedAt.Before(finished[j].startedAt)
 	})
+	// First pass: settled finished tasks, oldest first.
 	for _, e := range finished {
 		if len(m.entries) <= maxEntries {
 			break
 		}
-		delete(m.entries, e.task.ID)
+		if !e.result.UsageSettled {
+			continue
+		}
+		m.evictLocked(e)
+	}
+	// Last resort: all remaining finished entries are unsettled.
+	// Evict the oldest anyway — boundedness wins — but the
+	// detached mark preserves their late usage (see above).
+	for _, e := range finished {
+		if len(m.entries) <= maxEntries {
+			break
+		}
+		if e.result.UsageSettled {
+			continue
+		}
+		m.evictLocked(e)
 	}
 }
 
+// evictLocked removes one finished entry from the registry and
+// folds its recorded usage into the dead-letter ledger. Callers
+// must hold m.mu. The entry is marked detached so a late-arrival
+// waiter that may still hold its pointer folds any later usage
+// into the ledger instead of writing onto a detached object.
+func (m *Manager) evictLocked(e *taskEntry) {
+	e.detached = true
+	m.deadLetterTokens += e.result.Usage.Tokens
+	m.deadLetterTasks++
+	delete(m.entries, e.task.ID)
+}
+
 // Forget removes a finished task from the registry, freeing its result.
-// It returns false for unknown or still-running tasks.
+// It returns false for unknown or still-running tasks. A forgotten
+// task's settled usage is NOT folded into the dead-letter ledger:
+// forgetting is an explicit discard by the caller, who presumably
+// already charged the result or decided to drop it. But if the
+// task is still unsettled, nobody could have charged its usage yet
+// (both chargers skip unsettled tasks), so the entry is marked
+// detached and a late usage that arrives afterwards is folded into
+// the ledger by awaitLateOutcome instead of being lost.
 func (m *Manager) Forget(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -301,6 +409,7 @@ func (m *Manager) Forget(id string) bool {
 	if !ok || !entry.finished {
 		return false
 	}
+	entry.detached = true
 	delete(m.entries, id)
 	return true
 }
@@ -412,9 +521,22 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 // timer on this waiter would forfeit exactly the late usage it
 // exists to recover, and the entry is already terminal, so the
 // parked waiter holds no semaphore slot and no other resource.
+//
+// If the entry left the registry while the waiter was parked —
+// evicted as a last resort when every finished entry was unsettled
+// (F-A8-P2-1), or forgotten — the late usage is folded into the
+// dead-letter ledger instead of being written onto a detached
+// entry no reader could ever reach. The usage is still unsettled
+// at removal time, so no charger could have counted it yet, and
+// the fold is exact: the tokens are recorded once, in the ledger.
 func (m *Manager) awaitLateOutcome(entry *taskEntry, ch <-chan outcome) {
 	o := <-ch
 	m.mu.Lock()
+	if entry.detached {
+		m.deadLetterTokens += o.usage.Tokens
+		m.mu.Unlock()
+		return
+	}
 	entry.result.Usage = o.usage
 	entry.result.UsageSettled = true
 	m.mu.Unlock()

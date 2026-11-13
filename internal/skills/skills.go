@@ -325,18 +325,24 @@ func parseFile(path string) (Skill, error) {
 // (===== BEGIN SKILL "name" CONTENT ===== /
 // ===== END SKILL "name" CONTENT =====), with the name quoted or
 // bare. The match is deliberately fuzzy, not exact (Audit 7
-// F-A7-P2-1): a model's reading is fuzzy, so a lowercase marker,
-// a 4- or 6-equals marker, or a marker with the spaces around
-// BEGIN/END dropped is visually near-identical to the emitted
-// delimiter and could plausibly close the block in the model's
-// reading. The match is therefore case-insensitive, tolerates
-// 4-6 "=" on either side, and allows the spaces around BEGIN/END
-// and before the closing run to be dropped. It is anchored at the
-// start of the (trimmed, quote-stripped) line and not at its end:
-// a line beginning with a marker reads as a marker to the model
-// even with trailing text after it. A marker merely mentioned
-// mid-line ("See the ===== END SKILL ... format") does not match.
-var skillMarkerLine = regexp.MustCompile(`(?i)^={4,6}\s*(BEGIN|END)\s+SKILL\b.*CONTENT\s*={4,6}`)
+// F-A7-P2-1, widened by Audit 8 F-A8-P2-5): a model's reading is
+// fuzzy, so the delimiter is recognised by its OPENING, not by an
+// exact spelling. The old 4-6 "=" bound was arbitrary — 3- and
+// 7-equals variants loaded — so any run of "=" (one or more)
+// counts; the spaces around BEGIN/END are optional, including
+// between END and SKILL ("ENDSKILL" loaded on rc12); the word is
+// SKILL or SKILLS; and nothing more is required. CONTENT is
+// optional, a closing "=" run is optional, and trailing text is
+// irrelevant: a line that opens like a delimiter reads as one to
+// the model even truncated ("===== END SKILL \"x\" CONTENT") or
+// annotated ("... CONTENT (continued) ====="). The match is
+// anchored at the start of the (trimmed, quote-stripped) line:
+// a marker merely mentioned mid-line ("See the ===== END SKILL
+// ... format") does not match, and ordinary prose that merely
+// mentions SKILL does not match — there must be a leading "=" run
+// followed by BEGIN/END SKILL. The word boundaries matter:
+// "SKILLFUL" and "ENDLESS" are different words and do not match.
+var skillMarkerLine = regexp.MustCompile(`(?i)^=+\s*(BEGIN|END)\s*SKILLS?\b`)
 
 // stripMarkerQuotePrefix removes leading Markdown blockquote
 // markers ("> ") from a trimmed line, so a quoted marker line
@@ -353,12 +359,11 @@ func stripMarkerQuotePrefix(line string) string {
 
 // validateSkillContent rejects skill text that can blur the
 // BEGIN/END delimiter boundary (Audit 6 F-A6-2, fuzzy variants
-// Audit 7 F-A7-P2-1): any line that parses as a BEGIN/END SKILL
-// marker (case-insensitive, 4-6 "=", optional spaces, optionally
-// blockquoted), and any line shaped as an activation directive
-// ("Activate skill ...", "Activate the ... skill ...",
-// "Activate \"name\"", "Please activate skill ...", a mid-line
-// "activate skill", or a bare "Activate"). The delimiters are only
+// Audit 7 F-A7-P2-1, widened Audit 8 F-A8-P2-5): any line that
+// parses as a BEGIN/END SKILL marker (case-insensitive, any "="
+// run, optional spaces, optionally blockquoted, CONTENT and the
+// closing run optional), and any line shaped as an activation
+// directive (see isActivateDirective). The delimiters are only
 // labelling — a body containing its own END marker can close the
 // block early and inject a fake footer plus fresh instructions,
 // and a body-directed switch ("END SKILL" + "BEGIN SKILL
@@ -434,32 +439,92 @@ func wordIndex(s string, re *regexp.Regexp) int {
 	return -1
 }
 
+// skillToolBigram matches the compound "skill tool" / "skills tools"
+// (any case): the sanctioned activation path — activation goes
+// through the skill tool.
+var skillToolBigram = regexp.MustCompile(`(?i)\bskills?\s+tools?\b`)
+
+// nonSkillObjectWord matches a word that names a non-skill object
+// a quoted name can denote: a mode, a virtual environment, a
+// profile. Used only inside, or immediately after, a quoted object
+// following "activate" (see isQuotedSkillReference).
+var nonSkillObjectWord = regexp.MustCompile(`(?i)\b(mode|venv|virtualenv|environment|conda|profile)\b`)
+
+// nonSkillObjectWords is the same set as a lookup table for the
+// single word following a quoted object.
+var nonSkillObjectWords = map[string]bool{
+	"mode": true, "venv": true, "virtualenv": true,
+	"environment": true, "conda": true, "profile": true,
+}
+
 // isActivateDirective reports whether line is shaped as an
 // instruction to activate a skill (Audit 6 F-A6-2, widened by
-// Audit 7 F-A7-P2-1): the word "activate" appears anywhere in
-// the line — not only leading it, so "Please activate skill
-// ..." and a mid-line "activate skill" count — and what follows
-// it names a skill, or the line is a bare "Activate".
+// Audit 7 F-A7-P2-1, refined by Audit 8 F-A8-P2-6/F-A8-P2-7).
 //
-// What counts as naming a skill, in the text after "activate":
+// EVERY occurrence of the word "activate" in the line is examined
+// (F-A8-P2-6): the old code looked only at the first, so a "tool"
+// object on the first occurrence shielded a second directive
+// ("Activate the tool, then activate the skill"). Each occurrence
+// is judged on its own segment — the text up to the next
+// "activate" (or the end of the line) — so a skill named by a
+// later occurrence is never attributed to an earlier one, and
+// vice versa.
+//
+// One occurrence is a directive when, in its segment, what
+// follows it names a skill, or the line is a bare "Activate":
 //   - the word "skill" ("Activate skill ...", "Activate the
 //     other skill", "Please activate skill \"other\"");
 //   - a quoted name ("Activate \"name\" ..."), which in this
-//     context is a skill reference.
+//     context is a skill reference — unless the quoted name is,
+//     or is followed by, a named non-skill object (see
+//     isQuotedSkillReference).
 //
-// The "activate the tool" prose control is preserved by an
-// object-order rule: when both "tool" and "skill" follow
-// "activate", the one that comes first is the object of the
-// instruction. "To activate the tool, run it once" (tool first,
-// or no skill at all) is prose and loads; "Activate the skill
-// using the tool" (skill first) is a directive and is refused.
-// A line about a skill that merely mentions activation the
-// other way round ("This skill helps you activate the tool")
-// does not match either, because "skill" precedes "activate".
-// There is no defined textual activation syntax in the codebase
-// — activation goes through the skill tool — so any line shaped
-// like one is a body-directed switch attempt, not a legitimate
-// instruction.
+// Three carve-outs keep legitimate prose loading (F-A8-P2-7).
+// Each is deliberately narrow, and each is scoped to the clause
+// of the occurrence it excuses, so it cannot shield a later
+// directive:
+//   - Negation: when the clause immediately before the occurrence
+//     negates it ("should not activate", "do not activate",
+//     "never activate"), the line is a defensive instruction, not
+//     a directive. The negation is looked for only in the final
+//     clause fragment before the occurrence (split on sentence
+//     terminators and clause separators), so it never leaks
+//     across a sentence ("The skill is not broken. Activate the
+//     skill" is still a directive) or to a later occurrence
+//     ("Do not activate the tool, activate the skill" is still
+//     a directive).
+//   - Sanctioned path: an infinitive ("to activate") that names
+//     the skill tool as the means ("To activate the skill, use
+//     the skill tool.") documents the sanctioned activation path
+//     rather than directing a switch. The infinitive alone does
+//     not exempt ("To activate the skill, just do it." is still
+//     a directive), and neither does naming some other tool
+//     ("To activate the skill, use the tool.").
+//   - Object order: when both "tool" and "skill" follow an
+//     occurrence in its segment, the one that comes first is the
+//     object of the instruction. "To activate the tool, run it
+//     once" (tool first, or no skill at all) is prose and loads;
+//     "Activate the skill using the tool" (skill first) is a
+//     directive and is refused.
+//
+// SECURITY JUDGEMENT (F-A8-P2-7 vs Audit 7): the Audit 8 false
+// positive "bare Activate." (e.g. a venv step) is NOT admitted.
+// A line consisting solely of "Activate" — with or without
+// trailing punctuation — is indistinguishable from the Audit 7
+// bare-"Activate" evasion, and admitting the punctuated form
+// would admit the evasion with a period appended. The bare rule
+// therefore stays as it was. A venv step can name its object
+// ("Activate the venv." loads) or be a list item ("- Activate."
+// already loads: the line is not bare). Where this function had
+// to choose between a false positive (legitimate prose blocked)
+// and a false negative (an evasion admitted), it errs toward
+// security (reject). A line about a skill that merely mentions
+// activation the other way round ("This skill helps you activate
+// the tool") does not match either, because "skill" precedes
+// "activate". There is no defined textual activation syntax in
+// the codebase — activation goes through the skill tool — so any
+// line shaped like one is a body-directed switch attempt, not a
+// legitimate instruction.
 func isActivateDirective(line string) bool {
 	lower := strings.ToLower(strings.TrimSpace(line))
 	if lower == "" {
@@ -467,31 +532,122 @@ func isActivateDirective(line string) bool {
 	}
 	// Bare "Activate" (allowing trailing sentence punctuation):
 	// an imperative with no object at all, in a skill body,
-	// can only be read as "activate [a skill]".
+	// can only be read as "activate [a skill]". See the
+	// SECURITY JUDGEMENT above: this includes "Activate.".
 	if bare := strings.TrimRight(lower, ".!:"); bare == "activate" {
 		return true
 	}
-	loc := activateWord.FindStringIndex(lower)
-	if loc == nil {
+	locs := activateWord.FindAllStringIndex(lower, -1)
+	for i, loc := range locs {
+		end := len(lower)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		if isActivateOccurrenceDirective(lower, loc, lower[loc[1]:end]) {
+			return true
+		}
+	}
+	return false
+}
+
+// isActivateOccurrenceDirective reports whether one occurrence of
+// "activate" (at loc in the lowercased line) is a directive, judged
+// on its segment — the text after it up to the next "activate".
+func isActivateOccurrenceDirective(lower string, loc []int, segment string) bool {
+	seg := strings.TrimSpace(segment)
+	if seg == "" {
 		return false
 	}
-	rest := strings.TrimSpace(lower[loc[1]:])
-	if rest == "" {
+	// Negated in its own clause: a defensive instruction, not a
+	// directive (see isActivateDirective).
+	if clauseHasNegation(lower[:loc[0]]) {
+		return false
+	}
+	// Infinitive documenting the sanctioned skill-tool path.
+	if prevWordIs(lower[:loc[0]], "to") && skillToolBigram.MatchString(seg) {
 		return false
 	}
 	// "Activate \"name\" ..." — a quoted name after Activate is a
-	// skill reference in this context.
-	if strings.HasPrefix(rest, "\"") || strings.HasPrefix(rest, "'") {
-		return true
+	// skill reference in this context, unless it names a non-skill
+	// object (see isQuotedSkillReference).
+	if seg[0] == '"' || seg[0] == '\'' {
+		return isQuotedSkillReference(seg)
 	}
-	skillIdx := wordIndex(rest, skillWord)
+	skillIdx := wordIndex(seg, skillWord)
 	if skillIdx < 0 {
 		return false
 	}
 	// Object-order rule (see above): a "tool" named before the
-	// first "skill" makes the tool the object, not the skill.
-	if toolIdx := wordIndex(rest, toolWord); toolIdx >= 0 && toolIdx < skillIdx {
+	// first "skill" in this occurrence's segment makes the tool
+	// the object, not the skill.
+	if toolIdx := wordIndex(seg, toolWord); toolIdx >= 0 && toolIdx < skillIdx {
 		return false
+	}
+	return true
+}
+
+// clauseHasNegation reports whether the final clause fragment of
+// before (the text preceding one "activate" occurrence) negates
+// it. The fragment is cut at the last sentence terminator or
+// clause separator (".", "!", "?", ",", ";", ":"), so a negation
+// in an earlier clause or sentence never excuses this occurrence.
+func clauseHasNegation(before string) bool {
+	frag := before
+	if idx := strings.LastIndexAny(frag, ".!?,;:"); idx >= 0 {
+		frag = frag[idx+1:]
+	}
+	for _, w := range strings.Fields(frag) {
+		w = strings.Trim(w, ".,;:()[]\"'`")
+		switch {
+		case w == "not", w == "never", w == "cannot",
+			w == "refuse", w == "refuses", w == "refused":
+			return true
+		case strings.HasSuffix(w, "n't"):
+			return true
+		}
+	}
+	return false
+}
+
+// prevWordIs reports whether the last word of before is word
+// (punctuation around it ignored).
+func prevWordIs(before, word string) bool {
+	fields := strings.Fields(before)
+	if len(fields) == 0 {
+		return false
+	}
+	return strings.Trim(fields[len(fields)-1], ".,;:()[]\"'`") == word
+}
+
+// isQuotedSkillReference reports whether a segment that starts with
+// a quoted object names a skill. A quoted name containing "skill"
+// is a skill reference; a quoted name containing a non-skill object
+// word ("the venv", "dark mode") is not; otherwise the word after
+// the closing quote decides — a non-skill noun ("production"
+// mode, "work" profile) makes it a non-skill object, and anything
+// else (including nothing at all) leaves the Audit 7 rule: a bare
+// quoted name after Activate is a skill reference. When in doubt
+// it returns true (a directive): an unrecognised quoted object is
+// treated as a skill, not waved through.
+func isQuotedSkillReference(seg string) bool {
+	q := seg[0]
+	rest := seg[1:]
+	quoted := rest
+	after := ""
+	if idx := strings.IndexByte(rest, q); idx >= 0 {
+		quoted = rest[:idx]
+		after = rest[idx+1:]
+	}
+	if skillWord.MatchString(quoted) {
+		return true
+	}
+	if nonSkillObjectWord.MatchString(quoted) {
+		return false
+	}
+	if fields := strings.Fields(after); len(fields) > 0 {
+		if first := strings.Trim(fields[0], ".,;:()[]\"'`"); nonSkillObjectWords[first] {
+			return false
+		}
 	}
 	return true
 }

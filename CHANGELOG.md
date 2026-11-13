@@ -4,6 +4,51 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc13] — 2026-11-13
+
+### Audit 8 fixes (v0.2.0-rc13) — see `AUDIT8_2026-11-13.md`
+
+Fixes the 2 P1s and the P2 batch from the fresh-eyes audit of rc12
+(0 P0, 2 P1, 8 P2). **Verdict: NOT production-ready** — the 24–72 h
+daemon soak (F-A3-4) is still open, and F-A3-2 (no pprof/debug
+endpoint) is still open. Verified by the release coordinator on the
+final commit: **1,147 tests pass, 0 fail, 4 skip (total 1,151),
+21/21 packages, race clean 21/21, no data race**; live DeepSeek proof
+`17*23+5=396` in 3.9s, first attempt (rc12: 1,130 total: 1,126 pass,
+0 fail, 4 skip).
+
+- **F-A8-1** — CLI `/compress` budget gate now records CLI spend to
+  the checked bucket (the gate checked a bucket nothing ever filled,
+  so CLI compresses were never refused or recorded).
+- **F-A8-2** — PollStream offset is confirmed on handler completion,
+  not at handler spawn, so a crash mid-turn can no longer lose the
+  update permanently.
+- **F-A8-P2-1** — registry eviction no longer voids token accounting:
+  finished, unswept subagent tasks are no longer lost when the
+  registry evicts past its cap (9.1% of tokens lost in Audit 8).
+- **F-A8-P2-2** — the fetch path now charges timed-out late usage
+  instead of dropping it.
+- **F-A8-P2-3** — `/compress` completion overshoot capped (5.8x
+  overshoot in Audit 8).
+- **F-A8-P2-4** — version fallback bumped to `0.2.0-rc13`, and `make
+  release-check` now also builds without ldflags and asserts the
+  plain build reports the release in preparation, so a stale
+  fallback can never escape release-check again (this entry).
+- **F-A8-P2-5/6/7** — skills validator gaps closed.
+- **F-A8-P2-8** — duplicate-tap approval test made deterministic (was
+  flaky under `-race`, ~14%).
+- **Integration (coordinator)** — two pre-existing data races found
+  by `-race` during rc13 verification, both reproduced on rc12 and
+  fixed with regression tests: transcript `scrubRecord` mutated the
+  caller's shared ToolCalls array, racing with a concurrent FileStore
+  Save (rc12: 3/10 runs); approval log lines read the `os.Stderr`
+  global from background goroutines, racing with the test `capture()`
+  helper's swap (rc12: 1/10 runs). The sweep mid-sweep test's
+  missed-interleaving direction now retries instead of hard-failing,
+  and the turn-slots-full approval test now drains its queued turns
+  before returning (its TempDir cleanup failed under load when a
+  still-running turn created files after the test returned).
+
 ## [0.2.0-rc12] — 2026-11-13
 
 ### Audit 7 fixes (v0.2.0-rc12) — see `AUDIT7_2026-11-13.md`

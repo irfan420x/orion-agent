@@ -675,19 +675,27 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 			return 0, 0, 0, err
 		}
 	}
-	// Metering (F-A6-1): the CLI/global /compress runs outside
-	// any turn, so its tokens never pass through TurnFinished
-	// either — the sink reports them to the global agent's
-	// side-channel usage, which the next turn folds into its
-	// usage (the F-A5-5 side-channel mechanism), instead of
-	// vanishing. The CLI has no per-chat Budget, so there is no
-	// Budget record to make here; the per-chat path (chats.go)
-	// records to the chat's Budget directly.
+	// Metering (F-A6-1, F-A8-1): the CLI/global /compress runs
+	// outside any turn, so its tokens never pass through
+	// TurnFinished either — the sink reports them to the global
+	// agent's side-channel usage, which the next turn folds
+	// into its usage (the F-A5-5 side-channel mechanism), and
+	// the CLI budget sink records them to the unattributed
+	// bucket (cliCompressChatID) the pre-flight check above
+	// reads, so repeated CLI compresses past the limit are
+	// refused instead of spending without limit. Recording to
+	// the Budget is not double-counting: the CLI/global turn
+	// path never touches the Budget, so the side-channel
+	// folding carries the tokens into turn stats only, never
+	// into a second Budget record. A Record error (the
+	// compress pushed bucket 0 over its limit) is logged by
+	// the sink, never fatal: the summary already happened, and
+	// the NEXT /compress is the one that gets refused.
 	var sink func(model.Usage)
 	if ag := a.agent(); ag != nil {
 		sink = ag.AddSideChannelUsage
 	}
-	before, after, summaryLen, summary, err := compressWithOn(ctx, a.Memory, a.provider(), keepRecent, sessionMemory, sink)
+	before, after, summaryLen, summary, err := compressWithOn(ctx, a.Memory, a.provider(), keepRecent, sessionMemory, sink, a.cliCompressUsageSink())
 	if err == nil && summaryLen > 0 {
 		// A successful manual /compress clears the auto-compaction
 		// circuit breaker: the operator just proved summarisation
@@ -708,27 +716,59 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 }
 
 // cliCompressChatID is the budget bucket the CLI/global /compress
-// is checked against (F-A7-1): the CLI has no chat, so its
-// compress spend is checked against the unattributed bucket,
-// chatID 0 — the same bucket CLI subagent spawns use
-// (internal/subagent: Spawn starts unattributed tasks at
-// chatID 0). The check is a refusal gate only; the CLI's
-// compress tokens are still accounted via the side-channel sink
-// (F-A6-1), not recorded to this bucket.
+// is checked against AND recorded to (F-A7-1, F-A8-1): the CLI has
+// no chat, so its compress spend is checked against and recorded
+// to the unattributed bucket, chatID 0 — the same bucket CLI
+// subagent spawns use (internal/subagent: Spawn starts
+// unattributed tasks at chatID 0). Checking without recording
+// (the rc12 state) left the gate dead: the bucket stayed empty
+// no matter how much CLI /compress spent. cliCompressUsageSink
+// is the record half; the pre-flight Check in compressWith is
+// the refusal half.
 const cliCompressChatID = 0
 
-// projectedCompressTokens estimates the input tokens the
-// /compress summarisation call will carry: the bounded old
-// prefix actually sent to the provider (same sizing as
-// compressWithOn — boundedCompressPrefix, the prompt overhead
-// and the gated session-memory section), in model.CountTokens
-// units. It is the pre-flight projection for the budget
-// (F-A7-1), mirroring projectedTurnTokens for turns: a chat
-// that cannot afford even the summarisation input is refused
-// before the provider call, instead of spending first and
-// being refused only on the next turn. A store read failure
-// degrades to 0 — compressWithOn fails on the same read with
-// its own error, and no provider call happens either way.
+// cliCompressUsageSink returns the metering sink for the CLI/global
+// /compress summarisation call (F-A8-1): it records the reported
+// usage to the unattributed bucket (cliCompressChatID) at the
+// daemon default provider/model, mirroring compressUsageSink for
+// per-chat /compress. It does NOT go through chatProviderInfo:
+// the CLI has no chat session, and resolving one for chatID 0
+// would create a phantom chat session. It is safe to pass when
+// the app has no Budget (it no-ops) and safe to call from
+// compressWithOn even when the summary is later refused by a
+// gate — the tokens were spent either way. A Record error (the
+// compress pushed bucket 0 over its limit) is logged, never
+// fatal: the summary already happened, and the NEXT /compress
+// is the one that gets refused.
+func (a *App) cliCompressUsageSink() func(model.Usage) {
+	return func(u model.Usage) {
+		if a == nil || a.Budget == nil {
+			return
+		}
+		if err := a.Budget.RecordUsageForModel(cliCompressChatID, a.providerName(), a.activeModel(), u, 0); err != nil && a.Logger != nil {
+			a.Logger.Printf("app: CLI /compress recorded %d tokens, over daily budget: %v", u.TotalTokens, err)
+		}
+	}
+}
+
+// projectedCompressTokens estimates the tokens the /compress
+// summarisation call will cost in total: the bounded old prefix
+// actually sent to the provider (same sizing as compressWithOn —
+// boundedCompressPrefix, the prompt overhead and the gated
+// session-memory section), in model.CountTokens units, PLUS the
+// completion allowance compressMaxSummaryTokens — the most the
+// capped summary can add. It is the pre-flight projection for
+// the budget (F-A7-1, F-A8-P2-3), mirroring projectedTurnTokens
+// for turns: a chat that cannot afford even the summarisation
+// input is refused before the provider call, instead of spending
+// first and being refused only on the next turn. Counting input
+// only (the rc12 shape) admitted a call at 800/1000 whose
+// provider then reported 5000 tokens — 5.8x the limit from one
+// call — because the completion was never projected and never
+// capped. A store read failure degrades to 0 — compressWithOn
+// fails on the same read with its own error, and no provider
+// call happens either way. When there is nothing old enough to
+// compress the projection is 0: no provider call will happen.
 func projectedCompressTokens(store memory.Store, keepRecent int, sessionMemory string) int {
 	if keepRecent < 1 {
 		keepRecent = compressRecentWindow
@@ -755,7 +795,13 @@ func projectedCompressTokens(store memory.Store, keepRecent int, sessionMemory s
 	for _, m := range toSummarise {
 		n += compressMessageTokens(m)
 	}
-	return n
+	// Plus the completion allowance: the summary the provider
+	// is capped at generating (F-A8-P2-3 — see
+	// compressMaxSummaryTokens). The worst case this call can
+	// cost is input + capped completion; projecting only the
+	// input let one admitted call overshoot the limit several
+	// times over.
+	return n + compressMaxSummaryTokens
 }
 
 // compressWithOn summarises store's conversation prefix older than
@@ -799,6 +845,19 @@ const compressMaxInputTokens = 16000
 // provider-bound input — not just the message bodies — stays
 // within the cap (mirrors core's summariserPromptOverheadTokens).
 const compressPromptOverheadTokens = 128
+
+// compressMaxSummaryTokens caps the /compress summarisation
+// call's completion (F-A8-P2-3): the ChatRequest in
+// compressWithOn carries MaxTokens = 800, the same cap
+// auto-compaction uses (internal/core/compact.go), so one
+// admitted call cannot generate an unbounded summary. It is
+// also the completion allowance projectedCompressTokens counts
+// in the pre-flight budget check, so admission only happens
+// when input + the full capped completion fit the remaining
+// budget — a provider that ignores MaxTokens still cannot
+// overshoot several-fold from an admitted call, because the
+// call was only admitted when the worst case fit.
+const compressMaxSummaryTokens = 800
 
 // compressSessionMemoryMaxTokens bounds the session-memory
 // section of the /compress prompt: session memory is
@@ -962,6 +1021,15 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 			{Role: "system", Content: "You summarise conversations into compact memories."},
 			{Role: "user", Content: b.String()},
 		},
+		// Completion cap (F-A8-P2-3): without it the provider
+		// may generate an unbounded summary and one admitted
+		// /compress can overshoot the daily budget several
+		// times over. 800 matches auto-compaction's cap
+		// (internal/core/compact.go) for the same job, and the
+		// pre-flight projection counts the same 800 as the
+		// completion allowance, so admission only happens
+		// when input + capped completion fit the budget.
+		MaxTokens: compressMaxSummaryTokens,
 	})
 	if err != nil {
 		return before, before, 0, "", fmt.Errorf("app: compress: summarisation call: %w", err)

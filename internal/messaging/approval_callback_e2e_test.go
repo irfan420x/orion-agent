@@ -535,17 +535,45 @@ func TestW6ApprovalDuplicateTap(t *testing.T) {
 		_, ok := h.answerWithText("This approval request has expired.")
 		return ok
 	})
+	// Wait for the FIRST tap's outcome answer before counting it.
+	// The two taps run on concurrent callback handlers (PollStream
+	// dispatches each tap as `go handleCallback`, cbSem cap 8), and
+	// the first tap's outcome answer is the LAST step of its
+	// handler: Resolve -> outcome edit (editMessageText) -> answer.
+	// The second tap's "expired" answer needs only one Bot API
+	// call, so it routinely lands BEFORE the first tap's outcome
+	// answer — and the turn is released by Resolve, before the
+	// first tap's edit even starts. Asserting the count right
+	// after the "expired" wait therefore raced the first
+	// handler's still-in-flight edit+answer and saw 0 (the
+	// "outcome edit failed: context canceled" in the failing log
+	// is the test tearing down mid-edit, a symptom of the same
+	// race, not the cause). Waiting for the outcome answer to
+	// appear settles the first handler before the count is read.
+	// A real regression (the outcome answer never sent) still
+	// fails here, via the w6WaitFor timeout.
+	w6WaitFor(t, "first tap to be answered with the approval outcome", func() bool {
+		_, ok := h.answerWithText("✅ Approved — running it now.")
+		return ok
+	})
 	// Exactly one approval outcome answer: the request resolved once.
 	count := 0
+	expired := 0
 	h.fake.mu.Lock()
 	for _, a := range h.fake.answers {
 		if txt, _ := a["text"].(string); txt == "✅ Approved — running it now." {
 			count++
 		}
+		if txt, _ := a["text"].(string); txt == "This approval request has expired." {
+			expired++
+		}
 	}
 	h.fake.mu.Unlock()
 	if count != 1 {
 		t.Fatalf("approval outcome answered %d times, want exactly 1 (duplicate tap resolved twice)", count)
+	}
+	if expired != 1 {
+		t.Fatalf("expired answer sent %d times, want exactly 1 (duplicate tap answered once)", expired)
 	}
 }
 
