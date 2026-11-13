@@ -59,9 +59,10 @@ type rc8ProofFake struct {
 }
 
 type rc8Sent struct {
-	ChatID   int64
-	Text     string
-	Keyboard string // raw reply_markup JSON, "" when none
+	ChatID    int64
+	Text      string
+	Keyboard  string // raw reply_markup JSON, "" when none
+	MessageID int64  // the message_id the fake assigned to this send
 }
 
 func (f *rc8ProofFake) enqueue(u messaging.Update) {
@@ -89,7 +90,7 @@ func (f *rc8ProofFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(body, &req)
 		f.nextID++
-		f.sent = append(f.sent, rc8Sent{ChatID: req.ChatID, Text: req.Text, Keyboard: string(req.ReplyMarkup)})
+		f.sent = append(f.sent, rc8Sent{ChatID: req.ChatID, Text: req.Text, Keyboard: string(req.ReplyMarkup), MessageID: f.nextID})
 		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d}}`, f.nextID)
 	case strings.HasSuffix(r.URL.Path, "/editMessageText"):
 		f.edits = append(f.edits, string(body))
@@ -197,7 +198,7 @@ func TestScratchProofGateAndIsolation(t *testing.T) {
 	})
 	a.SetPermissionGate(gate)
 	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
-		return handleApprovalCallback(ctx, gw, gate, ownerID, q)
+		return handleApprovalCallback(ctx, gw, gate, ownerID, q, nil)
 	})
 
 	allowed := map[int64]bool{ownerID: true, 111: true, 222: true}

@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/irfan/orion/internal/app"
+	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/messaging"
@@ -192,14 +194,15 @@ func run(args []string) int {
 	if err := ruleStore.LoadError(); err != nil {
 		fmt.Fprintf(os.Stderr, "oriond: permissions file unusable, starting with no rules: %v\n", err)
 	}
-	gate := permissions.NewGate(ruleStore, func(ctx context.Context, req permissions.ApprovalRequest) error {
-		text := fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool.", req.Summary(), req.ChatID, req.SenderID)
-		_, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, text, messaging.ApprovalKeyboard(req.ID))
-		return err
-	})
+	// Permission gate (P1-O2) + approval cards: the prompter sends
+	// the Telegram inline-keyboard approval message and the expiry
+	// hook edits the card in place when the window closes, so a
+	// dead card never keeps live-looking buttons (the rc8
+	// incident). See buildApprovalGate.
+	gate, cards := buildApprovalGate(gw, ruleStore)
 	a.SetPermissionGate(gate)
 	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
-		return handleApprovalCallback(ctx, gw, gate, ownerID, q)
+		return handleApprovalCallback(ctx, gw, gate, ownerID, q, cards)
 	})
 
 	allowed := make(map[int64]bool, len(a.Config.TelegramAllowedChats))
@@ -256,6 +259,94 @@ func run(args []string) int {
 	}
 }
 
+// approvalCards tracks live approval-card message IDs by pending
+// request ID. note records a card when the prompter sends it;
+// take removes and returns it when the request expires (so the
+// expiry edit runs once); forget removes it when the request is
+// answered (so a resolved card is never expired later). All methods
+// are nil-safe: a nil *approvalCards means "no tracking" (tests
+// that call handleApprovalCallback directly pass nil).
+type approvalCards struct {
+	mu sync.Mutex
+	m  map[string]int64
+}
+
+func newApprovalCards() *approvalCards { return &approvalCards{m: map[string]int64{}} }
+
+func (c *approvalCards) note(id string, msgID int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]int64{}
+	}
+	c.m[id] = msgID
+}
+
+func (c *approvalCards) forget(id string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, id)
+}
+
+func (c *approvalCards) take(id string) (int64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msgID, ok := c.m[id]
+	if ok {
+		delete(c.m, id)
+	}
+	return msgID, ok
+}
+
+// buildApprovalGate wires the permission gate for the daemon: the
+// prompter sends the Telegram approval card (recording its message
+// ID in cards) and the expiry hook edits the card in place when the
+// window closes. It returns the gate and the card tracker; the
+// callback handler takes the tracker so a resolved card is never
+// expired later. Extracted from run() so the live-shape tests
+// exercise exactly the daemon's wiring, not a copy of it.
+func buildApprovalGate(gw *messaging.TelegramGateway, ruleStore *permissions.RuleStore) (*permissions.Gate, *approvalCards) {
+	cards := newApprovalCards()
+	gate := permissions.NewGate(ruleStore, func(ctx context.Context, req permissions.ApprovalRequest) error {
+		text := fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool.", req.Summary(), req.ChatID, req.SenderID)
+		msgID, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, text, messaging.ApprovalKeyboard(req.ID))
+		if err == nil {
+			cards.note(req.ID, msgID)
+			fmt.Fprintf(os.Stderr, "oriond: approval prompt: tool %q request %s chat %d card %d\n", req.Tool, req.ID, req.ChatID, msgID)
+		}
+		return err
+	})
+	// When a request dies unanswered, expire its card in place:
+	// replace the text and REMOVE the keyboard, so nobody can tap
+	// a dead button. The edit runs in a goroutine (the hook must
+	// return promptly) with a background context — the turn's
+	// context may already be cancelled, which is exactly why the
+	// request expired. Best-effort: a failed edit never fails
+	// anything; the card simply stays until Telegram prunes it.
+	gate.SetOnExpire(func(req permissions.ApprovalRequest) {
+		msgID, ok := cards.take(req.ID)
+		if !ok {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "oriond: approval expired: request %s chat %d card %d\n", req.ID, req.ChatID, msgID)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = gw.EditMessageTextMarkup(ctx, req.ChatID, msgID, "⚠️ Approval request: ⏰ Expired — no answer within the approval window. Send the request again to retry.", messaging.InlineKeyboardMarkup{InlineKeyboard: [][]messaging.InlineKeyboardButton{}})
+		}()
+	})
+	return gate, cards
+}
+
 // handleApprovalCallback resolves one permission-gate approval
 // tap (P1-O2). The decision comes from the button's callback data
 // (perm:<decision>:<requestID>); the pending request is looked up
@@ -266,20 +357,30 @@ func run(args []string) int {
 // someone else's tool call. The approval message is edited in place
 // to show the outcome, and the query is answered to clear the
 // button spinner. A tap on an expired request is told so.
-func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, gate *permissions.Gate, ownerID int64, q messaging.TGCallbackQuery) error {
+//
+// Every tap is logged (decision, request ID, sender, outcome): the
+// rc8 incident was undiagnosable from the log precisely because the
+// success and expired paths logged nothing, so a tap that never
+// arrived and a tap on a dead card looked identical. With these
+// lines the next incident reads: prompt (id=X) → tap (id=Y) →
+// resolved/expired — and X≠Y names the stale card at once.
+func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, gate *permissions.Gate, ownerID int64, q messaging.TGCallbackQuery, cards *approvalCards) error {
 	decision, id, ok := messaging.ParsePermissionCallback(q.Data)
 	if !ok {
 		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
-	}
-	req, found := gate.Pending(id)
-	if !found {
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
 	}
 	senderID := int64(0)
 	if q.From != nil {
 		senderID = q.From.ID
 	}
+	fmt.Fprintf(os.Stderr, "oriond: approval tap: %s request %s from %d\n", decision, id, senderID)
+	req, found := gate.Pending(id)
+	if !found {
+		fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s expired (no longer pending)\n", id)
+		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+	}
 	if senderID != req.SenderID && senderID != ownerID {
+		fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s refused for sender %d (requester %d, owner %d)\n", id, senderID, req.SenderID, ownerID)
 		return gw.AnswerCallbackQuery(ctx, q.ID, "Only the person who asked can approve this.")
 	}
 	var persist *permissions.Action
@@ -298,8 +399,11 @@ func handleApprovalCallback(ctx context.Context, gw *messaging.TelegramGateway, 
 		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool."
 	}
 	if !gate.Resolve(id, approved, persist) {
+		fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s expired during resolve\n", id)
 		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
 	}
+	fmt.Fprintf(os.Stderr, "oriond: approval tap: request %s resolved approved=%v\n", id, approved)
+	cards.forget(id)
 	// Edit the prompt in place so the chat shows the outcome. The
 	// edit carries the outcome only (no tool arguments): the
 	// prompt's summary is user/model-derived text and EditMessageText
@@ -335,23 +439,24 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 	if store != nil {
 		store.SetLastInput(chatID, text)
 	}
-	// P2-O9 per-chat daily token budget: refuse the turn before it
-	// runs when the chat is already over budget; record the spend
-	// afterwards (Record always accounts the tokens, even when the
-	// turn pushed the chat over, so the next turn is refused).
-	if a.Budget != nil {
-		if err := a.Budget.Check(chatID, 0); err != nil {
-			return "", nil, err
-		}
-	}
+	// P2-O9 per-chat daily token budget: enforced inside
+	// HandleStreamForChat (app.runChatTurn) — the single enforcement
+	// point every channel shares, so the check and the post-turn
+	// record cannot drift apart or double-count. A budget refusal
+	// arrives here as an error wrapping budget.ErrBudgetExceeded
+	// and is returned as a plain reply (not a "Sorry, I hit an
+	// error" handler error): the turn was refused on purpose, and
+	// the message names the usage, the limit and the UTC-midnight
+	// reset.
 	reply, stats, err := a.HandleStreamForChat(runCtx, chatID, text, emit)
+	if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
+		return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil, nil
+	}
 	if stats != nil && store != nil {
 		// Best effort: a failed usage write must never fail the
-		// turn that just completed.
+		// turn that just completed. (The budget record itself
+		// already happened inside HandleStreamForChat.)
 		_ = store.AddUsage(chatID, stats.Tokens)
-		if a.Budget != nil {
-			_ = a.Budget.Record(chatID, stats.Tokens)
-		}
 	}
 	if err != nil {
 		return "", nil, err
@@ -482,7 +587,8 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 		Usage: func() (int, int) {
 			return store.Totals()
 		},
-		Session: store.Get,
+		UsageForChat: a.UsageLineForChat,
+		Session:      store.Get,
 		NewSession: func(chatID int64) error {
 			if err := a.NewSessionForChat(chatID); err != nil {
 				return err
@@ -539,6 +645,36 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 		SessionMemory:      a.SessionMemoryText,
 		CompressWithSessionMemory: func(ctx context.Context, chatID int64, keepRecent int, sessionMemory string) (int, int, int, error) {
 			return a.CompressWithSessionMemoryForChat(ctx, chatID, keepRecent, sessionMemory)
+		},
+		// Per-session transcripts (audit P0 #4): /sessions lists
+		// this chat's transcripts, /resume restores one. The
+		// messaging-local SessionInfo is a field-for-field copy
+		// of session.Info, so no conversion can silently drop a
+		// field. Resume also resets the chat's turn bookkeeping
+		// (undo stack, last input), which belonged to the
+		// previous session's history — exactly as /new does.
+		ListSessions: func(chatID int64) ([]messaging.SessionInfo, string, error) {
+			infos, current, err := a.ListSessionsForChat(chatID)
+			if err != nil {
+				return nil, "", err
+			}
+			out := make([]messaging.SessionInfo, 0, len(infos))
+			for _, info := range infos {
+				out = append(out, messaging.SessionInfo{
+					ID: info.ID, CreatedAt: info.CreatedAt, UpdatedAt: info.UpdatedAt,
+					Messages: info.Messages, Summaries: info.Summaries,
+					Bytes: info.Bytes, Title: info.Title,
+				})
+			}
+			return out, current, nil
+		},
+		ResumeSession: func(chatID int64, idOrPrefix string) (string, int, error) {
+			id, n, err := a.ResumeSessionForChat(chatID, idOrPrefix)
+			if err != nil {
+				return "", 0, err
+			}
+			store.Reset(chatID)
+			return id, n, nil
 		},
 	}
 }

@@ -6,6 +6,91 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Feature gaps (v0.2.0-rc9) — see `orion-muse-sync/audit.md` §12/§8
+
+Builds the capability features the external audit identified as
+missing. **Verdict: NOT production-ready** — the 24–72 h daemon soak
+(F-A3-4) is still open. 972 tests pass, 0 fail, 4 skip (3 Ollama live
+tests + 1 MCP process test), race clean, 21/21 packages.
+
+- **Skill wiring** (`internal/skills`, `internal/core/skills.go`,
+  `internal/tools/skill.go`): the model sees skills in the system
+  prompt (names + one-line descriptions, never bodies), invokes one
+  with the `skill` tool (body lazy-loaded verbatim), and while a
+  skill is active only its allowed tools may be used (hard block in
+  `executeTool`). Skills load only from `~/.orion/skills`, never
+  from repo cwd. Subagent children are deliberately skill-free.
+- **Schema validation** (`internal/tools/validate.go`): central
+  validation in `Registry.Execute` — `required` fields enforced,
+  per-parameter JSON types + `enum` checked, clean `invalid_args`
+  errors, never a panic; runs after the permission gate, before
+  tool code and the denylist.
+- **Grep + Glob tools** (`internal/tools/search.go`): confined
+  content search and recursive glob on the same file roots as
+  file_read/file_write (O_NOFOLLOW + fd verification, symlink
+  escapes refused) — content search no longer needs `shell_exec`
+  `grep`, which bypassed confinement.
+- **Todo/Task tools** (`internal/tools/planning.go`): session
+  checklist (`todo_write`) + durable per-chat task store
+  (`task_create/get/list/update`), persisted under
+  `chats/<chatID>/` (the daemon wires `SetDataDir` in `Build`).
+- **Auto-compact + summary-before-drop** (`internal/core/compact.go`):
+  compaction at ~80% of the history budget, 70% warning band (shown
+  on the Telegram terminal card), summary of dropped turns written
+  before the 200-message FIFO cap drops them, 3-failure circuit
+  breaker (manual `/compress` resets it). Manual `/compress`
+  unchanged.
+- **Per-session JSONL transcript** (`internal/session/`,
+  `internal/app/sessions.go`): append-only per-session transcript
+  under `chats/<chatID>/sessions/` (CLI: `sessions/`), per-message
+  timestamps, `/sessions` + `/resume` commands, `orion sessions`
+  CLI; legacy `memory.json` turns migrate once, never deleted.
+  Facts and typed memories stay shared per the P1-O3 boundary.
+- **Hook bus** (`internal/hooks/`): PreToolUse/PostToolUse/Stop
+  events, exit-code protocol (0 = continue, 2 = block), trust-gated
+  to `~/.orion/hooks` only, scrubbed env, fail-closed PreToolUse.
+  Subagent children get the parent's bus. Hook blocks surface on
+  the Telegram terminal card.
+- **MCP client (stdio)** (`internal/mcp/`): launches configured
+  servers (config from the data dir only), exposes
+  `mcp__<server>__<tool>` tools through the Tool interface with the
+  permission gate + redaction + caps; server child env scrubbed.
+  MCP server mode is out of scope. Children deliberately get no MCP
+  tools (they run without the interactive gate; MCP tools are
+  ClassNetwork).
+- **USD cost** (`internal/cost/`): versioned price table
+  (v2026-11-13, effective 2026-11-13) + per-chat/per-day USD in
+  `/usage`, built on the rc8 per-chat daily token budget; unknown
+  prices report "unknown", never $0. Subagent tokens are attributed
+  to the chat footer (`1,240 tokens (incl. 300 subagent)`), and the
+  per-chat budget is now enforced on the `orion daemon` path too
+  (single enforcement point in `runChatTurn`).
+- **Approval-button hotfix — live rc8 bug** (`cmd/oriond`,
+  `internal/permissions`, `internal/messaging`): Irfan tapped
+  Approve on a live approval card and the gate timed out with zero
+  callback lines in the log. Reproduced end to end with the real
+  PollStream + a long-poll-faithful fake Bot API + a real turn
+  blocked on approval: **the delivery path is sound** — an
+  in-window tap resolves (poll trace: long-poll returns the
+  callback update, handler resolves, turn proceeds); the tap did
+  not reach Resolve in-window (late tap, or lost before Telegram).
+  Two real defects made it look like a broken button and made it
+  undiagnosable, both fixed: (1) an approval card NEVER expired
+  visually — its buttons stayed live-looking after the 90s window,
+  so a tap on the dead card (answered only with a transient
+  "expired" toast) looked exactly like a broken button. The gate
+  now has an `OnExpire` hook; the daemon edits the card in place
+  on timeout/cancel (text → "⏰ Expired…", keyboard REMOVED via
+  new `EditMessageTextMarkup`). (2) The callback path logged
+  NOTHING on success or expiry, and the prompt logged nothing —
+  a tap that never arrived and a tap on a dead card looked
+  identical in the log. Every prompt, tap and outcome is now
+  logged with the request ID (`oriond: approval prompt/tap/
+  expired/resolved`). Regression tests: live-shape approve
+  round-trip (long-poll, tap in a later cycle), card-expiry
+  E2E (no tap → card edited expired + keyboard removed),
+  realistic raw Telegram callback payload through GetUpdates.
+
 ### External-audit fixes (v0.2.0-rc8) — see `orion-muse-sync/audit.md`
 
 Fixes the security findings and docs staleness from the external

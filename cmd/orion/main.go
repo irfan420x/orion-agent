@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/irfan/orion/internal/app"
+	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/version"
@@ -52,6 +53,8 @@ func main() {
 		err = cmdTelegram(ctx, os.Args[2:])
 	case "daemon":
 		err = cmdDaemon(ctx, os.Args[2:])
+	case "sessions":
+		err = cmdSessions(os.Args[2:])
 	case "version", "--version", "-v":
 		if len(os.Args) > 2 {
 			fmt.Fprintf(os.Stderr, "version: takes no arguments\n")
@@ -123,6 +126,9 @@ Usage:
   orion telegram test         verify the Telegram bot token (getMe)
   orion telegram poll         start the Telegram gateway (polling)
   orion daemon                run Telegram polling until interrupted
+  orion sessions              list CLI sessions (transcripts)
+  orion sessions resume <id>  resume a CLI session
+  orion sessions new          start a fresh CLI session
   orion version               print version
 `, version.Version)
 }
@@ -804,7 +810,30 @@ Run Telegram polling until interrupted. Takes no arguments.
 	}
 	fmt.Printf("orion daemon running as @%s (provider %s, model %s). Ctrl+C to stop.\n",
 		username, a.Provider.Name(), active.Model)
-	return gw.Poll(ctx, func(c context.Context, chatID int64, text string) (string, error) {
-		return a.Handle(c, text)
-	})
+	return gw.Poll(ctx, daemonTurnHandler(a))
+}
+
+// daemonTurnHandler is the `orion daemon` turn function: each chat
+// runs on its own per-chat agent through App.HandleForChat, so a
+// chat's history, provider and usage are isolated from every other
+// chat (P1-O3) — and the per-chat daily token budget is enforced
+// (rc9 follow-up 2): the budget gate lives in app.runChatTurn,
+// shared with oriond's Telegram turns, so this path refuses an
+// over-budget chat exactly the way oriond does. Before rc9 this
+// handler called the GLOBAL App.Handle, which had no chat context
+// and no budget check at all: any allowlisted chat could spend
+// without limit on this path while oriond enforced the budget.
+//
+// A budget refusal is returned as a plain reply, not an error:
+// the turn was refused on purpose, and the message names the usage,
+// the limit and the UTC-midnight reset. Other errors stay errors
+// (the gateway reports them as "Sorry, I hit an error: ...").
+func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string, error) {
+	return func(c context.Context, chatID int64, text string) (string, error) {
+		reply, err := a.HandleForChat(c, chatID, text)
+		if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
+			return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil
+		}
+		return reply, err
+	}
 }

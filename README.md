@@ -3,10 +3,10 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc7.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc9.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (809 tests pass, 0 fail, 3 skip — Ollama live tests;
-> race clean). The model can now delegate to subagents (`subagent_spawn` /
+> built and tested (972 tests pass, 0 fail, 4 skip — Ollama live tests
+> plus one MCP process test that needs a live server; race clean). The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
 > history — fixed by a calibrated token estimator; same turn now costs
@@ -101,8 +101,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-17/17 packages, 809 tests passing, 0 failing, 3 skipped (the live
-Ollama tests, which need a running Ollama server), race clean — `go test
+21/21 packages, 972 tests passing, 0 failing, 4 skipped (the live
+Ollama tests, which need a running Ollama server, plus one MCP test
+that needs a live server process), race clean — `go test
 -count=1 ./...`, verified 2026-11-13. Run the suite with `go test ./...` or `make test`.
 
 ## Configuration
@@ -210,13 +211,19 @@ evidence (this VM has ~700 MiB free, so no Hermes model runs here).
 
 ## Tools (all wired into the agent)
 
-`shell_exec` (denylist + timeout + 64KB cap; opt-in namespace/chroot
-sandbox via `sandbox.enabled` — see [SECURITY.md](SECURITY.md)), `file_read`,
-`file_write`, `file_edit`, `file_list`, `web_fetch`, `web_search`
+`shell_exec` (denylist + timeout + 64KB cap; namespace/chroot
+sandbox with seccomp filter by default — see [SECURITY.md](SECURITY.md)), `file_read`,
+`file_write`, `file_edit`, `file_list`, `grep` (confined content
+search — use instead of shell `grep`, which bypasses confinement),
+`glob` (recursive glob patterns), `web_fetch`, `web_search`
 (real DuckDuckGo search), `calculator` (full expression parser),
-`datetime`, `process_list`, `subagent_spawn` (run a brief as a
-managed child agent), `subagent_list`, `subagent_result`,
-`subagent_stop`. Every tool result is capped at
+`datetime`, `process_list`, `skill` (invoke a skill from the user
+data dir; lazy body load; allowed-tools enforced), `todo_write`
+(session checklist), `task_create` / `task_get` / `task_list` /
+`task_update` (durable planning tasks, per chat), `subagent_spawn`
+(run a brief as a managed child agent), `subagent_list`, `subagent_result`,
+`subagent_stop`. MCP servers configured in the data dir add
+`mcp__<server>__<tool>` tools dynamically. Every tool result is capped at
 `max_tool_result_bytes` (default 256 KiB) before it reaches the model;
 see "Size caps" under [Configuration](#configuration).
 

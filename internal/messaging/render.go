@@ -36,7 +36,12 @@ type TurnFunc func(ctx context.Context, chatID int64, text string, emit func(cor
 // memories were used this turn (stats.MemoriesUsed, workstream B),
 // " · <N> memories" is appended ("1 memory" for one); it is omitted
 // when no memories were used, so footers with zero memories render
-// exactly as before.
+// exactly as before. When subagent results were consumed this turn
+// (stats.SubagentTokens), the tokens segment breaks them out —
+// "1,240 tokens (incl. 300 subagent)" — so the footer number
+// honestly includes delegated work instead of silently folding it
+// into the parent's total; it is omitted when zero, so footers with
+// no subagent work render exactly as before.
 func FormatFooter(stats *core.TurnStats) string {
 	if stats == nil {
 		return ""
@@ -45,8 +50,12 @@ func FormatFooter(stats *core.TurnStats) string {
 	if name == "" {
 		name = stats.Provider
 	}
-	footer := fmt.Sprintf("— %s · %s tokens · %d steps · %s",
-		name, formatThousands(stats.Tokens), stats.Steps, formatFooterDuration(stats.Duration))
+	tokens := formatThousands(stats.Tokens) + " tokens"
+	if stats.SubagentTokens > 0 {
+		tokens += fmt.Sprintf(" (incl. %s subagent)", formatThousands(stats.SubagentTokens))
+	}
+	footer := fmt.Sprintf("— %s · %s · %d steps · %s",
+		name, tokens, stats.Steps, formatFooterDuration(stats.Duration))
 	switch {
 	case stats.MemoriesUsed <= 0:
 		return footer
@@ -130,9 +139,37 @@ type TerminalCard struct {
 // entries; ToolCallFinished updates the matching entry's status — a
 // finished entry keeps its text, a failed one gets a " — failed"
 // suffix at render time. (Hermes shows no checkmarks, so successful
-// entries get no marker at all.) Other event kinds are ignored.
+// entries get no marker at all.) Compaction events create entries
+// too, so the warning band and the auto-compaction itself reach the
+// user on the card instead of only in the daemon log: a warning
+// (EventCompactionWarning) says compaction is approaching, or — when
+// it carries an error — that the circuit breaker tripped and
+// /compress is the remedy; EventAutoCompacted says older turns were
+// summarised before being dropped. Other event kinds are ignored.
 func (c *TerminalCard) Add(ev core.ProgressEvent) {
 	switch ev.Kind {
+	case core.EventCompactionWarning:
+		// The warning carries an error only when the circuit
+		// breaker tripped: that entry renders failed, so the
+		// tripped state is unmissable on the card.
+		display := "history nearly full — auto-compaction approaching"
+		failed := false
+		if ev.Err != nil {
+			display = RedactDisplayText(ev.Err.Error())
+			failed = true
+		}
+		c.entries = append(c.entries, cardEntry{
+			toolName: "compaction",
+			display:  display,
+			finished: true,
+			failed:   failed,
+		})
+	case core.EventAutoCompacted:
+		c.entries = append(c.entries, cardEntry{
+			toolName: "compaction",
+			display:  "older turns summarised before being dropped from working history",
+			finished: true,
+		})
 	case core.EventToolCallStarted:
 		c.entries = append(c.entries, cardEntry{
 			toolName: ev.ToolName,
@@ -274,6 +311,13 @@ func renderEntry(e cardEntry, maxDisplay int) string {
 		return "✍️ Writing " + escapeHTML(trunc(e.display, maxPathRunes))
 	case e.toolName == "file_edit":
 		return "✍️ Editing " + escapeHTML(trunc(e.display, maxPathRunes))
+	case e.toolName == "compaction":
+		// Compaction entries carry the remedy ("run /compress")
+		// at the END of the message, so they get a wider cap
+		// than tool summaries: truncating at 60 runes would cut
+		// the remedy off a tripped-breaker entry. The card's
+		// 4000-rune budget still caps the total.
+		return "🗜 " + escapeHTML(trunc(e.display, 200))
 	case e.toolName == "calculator":
 		return "🧮 " + escapeHTML(trunc(e.display, maxSummaryRunes))
 	case e.toolName == "web_search" || e.toolName == "web_fetch":

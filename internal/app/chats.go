@@ -56,6 +56,7 @@ import (
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
+	"github.com/irfan/orion/internal/session"
 )
 
 // chatStore is a memory.Store that splits the two halves of memory
@@ -113,6 +114,13 @@ type chatSession struct {
 	// the app has no DataDir, or the log could not open — session
 	// extraction then degrades to off for this chat only).
 	sessionLog *memory.SessionLog
+	// sessionID is the chat's live per-session transcript id (see
+	// sessions.go); "" until the first transcript is opened.
+	// transcript is that session's append-only JSONL transcript
+	// (nil when the chat has no data dir, or it could not open —
+	// the chat then runs on memory only, exactly as before).
+	sessionID  string
+	transcript *session.Transcript
 	// agent is the chat's current agent (nil until the first turn).
 	agent *core.Agent
 	// provider is the agent's provider instance.
@@ -206,14 +214,52 @@ func (a *App) AgentForChat(chatID int64) (*core.Agent, error) {
 	// shared one): session extraction for this chat appends to
 	// this chat's session-memory.md only.
 	applyMemoryV2WiringTo(agent, a.typedAdapter, cs.sessionLog, a.driftRoot)
+	// Skill wiring: the rebuilt agent advertises the same skills
+	// as the app (nil-safe: a hand-built App has no Skills).
+	agent.SetSkills(a.Skills)
+	// Hook wiring (rc9): the chat agent enforces the same hook
+	// policy as the global agent (nil-safe: a hand-built App has
+	// no Hooks, and SetHooks(nil) means "no hooks").
+	agent.SetHooks(a.Hooks)
 	if g := a.permissionGate(); g != nil {
 		agent.SetPermissionGate(g)
 	}
+	// Per-session transcript (audit P0 #4): the agent records
+	// every stored turn into the chat's live session transcript.
+	// Best-effort — see wireChatTranscript.
+	a.wireChatTranscript(cs, agent)
 	cs.agent = agent
 	cs.provider = provider
 	cs.providerName = providerName
 	cs.modelName = modelName
 	return agent, nil
+}
+
+// wireChatTranscript opens (or reuses) the chat's live session
+// transcript and wires it into agent as its transcript sink, so
+// every turn the agent stores is also appended to the session's
+// JSONL file. The first open migrates any pre-transcript turns
+// from the chat's memory.json into the transcript (see
+// openOrCreateTranscript); later opens reuse the live session.
+// A chat with no data dir has no transcript. A failure is logged
+// and the agent runs on memory only — a transcript problem must
+// never fail a chat. Callers must hold chatsMu.
+func (a *App) wireChatTranscript(cs *chatSession, agent *core.Agent) {
+	if cs == nil || agent == nil || cs.dir == "" {
+		return
+	}
+	if cs.transcript == nil {
+		tr, id, err := openOrCreateTranscript(cs.dir, cs.store, filepath.Join(cs.dir, "memory.json"), a.Logger)
+		if err != nil {
+			if a.Logger != nil {
+				a.Logger.Printf("app: chat transcript unavailable (%v); turns will not be recorded to a transcript", err)
+			}
+			return
+		}
+		cs.transcript = tr
+		cs.sessionID = id
+	}
+	agent.SetTranscript(cs.transcript)
 }
 
 // buildChatProviderLocked resolves the chat's effective provider:
@@ -351,38 +397,62 @@ func (a *App) permissionGate() *permissions.Gate {
 }
 
 // HandleForChat runs one user input through the chat's agent (the
-// per-chat equivalent of Handle, for non-streaming callers).
+// per-chat equivalent of Handle, for non-streaming callers). The
+// per-chat daily token budget is enforced (see runChatTurn): a chat
+// over budget is refused before the model is called, and the turn's
+// spend is recorded afterwards.
 func (a *App) HandleForChat(ctx context.Context, chatID int64, input string) (string, error) {
-	agent, err := a.AgentForChat(chatID)
-	if err != nil {
-		return "", err
-	}
-	reply, err := agent.Run(ctx, input)
-	if a.Audit != nil {
-		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
-	}
+	reply, _, err := a.runChatTurn(ctx, chatID, input, nil)
 	return reply, err
 }
 
-// HandleStreamForChat is HandleStream for one chat: the turn runs on
-// the chat's agent, and the TurnStats carry the chat's provider and
-// model (so the footer shows the model THAT chat is using).
-func (a *App) HandleStreamForChat(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+// runChatTurn is the single per-chat turn path behind HandleForChat
+// and HandleStreamForChat, and the ONLY place the per-chat daily
+// token budget is enforced — every channel that runs a chat's agent
+// (oriond's Telegram turns, `orion daemon`, /retry) goes through
+// here, so no path can silently skip the budget:
+//
+//   - pre-flight: when the chat is already over budget, the turn is
+//     refused BEFORE the provider is called, with the
+//     BudgetExceededError (the caller turns it into a plain reply
+//     for the user; the error names the usage, the limit and the
+//     UTC-midnight reset). Nothing is recorded for a refused turn.
+//   - post-turn: the turn's reported usage is recorded with its
+//     prompt/completion/subagent split (RecordUsage), even when the
+//     turn errored — a failed turn still consumed tokens, and the
+//     next turn must see the spend. A Record error (the turn pushed
+//     the chat over the limit) is swallowed deliberately: the turn
+//     already ran, and the NEXT turn is the one that gets refused.
+//     A nil Budget (hand-built Apps) means unbudgeted, exactly as
+//     before.
+//
+// The returned stats carry the chat's provider/model plus the
+// prompt/completion/subagent split, so the footer and /usage can
+// show the turn honestly.
+func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	agent, err := a.AgentForChat(chatID)
 	if err != nil {
 		return "", nil, err
+	}
+	if a.Budget != nil {
+		if err := a.Budget.Check(chatID, 0); err != nil {
+			return "", nil, err
+		}
 	}
 	providerName, modelName := a.chatProviderInfo(chatID)
 	var stats *core.TurnStats
 	wrapped := func(ev core.ProgressEvent) {
 		if ev.Kind == core.EventTurnFinished {
 			stats = &core.TurnStats{
-				Provider:     providerName,
-				Model:        modelName,
-				Tokens:       ev.Usage.TotalTokens,
-				Steps:        ev.Step,
-				Duration:     ev.Duration,
-				MemoriesUsed: ev.MemoriesUsed,
+				Provider:         providerName,
+				Model:            modelName,
+				Tokens:           ev.Usage.TotalTokens,
+				PromptTokens:     ev.Usage.PromptTokens,
+				CompletionTokens: ev.Usage.CompletionTokens,
+				SubagentTokens:   ev.SubagentTokens,
+				Steps:            ev.Step,
+				Duration:         ev.Duration,
+				MemoriesUsed:     ev.MemoriesUsed,
 			}
 		}
 		if emit != nil {
@@ -390,10 +460,28 @@ func (a *App) HandleStreamForChat(ctx context.Context, chatID int64, input strin
 		}
 	}
 	reply, err := agent.RunWithEventHandler(ctx, input, wrapped)
+	if stats != nil && a.Budget != nil {
+		// Best effort: a failed record must never fail the turn
+		// that just completed (and an over-budget record is
+		// expected — the spend happened; the next turn refuses).
+		_ = a.Budget.RecordUsage(chatID, model.Usage{
+			PromptTokens:     stats.PromptTokens,
+			CompletionTokens: stats.CompletionTokens,
+			TotalTokens:      stats.Tokens,
+		}, stats.SubagentTokens)
+	}
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
 	}
 	return reply, stats, err
+}
+
+// HandleStreamForChat is HandleStream for one chat: the turn runs on
+// the chat's agent, and the TurnStats carry the chat's provider and
+// model (so the footer shows the model THAT chat is using). The
+// per-chat daily token budget is enforced (see runChatTurn).
+func (a *App) HandleStreamForChat(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return a.runChatTurn(ctx, chatID, input, emit)
 }
 
 // SwitchProviderForChat switches ONLY this chat's provider: it
@@ -447,9 +535,18 @@ func (a *App) SwitchProviderForChat(chatID int64, name string) error {
 	// shared one — applyMemoryV2Wiring would wire the shared
 	// log, so call the underlying helper directly).
 	applyMemoryV2WiringTo(agent, a.typedAdapter, cs.sessionLog, a.driftRoot)
+	// Skill wiring: the rebuilt agent advertises the same skills
+	// as the app (nil-safe: a hand-built App has no Skills).
+	agent.SetSkills(a.Skills)
+	// Hook wiring (rc9): same hook policy as the global agent
+	// (nil-safe — see AgentForChat).
+	agent.SetHooks(a.Hooks)
 	if g := a.permissionGate(); g != nil {
 		agent.SetPermissionGate(g)
 	}
+	// The rebuilt agent records into the same live session
+	// transcript as the agent it replaces.
+	a.wireChatTranscript(cs, agent)
 	cs.agent = agent
 	cs.provider = provider
 	return nil
@@ -457,14 +554,45 @@ func (a *App) SwitchProviderForChat(chatID int64, name string) error {
 
 // NewSessionForChat starts a fresh session for ONE chat: only that
 // chat's conversation history is dropped (facts survive — long-term
-// memory is not wiped by starting a new chat). Other chats are
-// untouched.
+// memory is not wiped by starting a new chat), and the live session
+// rotates: a fresh session id is recorded in sessions/current.json
+// and the chat's agent records further turns into the new
+// transcript. The old transcript file stays on disk, listed by
+// /sessions and resumable by /resume. Other chats are untouched.
+// A rotation failure is logged and the chat keeps recording into
+// its old transcript — /new's primary job (clearing history) has
+// already succeeded, and no turn is ever lost to a rotation error.
 func (a *App) NewSessionForChat(chatID int64) error {
 	cs, err := a.chatSessionFor(chatID)
 	if err != nil {
 		return err
 	}
-	return cs.store.ClearMessages()
+	if err := cs.store.ClearMessages(); err != nil {
+		return err
+	}
+	if cs.dir == "" {
+		return nil
+	}
+	tr, id, err := rotateTranscript(cs.dir)
+	if err != nil {
+		if a.Logger != nil {
+			a.Logger.Printf("app: chat %d: rotate session failed (%v); keeping live session %s", chatID, err, cs.sessionID)
+		}
+		return nil
+	}
+	a.chatsMu.Lock()
+	cs.transcript = tr
+	cs.sessionID = id
+	agent := cs.agent
+	a.chatsMu.Unlock()
+	if agent != nil {
+		// A new session starts with a clean compaction slate:
+		// the breaker state belonged to the previous session's
+		// history.
+		agent.SetTranscript(tr)
+		agent.ResetCompactionBreaker()
+	}
+	return nil
 }
 
 // UndoLastTurnsForChat removes the last n user turns from ONE
@@ -496,7 +624,26 @@ func (a *App) compressForChatWith(ctx context.Context, chatID int64, keepRecent 
 		return 0, 0, 0, err
 	}
 	provider := a.chatCompressProvider(chatID, cs)
-	return compressWithOn(ctx, cs.store, provider, keepRecent, sessionMemory)
+	before, after, summaryLen, summary, err := compressWithOn(ctx, cs.store, provider, keepRecent, sessionMemory)
+	if err == nil && summaryLen > 0 {
+		// A successful manual /compress clears this chat's
+		// auto-compaction circuit breaker, and the summary is
+		// preserved in the chat's live session transcript as
+		// well as the conversation-summary fact.
+		a.chatsMu.Lock()
+		agent := cs.agent
+		tr := cs.transcript
+		a.chatsMu.Unlock()
+		if agent != nil {
+			agent.ResetCompactionBreaker()
+		}
+		if tr != nil {
+			if err := tr.AppendSummary(summary); err != nil && a.Logger != nil {
+				a.Logger.Printf("app: chat %d: compress: record summary in transcript: %v", chatID, err)
+			}
+		}
+	}
+	return before, after, summaryLen, err
 }
 
 // chatCompressProvider returns the provider a chat's /compress
@@ -568,6 +715,23 @@ func (a *App) StatusLineForChat(chatID int64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Provider: %s\nModel: %s\nMax steps: %d\nTimeout: %ds\nMessages: %d\nFacts: %d\nData dir: %s",
 		providerName, modelName, maxSteps, timeout, msgs, facts, dataDir)
+	if id, err := a.CurrentSessionIDForChat(chatID); err == nil && id != "" {
+		fmt.Fprintf(&b, "\nSession: %s", id)
+	}
+	// Auto-compaction state, so a tripped breaker or an
+	// approaching compaction is visible in /status instead of
+	// silent: the user sees it before history pressure forces a
+	// drop, and a tripped breaker names its remedy (/compress).
+	if st, err := a.CompactionStatusForChat(chatID); err == nil {
+		switch {
+		case st.Tripped:
+			fmt.Fprintf(&b, "\nCompaction: breaker tripped after %d failures (%s); run /compress", st.ConsecutiveFailures, st.LastError)
+		case st.Warning:
+			fmt.Fprintf(&b, "\nCompaction: approaching (history %.0f%% full; auto-compacts at 80%%)", st.Pressure*100)
+		case st.Compactions > 0:
+			fmt.Fprintf(&b, "\nCompaction: %d auto-compaction(s), history %.0f%% full", st.Compactions, st.Pressure*100)
+		}
+	}
 	if !a.StartedAt.IsZero() {
 		fmt.Fprintf(&b, "\nUptime: %s", time.Since(a.StartedAt).Round(time.Second))
 	}
@@ -644,6 +808,12 @@ func (a *App) rebuildChatAgentsForDefault() error {
 			agent.SetLogger(a.Logger)
 		}
 		applyMemoryV2WiringTo(agent, a.typedAdapter, cs.sessionLog, a.driftRoot)
+		// Skill wiring: the rebuilt agent advertises the same skills
+		// as the app (nil-safe: a hand-built App has no Skills).
+		agent.SetSkills(a.Skills)
+		// Hook wiring (rc9): same hook policy as the global agent
+		// (nil-safe — see AgentForChat).
+		agent.SetHooks(a.Hooks)
 		if g := a.permissionGate(); g != nil {
 			agent.SetPermissionGate(g)
 		}
@@ -655,6 +825,11 @@ func (a *App) rebuildChatAgentsForDefault() error {
 			cs.agent = agent
 			cs.provider = provider
 			cs.providerName, cs.modelName = a.chatProviderInfoFromLocked()
+			// The rebuilt agent records into the same live
+			// session transcript as the agent it replaces.
+			if cs.transcript != nil {
+				agent.SetTranscript(cs.transcript)
+			}
 		}
 		a.chatsMu.Unlock()
 	}

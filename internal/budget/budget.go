@@ -23,6 +23,13 @@
 // That is deliberate — the budget is a rate control, not billing —
 // and it is documented here so nobody mistakes it for durable
 // accounting.
+//
+// RecordUsage additionally keeps the prompt/completion/subagent
+// split for the day, so the USD estimate (internal/cost) can price
+// the day's spend: prompt at the input rate, completion and
+// subagent tokens at the output rate. The split is accounting only;
+// the budget meter is always the total, and Record (total only)
+// stays the simple path for callers without a split.
 package budget
 
 import (
@@ -30,6 +37,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/irfan/orion/internal/model"
 )
 
 // ErrBudgetExceeded is the sentinel for a breached per-chat daily
@@ -53,10 +62,31 @@ func (e *BudgetExceededError) Error() string {
 // Unwrap lets errors.Is(err, ErrBudgetExceeded) match.
 func (e *BudgetExceededError) Unwrap() error { return ErrBudgetExceeded }
 
-// chatDay is one chat's usage for one UTC day.
+// chatDay is one chat's usage for one UTC day. prompt/completion
+// are the provider-reported split for the day's turns; subagent is
+// the subagent tokens consumed by those turns (already included in
+// used — the agent adds them to the turn's TotalTokens — and kept
+// separately only so the USD estimate can price them at the output
+// rate, since their own split is unknown). used is the budget
+// meter: the sum of TotalTokens as reported, subagent included.
 type chatDay struct {
-	day  string // "2006-01-02" in UTC
-	used int
+	day        string // "2006-01-02" in UTC
+	used       int
+	prompt     int
+	completion int
+	subagent   int
+}
+
+// DayUsage is one chat's token usage for today, with the split the
+// USD estimate needs. Total is the budget meter (used); Prompt +
+// Completion + Subagent need not sum to Total: a provider that
+// reports no split leaves Prompt/Completion at 0 while Total still
+// counts, and subagent tokens are already inside Total.
+type DayUsage struct {
+	Prompt     int
+	Completion int
+	Subagent   int
+	Total      int
 }
 
 // Budget is a per-chat daily token budget. The zero value is not
@@ -120,6 +150,9 @@ func (b *Budget) entryLocked(chatID int64) *chatDay {
 	if e.day != today {
 		e.day = today
 		e.used = 0
+		e.prompt = 0
+		e.completion = 0
+		e.subagent = 0
 	}
 	return e
 }
@@ -148,19 +181,48 @@ func (b *Budget) Check(chatID int64, tokens int) error {
 // the new total exceeds the budget. The tokens are always recorded —
 // even when they push the chat over the limit — because the spend
 // already happened and the next Check must see it. A negative tokens
-// value is a caller error and records nothing.
+// value is a caller error and records nothing. It is RecordUsage
+// without a split (prompt/completion/subagent stay 0); the budget
+// meter is identical either way.
 func (b *Budget) Record(chatID int64, tokens int) error {
-	if tokens < 0 {
-		return fmt.Errorf("budget: tokens must not be negative, got %d", tokens)
+	return b.RecordUsage(chatID, model.Usage{TotalTokens: tokens}, 0)
+}
+
+// RecordUsage adds a turn's reported usage to chatID's usage for
+// today and reports whether the new total exceeds the budget. It is
+// Record with the split kept: u.TotalTokens is the budget meter
+// (the agent already folds subagent tokens into TotalTokens, so
+// they are NOT added again), while u.PromptTokens,
+// u.CompletionTokens and subagentTokens are recorded separately for
+// the USD estimate. The tokens are always recorded — even when they
+// push the chat over the limit — because the spend already happened
+// and the next Check must see it. A negative count in any field is
+// a caller error and records nothing.
+func (b *Budget) RecordUsage(chatID int64, u model.Usage, subagentTokens int) error {
+	if u.PromptTokens < 0 || u.CompletionTokens < 0 || u.TotalTokens < 0 || subagentTokens < 0 {
+		return fmt.Errorf("budget: token counts must not be negative, got prompt=%d completion=%d total=%d subagent=%d", u.PromptTokens, u.CompletionTokens, u.TotalTokens, subagentTokens)
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	e := b.entryLocked(chatID)
-	e.used += tokens
+	e.used += u.TotalTokens
+	e.prompt += u.PromptTokens
+	e.completion += u.CompletionTokens
+	e.subagent += subagentTokens
 	if b.limit > 0 && e.used > b.limit {
-		return &BudgetExceededError{ChatID: chatID, Used: e.used - tokens, Requested: tokens, Limit: b.limit}
+		return &BudgetExceededError{ChatID: chatID, Used: e.used - u.TotalTokens, Requested: u.TotalTokens, Limit: b.limit}
 	}
 	return nil
+}
+
+// DayUsage returns chatID's token usage for today, with the
+// prompt/completion/subagent split. It is zero for a chat with no
+// usage, and it resets at UTC midnight.
+func (b *Budget) DayUsage(chatID int64) DayUsage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e := b.entryLocked(chatID)
+	return DayUsage{Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent, Total: e.used}
 }
 
 // Usage returns the tokens chatID has consumed today. It is 0 for a

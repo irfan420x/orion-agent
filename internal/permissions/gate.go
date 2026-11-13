@@ -98,13 +98,19 @@ var networkTools = map[string]bool{
 // are ClassSafe: the registry rejects them as unknown_tool before
 // they can run, so the gate has nothing to protect there, and
 // classifying an unknown tool as gated would only produce approval
-// prompts for calls that can never execute.
+// prompts for calls that can never execute. MCP tools (mcp__<server>__<tool>)
+// are the exception: they are ClassNetwork — a server is an external
+// process with unknown capabilities, so every MCP tool needs
+// approval when a gate is installed (rc9, audit P0 #7).
 func Classify(tool string) Class {
 	tool = strings.TrimSpace(tool)
 	if destructiveTools[tool] {
 		return ClassDestructive
 	}
 	if networkTools[tool] {
+		return ClassNetwork
+	}
+	if strings.HasPrefix(tool, "mcp__") {
 		return ClassNetwork
 	}
 	return ClassSafe
@@ -294,6 +300,18 @@ type Gate struct {
 	prompter Prompter
 	timeout  time.Duration
 	pending  map[string]*pendingRequest
+	// onExpire, when set via SetOnExpire, is called (once, outside
+	// the gate mutex) when a pending request dies unanswered — the
+	// approval window elapsed, or the turn was cancelled. The
+	// daemon uses it to expire the approval card in place, so a
+	// dead card never keeps live-looking buttons (the rc8 incident:
+	// a tap on an already-timed-out card looks exactly like a
+	// broken button). It is NOT called when Resolve answers the
+	// request, nor when the prompter fails (no card was sent).
+	// It must return promptly — spawn a goroutine for slow work
+	// (a network call) — because Check calls it before returning
+	// the denial.
+	onExpire func(ApprovalRequest)
 }
 
 // NewGate builds a gate over rules (may be nil: no standing rules)
@@ -320,6 +338,29 @@ func (g *Gate) SetTimeout(d time.Duration) {
 		d = DefaultTimeout
 	}
 	g.timeout = d
+}
+
+// SetOnExpire installs the hook called when a pending request dies
+// unanswered (timeout or turn cancellation). A nil hook removes it.
+// It is safe for concurrent use with a waiting Check: the hook is
+// read once, outside the gate mutex, when the request expires.
+func (g *Gate) SetOnExpire(fn func(ApprovalRequest)) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.onExpire = fn
+}
+
+// onExpireHook returns the installed expiry hook, or nil.
+func (g *Gate) onExpireHook() func(ApprovalRequest) {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.onExpire
 }
 
 // Timeout returns the approval wait bound.
@@ -427,9 +468,15 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 		return false, fmt.Sprintf("denied: the user declined the %s tool call %q", Classify(tool), tool)
 	case <-timer.C:
 		g.removePending(req.ID)
+		if hook := g.onExpireHook(); hook != nil {
+			hook(req)
+		}
 		return false, "denied: approval timed out (no answer within the approval window)"
 	case <-ctx.Done():
 		g.removePending(req.ID)
+		if hook := g.onExpireHook(); hook != nil {
+			hook(req)
+		}
 		return false, "denied: approval cancelled (the turn ended before an answer arrived)"
 	}
 }

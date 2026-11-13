@@ -76,6 +76,13 @@ type CommandEnv struct {
 	SwitchProvider func(name string) error
 	// Usage returns daemon-wide token/turn totals (all chats).
 	Usage func() (tokens int, turns int)
+	// UsageForChat renders the per-chat, per-day usage block for
+	// /usage (tokens today with the prompt/completion/subagent
+	// split, estimated USD cost, daily token budget). It is wired
+	// by the daemon to the app's per-chat accounting; nil in
+	// hand-built envs, where /usage shows the daemon-wide totals
+	// only, exactly as before.
+	UsageForChat func(chatID int64) string
 	// Session returns a copy of the chat's session state.
 	Session func(chatID int64) *Session
 	// NewSession drops the conversation history (facts survive) and
@@ -141,6 +148,18 @@ type CommandEnv struct {
 	// it is nil. Read errors are best-effort: /compress proceeds
 	// without it and says so.
 	SessionMemory func(ctx context.Context) (string, error)
+	// ListSessions lists this chat's per-session transcripts,
+	// newest first, with the live session id (audit P0 #4). Nil
+	// until the daemon wires it; /sessions then replies that
+	// sessions are unavailable instead of panicking.
+	ListSessions func(chatID int64) ([]SessionInfo, string, error)
+	// ResumeSession resumes a named session (full id or unique
+	// leading prefix) for this chat: the transcript's messages
+	// replace the working history and the live session moves to
+	// it. It returns the resolved id and the message count now in
+	// working history. Nil until the daemon wires it; /resume
+	// then replies that sessions are unavailable.
+	ResumeSession func(chatID int64, idOrPrefix string) (string, int, error)
 	// CompressWithSessionMemory is the /compress variant that
 	// takes the session-memory text so the saved summary preserves
 	// decisions/facts from session memory (not just the raw
@@ -158,6 +177,19 @@ type CommandEnv struct {
 // coordinator can wire TypedMemories straight to
 // memory.TypedStore.List with no conversion.
 type TypedMemory = memory.TypedMemory
+
+// SessionInfo is one per-session transcript, for /sessions (the
+// messaging-local view of session.Info: messaging never imports
+// the session package, so the daemon converts when wiring).
+type SessionInfo struct {
+	ID        string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Messages  int
+	Summaries int
+	Bytes     int64
+	Title     string // first user message, truncated
+}
 
 // memoryTypeOrder is the display order for /memory groups; types
 // outside this list render after them, sorted by type name.
@@ -408,6 +440,58 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 	})
 
 	r.Register(Command{
+		Name:        "sessions",
+		Description: "List saved sessions (transcripts) for this chat",
+		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
+			if env.ListSessions == nil {
+				return "Sessions are unavailable (not wired).", nil
+			}
+			infos, current, err := env.ListSessions(env.ChatID)
+			if err != nil {
+				return fmt.Sprintf("❌ Could not list sessions: %v", err), nil
+			}
+			if len(infos) == 0 {
+				return "No saved sessions yet. This chat's conversation is the live session.", nil
+			}
+			var b strings.Builder
+			b.WriteString("📼 Sessions (newest first):\n")
+			for _, info := range infos {
+				live := ""
+				if info.ID == current {
+					live = " ★ live"
+				}
+				title := ""
+				if info.Title != "" {
+					title = fmt.Sprintf(" — %q", info.Title)
+				}
+				fmt.Fprintf(&b, "• %s%s — %d message(s), %d summaries, updated %s%s\n",
+					info.ID, live, info.Messages, info.Summaries, formatAge(info.UpdatedAt), title)
+			}
+			b.WriteString("Resume one with /resume <id or prefix>.")
+			return b.String(), nil
+		},
+	})
+
+	r.Register(Command{
+		Name:        "resume",
+		Description: "Resume a saved session by id (or a unique prefix)",
+		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
+			args = strings.TrimSpace(args)
+			if args == "" {
+				return "Usage: /resume <session id or unique prefix>\nList sessions with /sessions.", nil
+			}
+			if env.ResumeSession == nil {
+				return "Sessions are unavailable (not wired).", nil
+			}
+			id, count, err := env.ResumeSession(env.ChatID, strings.Fields(args)[0])
+			if err != nil {
+				return fmt.Sprintf("❌ Could not resume session: %v", err), nil
+			}
+			return fmt.Sprintf("✅ Resumed session %s (%d message(s) in history). Facts and memories are shared, so nothing else changed.", id, count), nil
+		},
+	})
+
+	r.Register(Command{
 		Name:        "stop",
 		Description: "Kill all running background processes",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
@@ -463,8 +547,14 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			sess := env.Session(env.ChatID)
 			tokens, turns := env.Usage()
 			maxSteps, timeout := env.Limits()
-			return fmt.Sprintf("Tokens this chat: %d (%d turn(s))\nTokens (all chats): %d (%d turn(s))\nMax steps per turn: %d\nTimeout per step: %ds\nRate limits are set by the provider — Orion does not impose its own.",
-				sess.TotalTokens, sess.Turns, tokens, turns, maxSteps, timeout), nil
+			var b strings.Builder
+			if env.UsageForChat != nil {
+				b.WriteString(env.UsageForChat(env.ChatID))
+				b.WriteString("\n")
+			}
+			fmt.Fprintf(&b, "Tokens this chat (all time): %d (%d turn(s))\nTokens (all chats): %d (%d turn(s))\nMax steps per turn: %d\nTimeout per step: %ds\nRate limits are set by the provider — Orion does not impose its own.",
+				sess.TotalTokens, sess.Turns, tokens, turns, maxSteps, timeout)
+			return b.String(), nil
 		},
 	})
 

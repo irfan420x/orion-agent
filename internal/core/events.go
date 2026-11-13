@@ -13,6 +13,14 @@ const (
 	EventToolCallStarted  EventKind = "tool_call_started"
 	EventToolCallFinished EventKind = "tool_call_finished"
 	EventTurnFinished     EventKind = "turn_finished"
+	// EventCompactionWarning fires when history pressure enters
+	// the warning band (compaction approaching), when a
+	// compaction fails, and when the circuit breaker trips or is
+	// hit while tripped (Err set on the last two). Handlers must
+	// treat it as informational: the turn continues either way.
+	EventCompactionWarning EventKind = "compaction_warning"
+	// EventAutoCompacted fires after a successful auto-compaction.
+	EventAutoCompacted EventKind = "auto_compacted"
 )
 
 // ProgressEvent is one step of an agent turn, emitted synchronously on the
@@ -43,6 +51,12 @@ type ProgressEvent struct {
 	// (recall v2); set on TurnFinished only. Callers copy it into
 	// TurnStats for display (e.g. the Telegram footer).
 	MemoriesUsed int
+	// SubagentTokens is the subagent tokens consumed by this turn
+	// (results the parent fetched); set on TurnFinished only, and
+	// already included in Usage.TotalTokens. Callers copy it into
+	// TurnStats so the footer can break it out instead of silently
+	// folding delegated work into the parent's total.
+	SubagentTokens int
 }
 
 // EventHandler receives ProgressEvents from an Agent run.
@@ -53,8 +67,19 @@ type TurnStats struct {
 	Provider string
 	Model    string
 	Tokens   int // total tokens (Usage.TotalTokens from TurnFinished)
-	Steps    int // last step number
-	Duration time.Duration
+	// PromptTokens / CompletionTokens are the provider-reported
+	// split behind Tokens (zero when the provider reported no
+	// usage). They exist so the USD estimate can price the turn
+	// exactly instead of guessing from the total.
+	PromptTokens     int
+	CompletionTokens int
+	// SubagentTokens is the part of Tokens that came from subagent
+	// results the parent consumed this turn (already included in
+	// Tokens, never additional). The footer breaks it out so the
+	// number honestly shows delegated work.
+	SubagentTokens int
+	Steps          int // last step number
+	Duration       time.Duration
 	// MemoriesUsed counts the typed memories injected this turn
 	// (recall v2). Populated from the TurnFinished event's
 	// MemoriesUsed by the caller that builds the TurnStats

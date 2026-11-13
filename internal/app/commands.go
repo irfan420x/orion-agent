@@ -25,6 +25,7 @@ import (
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/cost"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/security"
@@ -83,11 +84,14 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 	wrapped := func(ev core.ProgressEvent) {
 		if ev.Kind == core.EventTurnFinished {
 			stats = &core.TurnStats{
-				Provider: providerName,
-				Model:    modelName,
-				Tokens:   ev.Usage.TotalTokens,
-				Steps:    ev.Step,
-				Duration: ev.Duration,
+				Provider:         providerName,
+				Model:            modelName,
+				Tokens:           ev.Usage.TotalTokens,
+				PromptTokens:     ev.Usage.PromptTokens,
+				CompletionTokens: ev.Usage.CompletionTokens,
+				SubagentTokens:   ev.SubagentTokens,
+				Steps:            ev.Step,
+				Duration:         ev.Duration,
 				// MemoriesUsed comes from the TurnFinished event
 				// (the agent counts typed memories injected this
 				// turn); the footer renders it when non-zero.
@@ -227,6 +231,12 @@ func (a *App) SwitchProvider(name string) error {
 	// drops typed recall, feedback injection, drift checking and
 	// session extraction for every subsequent turn (Audit 4 B P1-1).
 	a.applyMemoryV2Wiring(agent)
+	// Re-assert skills and hooks on the replacement agent: NewAgent
+	// leaves both unset, and without this a /model switch silently
+	// drops skill discovery and hook enforcement for every
+	// subsequent turn (same class as Audit 4 B P1-1 for Memory v2).
+	agent.SetSkills(a.Skills)
+	agent.SetHooks(a.Hooks)
 	a.Agent = agent
 	a.Provider = provider
 	if a.Subagents != nil {
@@ -238,7 +248,7 @@ func (a *App) SwitchProvider(name string) error {
 		// agent on every call (see Build), so no re-pointing is
 		// needed here: tokens from consumed results accrue to
 		// this new agent automatically.
-		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger))
+		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger, a.Hooks))
 	}
 	a.mu.Unlock()
 	// Chats without an override follow the new default; chats with
@@ -288,6 +298,83 @@ func (a *App) StatusLine() string {
 		providerName, modelName, maxSteps, timeout, msgs, facts, dataDir)
 	if !a.StartedAt.IsZero() {
 		fmt.Fprintf(&b, "\nUptime: %s", time.Since(a.StartedAt).Round(time.Second))
+	}
+	return b.String()
+}
+
+// UsageLineForChat renders the per-chat, per-day usage block for
+// /usage: tokens consumed TODAY by this chat (with the
+// prompt/completion/subagent split), the estimated USD cost of
+// today's spend at this chat's provider/model, and the daily token
+// budget (limit, remaining, UTC-midnight reset). It is the
+// per-chat view; the daemon-wide session totals come from the
+// messaging session store and are rendered by the /usage handler
+// alongside this block.
+//
+// The USD figure is an ESTIMATE, labelled as such with the price
+// table's version and effective date: it is the standard on-demand
+// list price for the tokens' split, not the bill (cache hits,
+// peak/off-peak rates and discounts are invisible to Orion). When
+// the chat's model has no price in the table the cost is reported
+// as unknown — never $0. A nil Budget (hand-built Apps) reports
+// the day as untracked instead of inventing numbers. It never
+// returns an error: a missing piece is shown as "unknown" rather
+// than failing the /usage command.
+func (a *App) UsageLineForChat(chatID int64) string {
+	if a == nil {
+		return "Usage today (this chat): unknown (app not initialised)"
+	}
+	providerName, modelName := a.chatProviderInfo(chatID)
+	if providerName == "" {
+		providerName = "unknown"
+	}
+	if modelName == "" {
+		modelName = "unknown"
+	}
+	if a.Budget == nil {
+		return fmt.Sprintf("Usage today (this chat): not tracked (no budget configured)\nProvider: %s\nModel: %s", providerName, modelName)
+	}
+	du := a.Budget.DayUsage(chatID)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Tokens today (this chat): %s (%s prompt + %s completion, incl. %s subagent)\n",
+		formatThousands(du.Total), formatThousands(du.Prompt), formatThousands(du.Completion), formatThousands(du.Subagent))
+	tbl := cost.DefaultTable()
+	if usd, ok := tbl.EstimateTotals(providerName, modelName, du.Prompt, du.Completion, du.Subagent); ok {
+		fmt.Fprintf(&b, "Est. cost today (this chat): %s (est., %s, price table v%s effective %s)\n",
+			cost.FormatUSD(usd), modelName, tbl.Version, tbl.Effective)
+	} else {
+		fmt.Fprintf(&b, "Est. cost today (this chat): unknown (no price for %s/%s in price table v%s effective %s)\n",
+			providerName, modelName, tbl.Version, tbl.Effective)
+	}
+	if limit := a.Budget.Limit(); limit <= 0 {
+		b.WriteString("Daily token budget: unlimited")
+	} else {
+		fmt.Fprintf(&b, "Daily token budget: %s tokens (%s remaining, resets %s)",
+			formatThousands(limit), formatThousands(a.Budget.Remaining(chatID)), a.Budget.ResetAt().Format("2006-01-02 15:04 UTC"))
+	}
+	return b.String()
+}
+
+// formatThousands renders n with "," thousands separators ("1240" ->
+// "1,240").
+func formatThousands(n int) string {
+	if n < 0 {
+		return "-" + formatThousands(-n)
+	}
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	rem := len(s) % 3
+	if rem > 0 {
+		b.WriteString(s[:rem])
+	}
+	for i := rem; i < len(s); i += 3 {
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(s[i : i+3])
 	}
 	return b.String()
 }
@@ -398,13 +485,39 @@ func (a *App) Drain(timeout time.Duration) bool {
 
 // NewSession starts a fresh session: the conversation history is
 // dropped from memory (facts survive — long-term memory is not
-// wiped by starting a new chat) and persisted. The caller resets
-// the per-chat session bookkeeping (undo stack, last input).
+// wiped by starting a new chat) and persisted, and the live
+// session rotates: a fresh session id is recorded in
+// sessions/current.json and the global agent records further turns
+// into the new transcript. The old transcript stays on disk for
+// listing/resume. The caller resets the per-chat session
+// bookkeeping (undo stack, last input). A rotation failure is
+// logged and the old transcript stays live — /new's primary job
+// has already succeeded, and no turn is ever lost to it.
 func (a *App) NewSession() error {
 	if a == nil || a.Memory == nil {
 		return errors.New("app: NewSession called on uninitialised App (nil Memory)")
 	}
-	return a.Memory.ClearMessages()
+	if err := a.Memory.ClearMessages(); err != nil {
+		return err
+	}
+	if a.Config == nil || a.Config.DataDir == "" {
+		return nil
+	}
+	tr, id, err := rotateTranscript(a.Config.DataDir)
+	if err != nil {
+		if a.Logger != nil {
+			a.Logger.Printf("app: rotate global session failed (%v); keeping live session %s", err, a.globalSessionID)
+		}
+		return nil
+	}
+	a.globalTranscript = tr
+	a.globalSessionID = id
+	if ag := a.agent(); ag != nil {
+		// A new session starts with a clean compaction slate.
+		ag.SetTranscript(tr)
+		ag.ResetCompactionBreaker()
+	}
+	return nil
 }
 
 // UndoLastTurns removes the last n user turns from memory — each turn
@@ -493,34 +606,54 @@ func (a *App) compressWith(ctx context.Context, keepRecent int, sessionMemory st
 	if a == nil || a.Memory == nil {
 		return 0, 0, 0, errors.New("app: Compress called on uninitialised App (nil Memory)")
 	}
-	return compressWithOn(ctx, a.Memory, a.provider(), keepRecent, sessionMemory)
+	before, after, summaryLen, summary, err := compressWithOn(ctx, a.Memory, a.provider(), keepRecent, sessionMemory)
+	if err == nil && summaryLen > 0 {
+		// A successful manual /compress clears the auto-compaction
+		// circuit breaker: the operator just proved summarisation
+		// works, so auto-compaction may try again.
+		if ag := a.agent(); ag != nil {
+			ag.ResetCompactionBreaker()
+		}
+		// The summary is preserved in the live session transcript
+		// as well as the conversation-summary fact, so the
+		// transcript keeps the full compaction record.
+		if a.globalTranscript != nil {
+			if err := a.globalTranscript.AppendSummary(summary); err != nil && a.Logger != nil {
+				a.Logger.Printf("app: compress: record summary in transcript: %v", err)
+			}
+		}
+	}
+	return before, after, summaryLen, err
 }
 
 // compressWithOn summarises store's conversation prefix older than
 // the recent window with a real model call (provider) and drops it:
 // the summary is stored as the "conversation-summary" fact (so
 // fact-aware recall still surfaces it) and only the recent window
-// stays in history. It is the store-level primitive behind Compress
-// (the global store, for the CLI) and CompressForChat (one chat's
-// store, for Telegram). When nothing is old enough (history fits the
-// window) it returns before == after with summaryLen == 0 and no
-// error. A provider failure leaves history untouched.
-func compressWithOn(ctx context.Context, store memory.Store, provider model.Provider, keepRecent int, sessionMemory string) (before, after, summaryLen int, err error) {
+// stays in history, and the summary text is returned so callers
+// can also record it in the session transcript and clear the
+// auto-compaction circuit breaker. It is the store-level primitive
+// behind Compress (the global store, for the CLI) and
+// CompressForChat (one chat's store, for Telegram). When nothing is
+// old enough (history fits the window) it returns before == after
+// with summaryLen == 0 and no error. A provider failure leaves
+// history untouched.
+func compressWithOn(ctx context.Context, store memory.Store, provider model.Provider, keepRecent int, sessionMemory string) (before, after, summaryLen int, summary string, err error) {
 	if keepRecent < 1 {
 		keepRecent = compressRecentWindow
 	}
 	all, err := store.RecentMessages(0)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("app: compress: read history: %w", err)
+		return 0, 0, 0, "", fmt.Errorf("app: compress: read history: %w", err)
 	}
 	before = len(all)
 	if before <= keepRecent {
-		return before, before, 0, nil
+		return before, before, 0, "", nil
 	}
 	old := all[:len(all)-keepRecent]
 	recent := all[len(all)-keepRecent:]
 	if provider == nil {
-		return before, before, 0, errors.New("app: compress: no provider configured")
+		return before, before, 0, "", errors.New("app: compress: no provider configured")
 	}
 	var b strings.Builder
 	b.WriteString("Summarise the following conversation messages into a concise memory. Preserve facts, decisions, names, numbers and anything the user asked to remember. Do not invent anything not in the messages.\n\n")
@@ -547,11 +680,11 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 		},
 	})
 	if err != nil {
-		return before, before, 0, fmt.Errorf("app: compress: summarisation call: %w", err)
+		return before, before, 0, "", fmt.Errorf("app: compress: summarisation call: %w", err)
 	}
-	summary := strings.TrimSpace(resp.Message.Content)
+	summary = strings.TrimSpace(resp.Message.Content)
 	if summary == "" {
-		return before, before, 0, errors.New("app: compress: provider returned an empty summary")
+		return before, before, 0, "", errors.New("app: compress: provider returned an empty summary")
 	}
 	// What-not-to-save gate (Audit 4 A P1-3): the summary is
 	// model-derived text on its way to becoming a stored fact (and
@@ -561,18 +694,18 @@ func compressWithOn(ctx context.Context, store memory.Store, provider model.Prov
 	if kept, ok := memory.FilterExplicitSave(summary); ok {
 		summary = kept
 	} else {
-		return before, before, 0, errors.New("app: compress: summary contained nothing worth saving (gate dropped it all)")
+		return before, before, 0, "", errors.New("app: compress: summary contained nothing worth saving (gate dropped it all)")
 	}
 	if strings.TrimSpace(sessionMemory) != "" {
 		summary += "\n(Drew on session memory.)"
 	}
 	if err := store.AddFact("conversation-summary", summary); err != nil {
-		return before, before, 0, fmt.Errorf("app: compress: store summary: %w", err)
+		return before, before, 0, "", fmt.Errorf("app: compress: store summary: %w", err)
 	}
 	if err := store.ReplaceMessages(recent); err != nil {
-		return before, before, 0, fmt.Errorf("app: compress: drop summarised messages: %w", err)
+		return before, before, 0, "", fmt.Errorf("app: compress: drop summarised messages: %w", err)
 	}
-	return before, len(recent), len([]rune(summary)), nil
+	return before, len(recent), len([]rune(summary)), summary, nil
 }
 
 // ExportConversation writes ONE chat's conversation as Markdown

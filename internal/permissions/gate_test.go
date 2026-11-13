@@ -28,6 +28,10 @@ func TestClassify(t *testing.T) {
 		"subagent_stop":  ClassSafe,
 		"unknown_tool":   ClassSafe,
 		"":               ClassSafe,
+		// MCP tools (rc9): any server tool is ClassNetwork — the
+		// server is an external process with unknown capabilities.
+		"mcp__fake__echo": ClassNetwork,
+		"mcp__fs__write":  ClassNetwork,
 	}
 	for tool, want := range cases {
 		if got := Classify(tool); got != want {
@@ -335,6 +339,76 @@ func TestGateTimeoutDenies(t *testing.T) {
 	}
 	if g.PendingCount() != 0 {
 		t.Error("timed-out request leaked")
+	}
+}
+
+// TestGateOnExpireFiresOnTimeoutNotOnResolve: the expiry hook (used
+// by the daemon to expire the approval card in place — the rc8
+// incident: a tap on an already-timed-out card looks exactly like a
+// broken button) fires exactly once when the window elapses, and
+// never when the user answers in time.
+func TestGateOnExpireFiresOnTimeoutNotOnResolve(t *testing.T) {
+	expired := make(chan ApprovalRequest, 1)
+
+	// Case 1: nobody answers — the hook fires with the request.
+	reqCh := make(chan ApprovalRequest, 1)
+	g2prompter := func(ctx context.Context, req ApprovalRequest) error {
+		reqCh <- req
+		return nil
+	}
+	g2 := NewGate(NewRuleStore(""), g2prompter)
+	g2.SetTimeout(50 * time.Millisecond)
+	g2.SetOnExpire(func(req ApprovalRequest) { expired <- req })
+	go func() {
+		_, _ = g2.Check(ctxWithChat(t), "shell_exec", `{"command":"echo hi"}`)
+	}()
+	var req ApprovalRequest
+	select {
+	case req = <-reqCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate never prompted")
+	}
+	select {
+	case got := <-expired:
+		if got.ID != req.ID {
+			t.Errorf("OnExpire request id = %q, want %q", got.ID, req.ID)
+		}
+		if got.Tool != "shell_exec" || got.ChatID != 42 {
+			t.Errorf("OnExpire request = %+v, want shell_exec for chat 42", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnExpire did not fire on timeout")
+	}
+	if g2.PendingCount() != 0 {
+		t.Error("timed-out request leaked")
+	}
+
+	// Case 2: the user answers in time — the hook never fires.
+	answered := make(chan bool, 1)
+	var g3 *Gate
+	g3 = NewGate(NewRuleStore(""), func(ctx context.Context, req ApprovalRequest) error {
+		// Answer at once, as a tap would.
+		go func() { _ = g3.Resolve(req.ID, true, nil) }()
+		return nil
+	})
+	g3.SetOnExpire(func(req ApprovalRequest) { expired <- req })
+	go func() {
+		ok, _ := g3.Check(ctxWithChat(t), "shell_exec", `{"command":"echo hi"}`)
+		answered <- ok
+	}()
+	select {
+	case ok := <-answered:
+		if !ok {
+			t.Error("answered approval was denied")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("answered Check did not return")
+	}
+	select {
+	case got := <-expired:
+		t.Errorf("OnExpire fired for an answered request (%q)", got.ID)
+	case <-time.After(200 * time.Millisecond):
+		// No hook: correct.
 	}
 }
 

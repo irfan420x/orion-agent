@@ -68,6 +68,12 @@ func TestSubagentUsageAddedToTurnFinished(t *testing.T) {
 	if finished.Usage.TotalTokens != 15+42 {
 		t.Fatalf("TurnFinished TotalTokens = %d, want %d (15 parent + 42 subagent)", finished.Usage.TotalTokens, 15+42)
 	}
+	// The subagent part is broken out on the event itself, so the
+	// footer can show it: TotalTokens honestly includes delegated
+	// work, and SubagentTokens says how much of it was delegated.
+	if finished.SubagentTokens != 42 {
+		t.Fatalf("TurnFinished SubagentTokens = %d, want 42", finished.SubagentTokens)
+	}
 	if finished.Usage.PromptTokens != 10 || finished.Usage.CompletionTokens != 5 {
 		t.Fatalf("TurnFinished Prompt/Completion = %d/%d, want 10/5 (subagent tokens go to Total only)",
 			finished.Usage.PromptTokens, finished.Usage.CompletionTokens)

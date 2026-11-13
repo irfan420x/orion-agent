@@ -95,6 +95,29 @@ func (r *Registry) Register(t Tool) error {
 	return nil
 }
 
+// RegisterAll registers every tool in ts, in order, stopping at
+// the first error (duplicate name, nil tool, empty name — see
+// Register). It is the dynamic-registration entry point: the MCP
+// manager hands the registry its discovered tools in one call
+// instead of the app looping Register itself.
+func (r *Registry) RegisterAll(ts []Tool) error {
+	for _, t := range ts {
+		if err := r.Register(t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ScrubEnv returns the process environment with secrets removed,
+// for child processes the agent launches (hook executables, MCP
+// servers): anything that looks like a credential never reaches a
+// process the model can influence. It is the exported form of the
+// scrub shell_exec already applies to its children (see shell.go);
+// the rules live in exactly one place — scrubEnv — so the hook and
+// MCP children can never drift from the shell child's scrub.
+func ScrubEnv() []string { return scrubEnv() }
+
 // Get returns a tool by name.
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
@@ -162,6 +185,27 @@ func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessag
 	t, ok := r.Get(name)
 	if !ok {
 		return "", &ToolError{Tool: name, Kind: "unknown_tool", Err: fmt.Errorf("unknown tool")}
+	}
+	// Central schema validation: required parameters and declared
+	// JSON types are enforced here, for every caller, before the
+	// tool runs — a call that fails validation never reaches tool
+	// code, so it cannot cause a side effect or bypass the
+	// denylist, and a validation failure is a clean invalid_args
+	// error, never a panic. The agent's permission gate has
+	// already decided the call before Execute is reached (see
+	// core.executeTool), so validation cannot bypass it either:
+	// a denied call never gets here, and a validated call still
+	// goes through the tool's own denylist checks underneath.
+	if err := validateArgs(t.Definition(), args); err != nil {
+		var toolErr *ToolError
+		if errors.As(err, &toolErr) {
+			return "", &ToolError{
+				Tool: toolErr.Tool,
+				Kind: toolErr.Kind,
+				Err:  errors.New(TruncateToolResult(security.RedactSecrets(toolErr.Err.Error()), r.MaxResultBytes())),
+			}
+		}
+		return "", err
 	}
 	result, err = t.Execute(ctx, args)
 	if err != nil {

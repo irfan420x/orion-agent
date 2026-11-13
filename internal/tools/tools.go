@@ -49,18 +49,27 @@ func DefaultRegistryWithSandboxAndTrustedEgress(sandboxCfg sandbox.Config, trust
 	}
 	r := NewRegistry()
 	roots := defaultFileRoots()
+	// Planning tools (todo_write + Task*) share one store. The
+	// store starts in-memory; the daemon points it at the data
+	// dir via Registry.PlanningStore().SetDataDir, after which
+	// state persists per chat under <DataDir>/chats/<chatID>/.
+	// See planning.go for the per-chat resolution.
+	planningTools := NewPlanningTools(NewPlanningStore(""))
 	tools := []Tool{
 		&shellExecTool{sandboxCfg: sandboxCfg},
 		&fileReadTool{roots: roots},
 		&fileWriteTool{roots: roots},
 		&fileEditTool{roots: roots},
 		&fileListTool{roots: roots},
+		&grepTool{roots: roots},
+		&globTool{roots: roots},
 		fetchTool,
 		searchTool,
 		&calculatorTool{},
 		&datetimeTool{},
 		&processListTool{},
 	}
+	tools = append(tools, planningTools...)
 	for _, t := range tools {
 		if err := r.Register(t); err != nil {
 			return nil, fmt.Errorf("tools: failed to register %q: %w", t.Name(), err)

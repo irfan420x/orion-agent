@@ -22,10 +22,12 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/config"
+	"github.com/irfan/orion/internal/hooks"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
+	"github.com/irfan/orion/internal/skills"
 	"github.com/irfan/orion/internal/tools"
 )
 
@@ -125,6 +127,31 @@ type Agent struct {
 	// next call.
 	gate   *permissions.Gate
 	gateMu sync.RWMutex
+	// hooksBus is the hook bus (rc9, audit P0 #6), installed by
+	// the app via SetHooks. Nil means no hooks: the agent runs
+	// exactly as before. hooksMu guards it; executeTool reads it
+	// on every tool call, so a bus installed mid-run applies to
+	// the next call.
+	hooksBus *hooks.Bus
+	hooksMu  sync.RWMutex
+	// transcript is the per-session JSONL transcript (see
+	// compact.go): every message stored in memory is also
+	// appended there. Nil means no transcript is wired.
+	transcript   transcriptSink
+	transcriptMu sync.RWMutex
+	// compactor holds the auto-compaction state (thresholds,
+	// circuit breaker); see compact.go. Created in NewAgent,
+	// lazily re-created for a zero-valued Agent.
+	compactor   *compactor
+	compactorMu sync.Mutex
+	// skillsReg is the skill registry installed with SetSkills
+	// (nil: no skills). skillsMu guards it. active is the skill
+	// active for the current turn, if any (see skills.go);
+	// activeMu guards it. A new turn starts with no skill active.
+	skillsReg *skills.Registry
+	skillsMu  sync.RWMutex
+	active    *activeSkill
+	activeMu  sync.Mutex
 }
 
 // MaxStepsError is returned by Run/RunStream when the step budget is
@@ -182,13 +209,14 @@ func NewAgent(cfg *config.Config, provider model.Provider, registry *tools.Regis
 	// agents takes the cap of the most recently created one.
 	registry.SetMaxResultBytes(cfg.MaxToolResultBytes)
 	return &Agent{
-		provider: provider,
-		tools:    registry,
-		memory:   mem,
-		cfg:      cfg,
-		logger:   log.New(os.Stderr, "orion/core: ", log.LstdFlags),
-		surfaced: map[string]struct{}{},
-		stale:    map[string]struct{}{},
+		provider:  provider,
+		tools:     registry,
+		memory:    mem,
+		cfg:       cfg,
+		logger:    log.New(os.Stderr, "orion/core: ", log.LstdFlags),
+		surfaced:  map[string]struct{}{},
+		stale:     map[string]struct{}{},
+		compactor: newCompactor(),
 	}, nil
 }
 
@@ -247,6 +275,24 @@ func (a *Agent) permissionGate() *permissions.Gate {
 	a.gateMu.RLock()
 	defer a.gateMu.RUnlock()
 	return a.gate
+}
+
+// SetHooks installs the hook bus (rc9) the agent consults around
+// every tool call and at turn end. A nil bus removes it (no hooks,
+// as before). It is safe for concurrent use with a running turn:
+// the next tool call sees the new bus. A nil *hooks.Bus behaves
+// as "no hooks" in any case, so wiring it unconditionally is safe.
+func (a *Agent) SetHooks(b *hooks.Bus) {
+	a.hooksMu.Lock()
+	defer a.hooksMu.Unlock()
+	a.hooksBus = b
+}
+
+// hooks returns the installed hook bus, or nil.
+func (a *Agent) hooks() *hooks.Bus {
+	a.hooksMu.RLock()
+	defer a.hooksMu.RUnlock()
+	return a.hooksBus
 }
 
 // SystemPrompt returns Orion's identity and operating rules.
@@ -375,6 +421,11 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 	// leak into this turn's accounting (see AddSubagentUsage).
 	a.resetSubagentUsage()
 
+	// A new turn starts with no skill active: a skill invoked last
+	// turn does not carry its tool restriction into this one — the
+	// model re-invokes the skill when it needs it again.
+	a.clearActiveSkill()
+
 	// Progress-event bookkeeping. Everything below this point is a
 	// real turn, so every return from here on emits exactly one
 	// TurnFinished (guarded by turnFinished); the early validation
@@ -401,25 +452,84 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		// for delegated work — the child reports one total).
 		// takeSubagentUsage also resets the accumulator, so a
 		// second finishTurn (impossible by the guard above)
-		// could never double-count.
-		usage.TotalTokens += a.takeSubagentUsage()
+		// could never double-count. The subagent total is
+		// carried on the event separately (SubagentTokens) so
+		// the footer can break it out: the turn's total
+		// honestly includes delegated work, and the reader can
+		// see how much of it was delegated.
+		subagentTokens := a.takeSubagentUsage()
+		usage.TotalTokens += subagentTokens
 		a.emit(ProgressEvent{
-			Kind:         EventTurnFinished,
-			Step:         lastStep,
-			Duration:     time.Since(turnStart),
-			Err:          err,
-			Usage:        usage,
-			MemoriesUsed: memoriesUsed,
+			Kind:           EventTurnFinished,
+			Step:           lastStep,
+			Duration:       time.Since(turnStart),
+			Err:            err,
+			Usage:          usage,
+			MemoriesUsed:   memoriesUsed,
+			SubagentTokens: subagentTokens,
 		})
+		// Stop hooks (rc9, audit P0 #6): fire once per turn, after
+		// the outcome is known. They observe only — a Stop hook
+		// can never prevent the turn ending or change its result
+		// (the bus logs a loud warning when one tries, and the
+		// turn ends anyway). A warning here is logged, never fed
+		// to the model. This runs inside finishTurn, so it fires
+		// on every exit path exactly once (the turnFinished
+		// guard), including max-steps and provider errors.
+		if bus := a.hooks(); bus != nil {
+			reason := "completed"
+			if err != nil {
+				var maxErr *MaxStepsError
+				if errors.As(err, &maxErr) {
+					reason = "max_steps"
+				} else {
+					reason = "error: " + err.Error()
+				}
+			}
+			if w := bus.Stop(ctx, reason); w != "" {
+				a.logf("stop hooks: %s", w)
+			}
+		}
 	}
 
 	// Build the conversation: system prompt, recent memory, user input.
+	// The full retained history is loaded first so auto-compaction
+	// can measure its pressure and summarise-before-drop BEFORE the
+	// turn runs: a turn that starts at 80% of budget must compact
+	// first, not run and then silently lose the oldest turns to
+	// the FIFO cap afterwards. The recent window fed to the model
+	// is re-read after a compaction changes history.
 	messages := []model.Message{{Role: "system", Content: systemPrompt}}
+	// Skill discovery (lazy bodies): the catalogue names skills
+	// with one-line descriptions only — never bodies. A body's
+	// text enters the context only when the model invokes that
+	// skill (see skills.go). With no skills the section is empty
+	// and the prompt stays byte-identical.
+	if section := a.skillSection(); section != "" {
+		messages[0].Content += section
+	}
 	var recent []model.Message
-	if r, err := a.memory.RecentMessages(maxRecentMessages); err != nil {
+	var allHistory []model.Message
+	if r, err := a.memory.RecentMessages(0); err != nil {
 		a.logf("memory RecentMessages failed (continuing without history): %v", err)
 	} else {
-		recent = r
+		allHistory = r
+		if a.maybeAutoCompact(ctx, allHistory) {
+			// History changed under us: re-read the recent
+			// window from the compacted store. A re-read
+			// failure keeps the pre-compaction window — the
+			// turn still runs, on slightly stale history.
+			if r2, err := a.memory.RecentMessages(0); err != nil {
+				a.logf("memory RecentMessages after auto-compact failed (using pre-compaction window): %v", err)
+			} else {
+				allHistory = r2
+			}
+		}
+		if len(allHistory) > maxRecentMessages {
+			recent = allHistory[len(allHistory)-maxRecentMessages:]
+		} else {
+			recent = allHistory
+		}
 		// Repair the window before it is sent: an earlier run that
 		// ended after storing an assistant tool-call message but
 		// before its tool result (cancelled in between, crashed,
@@ -438,9 +548,9 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 	}
 	userMsg := model.Message{Role: "user", Content: input}
 	messages = append(messages, userMsg)
-	if err := a.memory.AddMessage(userMsg); err != nil {
-		a.logf("memory AddMessage (user) failed: %v", err)
-	}
+	// recordMessage stores in memory AND appends to the wired
+	// per-session transcript (best-effort on the transcript leg).
+	a.recordMessage(userMsg)
 
 	// Fact-aware recall: facts and statements from older turns that
 	// the recent window no longer covers are injected into the system
@@ -505,7 +615,7 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		}
 		req := model.ChatRequest{
 			Messages:    append([]model.Message(nil), reqMessages...),
-			Tools:       a.tools.Definitions(),
+			Tools:       a.toolDefinitions(),
 			Temperature: a.cfg.Temperature,
 		}
 		var resp *model.ChatResponse
@@ -582,9 +692,7 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 			}
 			assistantMsg := model.Message{Role: "assistant", Content: resp.Message.Content}
 			messages = append(messages, assistantMsg)
-			if err := a.memory.AddMessage(assistantMsg); err != nil {
-				a.logf("memory AddMessage (assistant) failed: %v", err)
-			}
+			a.recordMessage(assistantMsg)
 			finishTurn(nil)
 			return resp.Message.Content, nil
 		}
@@ -634,9 +742,7 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 			ToolCalls: toolCalls,
 		}
 		messages = append(messages, assistantMsg)
-		if err := a.memory.AddMessage(assistantMsg); err != nil {
-			a.logf("memory AddMessage (assistant tool call) failed: %v", err)
-		}
+		a.recordMessage(assistantMsg)
 
 		for _, tc := range toolCalls {
 			if err := ctx.Err(); err != nil {
@@ -664,9 +770,7 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 			a.emit(ProgressEvent{Kind: EventToolCallFinished, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Duration: time.Since(toolStart), Err: toolErr, Usage: usage})
 			toolMsg := model.Message{Role: "tool", Content: result, ToolCallID: tc.ID}
 			messages = append(messages, toolMsg)
-			if err := a.memory.AddMessage(toolMsg); err != nil {
-				a.logf("memory AddMessage (tool result) failed: %v", err)
-			}
+			a.recordMessage(toolMsg)
 		}
 	}
 
@@ -1001,6 +1105,42 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 			return fmt.Sprintf("Error: permission denied for tool %q: %s", tc.Name, reason)
 		}
 	}
+	// Hook bus, PreToolUse (rc9, audit P0 #6): consulted after the
+	// gate has allowed the call and before anything executes. A
+	// block is returned as error text for the model — exactly as a
+	// gate denial — and the tool NEVER runs: the call's side
+	// effects do not happen. A hook failure fails closed inside
+	// PreToolUse (the bus blocks), so a hook that could not speak
+	// never lets a call through unseen. A non-blocking warning is
+	// logged, never fed to the model. The bus is nil-safe, so
+	// agents without hooks pay nothing here.
+	if bus := a.hooks(); bus != nil {
+		if out := bus.PreToolUse(ctx, tc.Name, args); out.Blocked {
+			a.logf("tool %q blocked by hook: %s", tc.Name, out.Reason)
+			return fmt.Sprintf("Error: tool %q blocked by hook: %s", tc.Name, out.Reason)
+		} else if out.Warning != "" {
+			a.logf("tool %q pre-tool hooks: %s", tc.Name, out.Warning)
+		}
+	}
+	// Skill invocation is handled here, not in the registry: the
+	// registry's skill tool is stateless (it just loads the body),
+	// while activation — which skill is active, which tools it
+	// allows — is agent-loop state (see executeSkillTool).
+	if tc.Name == "skill" {
+		result := a.executeSkillTool(ctx, tc, args)
+		a.postToolHooks(ctx, tc.Name, args, result)
+		return result
+	}
+	// Skill allowed-tool enforcement: while a skill with a tool
+	// restriction is active, any other tool is refused here — after
+	// the gate has decided, before the registry (and its schema
+	// validation) is reached — so a call planned before the skill
+	// was invoked cannot slip through, and a refused call never
+	// reaches tool code or the denylist.
+	if allowed, reason := a.skillAllows(tc.Name); !allowed {
+		a.logf("tool %q blocked by active skill: %s", tc.Name, reason)
+		return fmt.Sprintf("Error: tool %q is not allowed while a skill is active: %s. End the skill with the skill tool (action \"end\") or use an allowed tool.", tc.Name, reason)
+	}
 	// The registry enforces the security denylist for shell tools; log
 	// denials here so they are visible in the agent log.
 	result, err := a.tools.Execute(ctx, tc.Name, args)
@@ -1011,9 +1151,25 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 		} else {
 			a.logf("tool %q failed: %v", tc.Name, err)
 		}
-		return fmt.Sprintf("Error executing tool %q: %v", tc.Name, err)
+		result = fmt.Sprintf("Error executing tool %q: %v", tc.Name, err)
+		a.postToolHooks(ctx, tc.Name, args, result)
+		return result
 	}
+	a.postToolHooks(ctx, tc.Name, args, result)
 	return result
+}
+
+// postToolHooks runs the PostToolUse hooks for a completed tool call
+// (result is the text the model will see, error text included).
+// PostToolUse hooks observe only: they can never block or change the
+// result, and their warnings are logged, never fed to the model.
+// A nil bus (or a bus with no PostToolUse hooks) is a no-op.
+func (a *Agent) postToolHooks(ctx context.Context, name string, args json.RawMessage, result string) {
+	if bus := a.hooks(); bus != nil {
+		if w := bus.PostToolUse(ctx, name, args, result); w != "" {
+			a.logf("tool %q post-tool hooks: %s", name, w)
+		}
+	}
 }
 
 // parseToolArguments validates a tool call's argument string and returns

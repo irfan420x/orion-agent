@@ -1,4 +1,4 @@
-# Orion Architecture (v0.2.0-rc8)
+# Orion Architecture (v0.2.0-rc9)
 
 ```
 cmd/orion      CLI: run, chat, config, status, tools, memory, skills,
@@ -16,8 +16,10 @@ internal/core    Agent loop: system prompt + recent memory -> provider
                -> tool calls -> tool results -> reply. Max steps,
                per-iteration timeouts, ctx cancellation, streaming
                final turn, memory recording, graceful shutdown.
-internal/tools   Registry + 14 tools (shell, files, web, calculator,
-               datetime, process list, subagent). Shell delegates denylist
+internal/tools   Registry + 22 tools (shell, files, web, calculator,
+               datetime, process list, skill, grep, glob, todo/task,
+               subagent; MCP tools register dynamically). Central
+               schema validation in Registry.Execute. Shell delegates denylist
                checks to internal/security.
 internal/memory  FileStore: JSON file, atomic writes, facts + 200-msg
                conversation history, case-insensitive fact search.

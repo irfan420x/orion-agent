@@ -57,6 +57,7 @@ import (
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/hooks"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/subagent"
@@ -120,10 +121,17 @@ func newChildRegistry(cfg *config.Config) (*tools.Registry, error) {
 // in a FRESH child Agent: same provider (verified concurrent-safe,
 // see the package note above), a child registry without subagent
 // tools, an ephemeral in-memory store, the same config (timeouts and
-// caps), the read-only typed-memory view, and no session appender.
+// caps), the read-only typed-memory view, the parent's hook bus
+// (a PreToolUse hook can block a child's tool call exactly as it
+// blocks the parent's), and no session appender.
+// MCP tools and the skill tool are deliberately NOT in the child
+// registry: children run without the interactive permission gate,
+// and MCP tools are ClassNetwork — adding ungated network tools to
+// children would widen the hole the gate closes. Revisit when
+// children get a non-interactive gate.
 // The executor is safe to call concurrently — every spawn builds its
 // own agent, registry and store, sharing only the provider.
-func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger) subagent.Executor {
+func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger, hooksBus *hooks.Bus) subagent.Executor {
 	return func(ctx context.Context, brief string) (string, subagent.Usage, error) {
 		childReg, err := newChildRegistry(cfg)
 		if err != nil {
@@ -137,6 +145,11 @@ func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *
 		if logger != nil {
 			child.SetLogger(logger)
 		}
+		// Hooks: the child gets the parent's bus (nil-safe), so a
+		// PreToolUse hook can block a child's tool call. The bus
+		// is non-interactive and fail-closed, so it cannot stall
+		// a child turn waiting on a user.
+		child.SetHooks(hooksBus)
 		if typedSrc != nil {
 			child.SetTypedMemorySource(&readOnlyTypedSource{src: typedSrc})
 		}

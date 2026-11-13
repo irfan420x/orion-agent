@@ -2,6 +2,9 @@ package messaging
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -330,5 +333,87 @@ func TestSendMessageWithKeyboard(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no keyboard with the approval buttons reached the server: %v", fake.keyboards)
+	}
+}
+
+// TestGetUpdatesRealTelegramCallbackPayload: the live rc8 incident
+// (Irfan tapped Approve, gate timed out, zero callback lines) could
+// in principle be a real-Telegram JSON shape the structs mishandle
+// (extra fields, nested reply_markup, chat_instance). Feed a
+// realistic raw Bot API payload — verbatim, exactly as Telegram
+// sends it, with all the fields a real callback_query carries —
+// through the real GetUpdates and assert the callback query parses
+// with the right data, sender and message. Unknown fields must be
+// ignored; known fields must land in the right struct fields.
+func TestGetUpdatesRealTelegramCallbackPayload(t *testing.T) {
+	raw := `{"ok":true,"result":[{"update_id":987654321,"callback_query":{"id":"1122334455667788990","from":{"id":7429947930,"is_bot":false,"first_name":"Irfan","username":"irfan420x","language_code":"en"},"message":{"message_id":456,"from":{"id":123456789,"is_bot":true,"first_name":"ORION","username":"Magi420x_bot"},"chat":{"id":7429947930,"first_name":"Irfan","type":"private"},"date":1763013360,"text":"⚠️ Approval needed\n\nshell_exec: echo hi","reply_markup":{"inline_keyboard":[[{"text":"✅ Approve once","callback_data":"perm:approve:abcdef0123456789"},{"text":"❌ Deny","callback_data":"perm:deny:abcdef0123456789"}]]}},"chat_instance":"-9876543210987654321","data":"perm:approve:abcdef0123456789"}}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, raw)
+	}))
+	defer srv.Close()
+	gw, err := NewTelegramGateway(testToken, WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates, err := gw.GetUpdates(context.Background())
+	if err != nil {
+		t.Fatalf("GetUpdates on a realistic Telegram payload: %v", err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(updates))
+	}
+	q := updates[0].CallbackQuery
+	if q == nil {
+		t.Fatal("CallbackQuery is nil for a real callback_query payload")
+	}
+	if q.ID != "1122334455667788990" {
+		t.Errorf("callback id = %q, want %q", q.ID, "1122334455667788990")
+	}
+	if q.Data != "perm:approve:abcdef0123456789" {
+		t.Errorf("callback data = %q, want the perm:approve payload", q.Data)
+	}
+	if q.From == nil || q.From.ID != 7429947930 {
+		t.Errorf("callback from = %v, want user 7429947930", q.From)
+	}
+	if q.Message == nil || q.Message.MessageID != 456 || q.Message.Chat.ID != 7429947930 {
+		t.Errorf("callback message = %+v, want message 456 in chat 7429947930", q.Message)
+	}
+	dec, id, ok := ParsePermissionCallback(q.Data)
+	if !ok || dec != "approve" || id != "abcdef0123456789" {
+		t.Errorf("ParsePermissionCallback(%q) = (%q, %q, %v), want (approve, abcdef0123456789, true)", q.Data, dec, id, ok)
+	}
+	if got := gw.Offset(); got != 987654322 {
+		t.Errorf("gateway offset after the callback update = %d, want 987654322 (maxID+1)", got)
+	}
+}
+
+// TestEditMessageTextMarkupRemovesKeyboard: an expired approval card
+// must lose its buttons (the rc8 incident: a dead card with live
+// buttons looks exactly like a broken button). EditMessageTextMarkup
+// with an empty InlineKeyboardMarkup sends reply_markup with an
+// empty inline_keyboard, which is Telegram's way to remove the
+// keyboard.
+func TestEditMessageTextMarkupRemovesKeyboard(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	}))
+	defer srv.Close()
+	gw, err := NewTelegramGateway(testToken, WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.EditMessageTextMarkup(context.Background(), 77, 9, "expired", InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+		t.Fatalf("EditMessageTextMarkup: %v", err)
+	}
+	if !strings.Contains(gotBody, `"reply_markup":{"inline_keyboard":[]}`) {
+		t.Errorf("edit body = %s, want reply_markup with an empty inline_keyboard", gotBody)
+	}
+	if !strings.Contains(gotBody, `"text":"expired"`) {
+		t.Errorf("edit body = %s, want the expiry text", gotBody)
 	}
 }

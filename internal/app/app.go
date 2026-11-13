@@ -17,10 +17,13 @@ import (
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/hooks"
+	"github.com/irfan/orion/internal/mcp"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
+	"github.com/irfan/orion/internal/session"
 	"github.com/irfan/orion/internal/skills"
 	"github.com/irfan/orion/internal/subagent"
 	"github.com/irfan/orion/internal/tools"
@@ -40,6 +43,16 @@ type App struct {
 	// config.PerChatDailyTokenBudget in Build; nil for hand-built
 	// Apps, which are then unbudgeted.
 	Budget *budget.Budget
+	// Hooks is the hook bus (rc9, audit P0 #6), loaded from
+	// <dataDir>/hooks in Build; nil for hand-built Apps, which run
+	// without hooks. The bus is shared by the global agent and
+	// every per-chat agent (see chats.go).
+	Hooks *hooks.Bus
+	// MCP is the MCP client manager (rc9, audit P0 #7), started
+	// from <dataDir>/mcp.json in Build; nil when no MCP servers
+	// are configured (or for hand-built Apps). Its tools live on
+	// the shared registry, so every agent sees them.
+	MCP    *mcp.Manager
 	Logger *log.Logger
 	// StartedAt is when the app was built (zero for a hand-built App);
 	// StatusLine reports uptime from it and omits the line when zero.
@@ -77,6 +90,12 @@ type App struct {
 	// CLI never installs one). gateMu guards it.
 	gate   *permissions.Gate
 	gateMu sync.RWMutex
+	// globalTranscript/globalSessionID are the CLI/global live
+	// session transcript and id (see sessions.go); nil/"" until
+	// wireGlobalTranscript runs in Build, or when the transcript
+	// could not open (the CLI then runs on memory only).
+	globalTranscript *session.Transcript
+	globalSessionID  string
 }
 
 // Build loads config (default path when path == "") and wires every module.
@@ -104,6 +123,14 @@ func Build(path string) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Point the planning store at the data dir so todo/task state
+	// persists per chat (rc9 B2 gap: without this the store stays
+	// in-memory and planning state is lost on restart).
+	if ps := registry.PlanningStore(); ps != nil {
+		if err := ps.SetDataDir(cfg.DataDir); err != nil {
+			return nil, fmt.Errorf("app: planning store: %w", err)
+		}
+	}
 	mem, err := memory.NewFileStore(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("app: memory: %w", err)
@@ -114,6 +141,32 @@ func Build(path string) (*App, error) {
 		return nil, fmt.Errorf("app: agent: %w", err)
 	}
 	agent.SetLogger(logger)
+
+	// Hook bus (rc9, audit P0 #6): loads executables from
+	// <dataDir>/hooks ONLY — never from the repo working directory.
+	// A missing hooks dir means "no hooks", not an error; bad hooks
+	// are skipped and logged, never fatal. The bus is installed on
+	// the global agent here and on every per-chat agent at build
+	// time (see chats.go), and re-asserted in Handle so a provider
+	// switch (which rebuilds the agent) cannot silently drop it.
+	hookBus := hooks.NewBus(cfg.DataDir)
+	for _, err := range hookBus.LoadErrors() {
+		logger.Printf("hooks: %v", err)
+	}
+	if hookBus.HasHooks() {
+		logger.Printf("hooks: %d PreToolUse, %d PostToolUse, %d Stop hook(s) loaded",
+			hookBus.Count(hooks.EventPreToolUse), hookBus.Count(hooks.EventPostToolUse), hookBus.Count(hooks.EventStop))
+	}
+	agent.SetHooks(hookBus)
+
+	// MCP client (rc9, audit P0 #7): starts the servers configured
+	// in <dataDir>/mcp.json ONLY and registers their tools
+	// (mcp__<server>__<tool>) on the registry, so the permission
+	// gate, redaction and caps apply to them like any built-in
+	// tool. See wireMCP: a missing config means "no MCP
+	// configured", and a bad config or a failing server never
+	// fails the build.
+	mcpMgr := wireMCP(cfg.DataDir, registry, logger)
 
 	// Memory v2: typed memories (with a one-time migration of the
 	// JSON facts), session-memory extraction, and the layers the
@@ -133,7 +186,7 @@ func Build(path string) (*App, error) {
 	// parent turn) and pollutes the parent's history. The child
 	// shares only the provider (concurrent-safe) and the typed
 	// memories (read-only view).
-	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(provider, cfg, typedAdapter, logger))
+	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus))
 
 	// Model-visible subagent tools, registered on the PARENT
 	// registry only (children get a registry without them, so no
@@ -164,18 +217,19 @@ func Build(path string) (*App, error) {
 		}
 	}
 
-	skillReg := skills.NewRegistry()
-	skillDir := filepath.Join(cfg.DataDir, "skills")
-	if _, err := os.Stat(skillDir); err == nil {
-		if _, err := skillReg.LoadDir(skillDir); err != nil {
-			logger.Printf("skills: some skills failed to load: %v", err)
-		}
-	} else if !os.IsNotExist(err) {
-		// A stat failure other than "missing" (e.g. permission denied)
-		// used to be swallowed silently, leaving skills unloaded with
-		// no trace; log it instead of pretending the dir is absent.
-		logger.Printf("skills: cannot stat skills dir %s: %v", skillDir, err)
+	skillReg := loadSkills(cfg.DataDir, logger)
+	// The skill tool is the model's invocation path for skills:
+	// registered on the parent registry (children get a registry
+	// without it — see newChildRegistry — so a subagent cannot
+	// invoke skills, only the parent turn can). Registering after
+	// agent creation is safe: the agent loop reads definitions
+	// fresh on every step.
+	if skillTool, err := tools.NewSkillTool(skillReg); err != nil {
+		return nil, fmt.Errorf("app: skill tool: %w", err)
+	} else if err := registry.Register(skillTool); err != nil {
+		return nil, fmt.Errorf("app: register skill tool: %w", err)
 	}
+	agent.SetSkills(skillReg)
 
 	var audit *security.AuditLog
 	audit, err = security.NewAuditLog(filepath.Join(cfg.DataDir, "audit.jsonl"))
@@ -188,9 +242,16 @@ func Build(path string) (*App, error) {
 		Config: cfg, Provider: provider, Tools: registry, Memory: mem,
 		Agent: agent, Subagents: mgr, Skills: skillReg, Audit: audit, Logger: logger,
 		Budget:     budget.New(cfg.PerChatDailyTokenBudget),
+		Hooks:      hookBus,
+		MCP:        mcpMgr,
 		StartedAt:  time.Now(),
 		typedStore: typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
 	}
+	// Per-session transcript (audit P0 #4): the CLI/global agent
+	// records every stored turn into the live session transcript
+	// under <DataDir>/sessions/. Best-effort — see
+	// wireGlobalTranscript.
+	app.wireGlobalTranscript()
 	return app, nil
 }
 
@@ -205,6 +266,10 @@ type Local struct {
 	Tools  *tools.Registry
 	Memory memory.Store
 	Skills *skills.Registry
+	// MCP is the MCP client manager started from <dataDir>/mcp.json
+	// (rc9); nil when no MCP servers are configured. Closed by
+	// Local.Close.
+	MCP *mcp.Manager
 }
 
 // BuildLocal loads config (default path when path == "") and wires the
@@ -222,29 +287,105 @@ func BuildLocal(path string) (*Local, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Planning store persistence, as in Build: without this the
+	// CLI's todo/task state stays in-memory and is lost on exit.
+	if ps := registry.PlanningStore(); ps != nil {
+		if err := ps.SetDataDir(cfg.DataDir); err != nil {
+			return nil, fmt.Errorf("app: planning store: %w", err)
+		}
+	}
 	mem, err := memory.NewFileStore(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("app: memory: %w", err)
 	}
-	skillReg := skills.NewRegistry()
-	skillDir := filepath.Join(cfg.DataDir, "skills")
+	skillReg := loadSkills(cfg.DataDir, logger)
+	if skillTool, err := tools.NewSkillTool(skillReg); err != nil {
+		return nil, fmt.Errorf("app: skill tool: %w", err)
+	} else if err := registry.Register(skillTool); err != nil {
+		return nil, fmt.Errorf("app: register skill tool: %w", err)
+	}
+	// MCP tools, so `orion tools` lists them: the local commands
+	// never call a model, so the servers are started for listing
+	// only. The manager is retained on the Local and closed by
+	// Local.Close, so no server process is left behind.
+	mcpMgr := wireMCP(cfg.DataDir, registry, logger)
+	return &Local{Config: cfg, Tools: registry, Memory: mem, Skills: skillReg, MCP: mcpMgr}, nil
+}
+
+// wireMCP starts the MCP servers configured in <dataDir>/mcp.json
+// and registers their tools on registry. It is shared by Build (the
+// manager is retained on the App and closed at shutdown) and
+// BuildLocal (listing only). It never returns an error and never
+// fails the caller: a missing config means "no MCP configured"
+// (nil manager), a malformed config is logged loudly and MCP stays
+// off, a server that fails to start or list is recorded in
+// StartErrors and skipped, and a registration failure is logged
+// with the tools that did register kept. A bad mcp.json must never
+// brick the daemon or a local command.
+func wireMCP(dataDir string, registry *tools.Registry, logger *log.Logger) *mcp.Manager {
+	m, err := mcp.StartManager(dataDir, logger)
+	if err != nil {
+		logger.Printf("mcp: disabled (%v)", err)
+		return nil
+	}
+	if m == nil {
+		return nil
+	}
+	for name, err := range m.StartErrors() {
+		logger.Printf("mcp: server %q failed to start: %v", name, err)
+	}
+	if tools := m.Tools(); len(tools) > 0 {
+		if err := registry.RegisterAll(tools); err != nil {
+			// A duplicate name here is near-impossible (the
+			// mcp__ prefix is distinct from built-ins and the
+			// manager dedupes); log it and keep the tools that
+			// did register rather than failing the build.
+			logger.Printf("mcp: some tools failed to register: %v", err)
+		}
+	}
+	return m
+}
+
+// loadSkills loads skills from the user data dir ONLY
+// (<dataDir>/skills) — never from the repo working directory, so a
+// checked-out project can never smuggle skill instructions into the
+// agent. A missing dir means "no skills", not an error. A partially
+// broken dir is logged, not fatal: the skills that parsed still
+// load. A stat failure other than "missing" (e.g. permission denied)
+// is logged instead of silently skipped.
+func loadSkills(dataDir string, logger *log.Logger) *skills.Registry {
+	reg := skills.NewRegistry()
+	skillDir := filepath.Join(dataDir, "skills")
 	if _, err := os.Stat(skillDir); err == nil {
-		if _, err := skillReg.LoadDir(skillDir); err != nil {
+		if _, err := reg.LoadDir(skillDir); err != nil {
 			logger.Printf("skills: some skills failed to load: %v", err)
 		}
 	} else if !os.IsNotExist(err) {
 		logger.Printf("skills: cannot stat skills dir %s: %v", skillDir, err)
 	}
-	return &Local{Config: cfg, Tools: registry, Memory: mem, Skills: skillReg}, nil
+	return reg
 }
 
-// Close releases the local state's memory store. It is safe on a nil
-// or partially-built Local.
+// Close releases the local state's memory store and stops any MCP
+// servers started by BuildLocal. It is safe on a nil or
+// partially-built Local.
 func (l *Local) Close() error {
-	if l == nil || l.Memory == nil {
+	if l == nil {
 		return nil
 	}
-	return l.Memory.Close()
+	var errs []error
+	if l.MCP != nil {
+		if err := l.MCP.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if l.Memory == nil {
+		return errors.Join(errs...)
+	}
+	if err := l.Memory.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // truncateRunes shortens s to at most n runes, appending "..." when it
@@ -270,6 +411,16 @@ func (a *App) Handle(ctx context.Context, input string) (string, error) {
 	if a == nil || a.agent() == nil {
 		return "", errors.New("app: Handle called on uninitialised App (nil Agent)")
 	}
+	// Re-assert the skill registry on the current agent: a provider
+	// switch rebuilds the agent (see SwitchProvider), and the
+	// rebuild path must not silently drop skill discovery. This is
+	// idempotent — SetSkills just installs the pointer.
+	a.agent().SetSkills(a.Skills)
+	// Same for the hook bus: a provider switch rebuilds the agent
+	// (see SwitchProvider in commands.go, which does not re-apply
+	// hooks itself), so re-assert it here on every turn — a switch
+	// must never silently drop the hook policy.
+	a.agent().SetHooks(a.Hooks)
 	reply, err := a.agent().Run(ctx, input)
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
@@ -280,8 +431,9 @@ func (a *App) Handle(ctx context.Context, input string) (string, error) {
 // Close shuts the app down: subagents first, then the per-chat
 // agents (P1-O3 — each saves its chat store and closes only that
 // store), then the global agent (which saves and closes the shared
-// memory). It is safe on a zero or partially-built App: nil
-// subagents/agent are skipped instead of panicking.
+// memory), then the MCP servers. It is safe on a zero or
+// partially-built App: nil subagents/agent are skipped instead of
+// panicking.
 func (a *App) Close() error {
 	if a == nil {
 		return nil
@@ -293,11 +445,18 @@ func (a *App) Close() error {
 	if err := a.closeChatAgents(); err != nil {
 		errs = append(errs, err)
 	}
-	if a.Agent == nil {
-		return errors.Join(errs...)
+	if a.Agent != nil {
+		if err := a.Agent.Shutdown(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if err := a.Agent.Shutdown(); err != nil {
-		errs = append(errs, err)
+	// MCP servers last: a turn in flight (or a subagent) may still
+	// be calling one while the agents shut down, and killing the
+	// servers first would turn those calls into errors.
+	if a.MCP != nil {
+		if err := a.MCP.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

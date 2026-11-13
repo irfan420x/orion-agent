@@ -305,3 +305,44 @@ func TestFormatFooter(t *testing.T) {
 		t.Fatalf("FormatFooter = %q, want 1,234,567 tokens", got)
 	}
 }
+
+// TestTerminalCardCompactionEvents verifies the warning band reaches
+// the user on the card: a compaction warning renders as an entry, a
+// tripped breaker (warning with an error) renders failed, and a
+// successful auto-compaction renders its own entry — all without any
+// tool call, so the card is created for them.
+func TestTerminalCardCompactionEvents(t *testing.T) {
+	card := &TerminalCard{}
+	card.Add(core.ProgressEvent{Kind: core.EventCompactionWarning})
+	if card.IsEmpty() {
+		t.Fatalf("warning event should create a card entry")
+	}
+	rendered := card.Render()
+	if !strings.Contains(rendered, "🗜") || !strings.Contains(rendered, "auto-compaction approaching") {
+		t.Errorf("warning render missing the compaction entry:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "failed") {
+		t.Errorf("plain warning must not render failed:\n%s", rendered)
+	}
+
+	card.Add(core.ProgressEvent{Kind: core.EventAutoCompacted})
+	rendered = card.Render()
+	if !strings.Contains(rendered, "summarised before being dropped") {
+		t.Errorf("auto-compacted render missing its entry:\n%s", rendered)
+	}
+}
+
+func TestTerminalCardCompactionBreakerTripped(t *testing.T) {
+	card := &TerminalCard{}
+	card.Add(core.ProgressEvent{
+		Kind: core.EventCompactionWarning,
+		Err:  fmt.Errorf("core: auto-compaction circuit breaker tripped after repeated failures; run /compress"),
+	})
+	rendered := card.Render()
+	if !strings.Contains(rendered, "circuit breaker tripped") || !strings.Contains(rendered, "failed") {
+		t.Errorf("tripped-breaker render should name the trip and render failed:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "/compress") {
+		t.Errorf("tripped-breaker render should name the remedy:\n%s", rendered)
+	}
+}

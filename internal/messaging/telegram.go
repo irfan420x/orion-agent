@@ -876,6 +876,30 @@ func (g *TelegramGateway) EditMessageText(ctx context.Context, chatID, messageID
 	return err
 }
 
+// EditMessageTextMarkup edits messageID in chatID in place with new
+// HTML text AND a replacement inline keyboard. It is EditMessageText
+// with a reply_markup: pass an empty InlineKeyboardMarkup to REMOVE
+// the keyboard. That is what an expired approval card needs —
+// without it the dead card keeps live-looking Approve/Deny buttons,
+// and a tap on them (answered only with a transient "expired"
+// toast) looks exactly like a broken button (the rc8 incident:
+// the user tapped Approve on a card whose request had already
+// timed out). The "message is not modified" tolerance applies
+// exactly as in EditMessageText.
+func (g *TelegramGateway) EditMessageTextMarkup(ctx context.Context, chatID, messageID int64, htmlText string, markup InlineKeyboardMarkup) error {
+	_, err := g.call(ctx, "editMessageText", nil, struct {
+		ChatID      int64                `json:"chat_id"`
+		MessageID   int64                `json:"message_id"`
+		Text        string               `json:"text"`
+		ParseMode   string               `json:"parse_mode"`
+		ReplyMarkup InlineKeyboardMarkup `json:"reply_markup"`
+	}{ChatID: chatID, MessageID: messageID, Text: htmlText, ParseMode: "HTML", ReplyMarkup: markup})
+	if err != nil && strings.Contains(err.Error(), "message is not modified") {
+		return nil
+	}
+	return err
+}
+
 // BotCommand is one entry of the bot's /commands menu.
 type BotCommand struct {
 	Name        string `json:"command"`
@@ -1126,9 +1150,15 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			cardMu.Lock()
 			card.Add(ev)
 			cardMu.Unlock()
-			// Only tool-call events can change the card; other kinds
-			// (step/turn) are ignored by TerminalCard.Add anyway.
-			if ev.Kind == core.EventToolCallStarted || ev.Kind == core.EventToolCallFinished {
+			// Tool-call and compaction events can change the card;
+			// other kinds (step/turn) are ignored by
+			// TerminalCard.Add anyway. A compaction event alone
+			// creates the card: a turn that auto-compacts (or
+			// warns) with no tool calls still shows the user what
+			// happened, via the final syncCard(true) below at the
+			// latest.
+			if ev.Kind == core.EventToolCallStarted || ev.Kind == core.EventToolCallFinished ||
+				ev.Kind == core.EventCompactionWarning || ev.Kind == core.EventAutoCompacted {
 				syncCard(false)
 			}
 		}

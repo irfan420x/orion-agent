@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/hooks"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/subagent"
@@ -81,7 +84,7 @@ func TestSubagentExecutorRealChildLoop(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil)
 	out, usage, err := exec(context.Background(), "do the thing")
 	if err != nil {
 		t.Fatalf("executor: %v", err)
@@ -115,7 +118,7 @@ func TestSubagentExecutorPropagatesMaxStepsError(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(2), nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(2), nil, nil, nil)
 	out, _, err := exec(context.Background(), "loop forever")
 	if out != "" {
 		t.Fatalf("output = %q, want empty when the child errors", out)
@@ -211,7 +214,7 @@ func TestSubagentManagerEndToEndUsageAndIsolation(t *testing.T) {
 			}, nil
 		},
 	}
-	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(childProv, cfg, nil, nil))
+	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(childProv, cfg, nil, nil, nil))
 	defer mgr.Shutdown()
 
 	parentProv := &scriptedProvider{
@@ -353,5 +356,64 @@ func TestSubagentManagerEndToEndUsageAndIsolation(t *testing.T) {
 	}
 	if !strings.Contains(summary, "child-result-6x7-42") {
 		t.Fatalf("AgentsSummary missing result summary:\n%s", summary)
+	}
+}
+
+// TestRC9ChildAgentGetsHooks: a subagent child must get the parent's
+// hook bus (rc9 D2 gap) — a PreToolUse hook that blocks the
+// calculator must prevent the child's tool call exactly as it would
+// the parent's. The child still answers on the next step.
+func TestRC9ChildAgentGetsHooks(t *testing.T) {
+	dir := t.TempDir()
+	hookDir := filepath.Join(dir, "hooks", string(hooks.EventPreToolUse))
+	if err := os.MkdirAll(hookDir, 0o700); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+	const blockHook = "#!/bin/sh\necho '{\"decision\":\"block\",\"reason\":\"child cannot calc\"}'; exit 2\n"
+	if err := os.WriteFile(filepath.Join(hookDir, "block.sh"), []byte(blockHook), 0o700); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	bus := hooks.NewBus(dir)
+	var secondReq *model.ChatRequest
+	childProv := &scriptedProvider{
+		name: "child",
+		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
+			if call == 1 {
+				return &model.ChatResponse{
+					Message: model.Message{
+						Role:      "assistant",
+						ToolCalls: []model.ToolCall{{ID: "c1", Name: "calculator", Arguments: `{"expression":"1+1"}`}},
+					},
+					FinishReason: "tool_calls",
+				}, nil
+			}
+			cp := req
+			secondReq = &cp
+			return &model.ChatResponse{
+				Message:      model.Message{Role: "assistant", Content: "child-answer"},
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, bus)
+	out, _, err := exec(context.Background(), "compute 1+1")
+	if err != nil {
+		t.Fatalf("executor: %v", err)
+	}
+	if out != "child-answer" {
+		t.Fatalf("out = %q, want %q (the loop must continue after a hook block)", out, "child-answer")
+	}
+	if secondReq == nil {
+		t.Fatal("provider was never called a second time (loop did not continue after the hook block)")
+	}
+	raw, err := json.Marshal(secondReq)
+	if err != nil {
+		t.Fatalf("marshal second request: %v", err)
+	}
+	if !strings.Contains(string(raw), "blocked by hook") {
+		t.Errorf("second request does not mention the hook block: the child's hooks bus is not installed")
+	}
+	if strings.Contains(string(raw), "1+1 = 2") {
+		t.Errorf("second request contains calculator output %q: the hook did not block the child's tool call", "1+1 = 2")
 	}
 }
