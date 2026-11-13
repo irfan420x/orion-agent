@@ -176,7 +176,7 @@ sandbox unavailable.
 ### Config
 
 ```json
-{ "sandbox": { "enabled": true, "root": "~/.orion/sandbox", "allow_network": false } }
+{ "sandbox": { "enabled": true, "root": "~/.orion/sandbox", "allow_network": false, "allow_without_seccomp": false } }
 ```
 
 Env overrides: `ORION_SANDBOX=on`, `ORION_SANDBOX_ROOT=<path>`.
@@ -204,7 +204,21 @@ between runs; `/tmp` does not.
   unsandboxed; only an explicit
   `sandbox.allow_unsandboxed_fallback=true` restores the old
   warn-and-run behaviour (warning logged, result marked
-  `[warning: sandbox ...]`).
+  `[warning: sandbox ...]`). The same fail-closed rule covers a
+  missing seccomp filter: when the sandbox is enabled and the
+  filter is not disabled but no usable `orion-seccomp` launcher
+  can be found (or the launcher probe/staging fails), the command
+  is REFUSED unless the operator explicitly opted into unfiltered
+  runs with `sandbox.allow_without_seccomp=true` (Audit 3,
+  F-A3-1). The two opt-ins govern different degradations and
+  neither implies the other: the fallback opt-in covers a sandbox
+  that cannot be established at all, the filter opt-in covers
+  "sandboxed without syscall filtering" — a missing filter is
+  refused even with the fallback opt-in set, because letting it
+  run the command fully unsandboxed would be a worse degradation
+  than sandboxed-without-filter. An opted-in unfiltered run is
+  logged on every command, naming the opt-in, so the loss of
+  filtering is visible per command, not once per process.
 - The sandbox confines the **filesystem, network, and syscall
   surface**, not the process's own capabilities in the abstract:
   the sandboxed process is root inside its own user namespace, so
@@ -232,8 +246,11 @@ between runs; `/tmp` does not.
 - Seccomp filter: see "Seccomp filter" below. When a usable
   `orion-seccomp` launcher is installed, sandboxed commands run
   under a syscall filter (default-allow + blocklist); without it
-  they run with namespace/pivot_root containment only, and a
-  warning is logged once.
+  the command is refused (fail-closed, Audit 3 F-A3-1) unless
+  the operator opted in with `sandbox.allow_without_seccomp=true`
+  (then it runs with namespace/pivot_root containment only and
+  every degraded run is logged) or disabled the filter outright
+  with `sandbox.disable_seccomp=true`.
 
 ### Seccomp filter
 
@@ -307,10 +324,21 @@ itself and execs the target command — filters persist across
 execs through it when present. Discovery: `Config.SeccompLauncher`,
 `$ORION_SECCOMP_LAUNCHER`, `orion-seccomp` next to the running
 binary, then `PATH`. Config: `seccomp_launcher` (explicit path),
-`disable_seccomp` (opt out even when a launcher is available).
-When no usable launcher is found (or the kernel probe fails), the
-command still runs — namespaces + pivot_root only — and a warning
-is logged once (`TestSeccompFallbackWithoutLauncher`).
+`disable_seccomp` (opt out even when a launcher is available —
+a deliberate choice, never a refusal), `allow_without_seccomp`
+(opt into running WITHOUT the filter when no usable launcher
+exists; default false). When no usable launcher is found (or the
+kernel probe fails, or staging fails) and neither the opt-in nor
+the disable is set, `Prepare` refuses with an error wrapping
+`sandbox.ErrSeccompUnavailable` that names the opt-in, and
+`shell_exec` refuses the command (`denied`) — the old
+graceful-fallback behaviour (run unfiltered, warn once) is gone
+(Audit 3, F-A3-1; `TestSeccompMissingLauncherRefused`,
+`TestShellExecSandboxRefusesWithoutSeccompLauncher`). The
+availability probe (`sandbox.Available()`) is unaffected: it runs
+with `DisableSeccomp: true`, so it never logs a misleading
+"seccomp filter unavailable" warning
+(`TestPrepareWithDisabledSeccompLogsNoWarning`).
 
 Open: none — `install.sh` and the `Makefile` build and install
 `orion-seccomp` alongside `orion`/`oriond`, so in a normal install

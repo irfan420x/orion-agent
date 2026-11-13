@@ -55,8 +55,12 @@
 //     across execve, and Go's os/exec has no pre-exec hook, so the
 //     filter cannot be installed from the parent. The launcher is
 //     copied into the chroot by Prepare and exec'd by the wrapper
-//     after the chroot; if the launcher is unavailable the command
-//     still runs (graceful fallback) and a warning is logged once.
+//     after the chroot; if the launcher is unavailable and the filter
+//     is not explicitly disabled, Prepare refuses the command
+//     (fail-closed, Audit 3 F-A3-1) unless the operator explicitly
+//     opted into unfiltered runs with
+//     sandbox.allow_without_seccomp=true, in which case every
+//     degraded run is logged.
 //   - Supported architectures: amd64 and arm64, with per-arch
 //     syscall tables verified against the kernel headers
 //     (asm/unistd_64.h, asm-generic/unistd.h) and cross-checked
@@ -68,6 +72,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -470,38 +475,60 @@ func installSeccompLauncher(launcher, newRoot string) error {
 	return nil
 }
 
-var seccompWarnOnce sync.Once
-
-// warnSeccompOnce logs the fallback warning a single time per
-// process: the filter is unavailable, so sandboxed commands run
-// with namespace/chroot containment only.
-func warnSeccompOnce(reason string) {
-	seccompWarnOnce.Do(func() {
-		log.Printf("sandbox: seccomp filter unavailable (%s); sandboxed commands run without syscall filtering", reason)
-	})
-}
+// ErrSeccompUnavailable is the sentinel for a sandbox whose
+// seccomp filter is enabled (DisableSeccomp false) but cannot be
+// applied — no usable orion-seccomp launcher could be found, the
+// launcher failed its probe, or staging it into the chroot failed
+// — and AllowWithoutSeccomp is false. Prepare wraps it with the
+// concrete reason and the opt-in that would allow the run.
+// Callers use errors.Is to recognise it: a filter-absence refusal
+// is governed ONLY by AllowWithoutSeccomp, never by
+// AllowUnsandboxedFallback (see shell_exec), so the two opt-ins
+// stay independent — one buys "sandboxed without a filter", the
+// other "fully unsandboxed", and neither implies the other.
+var ErrSeccompUnavailable = errors.New("sandbox: seccomp filter unavailable")
 
 // setupSeccomp is the Prepare-time step: when the filter is enabled
 // (the default) and a usable launcher is found, stage it into the
-// chroot and report true so the wrapper execs through it. Otherwise
-// log the reason once and report false (graceful fallback: the
-// command still runs, contained by namespaces and chroot).
-func (c Config) setupSeccomp(newRoot string) bool {
+// chroot and return nil, so the wrapper execs through it. When the
+// filter is explicitly disabled (DisableSeccomp), return nil
+// without doing anything: disabling is a deliberate operator
+// choice, never a refusal.
+//
+// When the filter is enabled but cannot be applied — no launcher
+// found, the launcher probe fails, or staging fails — the outcome
+// depends on AllowWithoutSeccomp (fail-closed, Audit 3 F-A3-1):
+//
+//   - false (default): return an error wrapping
+//     ErrSeccompUnavailable, naming the reason and the opt-in.
+//     Prepare propagates it and the command is refused.
+//   - true: return nil, but log the degraded run CLEARLY on every
+//     such command — a once-per-process warning is not enough, an
+//     operator reading the log must see each unfiltered run.
+func (c Config) setupSeccomp(newRoot string) error {
 	if c.DisableSeccomp {
-		return false
+		return nil
 	}
 	launcher := c.findSeccompLauncher()
 	if launcher == "" {
-		warnSeccompOnce("no orion-seccomp launcher binary found; install it next to the orion binary to enable syscall filtering (see SECURITY.md)")
-		return false
+		return c.seccompUnavailable("no orion-seccomp launcher binary found; install it next to the orion binary to enable syscall filtering (see SECURITY.md)")
 	}
 	if err := probeSeccompLauncher(launcher); err != nil {
-		warnSeccompOnce(fmt.Sprintf("launcher %q unusable: %v", launcher, err))
-		return false
+		return c.seccompUnavailable(fmt.Sprintf("launcher %q unusable: %v", launcher, err))
 	}
 	if err := installSeccompLauncher(launcher, newRoot); err != nil {
-		warnSeccompOnce(fmt.Sprintf("could not stage launcher: %v", err))
-		return false
+		return c.seccompUnavailable(fmt.Sprintf("could not stage launcher: %v", err))
 	}
-	return true
+	return nil
+}
+
+// seccompUnavailable is the shared tail of setupSeccomp: log the
+// degraded run when the operator opted into it, else refuse with
+// an error naming the reason and the opt-in.
+func (c Config) seccompUnavailable(reason string) error {
+	if c.AllowWithoutSeccomp {
+		log.Printf("sandbox: seccomp filter unavailable (%s); running sandboxed command WITHOUT syscall filtering (sandbox.allow_without_seccomp=true)", reason)
+		return nil
+	}
+	return fmt.Errorf("%w: %s; refusing to run without syscall filtering (set sandbox.allow_without_seccomp=true to allow)", ErrSeccompUnavailable, reason)
 }

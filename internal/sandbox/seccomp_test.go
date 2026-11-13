@@ -2,7 +2,9 @@ package sandbox
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -586,22 +588,118 @@ func TestSeccompControlWithoutFilter(t *testing.T) {
 	}
 }
 
-// TestSeccompFallbackWithoutLauncher proves the graceful fallback:
-// with no launcher discoverable anywhere, Prepare still succeeds
-// and the command runs (namespaces + chroot only). The environment
-// is made hermetic for the lookup (empty ORION_SECCOMP_LAUNCHER,
-// a PATH with no orion-seccomp in it).
-func TestSeccompFallbackWithoutLauncher(t *testing.T) {
-	requireSandbox(t)
+// captureLog swaps the standard logger's output for buf for the
+// duration of the test, so a test can assert about what setup was
+// logged. Tests in this package run sequentially (no t.Parallel),
+// so swapping the process-global logger is safe here.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	old := log.Default().Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(old) })
+	return &buf
+}
+
+// hermeticLauncherEnv makes launcher discovery fail everywhere:
+// no explicit path, no env override, and a PATH with no
+// orion-seccomp in it. The test binary's own directory has no
+// launcher next to it either (asserted by the caller via
+// findSeccompLauncher).
+func hermeticLauncherEnv(t *testing.T) {
+	t.Helper()
 	t.Setenv(SeccompLauncherEnv, "")
 	t.Setenv("PATH", t.TempDir())
+}
+
+// TestSeccompMissingLauncherRefused is the F-A3-1 fail-closed
+// proof at the sandbox layer: with the sandbox enabled, the filter
+// enabled (the default) and no launcher discoverable anywhere,
+// Prepare REFUSES — the error wraps ErrSeccompUnavailable and
+// names the allow_without_seccomp opt-in — and no command is ever
+// prepared to run.
+func TestSeccompMissingLauncherRefused(t *testing.T) {
+	requireSandbox(t)
+	hermeticLauncherEnv(t)
 	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root")}
 	if got := cfg.findSeccompLauncher(); got != "" {
 		t.Fatalf("findSeccompLauncher() = %q, want empty (no launcher discoverable)", got)
 	}
-	out, code := runSandboxedCfg(t, cfg, "echo fallback-ok; mount -t tmpfs none /tmp && echo mount-ok")
-	if code != 0 || !strings.Contains(out, "fallback-ok") || !strings.Contains(out, "mount-ok") {
-		t.Fatalf("fallback run: want the command to run unfiltered, code %d, output:\n%s", code, out)
+	cmd := exec.Command("/bin/sh", "-c", "true")
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	err := cfg.Prepare(cmd, "true")
+	if err == nil {
+		t.Fatal("Prepare with no launcher: want refusal, got nil error")
+	}
+	if !errors.Is(err, ErrSeccompUnavailable) {
+		t.Fatalf("Prepare error %v: want it to wrap ErrSeccompUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "allow_without_seccomp") {
+		t.Fatalf("refusal should name the opt-in, got: %v", err)
+	}
+}
+
+// TestSeccompMissingLauncherOptInRuns proves the explicit opt-in:
+// with AllowWithoutSeccomp set and no launcher discoverable, the
+// command runs with namespace/chroot containment only — a mount
+// that the filter would block succeeds, proving the run really is
+// unfiltered — and the degraded run is logged on THIS command, not
+// just once per process: the log must carry the per-command
+// warning naming the opt-in.
+func TestSeccompMissingLauncherOptInRuns(t *testing.T) {
+	requireSandbox(t)
+	hermeticLauncherEnv(t)
+	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root"), AllowWithoutSeccomp: true}
+	if got := cfg.findSeccompLauncher(); got != "" {
+		t.Fatalf("findSeccompLauncher() = %q, want empty (no launcher discoverable)", got)
+	}
+	logged := captureLog(t)
+	out, code := runSandboxedCfg(t, cfg, "echo optin-ok; mount -t tmpfs none /tmp && echo mount-ok")
+	if code != 0 || !strings.Contains(out, "optin-ok") || !strings.Contains(out, "mount-ok") {
+		t.Fatalf("opt-in run: want the command to run unfiltered, code %d, output:\n%s", code, out)
+	}
+	if !strings.Contains(logged.String(), "WITHOUT syscall filtering") || !strings.Contains(logged.String(), "allow_without_seccomp=true") {
+		t.Fatalf("opt-in run: want a per-command degraded warning in the log, got:\n%s", logged.String())
+	}
+}
+
+// TestSeccompDisabledRunsWithoutLauncher proves DisableSeccomp is
+// a deliberate choice, not a refusal: with the filter explicitly
+// disabled and no launcher anywhere, Prepare succeeds and the
+// command runs — and nothing is logged about a missing filter,
+// because there is no missing filter to warn about.
+func TestSeccompDisabledRunsWithoutLauncher(t *testing.T) {
+	requireSandbox(t)
+	hermeticLauncherEnv(t)
+	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root"), DisableSeccomp: true}
+	logged := captureLog(t)
+	out, code := runSandboxedCfg(t, cfg, "echo disabled-ok; mount -t tmpfs none /tmp && echo mount-ok")
+	if code != 0 || !strings.Contains(out, "disabled-ok") || !strings.Contains(out, "mount-ok") {
+		t.Fatalf("disabled-filter run: want the command to run unfiltered, code %d, output:\n%s", code, out)
+	}
+	if strings.Contains(logged.String(), "seccomp filter unavailable") {
+		t.Fatalf("disabled-filter run: want no missing-filter warning, log:\n%s", logged.String())
+	}
+}
+
+// TestPrepareWithDisabledSeccompLogsNoWarning is the availability
+// probe's regression test: runProbe sets DisableSeccomp: true
+// precisely so that calling Available() never logs a misleading
+// "seccomp filter unavailable" warning, even when the launcher is
+// present and working for real commands. A Prepare with the filter
+// disabled must stay silent about seccomp whatever the launcher
+// situation is.
+func TestPrepareWithDisabledSeccompLogsNoWarning(t *testing.T) {
+	hermeticLauncherEnv(t)
+	logged := captureLog(t)
+	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root"), DisableSeccomp: true}
+	cmd := exec.Command("/bin/sh", "-c", "true")
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	if err := cfg.Prepare(cmd, "true"); err != nil {
+		t.Fatalf("Prepare with disabled filter: %v", err)
+	}
+	if strings.Contains(logged.String(), "seccomp") {
+		t.Fatalf("disabled-filter Prepare: want no seccomp warning at all, log:\n%s", logged.String())
 	}
 }
 

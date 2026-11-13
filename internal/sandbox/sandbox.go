@@ -98,8 +98,11 @@
 //     changes, cross-process memory access — to the sandboxed
 //     command. It is applied by a tiny helper binary, orion-seccomp,
 //     exec'd by the wrapper after the pivot_root; when the helper is
-//     unavailable the command still runs (namespaces + pivot_root
-//     only) and a warning is logged once. Seccomp is a second layer
+//     unavailable and the filter is not explicitly disabled,
+//     Prepare refuses the command (fail-closed, Audit 3 F-A3-1)
+//     unless the operator explicitly opted into unfiltered runs
+//     with sandbox.allow_without_seccomp=true, in which case
+//     every degraded run is logged. Seccomp is a second layer
 //     on top of the namespaces, never a replacement for them.
 //
 // Limits (see SECURITY.md for the full list):
@@ -158,9 +161,34 @@ type Config struct {
 	SeccompLauncher string `json:"seccomp_launcher"`
 	// DisableSeccomp turns the seccomp filter off even when the
 	// helper is available. Default false: the filter is applied
-	// whenever a usable launcher is found, and the command runs
-	// without it (with a warning logged once) when none is.
+	// whenever a usable launcher is found. Disabling is a
+	// deliberate operator choice, so a disabled filter is never a
+	// refusal: the command runs without it and no error is
+	// returned.
 	DisableSeccomp bool `json:"disable_seccomp"`
+	// AllowWithoutSeccomp is the explicit opt-in to run sandboxed
+	// commands WITHOUT syscall filtering when the filter is
+	// enabled (DisableSeccomp false) but no usable launcher can
+	// be found, the launcher probe fails, or staging it fails.
+	// Default false: fail-closed — Prepare refuses the command
+	// instead of silently dropping the filter (Audit 3, F-A3-1).
+	// With the opt-in set, the command runs with namespace/chroot
+	// containment only, and every such degraded run is logged
+	// (see setupSeccomp), so the loss of filtering is visible
+	// per command, not once per process.
+	//
+	// This opt-in governs ONLY filter absence. It is distinct
+	// from AllowUnsandboxedFallback, which governs sandbox
+	// ESTABLISHMENT failure (mechanism unavailable or Prepare
+	// failure) and lets the command run fully unsandboxed. The
+	// two degradations are different levels — sandboxed without
+	// a filter is strictly safer than not sandboxed at all — so
+	// neither opt-in implies the other: a missing filter is
+	// refused even when AllowUnsandboxedFallback is true, and a
+	// sandbox that cannot be established at all is refused even
+	// when AllowWithoutSeccomp is true. Each opt-in buys exactly
+	// the degradation it names, and nothing else.
+	AllowWithoutSeccomp bool `json:"allow_without_seccomp"`
 	// AllowUnsandboxedFallback, when true, lets shell_exec run a
 	// command unsandboxed (with a warning) when the sandbox is
 	// enabled but cannot be established — unavailable mechanism or
@@ -556,10 +584,18 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 	}
 
 	// Seccomp filter: stage the helper binary into the chroot when
-	// one is usable. The wrapper execs through it when present;
-	// when absent (or disabled) the command runs without the
-	// filter, with a warning logged once by setupSeccomp.
-	cfg.setupSeccomp(newRoot)
+	// one is usable. The wrapper execs through it when present.
+	// When the filter is enabled but no usable launcher exists,
+	// setupSeccomp returns an error (fail-closed, Audit 3 F-A3-1)
+	// unless the operator opted into unfiltered runs with
+	// AllowWithoutSeccomp, in which case it logs the degraded run
+	// and returns nil; a disabled filter (DisableSeccomp) is a
+	// deliberate choice and never an error. Prepare propagates
+	// the error, so the command is refused rather than run
+	// without the filter the operator opted into.
+	if err := cfg.setupSeccomp(newRoot); err != nil {
+		return err
+	}
 
 	cloneFlags := uintptr(syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID)
 	if !cfg.AllowNetwork {

@@ -109,6 +109,36 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   command (`denied`, naming the opt-in) and runs nothing. The old
   behaviour is available only via the explicit
   `sandbox.allow_unsandboxed_fallback=true` opt-in (default false).
+- **Seccomp-missing fail-open closed (Audit 3, F-A3-1)**
+  (`internal/sandbox/seccomp.go`, `sandbox.go`,
+  `internal/tools/shell.go`): when the sandbox is enabled and the
+  filter is not disabled, but no usable `orion-seccomp` launcher
+  can be found (or the launcher probe/staging fails), the command
+  used to run with namespace/chroot containment but NO syscall
+  filtering, with only a once-per-process warning. It is now
+  REFUSED (`denied`, error wraps the new
+  `sandbox.ErrSeccompUnavailable` sentinel and names the opt-in)
+  and runs nothing, unless the operator explicitly opts into
+  unfiltered runs with the new `sandbox.allow_without_seccomp=true`
+  (default false) — in which case every degraded run is logged,
+  naming the opt-in. `sandbox.disable_seccomp=true` still runs
+  without the filter and is never a refusal (explicit disable is
+  a deliberate choice). The two opt-ins govern different
+  degradations and neither implies the other: a missing filter is
+  refused even with `allow_unsandboxed_fallback=true` (the
+  fallback opt-in covers a sandbox that cannot be established at
+  all, and letting it run the command fully unsandboxed would be
+  a worse degradation). The availability probe is unaffected (it
+  runs with the filter disabled, so it never logs a misleading
+  missing-filter warning). Tests:
+  `TestSeccompMissingLauncherRefused`,
+  `TestSeccompMissingLauncherOptInRuns`,
+  `TestSeccompDisabledRunsWithoutLauncher`,
+  `TestPrepareWithDisabledSeccompLogsNoWarning`,
+  `TestShellExecSandboxRefusesWithoutSeccompLauncher`,
+  `TestShellExecSandboxSeccompOptInRunsDegraded`,
+  `TestShellExecSandboxDisableSeccompRuns`,
+  `TestShellExecSandboxSeccompFallbackComposition`.
 - **Telegram empty allowlist no longer means "everyone"**
   (`internal/messaging/telegram.go`, `cmd/oriond/main.go`,
   `cmd/orion/main.go`, `internal/config`): the daemon and the
@@ -252,16 +282,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sandbox enabled **refuses** commands (fail-closed) unless
   `sandbox.allow_unsandboxed_fallback=true` is explicitly set. The seccomp filter needs the
   `orion-seccomp` binary next to `orion` (installed by
-  `install.sh`/`make build`); the arm64 filter table is
+  `install.sh`/`make build`); with the filter enabled and no usable
+  launcher, commands are **refused** unless
+  `sandbox.allow_without_seccomp=true` is explicitly set (Audit 3,
+  F-A3-1, closed in [Unreleased]); the arm64 filter table is
   header-checked but unrun on arm64 hardware.
-- **Seccomp filter is fail-open when the launcher is missing.**
-  When the sandbox is enabled and the filter is not disabled, but
-  no `orion-seccomp` binary can be found (or the probe/install
-  fails), the command runs with namespace/chroot containment but
-  NO syscall filtering, with only a once-per-process warning. The
-  next hardening phase should refuse in that case unless an
-  explicit opt-out is set (same pattern as the sandbox fail-closed
-  fix). See `AUDIT3_2026-11-13.md` §10 (F-A3-1).
 
 ## [0.1.0] — 2026-11-13
 

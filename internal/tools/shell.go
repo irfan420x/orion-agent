@@ -184,6 +184,20 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	// into isolation must not silently lose it. Only an explicit
 	// opt-in (sandbox.allow_unsandboxed_fallback=true) restores
 	// the old warn-and-run behaviour.
+	//
+	// A missing seccomp filter is a DIFFERENT degradation from a
+	// sandbox that cannot be established at all, and it is governed
+	// by a different opt-in (sandbox.allow_without_seccomp), never
+	// by allow_unsandboxed_fallback: the fallback opt-in covers
+	// sandbox-establishment failure, and letting it silently run
+	// the command fully unsandboxed when only the filter is
+	// missing would be a worse degradation than sandboxed without
+	// a filter — and would make the filter opt-in meaningless.
+	// So a filter-absence error (sandbox.ErrSeccompUnavailable)
+	// is ALWAYS refused here, even with
+	// AllowUnsandboxedFallback set; only AllowWithoutSeccomp (or
+	// DisableSeccomp) lets a filterless run happen, and that
+	// decision is made in Prepare, not here.
 	sandboxWarn := ""
 	if t.sandboxCfg.Enabled {
 		var sandboxErr error
@@ -197,6 +211,14 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 			sandboxErr = fmt.Errorf("sandbox setup failed: %w", err)
 		}
 		if sandboxErr != nil {
+			if errors.Is(sandboxErr, sandbox.ErrSeccompUnavailable) {
+				// The wrapped error already names the missing
+				// launcher, the refusal, and the opt-in; repeat
+				// none of it here.
+				msg := sandboxErr.Error()
+				log.Printf("orion: shell_exec: %s", msg)
+				return "", &ToolError{Tool: t.Name(), Kind: "denied", Err: errors.New(msg)}
+			}
 			if t.sandboxCfg.AllowUnsandboxedFallback {
 				sandboxWarn = fmt.Sprintf("%v; ran without sandbox isolation", sandboxErr)
 				log.Printf("orion: shell_exec: %s", sandboxWarn)

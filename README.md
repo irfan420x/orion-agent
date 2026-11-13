@@ -104,7 +104,7 @@ Ollama tests, which need a running Ollama server), race clean — `go test
   "timeout_seconds": 120,
   "max_tool_result_bytes": 262144,
   "max_history_tokens": 32768,
-  "sandbox": { "enabled": false, "root": "~/.orion/sandbox", "allow_network": false }
+  "sandbox": { "enabled": false, "root": "~/.orion/sandbox", "allow_network": false, "allow_without_seccomp": false }
 }
 ```
 

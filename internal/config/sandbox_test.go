@@ -64,6 +64,7 @@ func TestSandboxSaveLoadRoundTrip(t *testing.T) {
 	cfg := Default()
 	cfg.Sandbox.Enabled = true
 	cfg.Sandbox.Root = filepath.Join(dir, "sbx")
+	cfg.Sandbox.AllowWithoutSeccomp = true
 	path := filepath.Join(dir, "config.json")
 	if err := cfg.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -74,5 +75,8 @@ func TestSandboxSaveLoadRoundTrip(t *testing.T) {
 	}
 	if !loaded.Sandbox.Enabled || loaded.Sandbox.Root != filepath.Join(dir, "sbx") {
 		t.Errorf("sandbox round trip mismatch: %+v", loaded.Sandbox)
+	}
+	if !loaded.Sandbox.AllowWithoutSeccomp {
+		t.Errorf("sandbox.allow_without_seccomp did not survive the round trip: %+v", loaded.Sandbox)
 	}
 }

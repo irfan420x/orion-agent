@@ -20,9 +20,17 @@ import (
 // returns combined output and exit code. It is the test-only driver
 // for Prepare: it builds the /bin/sh -c invocation exactly the way
 // shell_exec does, then hands it to the sandbox.
+//
+// These tests exercise namespace/chroot containment, not the
+// seccomp filter (filter coverage lives in seccomp_test.go and
+// adversarial_test.go), so they opt into running without the
+// filter via AllowWithoutSeccomp: the test binary has no
+// orion-seccomp next to it, and auto-discovery would otherwise
+// refuse every run after the F-A3-1 fail-closed change. The
+// opt-in is explicit here, per test, never a silent fallback.
 func runSandboxed(t *testing.T, root string, command string, allowNetwork bool) (string, int) {
 	t.Helper()
-	cfg := Config{Enabled: true, Root: root, AllowNetwork: allowNetwork}
+	cfg := Config{Enabled: true, Root: root, AllowNetwork: allowNetwork, AllowWithoutSeccomp: true}
 	return runSandboxedCfg(t, cfg, command)
 }
 
@@ -190,7 +198,10 @@ func TestPrepareFirstRunRootNotExist(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "root") // does not exist yet
 	cmd := exec.Command("/bin/sh", "-c", "true")
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
-	if err := (Config{Enabled: true, Root: root}).Prepare(cmd, "true"); err != nil {
+	// The filter is out of scope for this test (it only proves the
+	// root tree is created); disable it so the missing launcher
+	// cannot refuse the Prepare.
+	if err := (Config{Enabled: true, Root: root, DisableSeccomp: true}).Prepare(cmd, "true"); err != nil {
 		t.Fatalf("Prepare with a not-yet-existing root: %v", err)
 	}
 	for _, d := range []string{
@@ -412,7 +423,9 @@ func procEntries(t *testing.T, out string) (pids map[string]bool, names map[stri
 func TestPrepareRequestsPIDNamespace(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "true")
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
-	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root")}
+	// Clone flags are what this test proves; the filter is out of
+	// scope, so disable it rather than depend on a launcher.
+	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root"), DisableSeccomp: true}
 	if err := cfg.Prepare(cmd, "true"); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -579,7 +592,9 @@ func TestSandboxWrapperRefusesWithoutProc(t *testing.T) {
 		t.Skip("this host allows procfs mounts inside a nested user namespace, so the wrapper-failure path is not exercisable here")
 	}
 	root := filepath.Join(t.TempDir(), "root")
-	cfg := Config{Enabled: true, Root: root}
+	// Prepare only builds the root tree here (the wrapper is run
+	// directly below); the filter is out of scope, so disable it.
+	cfg := Config{Enabled: true, Root: root, DisableSeccomp: true}
 	dummy := exec.Command("/bin/sh", "-c", "true")
 	dummy.Env = os.Environ()
 	if err := cfg.Prepare(dummy, "true"); err != nil {

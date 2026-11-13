@@ -75,9 +75,12 @@ Telegram update / CLI line
 - Seccomp is a second layer on the sandbox, never a replacement
   for it: sandboxed commands run under a default-allow syscall
   blocklist (orion-seccomp helper, `internal/sandbox/seccomp.go`)
-  when a usable launcher is installed, and with namespace /
-  pivot_root containment only — plus a logged warning — when it
-  is not.
+  when a usable launcher is installed, and are REFUSED
+  (fail-closed, Audit 3 F-A3-1) when it is not — unless the
+  operator explicitly opted into unfiltered runs
+  (`sandbox.allow_without_seccomp`), in which case every degraded
+  run is logged, or disabled the filter outright
+  (`sandbox.disable_seccomp`).
 - Every network call has a timeout; every tool output is capped;
   every agent run has a max-step budget.
 - Secrets never appear in logs, config dumps, audit entries, or
