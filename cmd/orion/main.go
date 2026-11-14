@@ -22,6 +22,7 @@ import (
 	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/permissions"
+	"github.com/irfan/orion/internal/sandbox"
 	"github.com/irfan/orion/internal/version"
 )
 
@@ -405,6 +406,16 @@ func cmdConfig(args []string) error {
 		fmt.Printf("timeout_seconds: %d\n", cfg.TimeoutSeconds)
 		fmt.Printf("sandbox_enabled: %v\n", cfg.Sandbox.Enabled)
 		fmt.Printf("sandbox_root:    %s\n", cfg.Sandbox.Root)
+		// F-A21-11: the probe RESULT, not just the config flag — a
+		// host can show sandbox_enabled: true while every
+		// shell_exec is refused. The probe is cached for the
+		// process lifetime (F-A21-13): an operator fix to the
+		// host needs a daemon restart to re-probe.
+		if sandbox.Available() {
+			fmt.Printf("sandbox_probe:   available (ordering %s)\n", sandbox.Ordering())
+		} else {
+			fmt.Printf("sandbox_probe:   unavailable: %v\n", sandbox.AvailabilityError())
+		}
 		fmt.Println("providers:")
 		names := make([]string, 0, len(cfg.Providers))
 		for n := range cfg.Providers {

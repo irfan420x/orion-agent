@@ -21,6 +21,7 @@ import (
 	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/permissions"
+	"github.com/irfan/orion/internal/sandbox"
 	"github.com/irfan/orion/internal/version"
 )
 
@@ -331,6 +332,17 @@ func run(args []string) int {
 	}
 	fmt.Printf("oriond running as @%s (provider %s, model %s); version %s; pid %d; data dir %s; config %s\n",
 		username, a.Provider.Name(), active.Model, version.String(), os.Getpid(), a.Config.DataDir, configPath)
+
+	// F-A21-11: log sandbox availability + probe error at startup —
+	// before this, a daemon on a host without a working sandbox
+	// looked healthy while every shell_exec was refused. The probe
+	// is cached for the process lifetime (F-A21-13): an operator
+	// fix to the host needs a daemon restart to re-probe.
+	if sandbox.Available() {
+		fmt.Fprintf(os.Stderr, "oriond: sandbox available (ordering %s)\n", sandbox.Ordering())
+	} else {
+		fmt.Fprintf(os.Stderr, "oriond: sandbox unavailable: %v; shell_exec will refuse commands (see README.md \"Sandbox (shell_exec)\"); fix the host's user-namespace support or run as root, then restart oriond to re-probe\n", sandbox.AvailabilityError())
+	}
 
 	// F-A3-2: optional localhost-only pprof/debug endpoint. Off by
 	// default (config debug.pprof_enabled); when enabled it binds

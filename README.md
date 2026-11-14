@@ -263,6 +263,20 @@ established on the host, `shell_exec` refuses the command
 missing seccomp filter is likewise refused unless
 `sandbox.allow_without_seccomp=true` is set.
 
+The sandbox needs a host that lets it create Linux user namespaces:
+it works when the agent runs as root, or on a host that allows
+unprivileged user namespaces. A plain unprivileged user on a host
+without that capability cannot run the sandbox at all — `shell_exec`
+then refuses every command (fail-closed), and `orion config show`
+reports `sandbox_probe: unavailable` with the reason. Orion probes
+both namespace orderings at startup (user namespace created after
+the `/proc` mount first, then at clone time) and uses whichever
+works; if neither works the sandbox stays unavailable until the
+host allows user namespaces (or the agent runs as root), and the
+probe result is cached for the process lifetime, so a daemon restart
+is needed to re-probe after fixing the host. See [SECURITY.md](SECURITY.md)
+for the full reasoning and the fail-closed rules.
+
 ## MCP servers (confinement)
 
 MCP servers configured in `<data_dir>/mcp.json` (e.g. `~/.orion/mcp.json`,

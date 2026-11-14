@@ -324,6 +324,23 @@ if ! "$BIN_DIR/orion" config show >/dev/null 2>&1; then
 	fi
 fi
 
+# Sandbox probe (F-A21-11): `orion config show` now prints the live
+# probe result (sandbox_probe: available/unavailable), not just the
+# config flag. Warn when the probe reports unavailable — shell_exec
+# will refuse every command on this host until the host allows user
+# namespaces (or the agent runs as root); see README.md "Sandbox
+# (shell_exec)". Warn, never fail the install: the agent still
+# installs and runs, and the operator may fix the host afterwards
+# (a daemon restart re-probes). When config show itself fails the
+# probe is skipped here — the config failure is already warned
+# about above, and a sandbox warning on top of it would mislead.
+if SANDBOX_SHOW="$("$BIN_DIR/orion" config show 2>/dev/null)"; then
+	if printf '%s\n' "$SANDBOX_SHOW" | grep -q "sandbox_probe:.*unavailable"; then
+		PROBE_LINE="$(printf '%s\n' "$SANDBOX_SHOW" | grep "sandbox_probe:" | head -n 1)"
+		echo "warning: $PROBE_LINE — shell_exec will refuse commands on this host (see README.md \"Sandbox (shell_exec)\"); fix the host's user-namespace support or run as root, then restart oriond to re-probe" >&2
+	fi
+fi
+
 # Optional systemd user unit for the oriond daemon.
 if [ "$WITH_SYSTEMD" -eq 1 ]; then
 	[ "$HAS_ORIOND" -eq 1 ] || die "--systemd needs oriond, but cmd/oriond is not present in this repo"
@@ -392,6 +409,7 @@ echo "  $BIN_DIR/orion"
 [ "$HAS_ORIOND" -eq 1 ] && echo "  $BIN_DIR/oriond"
 [ -x "$BIN_DIR/orion-seccomp" ] && echo "  $BIN_DIR/orion-seccomp"
 echo "config: $CONFIG_PATH"
+echo "sandbox: on by default — needs root or a host that allows unprivileged user namespaces (see README.md \"Sandbox (shell_exec)\")"
 case ":$PATH:" in
 *":$BIN_DIR:"*) ;;
 *)
