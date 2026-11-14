@@ -44,6 +44,13 @@ func (e *ToolError) Unwrap() error { return e.Err }
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
+	// planMode is the plan-mode tool's PlanModeChecker, installed
+	// by Register on first sight (see PlanModeChecker). The agent
+	// loop consults it before running any tool, so a plan the user
+	// has not approved yet can never be executed by a mutating
+	// tool. A registry without a plan-mode tool has a nil checker
+	// and never blocks.
+	planMode PlanModeChecker
 	// maxResultBytes caps every tool result (and tool error text)
 	// returned by Execute. Zero means the default
 	// (DefaultMaxToolResultBytes); SetMaxResultBytes overrides it,
@@ -74,6 +81,23 @@ func (r *Registry) MaxResultBytes() int {
 		return DefaultMaxToolResultBytes
 	}
 	return r.maxResultBytes
+}
+
+// PlanModeBlocks reports whether tool is blocked by a pending plan
+// for the chat in ctx (see PlanModeChecker). A registry without a
+// plan-mode tool never blocks. Nil-safe: a nil registry blocks
+// nothing.
+func (r *Registry) PlanModeBlocks(ctx context.Context, tool string) (bool, string) {
+	if r == nil {
+		return false, ""
+	}
+	r.mu.RLock()
+	pm := r.planMode
+	r.mu.RUnlock()
+	if pm == nil {
+		return false, ""
+	}
+	return pm.PlanModeBlocks(ctx, tool)
 }
 
 // Register adds a tool; duplicate names are an error. A nil tool or a
@@ -111,6 +135,12 @@ func (r *Registry) Register(t Tool) error {
 		return fmt.Errorf("tools: duplicate tool %q", t.Name())
 	}
 	r.tools[t.Name()] = t
+	// The plan-mode checker is installed on first sight (see
+	// PlanModeChecker): exactly one tool per registry implements
+	// it, so first-wins is unambiguous in practice.
+	if pm, ok := t.(PlanModeChecker); ok && r.planMode == nil {
+		r.planMode = pm
+	}
 	return nil
 }
 

@@ -165,6 +165,19 @@ type RiskClasser interface {
 	RiskClass() permissions.Class
 }
 
+// PlanModeChecker — the plan-mode tool reports whether a tool call
+// may run while a plan is pending approval for the chat in ctx.
+// The agent loop consults it (via Registry.PlanModeBlocks) before
+// running any tool, so a plan the user has not approved yet can
+// never be executed by a mutating tool. Only a tool that owns
+// plan state implements this; Register installs the first one it
+// sees, so a registry built from the factories always has the
+// plan-mode tool's checker and a hand-built registry without it
+// simply never blocks.
+type PlanModeChecker interface {
+	PlanModeBlocks(ctx context.Context, tool string) (blocked bool, reason string)
+}
+
 // QuestionAskerInstaller — the tool needs the Telegram question
 // transport (a QuestionAskFunc) installed after the gateway exists.
 // The framework installs it; the tool never builds it (the

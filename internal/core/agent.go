@@ -1371,6 +1371,15 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 		// above, so the sequence still agrees).
 		a.logf("tool %q blocked by active skill: %s", tc.Name, reason)
 		return fmt.Sprintf("Error: tool %q is not allowed while a skill is active: %s. End the skill with the skill tool (action \"end\") or use an allowed tool.", tc.Name, reason)
+	} else if blocked, reason := a.tools.PlanModeBlocks(ctx, tc.Name); blocked {
+		// Plan-mode enforcement: while a plan is pending approval
+		// for this chat, no mutating tool runs — the agent
+		// presents the plan and waits for the user's decision
+		// first (see internal/tools plan_mode.go). A refused call
+		// never executed, so it is not journalled: a re-delivered
+		// turn re-decides it (like the skill restriction above).
+		a.logf("tool %q blocked by plan mode: %s", tc.Name, reason)
+		return fmt.Sprintf("Error: tool %q is blocked while a plan is pending approval: %s. Wait for the plan decision, or call exit_plan_mode to abandon the plan.", tc.Name, reason)
 	} else if res, err := a.tools.Execute(ctx, tc.Name, args); err != nil {
 		// The registry enforces the security denylist for shell tools; log
 		// denials here so they are visible in the agent log.
