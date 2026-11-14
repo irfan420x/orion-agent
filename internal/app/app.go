@@ -401,17 +401,23 @@ func BuildLocal(path string) (*Local, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: memory: %w", err)
 	}
+	// MCP tools FIRST, as in Build: wireMCP registers the
+	// mcp__<server>__<tool> tools on the registry before loadSkills
+	// derives the known-tool set, so a skill whose ## Tools names
+	// an MCP tool does not warn "unknown tool" (F-A21-9). BuildLocal
+	// used to load skills first, so the CLI's runtime known-tool
+	// set never contained MCP names even though the tools were
+	// registered moments later. The manager is retained on the
+	// Local and closed by Local.Close, so no server process is
+	// left behind; the local commands never call a model, so the
+	// servers are started for listing only.
+	mcpMgr := wireMCP(cfg.DataDir, registry, logger)
 	skillReg := loadSkills(cfg.DataDir, logger, knownToolNames(registry))
 	if skillTool, err := tools.NewSkillTool(skillReg); err != nil {
 		return nil, fmt.Errorf("app: skill tool: %w", err)
 	} else if err := registry.Register(skillTool); err != nil {
 		return nil, fmt.Errorf("app: register skill tool: %w", err)
 	}
-	// MCP tools, so `orion tools` lists them: the local commands
-	// never call a model, so the servers are started for listing
-	// only. The manager is retained on the Local and closed by
-	// Local.Close, so no server process is left behind.
-	mcpMgr := wireMCP(cfg.DataDir, registry, logger)
 	return &Local{Config: cfg, Tools: registry, Memory: mem, Skills: skillReg, MCP: mcpMgr}, nil
 }
 
