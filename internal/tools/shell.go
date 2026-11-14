@@ -205,6 +205,24 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 // the unconfigured value used by tests and by direct registry
 // construction, never a production default; do not rely on it to
 // run unsandboxed in production.
+// sandboxRefusalMessage formats the fail-closed refusal when the
+// sandbox is enabled but cannot be established (F-A21-4). It names
+// the cause and points at the docs — and never presents the
+// unsandboxed fallback as the remedy: the only way forward the
+// message offers is fixing the host so the sandbox can be
+// established. When the probe itself failed (unavailable), the
+// cause is the Linux user namespace the sandbox needs — an
+// unprivileged user without CAP_SYS_ADMIN or unprivileged user
+// namespaces enabled cannot create one. When the probe passed but
+// setup failed, the cause is in the wrapped setup error, so the
+// message stays neutral about it instead of blaming the namespace.
+func sandboxRefusalMessage(sandboxErr error, unavailable bool) string {
+	if unavailable {
+		return fmt.Sprintf("%v; refusing to run unsandboxed (sandbox is enabled). The sandbox needs a Linux user namespace: this host refused to create one — an unprivileged user needs CAP_SYS_ADMIN or unprivileged user namespaces enabled — so the command was not run. See \"Sandbox (shell_exec)\" in README.md.", sandboxErr)
+	}
+	return fmt.Sprintf("%v; refusing to run unsandboxed (sandbox is enabled). The command was not run. See \"Sandbox (shell_exec)\" in README.md.", sandboxErr)
+}
+
 type shellExecTool struct {
 	sandboxCfg sandbox.Config
 }
@@ -312,7 +330,9 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	sandboxWarn := ""
 	if t.sandboxCfg.Enabled {
 		var sandboxErr error
+		unavailable := false
 		if !sandbox.Available() {
+			unavailable = true
 			if availErr := sandbox.AvailabilityError(); availErr != nil {
 				sandboxErr = fmt.Errorf("sandbox unavailable: %w", availErr)
 			} else {
@@ -334,7 +354,7 @@ func (t *shellExecTool) Execute(ctx context.Context, args json.RawMessage) (stri
 				sandboxWarn = fmt.Sprintf("%v; ran without sandbox isolation", sandboxErr)
 				log.Printf("orion: shell_exec: %s", sandboxWarn)
 			} else {
-				msg := fmt.Sprintf("%v; refusing to run unsandboxed (sandbox is enabled) — set sandbox.allow_unsandboxed_fallback=true to allow unsandboxed fallback", sandboxErr)
+				msg := sandboxRefusalMessage(sandboxErr, unavailable)
 				log.Printf("orion: shell_exec: %s", msg)
 				return "", &ToolError{Tool: t.Name(), Kind: "denied", Err: errors.New(msg)}
 			}

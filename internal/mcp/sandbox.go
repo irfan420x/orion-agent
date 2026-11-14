@@ -60,6 +60,17 @@ import (
 	"github.com/irfan/orion/internal/sandbox"
 )
 
+// sandboxUnavailableRefusal formats the fail-closed refusal when
+// the sandbox mechanism is unavailable (F-A21-4). It names the
+// cause — the Linux user namespace the sandbox needs, which this
+// host refused to create — and points at the docs, and never
+// presents dropping the sandbox ("sandbox": false) as the remedy:
+// the only way forward the message offers is fixing the host so
+// the sandbox can be established.
+func sandboxUnavailableRefusal(serverName string, err error) error {
+	return fmt.Errorf("mcp: server %q: sandbox unavailable: %v; refusing to run unsandboxed. The sandbox needs a Linux user namespace: this host refused to create one — an unprivileged user needs CAP_SYS_ADMIN or unprivileged user namespaces enabled. See \"Sandbox (shell_exec)\" in README.md.", serverName, err)
+}
+
 // sanitizeServerName renders a server name safe for use in a
 // filesystem path: only letters, digits, underscore and hyphen
 // survive, everything else becomes "-". Server names are already
@@ -174,7 +185,7 @@ func (c *Client) prepareSandboxed(cmd *exec.Cmd, path string) error {
 		if err == nil {
 			err = errors.New("sandbox mechanism unavailable for an unknown reason")
 		}
-		return fmt.Errorf("mcp: server %q: sandbox unavailable: %v; refusing to run unsandboxed (set \"sandbox\": false in mcp.json to run this server fully trusted, like a hook)", c.name, err)
+		return sandboxUnavailableRefusal(c.name, err)
 	}
 	if !serverVisibleInSandbox(path) {
 		return fmt.Errorf("mcp: server %q: binary %q is not visible inside the sandbox (only /usr is mounted in the chroot); install the server under /usr, or set \"sandbox\": false in mcp.json to run it fully trusted, like a hook", c.name, path)

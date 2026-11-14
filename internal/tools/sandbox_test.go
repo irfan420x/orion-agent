@@ -122,7 +122,8 @@ func TestShellExecSandboxDenylistStillApplies(t *testing.T) {
 // TestShellExecSandboxRefusesWhenSetupFails proves fail-closed: with
 // sandbox mode on but setup impossible (root under /proc, which can
 // never be created), the command is REFUSED — kind "denied", naming
-// the opt-in — and never runs, instead of silently running
+// the docs pointer and never the unsandboxed fallback as a remedy
+// (F-A21-4) — and never runs, instead of silently running
 // unsandboxed. The marker file must not exist afterwards.
 func TestShellExecSandboxRefusesWhenSetupFails(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "marker.txt")
@@ -134,11 +135,45 @@ func TestShellExecSandboxRefusesWhenSetupFails(t *testing.T) {
 	if kind := toolErrKind(t, err); kind != "denied" {
 		t.Fatalf("expected kind denied, got %q (%v)", kind, err)
 	}
-	if !strings.Contains(err.Error(), "sandbox.allow_unsandboxed_fallback=true") {
-		t.Fatalf("refusal should name the opt-in, got: %v", err)
+	if !strings.Contains(err.Error(), "README.md") {
+		t.Fatalf("refusal should point at the docs, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "allow_unsandboxed_fallback") {
+		t.Fatalf("refusal must not present the unsandboxed fallback as a remedy, got: %v", err)
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Errorf("marker file %s exists: the command ran despite the refusal", marker)
+	}
+}
+
+// TestSandboxRefusalMessageNamesCauseAndDocs pins the two refusal
+// wordings (F-A21-4): the probe-failed branch names the cause (the
+// Linux user namespace / CAP_SYS_ADMIN) and the docs, and neither
+// branch presents the unsandboxed fallback as a remedy.
+func TestSandboxRefusalMessageNamesCauseAndDocs(t *testing.T) {
+	probeErr := fmt.Errorf("sandbox unavailable: sandbox: probe command failed (userns-after-clone): fork/exec /bin/sh: operation not permitted")
+	msg := sandboxRefusalMessage(probeErr, true)
+	for _, want := range []string{"user namespace", "CAP_SYS_ADMIN", "README.md", "was not run"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("unavailable refusal %q does not contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "allow_unsandboxed_fallback") {
+		t.Errorf("unavailable refusal must not present the fallback as a remedy, got: %q", msg)
+	}
+
+	setupErr := fmt.Errorf("sandbox setup failed: sandbox: root %q must not be inside system tree %q", "/proc/orion-sandbox-test", "/proc")
+	msg = sandboxRefusalMessage(setupErr, false)
+	for _, want := range []string{"README.md", "was not run"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("setup-failure refusal %q does not contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "allow_unsandboxed_fallback") {
+		t.Errorf("setup-failure refusal must not present the fallback as a remedy, got: %q", msg)
+	}
+	if strings.Contains(msg, "CAP_SYS_ADMIN") {
+		t.Errorf("setup-failure refusal must not blame the user namespace (the probe passed; setup failed), got: %q", msg)
 	}
 }
 
