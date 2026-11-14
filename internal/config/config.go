@@ -225,6 +225,13 @@ type Config struct {
 	// only an explicit false opts out.
 	Sandbox sandbox.Config `json:"sandbox"`
 
+	// Media configures Telegram file delivery: when the agent's reply
+	// contains a MEDIA:<path> line, the gateway uploads the file to
+	// the chat instead of showing the tag (see internal/messaging).
+	// Enabled by default; set media.enabled=false to disable
+	// extraction entirely (tags stay as visible text).
+	Media MediaDeliveryConfig `json:"media"`
+
 	// TrustedEgressCIDRs lists CIDR ranges this deployment's egress
 	// DNS may map public hosts into (for example, this deployment's
 	// egress-gateway range 198.18.31.0/24). Addresses in these ranges count
@@ -266,6 +273,67 @@ type DebugConfig struct {
 	PprofPort    int  `json:"pprof_port"`
 }
 
+// MediaDeliveryConfig configures Telegram file delivery (MEDIA: tags
+// in the agent's reply; see internal/messaging).
+//
+// Enabled turns extraction on (default true). AllowDirs lists the
+// directories files may be sent from; empty means the defaults
+// (~/orion-media and the OS temp dir). An explicitly set list
+// REPLACES the defaults. MaxFiles caps the files sent per reply
+// (default 5); MaxBytes caps one file's size (default 50 MiB, the
+// Bot API limit). Out-of-range limits are clamped by Resolve,
+// never rejected: a config file that sets an absurd value gets the
+// nearest sane one.
+type MediaDeliveryConfig struct {
+	Enabled   bool     `json:"enabled"`
+	AllowDirs []string `json:"media_allow_dirs"`
+	MaxFiles  int      `json:"media_max_files"`
+	MaxBytes  int64    `json:"media_max_bytes"`
+}
+
+// DefaultMediaMaxFiles is the default (and the value a zero
+// MaxFiles resolves to): at most 5 files per reply.
+const DefaultMediaMaxFiles = 5
+
+// MaxMediaFiles is the hard cap on files per reply: a larger
+// configured value is clamped down to this.
+const MaxMediaFiles = 20
+
+// DefaultMediaMaxBytes is the default per-file size cap: 50 MiB,
+// the Bot API limit for bot file uploads.
+const DefaultMediaMaxBytes = 50 << 20
+
+// DefaultMediaDeliveryConfig returns the media-delivery defaults:
+// enabled, 5 files per reply, 50 MiB per file, default allowlist
+// dirs (AllowDirs empty means the defaults in internal/messaging).
+func DefaultMediaDeliveryConfig() MediaDeliveryConfig {
+	return MediaDeliveryConfig{
+		Enabled:  true,
+		MaxFiles: DefaultMediaMaxFiles,
+		MaxBytes: DefaultMediaMaxBytes,
+	}
+}
+
+// Resolve returns mc with defaults filled in and out-of-range limits
+// clamped. It never rejects: MaxFiles <= 0 becomes the default (5),
+// above 20 becomes 20; MaxBytes <= 0 becomes the default (50 MiB),
+// above 50 MiB becomes 50 MiB. Enabled and AllowDirs pass through
+// unchanged — a zero MediaDeliveryConfig stays disabled, so a
+// gateway built without the option never extracts tags.
+func (mc MediaDeliveryConfig) Resolve() MediaDeliveryConfig {
+	if mc.MaxFiles <= 0 {
+		mc.MaxFiles = DefaultMediaMaxFiles
+	} else if mc.MaxFiles > MaxMediaFiles {
+		mc.MaxFiles = MaxMediaFiles
+	}
+	if mc.MaxBytes <= 0 {
+		mc.MaxBytes = DefaultMediaMaxBytes
+	} else if mc.MaxBytes > DefaultMediaMaxBytes {
+		mc.MaxBytes = DefaultMediaMaxBytes
+	}
+	return mc
+}
+
 // defaultConfig builds the default configuration with the given data
 // directory (which may be empty when no home directory is known; see
 // Default).
@@ -293,6 +361,12 @@ func defaultConfig(dataDir string) *Config {
 	// confines shell_exec, and only an explicit opt-out
 	// (sandbox.enabled=false, or ORION_SANDBOX=off) turns it off.
 	cfg.Sandbox = sandbox.DefaultConfig(dataDir)
+	// Media delivery defaults ON (enabled, 5 files, 50 MiB): the
+	// agent may send files with MEDIA: tags. Only an explicit
+	// media.enabled=false in the config file opts out — Load
+	// unmarshals over these defaults, so an omitted "media" key
+	// keeps them.
+	cfg.Media = DefaultMediaDeliveryConfig()
 	return cfg
 }
 
