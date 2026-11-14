@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/irfan/orion/internal/config"
+	"github.com/irfan/orion/internal/core"
 )
 
 // mediaFake is a fake Telegram server for the media tests. It
@@ -753,5 +754,50 @@ func TestDeliverMediaDedupesByResolvedPath(t *testing.T) {
 	}
 	if n := strings.Count(report, "📎 Sent"); n != 1 {
 		t.Errorf("report = %q, want exactly one 📎 Sent line", report)
+	}
+}
+
+// TestPollStreamMediaDelivery pins the hook itself: a turn whose
+// reply carries a MEDIA: tag sends the file and delivers one text
+// message with the prose, the delivery report, and no MEDIA: line.
+// (Poll is a thin wrapper over PollStream, so this covers it too.)
+func TestPollStreamMediaDelivery(t *testing.T) {
+	dir := t.TempDir()
+	csv := writeMediaFile(t, dir, "sales.csv", "a,b\n1,2\n")
+	fake := &mediaFake{updates: []Update{
+		{UpdateID: 1, Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "send it", From: &TGUser{ID: 77}}},
+	}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	mc := config.MediaDeliveryConfig{Enabled: true, AllowDirs: []string{dir}, MaxFiles: 5, MaxBytes: 50 << 20}
+	g, err := NewTelegramGateway(testToken, WithBaseURL(srv.URL), WithMediaDelivery(mc))
+	if err != nil {
+		t.Fatalf("NewTelegramGateway: %v", err)
+	}
+	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		return "Here is the file.\nMEDIA:" + csv + "\n", nil, nil
+	}
+	cancel, errCh := runPollStream(t, g, handler)
+	defer stopPollStream(t, cancel, errCh)
+
+	waitFor(t, "media reply", func() bool {
+		_, texts := fake.snapshot()
+		return len(texts) >= 1
+	})
+	calls, texts := fake.snapshot()
+	if len(calls) != 1 || calls[0].method != "sendDocument" || calls[0].filename != "sales.csv" {
+		t.Fatalf("file calls = %+v, want one sendDocument sales.csv", calls)
+	}
+	if len(texts) != 1 {
+		t.Fatalf("text messages = %d, want 1", len(texts))
+	}
+	if !strings.Contains(texts[0], "Here is the file.") {
+		t.Errorf("reply = %q, want the prose", texts[0])
+	}
+	if strings.Contains(texts[0], "MEDIA:") {
+		t.Errorf("reply = %q, want no MEDIA: line", texts[0])
+	}
+	if !strings.Contains(texts[0], "📎 Sent sales.csv (8 B)") {
+		t.Errorf("reply = %q, want the 📎 Sent line", texts[0])
 	}
 }

@@ -2499,8 +2499,19 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		if reply == "" {
 			return
 		}
+		// Media delivery runs on the model reply BEFORE the footer
+		// is appended, so the footer can never contain a MEDIA tag
+		// and the tag strip can never eat footer text. The delivery
+		// report is appended AFTER the footer, so it is the last
+		// thing the user reads. The error path above (herr != nil)
+		// never gets media treatment: an apology must not trigger
+		// a file send.
+		reply, report := g.deliverMedia(ctx, chatID, reply)
 		if stats != nil {
 			reply += "\n\n" + FormatFooter(stats)
+		}
+		if report != "" {
+			reply += "\n\n" + report
 		}
 		// Best effort: a failed reply must not kill polling.
 		_ = g.SendMessage(ctx, chatID, reply)
