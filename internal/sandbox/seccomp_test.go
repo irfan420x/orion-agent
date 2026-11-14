@@ -204,13 +204,36 @@ func parseProbeOutput(t *testing.T, out string) map[string]bool {
 // userfaultfd, setns, settimeofday, syslog on this VM), so those
 // read BLOCKED here and cannot discriminate the sandbox filter;
 // the rest must read UNBLOCKED here and BLOCKED under the filter.
+// runProbeOnHost runs the probe script on the host and returns
+// name -> blocked. It runs under a fresh user namespace AND a
+// fresh mount namespace (`unshare --user --map-root-user --mount`)
+// when they can be created, so the calibration runs with the same
+// privilege the sandboxed control runs with (root inside its own
+// user namespace, owning its mount namespace): the mount and
+// namespace syscalls the probe gates on capability (unshare,
+// fsopen, fsmount, fspick, move_mount) report EPERM for an
+// unprivileged host user but succeed for root in a user namespace,
+// and without the matching privilege the control test fails on a
+// plain host for a privilege difference, not a filter difference.
+// The fresh mount namespace matters too: without it the probe
+// shares the host mount namespace (owned by the outer user
+// namespace), so mount reports EPERM where the sandboxed control
+// — which owns its mount namespace — reports ENOENT. The ambient
+// (cell) filter, where one exists, is inherited across the
+// unshare, so a cell host calibrates the same way as before.
+// When the namespaces cannot be created the probe runs directly,
+// as before.
 func runProbeOnHost(t *testing.T) map[string]bool {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skip("python3 not available")
 	}
-	out, err := exec.Command(python, testdataPath(t, "seccomp_probe.py")).CombinedOutput()
+	probe := testdataPath(t, "seccomp_probe.py")
+	if out, err := exec.Command("unshare", "--user", "--map-root-user", "--mount", python, probe).CombinedOutput(); err == nil {
+		return parseProbeOutput(t, string(out))
+	}
+	out, err := exec.Command(python, probe).CombinedOutput()
 	if err != nil {
 		t.Fatalf("host probe run: %v\n%s", err, out)
 	}

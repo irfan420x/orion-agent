@@ -415,18 +415,27 @@ func procEntries(t *testing.T, out string) (pids map[string]bool, names map[stri
 }
 
 // TestPrepareRequestsPIDNamespace is the unit-level half of the
-// fail-closed rule: Prepare must ask the clone for a PID namespace,
-// and must NOT ask for a user namespace or set uid/gid mappings —
+// fail-closed rule for the DEFAULT ordering: Prepare with
+// userns-after-clone must ask the clone for a PID namespace, and
+// must NOT ask for a user namespace or set uid/gid mappings —
 // the user namespace is created by the wrapper after the /proc
 // mount (see sandbox.go), so a clone that silently lacked NEW PID
 // would be a bug, not a degraded mode.
+//
+// It pins the default ordering explicitly (via prepareWithOrdering),
+// NOT plain Prepare: plain Prepare follows the ordering the probe
+// selected, which on a host where only userns-at-clone works IS
+// the fallback ordering (CLONE_NEWUSER set — see
+// TestPrepareAtCloneRequestsUserNamespace). Pinning plain Prepare
+// here would contradict the probed ordering the fix exists to
+// select. Every assertion below is unchanged.
 func TestPrepareRequestsPIDNamespace(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "true")
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	// Clone flags are what this test proves; the filter is out of
 	// scope, so disable it rather than depend on a launcher.
 	cfg := Config{Enabled: true, Root: filepath.Join(t.TempDir(), "root"), DisableSeccomp: true}
-	if err := cfg.Prepare(cmd, "true"); err != nil {
+	if err := cfg.prepareWithOrdering(cmd, "true", orderingAfterClone); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 	attr := cmd.SysProcAttr

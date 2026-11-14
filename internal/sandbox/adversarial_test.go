@@ -541,17 +541,33 @@ capsh --print 2>&1 | head -3; echo CAPSH=$?;
 	if !strings.Contains(out, "Operation not permitted") {
 		t.Errorf("expected EPERM failures from the seccomp filter, output:\n%s", out)
 	}
-	// Control: sethostname must fail the same way WITHOUT the
-	// filter. That proves the failure is namespace/capability
-	// containment (the UTS namespace is owned by the outer
-	// user namespace), not the filter — and stops this test
-	// from ever again being misread as a filter proof.
+	// Control: what sethostname does WITHOUT the filter depends on
+	// the probed ordering (F-A21-3). With userns-after-clone the
+	// UTS namespace is owned by the OUTER user namespace, so
+	// sethostname must fail even without the filter — that proves
+	// the failure is namespace/capability containment, not the
+	// filter. With userns-at-clone the UTS namespace is owned by
+	// the NEW user namespace (created by the same clone), so
+	// sethostname succeeds without the filter — and the proof
+	// moves to containment: the new name must stay inside the
+	// sandbox's own UTS namespace, so the host hostname (read
+	// before and after) must be unchanged. Either way the FILTERED
+	// run above (HOSTNAME != 0) is the proof the filter blocks it
+	// in the production configuration.
+	hostBefore, _ := os.Hostname()
 	root2 := filepath.Join(t.TempDir(), "root")
 	ctl, code := runSandboxedCfg(t, advConfigNoFilter(t, root2, false), "hostname evil-name 2>&1; echo HOSTNAME=$?")
 	if code != 0 {
 		t.Fatalf("control probe exit %d, output:\n%s", code, ctl)
 	}
-	if markerValue(ctl, "HOSTNAME") == "0" {
+	if Ordering() == "userns-at-clone" {
+		if markerValue(ctl, "HOSTNAME") != "0" {
+			t.Errorf("control (userns-at-clone): sethostname failed without the filter — the process should own its UTS namespace, output:\n%s", ctl)
+		}
+		if hostAfter, _ := os.Hostname(); hostBefore != "" && hostAfter != hostBefore {
+			t.Errorf("control (userns-at-clone): sandboxed sethostname changed the HOST hostname %q -> %q — the UTS namespace is not contained, output:\n%s", hostBefore, hostAfter, ctl)
+		}
+	} else if markerValue(ctl, "HOSTNAME") == "0" {
 		t.Errorf("control: sethostname succeeded without the filter — the containment proof is broken, output:\n%s", ctl)
 	}
 }
@@ -593,11 +609,14 @@ func TestAdversarialSeccompFilterReallyOn(t *testing.T) {
 // sandbox needs it) and modify_ldt (LDT manipulation). Both must
 // be BLOCKED under the filter. The control expectations differ
 // per syscall because the ambient cell filter already blocks
-// io_uring on this host (host calibration: EPERM) but NOT
+// io_uring on a cell host (host calibration: EPERM) but NOT
 // modify_ldt (host calibration: success) — so modify_ldt is the
 // live discriminating proof, while io_uring is proven live here
 // and structurally by TestSeccompFilterProgram (which checks
-// every table entry has a JEQ landing on DENY).
+// every table entry has a JEQ landing on DENY). On a plain host
+// (no ambient filter) io_uring is UNBLOCKED on the host, and the
+// control must agree with the host instead of with the cell —
+// the filter blocking it above is the proof either way.
 //
 // pidfd_getfd is deliberately NOT blocklisted: it can only target
 // processes in the sandbox's own PID namespace (host PIDs do not
@@ -620,11 +639,12 @@ func TestAdversarialSeccompGaps(t *testing.T) {
 	if !strings.Contains(host, "modify_ldt UNBLOCKED") {
 		t.Errorf("host calibration: modify_ldt is not UNBLOCKED on the host — the control is broken, output:\n%s", host)
 	}
-	// io_uring is already EPERM on this host (the cell filter
-	// blocks it); the probe must agree, not contradict it.
-	if !strings.Contains(host, "io_uring_setup BLOCKED") {
-		t.Errorf("host calibration: io_uring_setup is not BLOCKED on the host — expected the cell filter to block it, output:\n%s", host)
-	}
+	// io_uring_setup is BLOCKED on the host only when an ambient
+	// (cell) filter blocks it; on a plain host it is UNBLOCKED.
+	// Either value is legitimate — what matters is that the
+	// control below agrees with the host, and that the filter
+	// blocks it above.
+	hostIouringBlocked := strings.Contains(host, "io_uring_setup BLOCKED")
 
 	runProbe := func(cfg Config) string {
 		t.Helper()
@@ -649,15 +669,19 @@ func TestAdversarialSeccompGaps(t *testing.T) {
 
 	// Without the filter (control): modify_ldt must be UNBLOCKED
 	// (proving the filter is what blocks it above); io_uring
-	// stays BLOCKED (the cell filter), matching the host.
+	// must agree with the host — BLOCKED where an ambient filter
+	// blocks it, UNBLOCKED on a plain host.
 	root2 := filepath.Join(t.TempDir(), "root")
 	control := runProbe(advConfigNoFilter(t, root2, false))
 	t.Logf("control (no filter):\n%s", control)
 	if !strings.Contains(control, "modify_ldt UNBLOCKED") {
 		t.Errorf("control: modify_ldt is not UNBLOCKED without the filter — the probe cannot discriminate, output:\n%s", control)
 	}
-	if !strings.Contains(control, "io_uring_setup BLOCKED") {
+	if hostIouringBlocked && !strings.Contains(control, "io_uring_setup BLOCKED") {
 		t.Errorf("control: io_uring_setup is not BLOCKED without the filter — expected the cell filter to block it, output:\n%s", control)
+	}
+	if !hostIouringBlocked && !strings.Contains(control, "io_uring_setup UNBLOCKED") {
+		t.Errorf("control: io_uring_setup is not UNBLOCKED without the filter — expected it to agree with the host (no ambient filter), output:\n%s", control)
 	}
 
 	// pidfd_getfd: must not yield a host file in either mode.
