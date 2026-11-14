@@ -5,6 +5,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"sort"
 	"testing"
 
@@ -84,6 +85,23 @@ func TestFactoriesRegisterAllDefaultTools(t *testing.T) {
 	for i := range factoryNames {
 		if factoryNames[i] != toolNames[i] {
 			t.Fatalf("factories %v != tools %v", factoryNames, toolNames)
+		}
+	}
+}
+
+// TestToolDepsHasNoDataDirField pins F-A20-3: ToolDeps must not
+// carry a DataDir — the field existed, was read by nothing (the
+// planning store's data dir travels with ToolDeps.PlanningStore,
+// pointed at it by SetDataDir; TestRegistryPlanningStoreViaDeps
+// pins that path end to end), and was removed. If a data dir is
+// ever needed again it belongs on the store, not on ToolDeps: a
+// field here would silently invite a second, drifting source of
+// truth for where planning state lives.
+func TestToolDepsHasNoDataDirField(t *testing.T) {
+	typ := reflect.TypeOf(ToolDeps{})
+	for i := 0; i < typ.NumField(); i++ {
+		if typ.Field(i).Name == "DataDir" {
+			t.Errorf("ToolDeps must not have a DataDir field (F-A20-3): the planning store's data dir travels with ToolDeps.PlanningStore")
 		}
 	}
 }

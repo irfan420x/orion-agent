@@ -58,7 +58,6 @@ type ToolDeps struct {
 	SandboxCfg         sandbox.Config
 	FileRoots          []string
 	TrustedEgressCIDRs []string
-	DataDir            string
 	PlanningStore      *PlanningStore
 }
 
@@ -283,7 +282,8 @@ type ReplyInterceptor interface {
 // (first allowlisted chat); LogPrefix is "orion" | "oriond" — the
 // only per-binary difference. There is no DataDir field: no tool
 // needs it from the host (the planning store's data dir travels
-// in ToolDeps instead).
+// with ToolDeps.PlanningStore instead — a ToolDeps.DataDir field
+// existed once, was read by nothing, and was removed, F-A20-3).
 type ToolHost struct {
 	Gateway   CallbackGateway
 	OwnerID   int64
