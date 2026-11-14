@@ -294,6 +294,9 @@ func run(args []string) int {
 		messaging.WithLogger(func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "oriond: "+format+"\n", args...)
 		}),
+		// Media delivery: the agent's MEDIA: tags send files from
+		// ~/orion-media and /tmp (or media_allow_dirs) to the chat.
+		messaging.WithMediaDelivery(a.Config.Media),
 	}
 	if a.Config.AllowAllTelegramChats {
 		// P2-O5 / F-A17-4: the opt-in is time-boxed — IsChatAllowed
