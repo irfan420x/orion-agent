@@ -6,6 +6,64 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### F1 — Audit 21 fixes (P1 + P2/P3 leftovers)
+
+Fixes Audit 21's P1 and the P2/P3 leftovers, on top of plan_mode.
+Suite: **1,501 tests total (1,497 pass, 0 fail, 4 skip), 24/24
+packages**.
+
+- **F-A21-1 (P1) — Novel-name default-Safe hole, closed both
+  layers.** `Classify` now returns Destructive for any name in
+  none of the maps, and `Register` rejects names that are not
+  explicitly classified at all, whatever they declare; the gate
+  denies unknown names outright, without prompting, even against
+  a persisted allow rule. Safe now means "listed" (19 Safe
+  built-ins in a new `safeTools` map), never "defaulted".
+  `Classify` lookups fold case (F-A21-17); `Register` rejects
+  typed-nil tools instead of panicking (F-A21-8). Planning tools
+  stay Safe with the rationale documented (F-A21-15).
+- **F-A21-2 (P2) — IsCommand enforcement + consumption audit
+  trail.** A command update now skips every reply interceptor
+  (the interceptor is not even called) and is logged; every
+  consumption is logged with interceptor, chat and text. The
+  question interceptor is structurally first, then tool
+  interceptors in registry order (F-A21-22).
+- **F-A21-3 (P2) — Sandbox probed dual-ordering.** The probe
+  tries userns-after-clone first, then userns-at-clone, and
+  caches the winner; the sandbox is now available on plain
+  unprivileged hosts (verified live on the laptop).
+- **F-A21-4 (P2) — Refusal text names the cause** (missing user
+  namespace / CAP_SYS_ADMIN) and points at the README Sandbox
+  section; it no longer presents the unsafe fallback as the
+  remedy.
+- **F-A21-5 (P2) — README Tools list completed** (`ask_user_question`,
+  `enter_plan_mode`, `exit_plan_mode`) and pinned to the factory
+  set by a test, so the next added tool fails loudly instead of
+  shipping with stale docs. README counts are pinned the same way
+  (F-A21-10).
+- **F-A21-7 (P3) — WireTelegram is validate-then-install:**
+  every callback prefix is pre-checked before any is
+  registered, so a failed wiring leaves a clean router and a
+  retry on the same gateway can succeed.
+- **F-A21-9 (P3) — BuildLocal wires MCP before loading skills,**
+  as Build does, so a skill naming an MCP tool no longer warns
+  "unknown tool".
+- **F-A21-11/12 (P3) — Sandbox visibility:** the daemon logs
+  sandbox availability at startup, `orion config show` prints
+  the probe result, `install.sh` warns when the probe fails, and
+  the README Sandbox section states the host requirement.
+- **F-A21-18 (P3) — Sweep test window widened** (320 ms to 2 s)
+  so turn 1 no longer has to start inside ~300 ms on a contended
+  VM; the race the test guards is unchanged. Comment/wording
+  fixes: F-A21-19 (this file), F-A21-20/21/23 (stale test
+  comments).
+- **Sandbox default re-verified (user follow-up, 2026-11-14):**
+  the end-user default is still sandbox ON in code
+  (`sandbox.DefaultConfig` sets `Enabled: true`, used by
+  `config.defaultConfig`); the laptop's sandbox-off state is a
+  config-file override only. Pinned by the existing
+  `TestSandboxDefaults`.
+
 ### plan_mode (tool 2 of 14) + Audit 20 Step 1 fixes
 
 plan_mode is the second of the 14 advanced tools: the agent enters
@@ -96,8 +154,8 @@ over the framework build a633ed3).
   handler/interceptor state lives in the tool itself.
 - **F-A20-7 (P2) — WireTelegram has direct tests.** Nil args, a
   second call on one gateway (duplicate `ask:`), and the
-  partial-failure window (a failed wiring installs no handler, so
-  it can never serve traffic) — all loud fail.
+  partial-failure window (a failed wiring installs no gateway
+  handler, so no tap can dispatch) — all loud fail.
 - **F-A20-16 (P2) — the manual lists are pinned to the factory
   set.** `skills.KnownBuiltInTools()` (new exported accessor)
   returns the fallback list, pinned by a test to the full tool
