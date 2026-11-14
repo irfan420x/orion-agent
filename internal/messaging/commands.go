@@ -14,8 +14,8 @@
 //  2. If the command needs a capability CommandEnv does not have,
 //     add a function field to CommandEnv, wire it in
 //     cmd/oriond/buildCommandEnv, and use it in the handler.
-//  3. Add a test in commands_test.go (Dispatch the command through a
-//     stub env and assert the reply and the side effect).
+//  3. Add a test (Dispatch the command through a stub env and
+//     assert the reply and the side effect).
 //
 // /help lists the registry, so a new command shows up in the menu
 // and in /help automatically; BotCommands feeds the same list to
@@ -34,6 +34,7 @@ import (
 
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/memory"
+	"github.com/irfan/orion/internal/permissions"
 )
 
 // Command is one slash command.
@@ -60,6 +61,14 @@ type CommandEnv struct {
 	// concurrent chats never share the value. Handlers read it; they
 	// never write it.
 	ChatID int64
+	// OwnerID is the owner chat/user id: the first
+	// telegram_allowed_chats entry (messaging.OwnerIDFromAllowlist).
+	// 0 means "no owner" (empty allowlist with allow-all opt-in):
+	// owner-only commands are then refused for everyone. The
+	// daemon sets it in cmd/oriond/buildCommandEnv; handlers use
+	// isOwner to check it (chat match, or the sender from ctx —
+	// the owner sending from a group chat — see SenderIDFromContext).
+	OwnerID int64
 	// Status renders the /status body (provider, model, limits,
 	// memory counts, data dir, uptime).
 	Status func() string
@@ -122,9 +131,40 @@ type CommandEnv struct {
 	// SaveConversation exports the conversation to Markdown and
 	// returns the path and message count.
 	SaveConversation func(chatID int64) (path string, count int, err error)
-	// Restart signals the daemon to drain active runs and exit 0
+	// Restart signals the daemon to drain active runs and exit 42
 	// (a supervisor restarts it).
 	Restart func()
+	// BudgetInfo returns the per-chat daily token budget for
+	// /budget: the configured limit (<= 0 means unlimited) and the
+	// tokens this chat has used today (UTC day). The daemon wires
+	// it to the app's Budget (see App.BudgetInfoForChat); nil in
+	// hand-built envs, where /budget reports that budget info is
+	// unavailable instead of inventing numbers.
+	BudgetInfo func(chatID int64) (limit int, usedToday int)
+	// SetBudget persists a new per-chat daily token limit (0 =
+	// unlimited, otherwise 1000–10000000, matching config
+	// validation) AND applies it to the live budget, so the new
+	// limit survives restarts. The daemon wires it to
+	// App.SetDailyBudget, which saves the config atomically
+	// (0600, like SwitchProvider) before touching the live
+	// budget; an in-memory-only SetLimit would be silently lost
+	// on the next restart, so a SetBudget that does not persist
+	// is a wiring bug. The handler validates the range first and
+	// reports bad input as a reply, so this is only called with
+	// a valid limit — it still validates defensively and returns
+	// an error naming the problem.
+	SetBudget func(limit int) error
+	// ReloadSkills re-reads the skills directory (F-A17-15) and
+	// returns how many skills loaded. New/changed files are
+	// picked up, removed files are dropped, and a file that now
+	// fails to parse is dropped with the error returned (the
+	// previously loaded skills stay live when the directory
+	// cannot be read at all). The daemon wires it to
+	// App.ReloadSkills, which reloads the registry in place, so
+	// the agent and the skill tool keep working on the same
+	// registry pointer. Nil in hand-built envs, where /skills
+	// reports that reloading is unavailable.
+	ReloadSkills func() (loaded int, err error)
 	// Whoami renders the access line for the chat.
 	Whoami func(chatID int64) string
 	// SetFooter persists the per-chat footer preference.
@@ -187,6 +227,51 @@ type CommandEnv struct {
 	// (internal/app Compress lives outside messaging); /compress
 	// then falls back to plain Compress.
 	CompressWithSessionMemory func(ctx context.Context, chatID int64, keepRecent int, sessionMemory string) (before, after, summaryLen int, err error)
+	// IsOwner reports whether chatID is the daemon owner (the
+	// first allowlisted chat). /rules is owner-only and checks
+	// this itself — unlike /restart, whose check lives in
+	// cmd/oriond/buildTurnHandler because the shared env's
+	// Restart cannot refuse. The coordinator wires it in
+	// cmd/oriond/buildCommandEnv as:
+	//   IsOwner: func(chatID int64) bool { return ownerID != 0 && chatID == ownerID },
+	// Nil until wired; /rules then replies that it is
+	// unavailable instead of guessing.
+	IsOwner func(chatID int64) bool
+	// ListRules returns all standing permission rules (F-A17-6):
+	// legacy global rules (ChatID 0) and per-chat rules, sorted
+	// by chat then tool (see permissions.RuleStore.List). The
+	// coordinator wires it in cmd/oriond/buildCommandEnv as:
+	//   ListRules: func() []permissions.Rule {
+	//       g := a.PermissionGate()
+	//       if g == nil || g.Rules() == nil { return nil }
+	//       return g.Rules().List()
+	//   },
+	// Nil until wired; /rules then replies that rules are
+	// unavailable instead of showing a stale or empty list.
+	ListRules func() []permissions.Rule
+	// DeleteRule deletes the rule for tool in chatID (0 = the
+	// legacy global rule) and persists. The coordinator wires
+	// it in cmd/oriond/buildCommandEnv as:
+	//   DeleteRule: func(chatID int64, tool string) error {
+	//       g := a.PermissionGate()
+	//       if g == nil || g.Rules() == nil { return errors.New("rules store unavailable") }
+	//       return g.Rules().DeleteForChat(chatID, tool)
+	//   },
+	// Nil until wired; /rules delete then replies that it is
+	// unavailable.
+	DeleteRule func(chatID int64, tool string) error
+	// SetRule stores the rule for tool in chatID and persists
+	// (0 = the legacy global scope). /rules scope uses it to
+	// move a legacy global rule onto one chat. The coordinator
+	// wires it in cmd/oriond/buildCommandEnv as:
+	//   SetRule: func(chatID int64, tool string, action permissions.Action) error {
+	//       g := a.PermissionGate()
+	//       if g == nil || g.Rules() == nil { return errors.New("rules store unavailable") }
+	//       return g.Rules().SetForChat(chatID, tool, action)
+	//   },
+	// Nil until wired; /rules scope then replies that it is
+	// unavailable.
+	SetRule func(chatID int64, tool string, action permissions.Action) error
 }
 
 // TypedMemory is one typed memory file (workstream A:
@@ -350,13 +435,38 @@ func (r *Registry) Commands() []Command {
 
 // BotCommands returns the registry as Telegram BotCommand entries
 // (names without "/", in the same sorted order) for setMyCommands.
+// Names the Bot API rejects are left out: a command name must be
+// 1–32 characters of [a-z0-9_] (Telegram's rule), so a non-Latin
+// alias such as /বাজেট would fail setMyCommands on every startup
+// and leave the whole "/" menu stale. Excluded commands still work
+// via Dispatch and still appear in /help — only the menu omits them.
 func (r *Registry) BotCommands() []BotCommand {
 	cmds := r.Commands()
 	out := make([]BotCommand, 0, len(cmds))
 	for _, c := range cmds {
+		if !isValidBotCommandName(c.Name) {
+			continue
+		}
 		out = append(out, BotCommand{Name: c.Name, Description: c.Description})
 	}
 	return out
+}
+
+// isValidBotCommandName reports whether name is a valid Telegram bot
+// command name for setMyCommands: 1–32 characters, lowercase Latin
+// letters, digits and underscores only.
+func isValidBotCommandName(name string) bool {
+	if len(name) < 1 || len(name) > 32 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Parse splits text into a command name and arguments. It accepts
@@ -440,7 +550,120 @@ func parseCount(args string, def int) (int, string) {
 	return n, ""
 }
 
-// DefaultRegistry returns a registry with the 17 core commands. env
+// isOwner reports whether the current dispatch is from the owner:
+// the chat itself is the owner, or the sender carried in ctx is
+// (the owner sending from a group chat — buildTurnHandler puts the
+// sender in ctx, see WithSenderID). No owner configured (OwnerID
+// 0) means nobody is the owner: owner-only commands fail closed.
+// It is a method on CommandEnv so handlers share one check instead
+// of each re-implementing the chat-or-sender rule.
+func (env *CommandEnv) isOwner(ctx context.Context) bool {
+	if env == nil || env.OwnerID == 0 {
+		return false
+	}
+	if env.ChatID == env.OwnerID {
+		return true
+	}
+	if senderID, ok := SenderIDFromContext(ctx); ok && senderID != 0 && senderID == env.OwnerID {
+		return true
+	}
+	return false
+}
+
+// budgetLimit bounds for /budget (and App.SetDailyBudget): 0 is
+// unlimited, otherwise the same 1000–10000000 range config
+// validation enforces for per_chat_daily_token_budget.
+const (
+	minDailyBudgetLimit = 1000
+	maxDailyBudgetLimit = 10000000
+)
+
+// parseBudgetArg parses one /budget argument: "infinity", "inf" or
+// "unlimited" (case-insensitive) means unlimited (0); otherwise a
+// plain integer. ok=false means the argument is not a limit at all.
+func parseBudgetArg(arg string) (limit int, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "infinity", "inf", "unlimited":
+		return 0, true
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(arg))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// budgetHandler implements /budget and its /বাজেট alias (owner-only,
+// F-A17-9 companion user order): no argument shows the current
+// limit and today's usage for the chat; an argument sets the daily
+// per-chat limit (persisted by SetBudget, so it survives restarts).
+func budgetHandler(ctx context.Context, env *CommandEnv, args string) (string, error) {
+	if !env.isOwner(ctx) {
+		return "⛔ /budget is owner-only. Your chat can use every other command, but only the owner can view or change the daily token budget.", nil
+	}
+	if env.BudgetInfo == nil {
+		return "Budget info is unavailable (not wired).", nil
+	}
+	limit, used := env.BudgetInfo(env.ChatID)
+	arg := ""
+	if fields := strings.Fields(args); len(fields) > 0 {
+		arg = fields[0]
+	}
+	if arg == "" {
+		if limit <= 0 {
+			return fmt.Sprintf("💰 Daily token budget (this chat): unlimited\nTokens used today: %s (resets at UTC midnight)", formatThousands(used)), nil
+		}
+		remaining := limit - used
+		if remaining < 0 {
+			remaining = 0
+		}
+		return fmt.Sprintf("💰 Daily token budget (this chat): %s tokens per day\nTokens used today: %s\nRemaining today: %s (resets at UTC midnight)",
+			formatThousands(limit), formatThousands(used), formatThousands(remaining)), nil
+	}
+	newLimit, ok := parseBudgetArg(arg)
+	if !ok {
+		return "Usage: /budget [limit|infinity] — limit is a number of tokens per chat per day (1000–10000000), or infinity (or 0) for unlimited. /budget with no argument shows the current limit and today's usage.", nil
+	}
+	if newLimit != 0 && (newLimit < minDailyBudgetLimit || newLimit > maxDailyBudgetLimit) {
+		return fmt.Sprintf("❌ Daily token budget must be 0 (unlimited) or between %d and %d tokens, got %d.", minDailyBudgetLimit, maxDailyBudgetLimit, newLimit), nil
+	}
+	if env.SetBudget == nil {
+		return "Setting the budget is unavailable (not wired).", nil
+	}
+	if err := env.SetBudget(newLimit); err != nil {
+		return fmt.Sprintf("❌ Could not set the budget: %v", err), nil
+	}
+	// The limit is one value shared by every chat (the per-chat
+	// daily cap), not a per-chat override: say so, so the owner
+	// does not think only this chat changed. Today's usage is
+	// untouched — a lower limit below today's spend simply blocks
+	// the next turn until the UTC day rolls over.
+	if newLimit == 0 {
+		return "✅ Daily token budget set to unlimited for every chat. Today's usage is unchanged.", nil
+	}
+	return fmt.Sprintf("✅ Daily token budget set to %s tokens per chat per day, for every chat. Today's usage is unchanged.", formatThousands(newLimit)), nil
+}
+
+// skillsReloadHandler implements /skills reload (F-A17-15): re-read
+// the skills directory without restarting the daemon.
+func skillsReloadHandler(ctx context.Context, env *CommandEnv, args string) (string, error) {
+	if env.ReloadSkills == nil {
+		return "Skills reload is unavailable (not wired).", nil
+	}
+	loaded, err := env.ReloadSkills()
+	if err != nil {
+		if loaded > 0 {
+			return fmt.Sprintf("⚠️ Reloaded %d skill(s), but some skills failed to load: %v", loaded, err), nil
+		}
+		return fmt.Sprintf("❌ Could not reload skills: %v", err), nil
+	}
+	if loaded == 1 {
+		return "✅ Reloaded 1 skill from the skills directory.", nil
+	}
+	return fmt.Sprintf("✅ Reloaded %d skills from the skills directory.", loaded), nil
+}
+
+// DefaultRegistry returns a registry with the 23 core commands. env
 // is captured by the handlers; /help closes over the registry itself
 // so its list can never go stale.
 func DefaultRegistry(env *CommandEnv) *Registry {
@@ -624,6 +847,24 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 	})
 
 	r.Register(Command{
+		Name:        "budget",
+		Description: "Show or set the daily token budget (owner-only)",
+		Handler:     budgetHandler,
+	})
+
+	// /বাজেট is the Bengali alias for /budget: the same handler,
+	// the same owner check. It is deliberately NOT advertised in
+	// the Telegram "/" menu — BotCommands only lists names the
+	// Bot API accepts ([a-z0-9_]), so a Bengali name there would
+	// fail setMyCommands on every startup; Dispatch still accepts
+	// it, and /help lists it.
+	r.Register(Command{
+		Name:        "বাজেট",
+		Description: "বাজেট দেখুন বা বদলান (owner-only; /budget-এর বাংলা নাম)",
+		Handler:     budgetHandler,
+	})
+
+	r.Register(Command{
 		Name:        "undo",
 		Description: "Back up N user turns and re-prompt (default 1)",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
@@ -772,7 +1013,109 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 		Description: "Gracefully restart the gateway after draining active runs",
 		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
 			env.Restart()
-			return "🔄 Restarting… Active runs drain first (up to 10s); if no supervisor (systemd) is running the daemon, start oriond again manually.", nil
+			return "🔄 Restarting… Active runs drain first (up to 30s); if no supervisor (systemd) is running the daemon, start oriond again manually.", nil
+		},
+	})
+
+	// /rules (F-A17-6): the owner-only migration path for legacy
+	// global rules. Rules written before rc22 carry no chat, so
+	// they apply to every chat forever — and until this command
+	// there was no way to list or delete one. /rules lists them
+	// (global rules flagged as legacy), /rules delete <tool>
+	// deletes a legacy global rule, /rules delete <chat>:<tool>
+	// deletes one chat's rule, and /rules scope <tool> <chat>
+	// moves a global rule onto a single chat. Owner-only like
+	// /restart: the check lives in the handler (IsOwner), so it
+	// is testable through Dispatch with a stub env.
+	r.Register(Command{
+		Name:        "rules",
+		Description: "Owner-only: list permission rules; '/rules delete <tool>' deletes a legacy global rule, '/rules delete <chat>:<tool>' deletes a per-chat rule, '/rules scope <tool> <chat>' moves a global rule to one chat",
+		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
+			const usage = "Usage: /rules — list rules; /rules delete <tool> — delete a legacy global rule; /rules delete <chat>:<tool> — delete a per-chat rule; /rules scope <tool> <chat> — move a global rule to one chat."
+			if env.IsOwner == nil {
+				return "Rules are unavailable (not wired).", nil
+			}
+			if !env.IsOwner(env.ChatID) {
+				return "⛔ /rules is owner-only. Only the owner can list, delete, or scope permission rules.", nil
+			}
+			fields := strings.Fields(args)
+			if len(fields) == 0 {
+				if env.ListRules == nil {
+					return "Rules are unavailable (not wired).", nil
+				}
+				rules := env.ListRules()
+				if len(rules) == 0 {
+					return "No standing permission rules. Gated tools will prompt every time until you tap “Always” or “Never” on an approval card.", nil
+				}
+				var b strings.Builder
+				b.WriteString("📜 Permission rules:\n")
+				for _, r := range rules {
+					scope := fmt.Sprintf("chat %d", r.ChatID)
+					if r.ChatID == 0 {
+						scope = "GLOBAL (legacy — applies to every chat)"
+					}
+					fmt.Fprintf(&b, "• %s — %s — %s\n", r.Tool, r.Action, scope)
+				}
+				b.WriteString("Delete a legacy global rule with /rules delete <tool>; move one to a single chat with /rules scope <tool> <chat>.")
+				return strings.TrimRight(b.String(), "\n"), nil
+			}
+			switch strings.ToLower(fields[0]) {
+			case "delete":
+				if len(fields) != 2 {
+					return usage, nil
+				}
+				if env.DeleteRule == nil {
+					return "Rules are unavailable (not wired).", nil
+				}
+				target := fields[1]
+				chatID := int64(0)
+				tool := target
+				if i := strings.Index(target, ":"); i > 0 {
+					id, err := strconv.ParseInt(target[:i], 10, 64)
+					if err != nil || strings.TrimSpace(target[i+1:]) == "" {
+						return usage, nil
+					}
+					chatID, tool = id, target[i+1:]
+				}
+				if err := env.DeleteRule(chatID, tool); err != nil {
+					return fmt.Sprintf("❌ Could not delete the rule: %v", err), nil
+				}
+				if chatID == 0 {
+					return fmt.Sprintf("🗑 Deleted the legacy global rule for %q. It no longer applies to any chat.", tool), nil
+				}
+				return fmt.Sprintf("🗑 Deleted the rule for %q in chat %d.", tool, chatID), nil
+			case "scope":
+				if len(fields) != 3 {
+					return usage, nil
+				}
+				if env.ListRules == nil || env.SetRule == nil || env.DeleteRule == nil {
+					return "Rules are unavailable (not wired).", nil
+				}
+				tool := fields[1]
+				chatID, err := strconv.ParseInt(fields[2], 10, 64)
+				if err != nil || chatID == 0 {
+					return "Usage: /rules scope <tool> <chat> — <chat> must be a non-zero chat id.", nil
+				}
+				var action permissions.Action
+				found := false
+				for _, r := range env.ListRules() {
+					if r.ChatID == 0 && r.Tool == tool {
+						action, found = r.Action, true
+					}
+				}
+				if !found {
+					return fmt.Sprintf("No legacy global rule for %q to scope.", tool), nil
+				}
+				if err := env.SetRule(chatID, tool, action); err != nil {
+					return fmt.Sprintf("❌ Could not scope the rule: %v", err), nil
+				}
+				if err := env.DeleteRule(0, tool); err != nil {
+					return fmt.Sprintf("⚠️ The rule is now set for chat %d, but the legacy global rule could not be deleted: %v — it still applies to every chat, so delete it with /rules delete %s.", chatID, err, tool), nil
+				}
+				return fmt.Sprintf("✅ Moved the %q rule (%s) from global to chat %d only. Other chats will be prompted again for %q.", tool, action, chatID, tool), nil
+			default:
+				return usage, nil
+			}
 		},
 	})
 
@@ -880,6 +1223,17 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 				}
 			}
 			return info, nil
+		},
+	})
+
+	r.Register(Command{
+		Name:        "skills",
+		Description: "Reload skills from the skills directory ('/skills reload')",
+		Handler: func(ctx context.Context, env *CommandEnv, args string) (string, error) {
+			if strings.ToLower(strings.TrimSpace(args)) != "reload" {
+				return "Usage: /skills reload — re-reads the skills directory (picks up new, changed and removed skill files) without restarting the daemon.", nil
+			}
+			return skillsReloadHandler(ctx, env, args)
 		},
 	})
 

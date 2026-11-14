@@ -1,11 +1,15 @@
 // Package tools — web tools: web_fetch and web_search.
 //
-// web_fetch performs a plain HTTP GET with redirect and size caps.
+// web_fetch performs a plain HTTP GET with redirect and size caps
+// and returns EXTRACTED text (HTML → clean text, JSON → compact
+// summary), never a raw dump — a raw 68KB API response cost
+// ~17,900 tokens in one turn (rc23 fetch-cost fix).
 // web_search is a real search: it queries the DuckDuckGo Instant Answer
 // API and falls back to the DuckDuckGo lite HTML results page.
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +29,16 @@ import (
 )
 
 const (
-	defaultFetchMaxBytes = 256 * 1024 // 256KB
+	// defaultFetchMaxBytes is the default raw-fetch cap: 32KB.
+	// It was 256KB (rc22), which let one fetch dump up to ~64k
+	// tokens of raw body into the model context — a 68KB
+	// repos.json cost ~17,900 tokens in a single turn and tripped
+	// the daily budget (F-A17-23 / queued user item). 32KB of raw
+	// input, extracted (see extractFetchBody) and capped at
+	// maxBytes/4 output chars, costs ~2k tokens by default; the
+	// agent raises max_bytes explicitly when it needs the full
+	// page.
+	defaultFetchMaxBytes = 32 * 1024 // 32KB
 	maxFetchMaxBytes     = 10 * 1024 * 1024
 	fetchTimeout         = 30 * time.Second
 	searchTimeout        = 20 * time.Second
@@ -203,6 +217,23 @@ func (s *fetchSession) setPin(host string, ips []net.IP) {
 // allowPrivateFetchHosts is set (tests only), validation is skipped
 // but the pin is still recorded, so test fetches to local servers
 // dial the resolved address exactly once as well.
+// trustedCIDRString renders this session's trusted egress CIDRs
+// for an error message: the configured ranges, or "none
+// configured" when there are none. resolveHost refusals name
+// them (queued user item, rc23) so the model explains the real
+// cause — the deployment's egress range is not trusted — instead
+// of blaming the user's network.
+func (s *fetchSession) trustedCIDRString() string {
+	if s == nil || len(s.trusted) == 0 {
+		return "none configured"
+	}
+	parts := make([]string, len(s.trusted))
+	for i, n := range s.trusted {
+		parts[i] = n.String()
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (s *fetchSession) resolveHost(ctx context.Context, host string) error {
 	h := stripFetchHost(host)
 	if ips, ok := s.pinned(h); ok && len(ips) > 0 {
@@ -210,7 +241,7 @@ func (s *fetchSession) resolveHost(ctx context.Context, host string) error {
 	}
 	if ip := net.ParseIP(h); ip != nil {
 		if !allowPrivateFetchHosts && !isPublicIP(ip, s.trusted) {
-			return fmt.Errorf("refusing to fetch non-public address %q", h)
+			return fmt.Errorf("refusing to fetch non-public address %q (trusted egress CIDRs: %s)", h, s.trustedCIDRString())
 		}
 		s.setPin(h, []net.IP{ip})
 		return nil
@@ -225,7 +256,7 @@ func (s *fetchSession) resolveHost(ctx context.Context, host string) error {
 	if !allowPrivateFetchHosts {
 		for _, ip := range ips {
 			if !isPublicIP(ip, s.trusted) {
-				return fmt.Errorf("host %q resolves to non-public address %s", h, ip)
+				return fmt.Errorf("host %q resolves to non-public address %s (trusted egress CIDRs: %s)", h, ip, s.trustedCIDRString())
 			}
 		}
 	}
@@ -349,6 +380,223 @@ func parseTrustedEgressCIDRs(cidrs []string) ([]*net.IPNet, error) {
 	return nets, nil
 }
 
+// ----------------------------------------------------------------
+// Response extraction (rc23 fetch-cost fix).
+//
+// web_fetch used to return the RAW body (up to 256KB) straight
+// into the model context: a 68KB GitHub repos.json cost ~17,900
+// tokens in one turn, and a 212KB GitHub HTML page cost ~50k+
+// before trimming. extractFetchBody returns EXTRACTED text
+// instead, capped at roughly maxBytes/4 characters (~2k tokens
+// at the 32KB default):
+//
+//   - HTML → visible text only (scripts, styles, comments and
+//     tags stripped, entities unescaped, blank lines dropped).
+//   - JSON array of objects → one compact line per object
+//     (scalar fields only, values truncated, nested values
+//     summarised), streamed element-by-element so a body cut off
+//     by the raw cap still yields the complete items before the
+//     cut instead of failing to parse at all.
+//   - JSON object/scalar → minified, then truncated to budget.
+//   - Anything else → plain text, truncated to budget.
+//
+// A body that is not HTML or JSON (or JSON that will not parse
+// even tolerantly) falls back to plain text, so extraction can
+// never turn a fetch into an error. Every truncation carries a
+// "[truncated]" marker naming the remedy (a larger max_bytes),
+// and the marker text always contains the literal "[truncated]"
+// for the existing cap tests.
+
+var (
+	htmlCommentRe     = regexp.MustCompile(`(?is)<!--.*?-->`)
+	htmlScriptStyleRe = regexp.MustCompile(`(?is)<(script|style|noscript|svg|template)[^>]*>.*?</(script|style|noscript|svg|template)>`)
+)
+
+// extractOutputBudget is the extracted-text char budget for a
+// fetch: a quarter of the raw cap, at least 1024 chars, so the
+// agent's single max_bytes knob controls both the download and
+// the context cost.
+func extractOutputBudget(maxBytes int) int {
+	if b := maxBytes / 4; b > 1024 {
+		return b
+	}
+	return 1024
+}
+
+// truncateExtracted caps s at budget runes, appending a
+// "[truncated]" marker that reports how much was omitted and
+// the remedy. A short string comes back unchanged (no marker),
+// so small fetches keep their exact text.
+func truncateExtracted(s string, budget int) string {
+	r := []rune(s)
+	if len(r) <= budget {
+		return s
+	}
+	return string(r[:budget]) + fmt.Sprintf("\n[truncated] (showing first %d of %d chars; re-fetch with a larger max_bytes for more)", budget, len(r))
+}
+
+// extractFetchBody converts a fetched body into the text the
+// model sees. contentType is the response Content-Type header
+// (sniffed from the body when it is empty or generic).
+func extractFetchBody(body []byte, contentType string, maxBytes int) string {
+	budget := extractOutputBudget(maxBytes)
+	ct := strings.ToLower(contentType)
+	trimmed := bytes.TrimSpace(body)
+	isHTML := strings.Contains(ct, "html")
+	isJSON := strings.Contains(ct, "json")
+	if !isHTML && !isJSON {
+		lower := bytes.ToLower(trimmed)
+		if bytes.HasPrefix(lower, []byte("<!doctype html")) || bytes.HasPrefix(lower, []byte("<html")) {
+			isHTML = true
+		} else if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			isJSON = true
+		}
+	}
+	if isHTML {
+		return truncateExtracted(extractHTMLText(body), budget)
+	}
+	if isJSON {
+		if out, ok := compactJSON(trimmed, budget); ok {
+			return out
+		}
+		// Unparseable JSON falls through to plain text.
+	}
+	return truncateExtracted(string(body), budget)
+}
+
+// extractHTMLText strips a page down to its visible text:
+// comments, script/style/noscript/svg/template blocks and all
+// tags go; entities are unescaped; runs of whitespace collapse
+// and empty lines drop, so navigation chrome and markup do not
+// cost context.
+func extractHTMLText(body []byte) string {
+	s := htmlCommentRe.ReplaceAllString(string(body), "")
+	s = htmlScriptStyleRe.ReplaceAllString(s, "")
+	s = htmlTagRe.ReplaceAllString(s, "\n")
+	s = htmlUnescape(s)
+	s = strings.ReplaceAll(s, "\u00a0", " ")
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.Join(strings.Fields(line), " ")
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// compactJSON renders a JSON body compactly within budget. An
+// array of objects becomes one line per object (see
+// compactJSONObject); anything else is minified and truncated.
+// ok is false when the body is not parseable JSON at all (the
+// caller falls back to plain text). A body cut off by the raw
+// cap still yields the complete array elements before the cut:
+// the decoder streams element-by-element and stops at the
+// truncation point instead of failing the whole parse.
+func compactJSON(trimmed []byte, budget int) (string, bool) {
+	if len(trimmed) == 0 {
+		return "", false
+	}
+	if trimmed[0] != '[' {
+		var v any
+		if err := json.Unmarshal(trimmed, &v); err != nil {
+			return "", false
+		}
+		min, err := json.Marshal(v)
+		if err != nil {
+			return "", false
+		}
+		return truncateExtracted(string(min), budget), true
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('[') {
+		return "", false
+	}
+	var sb strings.Builder
+	count := 0
+	truncated := false
+	for dec.More() {
+		var elem any
+		if err := dec.Decode(&elem); err != nil {
+			// Truncated input (or a bad element): keep the
+			// complete elements already rendered.
+			truncated = true
+			break
+		}
+		line := compactJSONValue(elem)
+		if sb.Len() > 0 && sb.Len()+len(line)+1 > budget {
+			truncated = true
+			break
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(line)
+		count++
+	}
+	if count == 0 {
+		return "", false
+	}
+	out := sb.String()
+	if truncated {
+		out += "\n[truncated] (not all items shown; re-fetch with a larger max_bytes for more)"
+	}
+	return out, true
+}
+
+// maxCompactFieldChars bounds one scalar value inside a compacted
+// JSON object line, so one huge description cannot eat the whole
+// budget.
+const maxCompactFieldChars = 120
+
+// compactJSONValue renders one JSON value compactly. An object
+// becomes "k=v | k=v" over its scalar fields (keys sorted, so
+// the output is deterministic); nested objects and arrays are
+// summarised, never expanded; other values are minified.
+func compactJSONValue(v any) string {
+	obj, ok := v.(map[string]any)
+	if !ok {
+		min, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return truncateRunesCompact(string(min), maxCompactFieldChars*2)
+	}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		val := obj[k]
+		switch t := val.(type) {
+		case nil:
+			parts = append(parts, k+"=null")
+		case string, float64, bool:
+			parts = append(parts, k+"="+truncateRunesCompact(fmt.Sprint(t), maxCompactFieldChars))
+		case map[string]any:
+			parts = append(parts, k+"=<object>")
+		case []any:
+			parts = append(parts, fmt.Sprintf("%s=<%d items>", k, len(t)))
+		default:
+			parts = append(parts, k+"=<value>")
+		}
+	}
+	return strings.Join(parts, " | ")
+}
+
+// truncateRunesCompact caps s at max runes with an ellipsis
+// marker; short values are untouched.
+func truncateRunesCompact(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
 type webFetchTool struct {
 	// trusted holds the deployment's trusted egress CIDRs, parsed
 	// once at construction (see newWebFetchTool). The zero value is
@@ -371,7 +619,7 @@ func newWebFetchTool(trustedCIDRs []string) (*webFetchTool, error) {
 func (t *webFetchTool) Name() string { return "web_fetch" }
 
 func (t *webFetchTool) Description() string {
-	return "Fetch a URL over HTTP(S) and return the response body as text (up to 256KB by default)."
+	return "Fetch a URL over HTTP(S) and return the extracted text (HTML → clean text, JSON → compact summary; up to 32KB fetched by default, extracted text capped at ~8K chars)."
 }
 
 func (t *webFetchTool) Definition() model.ToolDefinition {
@@ -384,7 +632,7 @@ func (t *webFetchTool) Definition() model.ToolDefinition {
 				"url": map[string]any{"type": "string", "description": "HTTP or HTTPS URL to fetch."},
 				"max_bytes": map[string]any{
 					"type":        "integer",
-					"description": "Maximum response bytes to return (default 262144, max 10485760).",
+					"description": "Maximum response bytes to fetch (default 32768, max 10485760). The returned text is extracted (HTML → clean text, JSON → compact summary) and capped at roughly max_bytes/4 characters; raise max_bytes when the full page is genuinely needed.",
 					"minimum":     1,
 					"maximum":     10485760,
 				},
@@ -478,9 +726,13 @@ func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if truncated {
 		body = body[:maxBytes]
 	}
-	out := string(body)
+	// Extracted text, not a raw dump (rc23 fetch-cost fix): the
+	// model sees clean text / a compact JSON summary, capped at
+	// roughly maxBytes/4 chars, instead of up to maxBytes of raw
+	// markup or API metadata.
+	out := extractFetchBody(body, resp.Header.Get("Content-Type"), maxBytes)
 	if truncated {
-		out += "\n[truncated]"
+		out += "\n[truncated] (response exceeded max_bytes; re-fetch with a larger max_bytes for more)"
 	}
 	return out, nil
 }
@@ -543,6 +795,26 @@ type searchResult struct {
 	Text  string
 }
 
+// errDDGCaptcha is the sentinel for a DuckDuckGo bot challenge
+// (rc23, queued user item): DDG answers automated requests with
+// HTTP 202 and a challenge page instead of results. It is
+// detected in searchViaAPI/searchViaLite and reported by Execute
+// as "search backend is blocking automated requests right now"
+// instead of the misleading "no results found" — the results
+// exist, the backend is refusing to serve them to this egress
+// IP, and it usually clears on its own.
+var errDDGCaptcha = errors.New("search backend is blocking automated requests right now (DuckDuckGo bot challenge)")
+
+// isDDGChallengeBody reports whether a lite results page is a
+// bot-challenge page rather than results: a challenge page has
+// no result links and names the challenge. Checked only when the
+// page parses to zero results, so a real results page that
+// happens to mention the word "challenge" in a snippet is never
+// misread.
+func isDDGChallengeBody(body []byte) bool {
+	return strings.Contains(strings.ToLower(string(body)), "challenge")
+}
+
 func (t *webSearchTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a webSearchArgs
 	if err := decodeArgs(t.Name(), args, &a); err != nil {
@@ -566,6 +838,15 @@ func (t *webSearchTool) Execute(ctx context.Context, args json.RawMessage) (stri
 		liteResults, liteErr := t.searchViaLite(ctx, query, count)
 		if len(liteResults) > 0 {
 			results = liteResults
+		} else if errors.Is(apiErr, errDDGCaptcha) || errors.Is(liteErr, errDDGCaptcha) {
+			// The backend is refusing automated requests
+			// (DDG bot challenge, HTTP 202) — say so
+			// instead of "no results", which would be a lie:
+			// the results exist, this egress IP is blocked
+			// from seeing them right now. A plain reply,
+			// not an error: it is a transient backend
+			// condition, not a bad query.
+			return "Search backend is blocking automated requests right now (DuckDuckGo bot challenge). Try again later.", nil
 		} else if apiErr != nil {
 			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("web search failed (API: %v; lite fallback: %v)", apiErr, liteErr)}
 		} else if liteErr != nil {
@@ -650,6 +931,13 @@ func (t *webSearchTool) searchViaAPI(ctx context.Context, query string, count in
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		// DuckDuckGo bot challenge (rc23): the API answers
+		// automated requests with HTTP 202 and a challenge
+		// page instead of JSON. Surface it as the captcha
+		// sentinel, never as an empty result set.
+		return nil, errDDGCaptcha
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("DuckDuckGo API returned status %d", resp.StatusCode)
 	}
@@ -776,6 +1064,10 @@ func (t *webSearchTool) searchViaLite(ctx context.Context, query string, count i
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		// DuckDuckGo bot challenge (rc23): see searchViaAPI.
+		return nil, errDDGCaptcha
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("DuckDuckGo lite returned status %d", resp.StatusCode)
 	}
@@ -813,6 +1105,11 @@ func (t *webSearchTool) searchViaLite(ctx context.Context, query string, count i
 		if len(results) >= count {
 			break
 		}
+	}
+	if len(results) == 0 && isDDGChallengeBody(body) {
+		// A challenge page with no results (rc23): see
+		// searchViaAPI — report the block, not "no results".
+		return nil, errDDGCaptcha
 	}
 	return results, nil
 }

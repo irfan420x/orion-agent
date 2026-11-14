@@ -67,6 +67,86 @@ type Skill struct {
 type Registry struct {
 	mu     sync.RWMutex
 	skills map[string]Skill
+	// knownTools, when set with SetKnownTools, is the tool-name set
+	// ## Tools entries are validated against (F-A17-14). Nil means
+	// the built-in set (knownBuiltInTools): a Registry built by
+	// hand or by tests validates against the tools Orion ships,
+	// and the daemon extends it with the live registry's names
+	// (subagent/skill/MCP tools) via loadSkills.
+	knownTools map[string]bool
+}
+
+// knownBuiltInTools is the set of tool names Orion ships (the
+// tools DefaultRegistry registers, plus the "skill" tool itself,
+// which a skill may always name — the agent loop never blocks it).
+// It is the validation baseline for ## Tools (F-A17-14): a name
+// outside this set (and outside any SetKnownTools extension, e.g.
+// MCP tools) warns at load time instead of silently never
+// matching a real tool. UPDATE THIS LIST when a built-in tool is
+// added, renamed or removed — the list is data, not derived from
+// the tools package, because tools imports skills (the skill tool
+// looks skills up), so skills cannot import tools back.
+var knownBuiltInTools = map[string]bool{
+	"calculator": true, "datetime": true,
+	"file_edit": true, "file_list": true, "file_read": true, "file_write": true,
+	"glob": true, "grep": true,
+	"process_list":  true,
+	"shell_exec":    true,
+	"skill":         true,
+	"subagent_list": true, "subagent_result": true, "subagent_spawn": true, "subagent_stop": true,
+	"task_create": true, "task_get": true, "task_list": true, "task_update": true,
+	"todo_write": true,
+	"web_fetch":  true, "web_search": true,
+}
+
+// SetKnownTools extends the tool-name set ## Tools entries are
+// validated against (F-A17-14): names is added to the built-in set
+// (never replaces it — "skill" and the built-ins stay known), so a
+// caller that knows more tools than the built-ins (the daemon,
+// whose live registry also holds MCP tools) can pass them in
+// without re-listing the built-ins. It is additive and safe to call
+// before or after loading: skills loaded before the call keep the
+// warnings they were loaded with, and Reload re-validates against
+// the extended set. A nil/empty names is a no-op. The names are
+// copied, so later mutation of the caller's slice cannot change
+// the set.
+func (r *Registry) SetKnownTools(names []string) {
+	if r == nil || len(names) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.knownTools == nil {
+		r.knownTools = make(map[string]bool, len(knownBuiltInTools)+len(names))
+		for name := range knownBuiltInTools {
+			r.knownTools[name] = true
+		}
+	}
+	for _, name := range names {
+		if name = strings.TrimSpace(name); name != "" {
+			r.knownTools[name] = true
+		}
+	}
+}
+
+// knownSet returns a copy of the tool-name set to validate ## Tools
+// against: the registry's extension when set, else the built-in
+// set. It is a copy so a concurrent SetKnownTools cannot race a
+// load that is reading the set.
+func (r *Registry) knownSet() map[string]bool {
+	if r == nil {
+		return knownBuiltInTools
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.knownTools == nil {
+		return knownBuiltInTools
+	}
+	out := make(map[string]bool, len(r.knownTools))
+	for name := range r.knownTools {
+		out[name] = true
+	}
+	return out
 }
 
 // NewRegistry returns an empty skill registry.
@@ -198,6 +278,9 @@ func (r *Registry) LoadDir(dir string) (int, error) {
 	var errs []error
 	loaded := 0
 	sawMD := false
+	// The known-tool set is snapshotted once per load, so a
+	// concurrent SetKnownTools cannot change validation mid-dir.
+	known := r.knownSet()
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -223,7 +306,7 @@ func (r *Registry) LoadDir(dir string) (int, error) {
 			errs = append(errs, fmt.Errorf("skills: refusing symlink %q: skill files must be regular files inside %q", path, dir))
 			continue
 		}
-		skill, err := parseFile(path)
+		skill, err := parseFileWithKnownTools(path, known)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -244,10 +327,52 @@ func (r *Registry) LoadDir(dir string) (int, error) {
 	return loaded, nil
 }
 
+// Reload re-reads every *.md file in dir (F-A17-15) without
+// restarting the daemon: new files are picked up, changed files
+// re-parsed, removed files dropped. It loads into a fresh registry
+// first and swaps the contents in only when the load produced at
+// least one skill: a directory that cannot be read at all, or one
+// with no loadable skills, leaves the current registry untouched
+// (the previously loaded skills stay live) and returns the error.
+// A partial load (some files broken) still swaps — the good files
+// are the directory's current truth — and returns the joined error
+// alongside the count, so the caller can report both. The swap is
+// one lock hold, so readers never see a half-reloaded registry,
+// and the registry pointer itself never changes: the agent and the
+// skill tool keep working on the same Registry. The fresh load is
+// validated against this registry's known-tool set (see
+// SetKnownTools), so a reload re-warns about unknown tools.
+func (r *Registry) Reload(dir string) (int, error) {
+	if r == nil {
+		return 0, errors.New("skills: Reload on nil Registry")
+	}
+	fresh := NewRegistry()
+	// Carry the known-tool extension over, so the reload
+	// re-validates against the same set (a nil extension means
+	// the built-in default, which fresh already uses).
+	r.mu.RLock()
+	if r.knownTools != nil {
+		cp := make(map[string]bool, len(r.knownTools))
+		for name := range r.knownTools {
+			cp[name] = true
+		}
+		fresh.knownTools = cp
+	}
+	r.mu.RUnlock()
+	loaded, err := fresh.LoadDir(dir)
+	if loaded == 0 && err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	r.skills = fresh.skills
+	r.mu.Unlock()
+	return loaded, err
+}
+
 // LoadFile parses a single skill file and returns it. The skill is not
 // registered; use Register to add it to the registry.
 func (r *Registry) LoadFile(path string) (Skill, error) {
-	return parseFile(path)
+	return parseFileWithKnownTools(path, r.knownSet())
 }
 
 // parseFile reads one skill file (capped at maxFileSize) and parses it.
@@ -265,6 +390,14 @@ func (r *Registry) LoadFile(path string) (Skill, error) {
 // that was checked a moment earlier. LoadDir's own Lstat pre-check
 // is only an early, clearer error; the checks here are authoritative.
 func parseFile(path string) (Skill, error) {
+	return parseFileWithKnownTools(path, knownBuiltInTools)
+}
+
+// parseFileWithKnownTools is parseFile validated against known: the
+// tool names in the file's "## Tools" section are checked against
+// it (see parseSkillWithKnownTools), and unknown names warn instead
+// of failing the load.
+func parseFileWithKnownTools(path string, known map[string]bool) (Skill, error) {
 	if strings.TrimSpace(path) == "" {
 		return Skill{}, errors.New("skills: empty file path")
 	}
@@ -306,7 +439,7 @@ func parseFile(path string) (Skill, error) {
 	if err := validateSkillContent(string(data)); err != nil {
 		return Skill{}, fmt.Errorf("skills: file %q: %w", path, err)
 	}
-	skill, warnings := parseSkill(path, string(data))
+	skill, warnings := parseSkillWithKnownTools(path, string(data), known)
 	for _, w := range warnings {
 		log.Printf("orion: skills: %s: %s", path, w)
 	}
@@ -2249,7 +2382,23 @@ func isQuotedSkillReference(seg string) bool {
 // section but were not recognised as one (see normalizeToolsHeading):
 // the file's restriction is then silently absent, and the caller logs
 // the warning so the author finds out instead of running unrestricted.
+//
+// It also warns about "## Tools" entries that name no known tool
+// (F-A17-14): the skill still loads with the name kept — an unknown
+// name can never match a real tool at enforcement time, so keeping
+// it is harmless — but the author is told, with a did-you-mean
+// suggestion when one is close. parseSkill validates against the
+// built-in tools; parseSkillWithKnownTools takes the caller's set
+// (see Registry.SetKnownTools).
 func parseSkill(path, content string) (Skill, []string) {
+	return parseSkillWithKnownTools(path, content, knownBuiltInTools)
+}
+
+// parseSkillWithKnownTools is parseSkill validated against known.
+func parseSkillWithKnownTools(path, content string, known map[string]bool) (Skill, []string) {
+	if known == nil {
+		known = knownBuiltInTools
+	}
 	skill := Skill{
 		Path:    path,
 		Content: content,
@@ -2408,9 +2557,81 @@ func parseSkill(path, content string) (Skill, []string) {
 		}
 		seenTools[item] = true
 		skill.Tools = append(skill.Tools, item)
+		// Unknown tool names warn (F-A17-14) instead of failing
+		// the load: a misspelled name ("shell_exe") would
+		// otherwise silently give the skill a tool it can never
+		// receive, and the author would never find out. The name
+		// stays in the list — it can never match a real tool at
+		// enforcement time, so keeping it is harmless, and a
+		// tool added later (or an MCP tool the loader did not
+		// know about) then just works.
+		if !known[item] {
+			msg := fmt.Sprintf("unknown tool %q in \"## Tools\" of skill %q — the skill will never receive that tool", item, skill.Name)
+			if sug := closestKnownTool(item, known); sug != "" {
+				msg += fmt.Sprintf("; did you mean %q?", sug)
+			}
+			warnings = append(warnings, msg)
+		}
 	}
 
 	return skill, warnings
+}
+
+// closestKnownTool returns the known tool name closest to name
+// (Levenshtein distance ≤ 2), or "" when none is close — the
+// did-you-mean suggestion for an unknown ## Tools entry
+// (F-A17-14). Ties break towards the lexicographically smallest
+// name, so the suggestion is deterministic.
+func closestKnownTool(name string, known map[string]bool) string {
+	best := ""
+	bestDist := 3 // anything above the threshold never wins
+	for candidate := range known {
+		if d := levenshteinDistance(name, candidate); d < bestDist || (d == bestDist && d <= 2 && candidate < best) {
+			best, bestDist = candidate, d
+		}
+	}
+	if bestDist > 2 {
+		return ""
+	}
+	return best
+}
+
+// levenshteinDistance is the edit distance between a and b
+// (insert/delete/substitute, cost 1), over runes. Only used for
+// the did-you-mean suggestion above, so the simple O(n*m) table
+// is fine — tool names are a dozen characters at most.
+func levenshteinDistance(a, b string) int {
+	ar, br := []rune(a), []rune(b)
+	prev := make([]int, len(br)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		cur := make([]int, len(br)+1)
+		cur[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 0
+			if ar[i-1] != br[j-1] {
+				cost = 1
+			}
+			cur[j] = min3(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(br)]
+}
+
+func min3(a, b, c int) int {
+	if a < b {
+		if a < c {
+			return a
+		}
+		return c
+	}
+	if b < c {
+		return b
+	}
+	return c
 }
 
 // normalizeToolsHeading reports whether a level-2 heading title is a

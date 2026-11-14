@@ -331,7 +331,7 @@ func (c *Config) AllowAllTelegramWarning() string {
 	if !c.AllowAllTelegramChats {
 		return ""
 	}
-	return fmt.Sprintf("WARNING: allow_all_telegram_chats is ON — ANY Telegram chat can drive this agent (including shell_exec) until the opt-in auto-disables %s after daemon start. This is for first-time setup only (send /whoami to learn your chat ID): set telegram_allowed_chats in config.json and restart, and never leave allow_all_telegram_chats=true in a running deployment.",
+	return fmt.Sprintf("WARNING: allow_all_telegram_chats is ON — ANY Telegram chat can drive this agent (including shell_exec) until the opt-in auto-disables %s after the window first opened. This is for first-time setup only (send /whoami to learn your chat ID): set telegram_allowed_chats in config.json and restart, and never leave allow_all_telegram_chats=true in a running deployment.",
 		c.AllowAllWindow())
 }
 

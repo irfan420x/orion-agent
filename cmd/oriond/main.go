@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/app"
+	"github.com/irfan/orion/internal/backup"
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
@@ -26,6 +27,40 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+// Daemon exit codes (F-A17-2, F-A17-3). Exit 1 stays the generic
+// startup/poll failure; the codes below let a supervisor — and the
+// journal — tell an intentional restart and a refused second instance
+// apart from a crash.
+const (
+	// exitRestartRequested (42) is returned only by the /restart
+	// path: the owner asked for a restart, so the process must come
+	// back. 42 is not a sysexits.h code, so it can never be confused
+	// with a standard failure, and it is deliberately NOT 0: with
+	// Restart=always a clean exit 0 and a crash counted identically
+	// toward the start-limit burst, so an operator's /restart could
+	// consume the last restart the burst allowed and strand the
+	// unit. See the /restart case in run for the unit lines.
+	exitRestartRequested = 42
+	// exitAlreadyRunning (2) is returned when another oriond already
+	// holds the instance lock (F-A17-3): a second poller would draw
+	// a Telegram 409 and flap the good daemon too, so the second
+	// instance refuses to start. 2 matches the existing usage-error
+	// exit code — a refusal to start, not a crash.
+	exitAlreadyRunning = 2
+)
+
+// drainTimeout bounds Drain in both shutdown paths of this binary
+// (F-A17-17): /restart and SIGTERM/SIGINT both wait this long for the
+// cancelled in-flight turns to wind down (finish writing state, not
+// finish replying — their contexts are already cancelled, so the
+// replies are lost either way). 30s is the same bound
+// cmd/orion/main.go pollTelegram uses: it is the F-A10-5 margin that
+// keeps a turn from racing transcript/memory writes during teardown,
+// the only reasoned bound in the codebase — the 10s oriond used
+// before was never justified. The two entrypoints MUST use the same
+// value; if it changes here, change it in cmd/orion/main.go too.
+const drainTimeout = 30 * time.Second
+
 func usage() {
 	fmt.Printf(`oriond — Orion daemon (v%s)
 
@@ -33,6 +68,10 @@ Usage:
   oriond                  run Telegram polling until interrupted
   oriond --help           show this help
   oriond --version        print version
+  oriond --restore <snapshot>
+                          restore ~/.orion from a backup snapshot and exit
+                          (F-A17-13; verify the snapshot first, then start
+                          normally to run)
 
 Environment:
   ORION_TELEGRAM_BASE_URL override the Telegram Bot API endpoint
@@ -59,6 +98,27 @@ func run(args []string) int {
 				return 2
 			}
 			fmt.Printf("oriond %s (go, model-agnostic, telegram-only)\n", version.String())
+			return 0
+		case "--restore":
+			// F-A17-13: restore runs BEFORE the app starts, so no
+			// daemon state is loaded from the (possibly damaged)
+			// data dir first. The snapshot is verified (every
+			// hash) before anything is written; a corrupt
+			// snapshot is refused with nothing restored.
+			if len(args) != 2 {
+				fmt.Fprintln(os.Stderr, "oriond: --restore takes exactly one argument (a backup snapshot path)")
+				return 2
+			}
+			cfg, err := config.Load("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "oriond: cannot load config: %v\n", err)
+				return 1
+			}
+			if err := backup.Restore(args[1], cfg.DataDir); err != nil {
+				fmt.Fprintf(os.Stderr, "oriond: restore failed: %v\n", err)
+				return 1
+			}
+			fmt.Fprintf(os.Stderr, "oriond: restored data dir %s from snapshot %s; start normally to run\n", cfg.DataDir, args[1])
 			return 0
 		default:
 			fmt.Fprintf(os.Stderr, "oriond: unknown argument %q\n", args[0])
@@ -106,6 +166,24 @@ func run(args []string) int {
 	}
 	defer a.Close()
 
+	// F-A17-3: single-instance guard — an exclusive flock on
+	// <dataDir>/oriond.lock, held for the life of the process. A
+	// second oriond polling with the same token draws Telegram 409
+	// Conflict, which is fatal: both instances flap, and the good
+	// daemon dies with the bad one. The lock is taken before
+	// getMe/polling starts, so the second instance exits 2 with a
+	// clear log line and never talks to Telegram at all. flock is
+	// released when the process dies (fd close), so a crash can
+	// never leave a stale lock behind; the lock file itself stays
+	// on disk, empty, which is fine — the lock is the flock, not
+	// the file's existence.
+	lockFile, err := acquireInstanceLock(a.Config.DataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
+		return exitAlreadyRunning
+	}
+	defer lockFile.Close()
+
 	if a.Config.TelegramToken == "" {
 		fmt.Fprintln(os.Stderr, "oriond: no telegram token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
 		return 1
@@ -136,9 +214,11 @@ func run(args []string) int {
 		}),
 	}
 	if a.Config.AllowAllTelegramChats {
-		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
-		// every chat once the window (from daemon start) elapses.
-		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
+		// P2-O5 / F-A17-4: the opt-in is time-boxed — IsChatAllowed
+		// refuses every chat once the window elapses. The deadline
+		// is persisted in the data dir, so a restart resumes the
+		// recorded window instead of opening a fresh one.
+		gwOpts = append(gwOpts, messaging.WithAllowAllPersisted(a.Config.AllowAllWindow(), a.Config.DataDir))
 	}
 	gw, err := messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
 	if err != nil {
@@ -159,8 +239,17 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
 		return 1
 	}
-	fmt.Printf("oriond running as @%s (provider %s, model %s). Ctrl+C to stop.\n",
-		username, a.Provider.Name(), active.Model)
+	// F-A17-16: one startup line carrying everything the next
+	// incident needs — version, PID, data dir, config path — so a
+	// journal line can tell which build a dead daemon was. The
+	// "oriond running as @..." prefix is kept verbatim: the
+	// Audit 3 start/stop test waits for it.
+	configPath, _ := config.DefaultPath()
+	if configPath == "" {
+		configPath = "unknown"
+	}
+	fmt.Printf("oriond running as @%s (provider %s, model %s); version %s; pid %d; data dir %s; config %s\n",
+		username, a.Provider.Name(), active.Model, version.String(), os.Getpid(), a.Config.DataDir, configPath)
 
 	// F-A3-2: optional localhost-only pprof/debug endpoint. Off by
 	// default (config debug.pprof_enabled); when enabled it binds
@@ -282,17 +371,52 @@ func run(args []string) int {
 		}
 		return 0
 	case <-restartCh:
-		fmt.Fprintln(os.Stderr, "oriond: restart requested; draining active runs (up to 10s)...")
-		if !a.Drain(10 * time.Second) {
-			fmt.Fprintln(os.Stderr, "oriond: restart: some runs still active after 10s; exiting anyway")
+		// F-A17-17: honest language — the turn contexts are already
+		// cancelled (their contexts derive from ctx), so Drain only
+		// waits for the cancelled turns to wind down and finish
+		// writing state; it does not let them finish replying.
+		fmt.Fprintf(os.Stderr, "oriond: restart requested; waiting up to %s for cancelled in-flight turns to wind down...\n", drainTimeout)
+		if !a.Drain(drainTimeout) {
+			fmt.Fprintf(os.Stderr, "oriond: restart: some turns had not wound down after %s; exiting anyway (their replies are lost)\n", drainTimeout)
 		}
-		// Exit 0 so a supervisor restarts the daemon: the shipped
-		// oriond.service sets Restart=always, so a clean exit 0
-		// IS a restart trigger (an explicit `systemctl stop` is
-		// still a stop, not a restart). Without a supervisor the
-		// daemon simply exits and must be started manually — see
-		// /restart's reply and ARCHITECTURE.md.
-		return 0
+		// F-A17-2: /restart exits 42 (exitRestartRequested), NOT 0.
+		// Choice: (a) distinct exit code + RestartForceExitStatus —
+		// verified against the systemd.service man page, which
+		// states plainly that a restart "is subject to unit start
+		// rate limiting": RestartForceExitStatus does NOT bypass
+		// StartLimitBurst, so (a) cannot by itself stop a
+		// persistent fault from stranding the unit — the burst
+		// limit stays the circuit breaker for genuine faults, by
+		// design. What (a) DOES fix is the classification: with
+		// Restart=always every exit — clean 0, intentional
+		// restart, crash — counted identically toward the burst,
+		// so /restart itself could burn the last restart the burst
+		// allowed. With exit 42 + Restart=on-failure +
+		// RestartForceExitStatus=42, an intentional restart is
+		// distinguishable in the journal, restarts even under the
+		// stricter policy, and a clean exit 0 (SIGTERM shutdown,
+		// PollStream returning nil on context cancel — the only
+		// nil return in PollStream) no longer restarts at all.
+		// Rejected: (b) StartLimitIntervalSec 600s — a rapid loop
+		// trips 12-in-600s exactly as it trips 12-in-60s (12
+		// starts in ~60s either way), so it adds no self-recovery
+		// and only makes slow loops strand sooner; (c) a startup
+		// pre-flight check — the daemon already fails fast at
+		// startup (config validate, getMe) and a check cannot
+		// distinguish a transient from a deterministic fault
+		// without error classification, so it duplicates the
+		// existing failures without fixing the classification.
+		// Unit lines the coordinator applies (W1 owns the unit
+		// files — do NOT edit them here):
+		//   [Service]
+		//   Restart=on-failure
+		//   RestartSec=5s
+		//   RestartForceExitStatus=42
+		// ([Unit] StartLimitIntervalSec=60s / StartLimitBurst=12
+		// unchanged.) Without a supervisor the daemon simply exits
+		// 42 and must be started manually — see /restart's reply
+		// and ARCHITECTURE.md.
+		return exitRestartRequested
 	case <-ctx.Done():
 		// SIGINT/SIGTERM: let in-flight turns unwind and persist
 		// before Close saves and closes the memory store — the
@@ -301,7 +425,7 @@ func run(args []string) int {
 		// recording its last step. Turns are already cancelled
 		// (their contexts derive from ctx), so this is prompt
 		// unless a run is stuck in a non-cancellable operation;
-		// the 10s bound keeps shutdown from hanging either way.
+		// the drainTimeout bound keeps shutdown from hanging either way.
 		// F-A16-5: log which signal stopped the daemon, so the
 		// log can tell a stop from a crash after the fact.
 		// signalName spells it "SIGTERM", not the os.Signal
@@ -313,8 +437,11 @@ func run(args []string) int {
 		default:
 		}
 		fmt.Fprintf(os.Stderr, "oriond: shutting down on %s...\n", sigName)
-		if !a.Drain(10 * time.Second) {
-			fmt.Fprintln(os.Stderr, "oriond: shutdown: some runs still active after 10s; exiting anyway")
+		// F-A17-17: same bound as /restart (drainTimeout), and honest
+		// language — Drain only waits for the cancelled turns to
+		// wind down; their replies are already lost.
+		if !a.Drain(drainTimeout) {
+			fmt.Fprintf(os.Stderr, "oriond: shutdown: some turns had not wound down after %s; exiting anyway (their replies are lost)\n", drainTimeout)
 		}
 		fmt.Fprintln(os.Stderr, "oriond: shutdown complete")
 		return 0
@@ -336,6 +463,32 @@ func signalName(sig os.Signal) string {
 	default:
 		return sig.String()
 	}
+}
+
+// acquireInstanceLock takes an exclusive, non-blocking flock on
+// <dataDir>/oriond.lock (F-A17-3). The returned file must stay open
+// for the life of the process: closing it releases the lock. A second
+// instance gets an error naming the lock, so the caller can refuse to
+// start with exit 2. A lock failure that is not "already locked"
+// (permissions, missing dir) is a different error, so it is never
+// misreported as a second instance.
+func acquireInstanceLock(dataDir string) (*os.File, error) {
+	if dataDir == "" {
+		return nil, errors.New("oriond: cannot take the instance lock: data dir is empty")
+	}
+	path := filepath.Join(dataDir, "oriond.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("oriond: open instance lock %q: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("oriond: another oriond instance is already running (instance lock %q is held); refusing to start a second poller", path)
+		}
+		return nil, fmt.Errorf("oriond: lock instance lock %q: %w", path, err)
+	}
+	return f, nil
 }
 
 // buildApprovalGate wires the permission gate for the daemon
@@ -643,6 +796,40 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 				SummariesLoaded:    rep.SummariesLoaded,
 				Capped:             rep.Capped,
 			}, true
+		},
+		// OwnerID + budget + skills reload + rules (rc23):
+		// /budget and /skills reload (F-A17-15) and the /rules
+		// command (F-A17-6) are wired here. The /budget owner
+		// check lives in the handler (CommandEnv.isOwner, using
+		// OwnerID); /rules takes IsOwner as a function so the
+		// handler never guesses when the gate is unavailable.
+		OwnerID:      ownerID,
+		BudgetInfo:   a.BudgetInfoForChat,
+		SetBudget:    a.SetDailyBudget,
+		ReloadSkills: a.ReloadSkills,
+		IsOwner: func(chatID int64) bool {
+			return ownerID != 0 && chatID == ownerID
+		},
+		ListRules: func() []permissions.Rule {
+			g := a.PermissionGate()
+			if g == nil || g.Rules() == nil {
+				return nil
+			}
+			return g.Rules().List()
+		},
+		DeleteRule: func(chatID int64, tool string) error {
+			g := a.PermissionGate()
+			if g == nil || g.Rules() == nil {
+				return errors.New("rules store unavailable")
+			}
+			return g.Rules().DeleteForChat(chatID, tool)
+		},
+		SetRule: func(chatID int64, tool string, action permissions.Action) error {
+			g := a.PermissionGate()
+			if g == nil || g.Rules() == nil {
+				return errors.New("rules store unavailable")
+			}
+			return g.Rules().SetForChat(chatID, tool, action)
 		},
 	}
 }

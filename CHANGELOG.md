@@ -4,6 +4,168 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc23] — 2026-11-14
+
+### Audit 17 fixes (v0.2.0-rc23) — see `AUDIT17_2026-11-14.md`
+
+Fixes the P1, all twelve P2s and all five P3s from the fresh-eyes
+audit of rc22 (0 P0, 1 P1, 12 P2, 5 P3). Audit 16's fixes are all
+genuinely fixed (F-A16-6 is now fully closed by the install.sh test)
+and all earlier fixes still hold; rc8 security holds.
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open. Verified by the release coordinator on the final
+commit: **1,323 tests pass, 0 fail, 4 skip (total 1,327), 24/24
+packages, race clean 24/24, no data race** (clean-clone recount;
+the coordinator corrects these numbers here if the recount differs).
+
+- **F-A17-1 (P1)** — the live unit files are now committed:
+  `systemd/oriond.service` and `systemd/oriond-sampler.service`
+  (previously only in the working tree, so
+  `TestShippedUnitRestartsOnCleanExit` failed in a clean checkout
+  and the rc22 "1,250/0" claim was false). The dated log path
+  (`oriond-live-2026-11-14.log`) is replaced with the stable
+  `oriond-live.log`. The drift guard is preserved — the test is
+  unchanged in intent (renamed to
+  `TestShippedUnitRestartsOnRestartRequest` for the new policy)
+  and passes in a clean checkout.
+- **F-A17-2 (P2)** — crash-loop: /restart now exits **42**
+  (`exitRestartRequested`), and both units use
+  `Restart=on-failure` + `RestartForceExitStatus=42`; a clean exit
+  0 no longer restarts. The burst limit (12/60s) is unchanged and
+  stays the circuit breaker for genuine faults by design — a
+  persistent fault still strands the unit in failed state until
+  an operator resets it (no alerting yet).
+- **F-A17-3 (P2)** — single-instance guard: an exclusive flock on
+  `<dataDir>/oriond.lock` (0600), held for the process lifetime.
+  A second oriond exits 2 with a clear log line and never talks
+  to Telegram (no more 409 fatal flap). Residual: the CLI
+  `orion daemon` / `telegram poll` paths take no instance lock.
+  Coordinator fix: the second-instance test's capture helper
+  swapped the os.Stdout/os.Stderr globals while the first daemon
+  was still writing to them — a real data race the clean-clone
+  `-race` run caught. The test now runs the second instance with
+  no swap (its line lands in the first daemon's shared, locked
+  output buffer), and the harness buffer is a locked type so
+  concurrent reads are safe.
+- **F-A17-4 (P2)** — the allow-all window deadline is persisted
+  atomically in the data dir (`allow-all-until`, RFC3339Nano,
+  0600); a restart resumes the recorded window instead of opening
+  a fresh one. Corrupt state fails closed. The CLI gateway now
+  uses the persisted form too.
+- **F-A17-5 (P2)** — the /proc bypass of the F-A16-9 read rule is
+  closed: `/proc/<pid|self>/environ`, `/proc/self/cwd[/...]`,
+  `/proc/self/root[/...]`, `/proc/*/fd[/...]` operands are blocked
+  in `IsBlockedCommand` (literals, `=` values, variable-expanded
+  forms). `cat /proc/self/status`, `/proc/cpuinfo`, `ls /proc`
+  stay allowed.
+- **F-A17-6 (P2)** — legacy global rules: first use of a legacy
+  global rule now logs a warning naming the rule and the
+  owner-only /rules command. New owner-only `/rules` command:
+  bare `/rules` lists rules (globals flagged `GLOBAL (legacy)`),
+  `/rules delete <tool>` deletes a legacy global rule,
+  `/rules delete <chat>:<tool>` deletes a per-chat rule,
+  `/rules scope <tool> <chat>` moves a global rule onto one chat.
+- **F-A17-7 (P2)** — sampler: `resolve_pid()` now runs
+  `systemctl --user show oriond`, output paths are parameterised
+  (`SAMPLER_OUT` / `SAMPLER_CSV` / `ORION_BIN`), and
+  `systemd/oriond-sampler.service` is committed. The rc22
+  CHANGELOG claim that the sampler service was committed is
+  corrected: it was not in rc22; it is in rc23.
+- **F-A17-8 (P2)** — `install.sh --systemd` is now pinned by
+  `install_systemd_test.go`: the real script runs against a
+  scratch HOME/prefix with stub systemctl/loginctl, asserting the
+  shipped user unit is installed with ExecStart rewritten to the
+  install dir, `enable --now` (not bare enable), linger, the
+  existing config left untouched, and the real HOME untouched.
+  Boot recovery after a real reboot is still PENDING (laptop only
+  — no safe reboot on this VM) and is recorded as such in the
+  test, not claimed. No watchdog yet (needs sd_notify).
+- **F-A17-9 (P2)** — photos are no longer silently dropped:
+  `TGMessage` carries the photo sizes, and a photo gets the
+  honest reply "I can't see images yet" (after allowlist/sender
+  checks; a caption never runs a turn).
+- **F-A17-10 (P2)** — vision 400s from a provider are translated
+  into the same cannot-see message instead of a raw error. No
+  vision implementation in rc23 (feature phase).
+- **F-A17-11 (P2)** — skill API-gating is NOT in rc23
+  (pluggable-skills feature phase). The skill format is unchanged.
+- **F-A17-12 (P2)** — subagent state is now persisted: task
+  records + dead-letter ledger survive a reboot in
+  `<dataDir>/subagent-state.json` (0600, atomic temp+rename+dir
+  fsync; newest 200 finished tasks, outputs capped 16K runes).
+  A task running at stop reloads as failed with an explicit
+  "lost on restart" error and contributes nothing to the ledger;
+  the startup log line reports recovered/lost counts. Corrupt or
+  wrong-version files log and start empty. Coordinator fix: the
+  finish is now persisted BEFORE the wait channel closes, so a
+  `Wait` return guarantees the result is on disk (persisting
+  after the close let a concurrent file replacement be clobbered
+  by the still-pending write — a real race caught by the
+  coordinator's full-suite run).
+- **F-A17-13 (P2)** — `~/.orion` backup: new `internal/backup`
+  package — `Snapshot` (timestamped dir, `manifest.json` with
+  size + SHA-256 per file; symlinks/non-regular files skipped),
+  `Restore` (verifies ALL hashes before writing anything; merge
+  restore, never deletes extras), `List`, `Prune` (newest 7).
+  Entry points: `orion backup` (snapshot + rotate) and
+  `oriond --restore <snapshot>` (restore before the app starts,
+  then exit). Verified by test: snapshot → wipe → restore →
+  byte-identical; a tampered snapshot is refused with zero writes.
+- **F-A17-14 (P3)** — unknown/misspelled tool names in a skill's
+  `## Tools` now warn at load with a Levenshtein "did you mean
+  …?" suggestion. Load never fails on a warning.
+- **F-A17-15 (P3)** — `/skills reload` command: re-reads the
+  skills directory and swaps the registry under one lock; a
+  total failure leaves the old skills live. (Not owner-only —
+  not requested; flagged, not silently restricted.)
+- **F-A17-16 (P3)** — the startup banner now carries one line
+  with version, PID, data dir and config path.
+- **F-A17-17 (P3)** — drain is unified at 30s in both entrypoints
+  (/restart and SIGTERM/SIGINT) with honest log language.
+- **F-A17-18 (P3)** — systemd hardening on `systemd/oriond.service`:
+  `NoNewPrivileges`, `ProtectSystem=true`, `PrivateTmp`.
+  `ProtectSystem=true`, not strict: the data dir and working
+  directory live under /home. `CapabilityBoundingSet` is
+  DELIBERATELY omitted: any restriction of the bounding set breaks
+  the sandbox's `unshare --user --map-root-user` uid_map write
+  (verified with a 9-unit matrix — empty set, CAP_SETUID/CAP_SETGID,
+  CAP_SYS_ADMIN, and +AmbientCapabilities all fail) and would
+  silently break every sandboxed tool call on this root-run unit.
+  Verified: `systemd-analyze verify` clean; the daemon starts,
+  polls, writes its data dir, and stops cleanly (SIGTERM, exit 0)
+  under exactly this set.
+
+### Queued user items (rc23)
+
+- **/budget command (owner-only)** — `/budget` shows the current
+  limit + today's usage for the chat; `/budget <number>` sets the
+  daily per-chat limit (1000–10000000, matching config
+  validation); `/budget infinity` (also `inf`, `unlimited`) sets
+  unlimited (0). The new limit is persisted to the config file
+  (atomic 0600 save, before the live limit changes; a save
+  failure rolls back) so it survives restarts. The `/বাজেট`
+  alias works. Follows the /restart owner-only pattern.
+- **web_fetch cost fix** — web_fetch now returns EXTRACTED text,
+  not raw dumps: HTML → clean text (scripts/styles/tags stripped,
+  entities unescaped), JSON → compact one-line-per-item summaries.
+  Default `max_bytes` lowered 256KB → 32KB; extracted output is
+  capped at `maxBytes/4` chars (~2k tokens at default). Measured
+  shrink: a GitHub HTML page 176,746 → 4,910 bytes (2.8% of raw);
+  a 13-repo repos.json 82,617 → 6,007 bytes (7.3%). The agent can
+  still raise `max_bytes` explicitly for a full page. web_search
+  is unchanged (already compact).
+- **resolveHost errors name the trusted egress CIDRs** — a refused
+  host now reports e.g. `host "example.com" resolves to non-public
+  address 10.1.2.3 (trusted egress CIDRs: 198.18.0.0/15)` (or
+  `(trusted egress CIDRs: none configured)` when empty), so the
+  model explains the real cause instead of blaming the user's
+  network. Tests assert the CIDRs appear.
+- **DuckDuckGo captcha detection** — an HTTP 202 from the DDG
+  API/lite endpoint, or a zero-result lite page naming the
+  challenge, now replies "Search backend is blocking automated
+  requests right now (DuckDuckGo bot challenge). Try again later."
+  instead of "No results".
+
 ## [0.2.0-rc22] — 2026-11-14
 
 ### Audit 16 fixes (v0.2.0-rc22) — see `AUDIT16_2026-11-14.md`
@@ -14,7 +176,12 @@ all earlier fixes still hold; rc8 security holds; pprof 7/7 PASS.
 **Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
 is still open. Verified by the release coordinator on the final
 commit: **1,250 tests pass, 0 fail, 4 skip (total 1,254), 22/22
-packages, race clean 22/22, no data race** (rc21: 1,227 total:
+packages, race clean 22/22, no data race** — CORRECTION (Audit 17,
+F-A17-1): that claim was false in a clean checkout; the true rc22
+numbers were **1,249 pass, 1 fail, 4 skip (total 1,254), 21/22
+packages** (`TestShippedUnitRestartsOnCleanExit` failed — `systemd/`
+was not in git). Fixed in rc23 by committing the unit files.
+(rc21: 1,227 total:
 1,223 pass, 0 fail, 4 skip). New
 regression tests: 27 top-level functions — `cmd/oriond/
 rc22_teama_test.go` (4) and `cmd/orion/rc22_teama_test.go` (3),
@@ -132,7 +299,11 @@ rc22_teama_test.go` (4) and `cmd/orion/rc22_teama_test.go` (3),
 Also folded into rc22 (not audit findings):
 
 - The uncommitted `audit3-daemon-sampler.sh` follow mode (for the
-  systemd sampler service) is committed as part of rc22.
+  systemd sampler service) is committed as part of rc22 — but NOTE
+  (Audit 17, F-A17-7): only the *script* was committed in rc22; the
+  systemd sampler service unit itself
+  (`systemd/oriond-sampler.service`) was NOT in the repo in rc22
+  and is committed in rc23.
 - CHANGELOG fix (auditor §8 #1): the rc19 subtest count said
   "204" — the file has 198 cases (40+21+12+31+51+43), verified by
   counting. Fixed to 198.

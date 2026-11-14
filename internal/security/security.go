@@ -2593,6 +2593,100 @@ func readsSensitivePath(seg []string, vars map[string][]string) bool {
 	return false
 }
 
+// procSensitiveComponents are the /proc/<pid>/ entries whose
+// contents can expose the daemon's own secrets or its filesystem
+// view (F-A17-5, rc23). With the sandbox OFF, /proc is the live
+// process's procfs, so these are reads of the daemon itself, not
+// of a fresh namespace:
+//
+//   - environ: the process environment — API keys, tokens.
+//   - cwd[/...]: the process's working directory, re-rooted —
+//     /proc/self/cwd/.orion/config.json is the config read
+//     F-A16-9 blocks, reached through the process instead.
+//   - root[/...]: the process's root — /proc/self/root/home/...
+//     re-roots any absolute path, including sensitive homes.
+//   - fd[/...]: an already-open file descriptor — re-opens
+//     whatever the daemon (or any process) already has open,
+//     including the config file.
+//
+// Only these four are blocked. The rest of /proc (status, stat,
+// cpuinfo, ...) is ordinary diagnostic surface and stays allowed,
+// so `cat /proc/self/status` and `ls /proc` keep working.
+var procSensitiveComponents = []string{"environ", "cwd", "root", "fd"}
+
+// isProcSensitivePath reports whether p — already expanded and
+// cleaned — names a sensitive entry under /proc/<pid>/ or
+// /proc/self/: /proc/<pid>/environ, /proc/<pid>/cwd[/...],
+// /proc/<pid>/root[/...], /proc/<pid>/fd[/...]. A bare
+// /proc/<pid> or /proc/self (no third component) is not
+// sensitive, and neither is any other /proc entry.
+func isProcSensitivePath(p string) bool {
+	if p == "" || !strings.HasPrefix(p, "/proc/") {
+		return false
+	}
+	rest := strings.TrimPrefix(p, "/proc/")
+	pid, tail, ok := strings.Cut(rest, "/")
+	if !ok || tail == "" {
+		return false
+	}
+	if pid != "self" && !isAllDigits(pid) {
+		return false
+	}
+	first, _, _ := strings.Cut(tail, "/")
+	for _, c := range procSensitiveComponents {
+		if first == c {
+			return true
+		}
+	}
+	return false
+}
+
+// isAllDigits reports whether s is non-empty and all ASCII digits
+// (a /proc PID component).
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// readsProcSensitivePath reports whether any operand of seg names
+// a sensitive /proc entry (F-A17-5). Every token is checked,
+// whatever the binary, and --flag=<path> values are checked too.
+// A token is checked both literally (filepath.Clean, so
+// //proc/self/environ is caught) and after variable expansion
+// (f=/proc/self/environ; cat $f), mirroring readsSensitivePath.
+func readsProcSensitivePath(seg []string, vars map[string][]string) bool {
+	check := func(tok string) bool {
+		if tok == "" {
+			return false
+		}
+		if strings.HasPrefix(tok, "/") && isProcSensitivePath(filepath.Clean(tok)) {
+			return true
+		}
+		if abs, ok := expandReadPath(tok, vars); ok && isProcSensitivePath(abs) {
+			return true
+		}
+		return false
+	}
+	for _, tok := range seg {
+		if check(tok) {
+			return true
+		}
+		if i := strings.IndexByte(tok, '='); i >= 0 {
+			if check(tok[i+1:]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // IsBlockedCommand reports whether a shell command string must be refused.
 // It is TOKEN-BASED: the binary basename is resolved (so /bin/rm,
 // /usr/bin/rm, ./rm all match "rm"), wrappers and shell keywords are
@@ -2631,7 +2725,7 @@ func isBlockedCommand(cmd string, outer map[string][]string) bool {
 		// it, so `x=rm; $x -rf /` resolves while an assignment in a
 		// later segment does not affect an earlier one.
 		collectSegmentAssignments(seg, vars)
-		if blockedSegment(seg, vars) || blockedRedirect(seg, vars) || readsSensitivePath(seg, vars) {
+		if blockedSegment(seg, vars) || blockedRedirect(seg, vars) || readsSensitivePath(seg, vars) || readsProcSensitivePath(seg, vars) {
 			return true
 		}
 	}

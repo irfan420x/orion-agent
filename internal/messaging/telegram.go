@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -93,13 +94,44 @@ type TGChat struct {
 	ID int64 `json:"id"`
 }
 
+// TGPhotoSize is one size variant of a photo attached to a message.
+// Telegram sends the same image in several sizes; the largest is
+// last. Only FileID matters to Orion (it never downloads the file:
+// see CannotSeeImagesMessage) — Width/Height are kept so tests and
+// logs can tell a photo from any other attachment.
+type TGPhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int    `json:"file_size,omitempty"`
+}
+
 // TGMessage is a Telegram message.
 type TGMessage struct {
 	MessageID int64   `json:"message_id"`
 	Chat      TGChat  `json:"chat"`
 	Text      string  `json:"text"`
 	From      *TGUser `json:"from,omitempty"`
+	// Photo holds the size variants of an attached photo, if any
+	// (F-A17-9). A photo message carries its caption in "caption",
+	// not "text", so Text is empty for a photo even with a caption
+	// — HasPhoto is the only reliable photo test. The photo bytes
+	// are never fetched: Orion has no vision support.
+	Photo []TGPhotoSize `json:"photo,omitempty"`
 }
+
+// HasPhoto reports whether the message carries a photo attachment.
+func (m *TGMessage) HasPhoto() bool {
+	return m != nil && len(m.Photo) > 0
+}
+
+// CannotSeeImagesMessage is the honest reply sent when a photo
+// arrives (F-A17-9) and when a provider rejects image input
+// (F-A17-10): Orion has no vision support in rc23, so it must say
+// so instead of silently dropping the photo or surfacing a raw
+// provider "status 400". The reply asks for a text description,
+// which is the only image input Orion can use today.
+const CannotSeeImagesMessage = "📷 I can't see images yet — Orion has no vision support, so I can't view photos or screenshots sent here. Please describe the image in words and I'll help from your description."
 
 // TGCallbackQuery is a Telegram callback query: a tap on an inline
 // keyboard button. Message is the message the button belongs to
@@ -199,10 +231,15 @@ type TelegramGateway struct {
 	// allowAllSince (daemon start); IsChatAllowed is the only
 	// enforcement point. allowAllExpiredLogged makes the expiry log
 	// line fire once, not on every dropped message.
+	// allowAllStatePath, when set by WithAllowAllPersisted, is the
+	// data-dir file holding the window's deadline (F-A17-4): the
+	// deadline survives restarts, so a restart resumes the recorded
+	// window instead of opening a fresh one.
 	allowAll              bool
 	allowAllSince         time.Time
 	allowAllWindow        time.Duration
 	allowAllExpiredLogged bool
+	allowAllStatePath     string
 	// callbackHandler, when set via SetCallbackHandler, receives
 	// callback-query updates (inline-keyboard taps). It is invoked
 	// outside any per-chat lock (see CallbackHandler).
@@ -333,6 +370,11 @@ const DefaultAllowAllWindow = 10 * time.Minute
 // (WithAllowedChats), the allowlist wins: only listed chats pass,
 // and the window is irrelevant. The window is measured from
 // creation, not from first use, so an idle daemon still closes.
+//
+// Prefer WithAllowAllPersisted for the daemon: it records the window
+// deadline in the data dir, so a restart resumes the same window
+// instead of opening a fresh one (F-A17-4). This in-memory form
+// stays for tests and hand-built gateways.
 func WithAllowAll(window time.Duration) GatewayOption {
 	return func(g *TelegramGateway) {
 		if window <= 0 {
@@ -342,6 +384,131 @@ func WithAllowAll(window time.Duration) GatewayOption {
 		g.allowAllSince = time.Now()
 		g.allowAllWindow = window
 	}
+}
+
+// AllowAllStateFileName is the file in the data dir that records the
+// allow-all opt-in window's deadline (F-A17-4). One line, the
+// deadline in RFC3339Nano, written atomically (0600) when the window
+// first opens. The file is the window's memory across restarts: a
+// daemon that restarts resumes the recorded deadline instead of
+// opening a fresh window.
+const AllowAllStateFileName = "allow-all-until"
+
+// WithAllowAllPersisted is WithAllowAll with the window deadline
+// persisted in the data dir (F-A17-4). The first start with the
+// opt-in opens a fresh window and writes its deadline to
+// <dataDir>/allow-all-until before polling starts; every later
+// start reads that file back:
+//
+//   - deadline still in the future: the window resumes with the
+//     recorded deadline — a restart neither extends it nor reopens
+//     it. The recorded deadline wins over a later change to the
+//     configured window length; delete the file to start a fresh
+//     window.
+//   - deadline already past: the window stays shut. The file is
+//     NOT rewritten, so a restart, a crash-loop, or a reboot can
+//     never reopen the bot to every chat — the F-A17-4 bug, where
+//     each restart silently granted a fresh 10 minutes.
+//   - file missing: first start, fresh window (as above).
+//   - file unreadable or corrupt, or unreadable for any other
+//     reason: fail closed — the window stays shut and the log names
+//     the file, so the operator can delete it to start over.
+//     A torn write cannot produce this: the write is atomic (temp
+//     file + fsync + rename), so a corrupt file means tampering or
+//     disk trouble, never a half-written deadline.
+//
+// With an empty dataDir this behaves exactly like WithAllowAll
+// (in-memory window only), for hand-built gateways and tests. When
+// an allowlist is also set, the allowlist wins and the window is
+// irrelevant, exactly as with WithAllowAll.
+func WithAllowAllPersisted(window time.Duration, dataDir string) GatewayOption {
+	return func(g *TelegramGateway) {
+		if window <= 0 {
+			window = DefaultAllowAllWindow
+		}
+		g.allowAll = true
+		g.allowAllWindow = window
+		if strings.TrimSpace(dataDir) == "" {
+			g.allowAllSince = time.Now()
+			return
+		}
+		path := filepath.Join(dataDir, AllowAllStateFileName)
+		g.allowAllStatePath = path
+		now := time.Now()
+		raw, err := os.ReadFile(path)
+		switch {
+		case err == nil:
+			deadline, perr := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(raw)))
+			if perr != nil {
+				// Corrupt state: fail closed (since is set
+				// already past the window) instead of silently
+				// opening a fresh one.
+				g.logf("telegram allow-all state %q is unreadable (%v); refusing all chats until telegram_allowed_chats is set (delete the file to start a fresh window)", path, perr)
+				g.allowAllSince = now.Add(-window)
+				return
+			}
+			// Resume the recorded window: the deadline is
+			// absolute, so a restart neither extends it nor
+			// reopens it once it has passed.
+			g.allowAllSince = deadline.Add(-window)
+		case os.IsNotExist(err):
+			// First start with the opt-in: open a fresh window
+			// and persist its deadline before polling starts.
+			g.allowAllSince = now
+			if err := persistAllowAllDeadline(path, now.Add(window)); err != nil {
+				// Best effort: a failed persist must not stop
+				// the daemon, but it is logged loudly — without
+				// the file the window WILL reopen on restart,
+				// which is exactly the F-A17-4 bug.
+				g.logf("telegram allow-all window could not be persisted (%v); it will reopen on restart", err)
+			}
+		default:
+			// The file exists but cannot be read: fail closed,
+			// like the corrupt case.
+			g.logf("telegram allow-all state %q could not be read (%v); refusing all chats until telegram_allowed_chats is set", path, err)
+			g.allowAllSince = now.Add(-window)
+		}
+	}
+}
+
+// persistAllowAllDeadline atomically writes the allow-all deadline
+// (RFC3339Nano, one line, 0600): the same temp-file + fsync +
+// rename + dir-sync idiom as the session and permission stores, so
+// a crash mid-write can never leave a torn file behind.
+func persistAllowAllDeadline(path string, deadline time.Time) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("messaging: create allow-all state dir %q: %w", dir, err)
+	}
+	data := []byte(deadline.Format(time.RFC3339Nano) + "\n")
+	tmp, err := os.CreateTemp(dir, ".allow-all-*.tmp")
+	if err != nil {
+		return fmt.Errorf("messaging: create temp allow-all state file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("messaging: chmod temp allow-all state file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("messaging: write temp allow-all state file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("messaging: sync temp allow-all state file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("messaging: close temp allow-all state file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("messaging: rename temp allow-all state file: %w", err)
+	}
+	if err := syncSessionDir(dir); err != nil {
+		return fmt.Errorf("messaging: sync allow-all state dir %q: %w", dir, err)
+	}
+	return nil
 }
 
 // IsChatAllowed reports whether chatID may drive the agent through this
@@ -383,7 +550,7 @@ func (g *TelegramGateway) IsChatAllowed(chatID int64) bool {
 	g.allowAllExpiredLogged = true
 	g.mu.Unlock()
 	if !logged {
-		g.logf("telegram allow-all opt-in expired after %s: refusing all chats until restart with telegram_allowed_chats set", window)
+		g.logf("telegram allow-all opt-in expired after %s: refusing all chats until telegram_allowed_chats is set (a restart does not reopen the window)", window)
 	}
 	return false
 }
@@ -1450,6 +1617,44 @@ const typingResendInterval = 4 * time.Second
 // re-delivers the in-flight update instead of confirming and
 // losing it (F-A8-2: confirmation happens on handler
 // completion, never at spawn).
+// isVisionError reports whether err looks like a provider
+// rejecting image input (F-A17-10): the model/provider cannot
+// take images, and the provider says so with a 400/bad-request
+// that mentions images, vision, or multimodal input. Both halves
+// must match — a bare 400 (malformed request, over-long context)
+// is a different failure and must keep its own error text, and
+// an "image" mention without a rejection is not an error at all.
+func isVisionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	mentionsImage := strings.Contains(s, "image") ||
+		strings.Contains(s, "vision") ||
+		strings.Contains(s, "multimodal") ||
+		strings.Contains(s, "picture") ||
+		strings.Contains(s, "photo")
+	if !mentionsImage {
+		return false
+	}
+	return strings.Contains(s, "400") ||
+		strings.Contains(s, "bad request") ||
+		strings.Contains(s, "not support") ||
+		strings.Contains(s, "unsupported") ||
+		strings.Contains(s, "invalid")
+}
+
+// userErrorMessage renders a handler error for the chat: a vision
+// rejection becomes the honest cannot-see message instead of the
+// raw provider "status 400" text (F-A17-10); anything else keeps
+// the redacted "Sorry, I hit an error" form.
+func userErrorMessage(err error) string {
+	if isVisionError(err) {
+		return CannotSeeImagesMessage
+	}
+	return security.RedactSecrets(fmt.Sprintf("Sorry, I hit an error: %v", err))
+}
+
 func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) error {
 	if handler == nil {
 		return errors.New("messaging: telegram PollStream: handler must not be nil")
@@ -1492,8 +1697,10 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// Semantics (at-least-once):
 	//   - "Decided" means the handler finished (reply sent, or
 	//     callback answered, or panic recovered and apology
-	//     sent) or the update was deliberately dropped/skipped
-	//     (non-allowlisted sender/chat, empty text). An update
+	//     sent, or photo answered with the cannot-see reply) or
+	//     the update was deliberately dropped/skipped
+	//     (non-allowlisted sender/chat, empty text with no
+	//     photo). An update
 	//     whose handler is still running is NOT decided, and the
 	//     watermark stays behind it — and behind every later
 	//     update too, because the watermark only advances past
@@ -1650,6 +1857,25 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		}
 	}
 
+	// handlePhoto answers a photo message (F-A17-9): Orion has no
+	// vision support, so the honest reply is "I can't see images"
+	// — never a turn on the caption (the model would answer about
+	// an image it never saw: confabulation), and never silence.
+	// It mirrors handle's confirmation discipline (markDecided on
+	// completion, never at spawn) and takes the per-chat lock, so
+	// a photo reply cannot overtake a turn for the same chat. The
+	// send is best-effort, like every other reply: a failed send
+	// must not kill polling.
+	handlePhoto := func(upd Update) {
+		defer markDecided(upd.UpdateID)
+		defer func() { <-sem }()
+		lock := chatLock(upd.Message.Chat.ID)
+		lock.Lock()
+		defer lock.Unlock()
+		g.logf("telegram poll: photo from chat %d answered with cannot-see reply (no vision support)", upd.Message.Chat.ID)
+		_ = g.SendMessage(ctx, upd.Message.Chat.ID, CannotSeeImagesMessage)
+	}
+
 	handle := func(upd Update) {
 		// Registered first, so it runs LAST (LIFO): after the
 		// reply/apology is sent, after the panic recovery, and
@@ -1665,10 +1891,15 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// the slot is still released.
 		defer func() {
 			if r := recover(); r != nil {
-				msg := fmt.Sprintf("Sorry, I hit an error: %v", r)
-				// Redact before sending: a handler panic value
-				// could carry a provider/config error with a key.
-				msg = security.RedactSecrets(msg)
+				var msg string
+				if rerr, ok := r.(error); ok && isVisionError(rerr) {
+					msg = CannotSeeImagesMessage
+				} else {
+					msg = fmt.Sprintf("Sorry, I hit an error: %v", r)
+					// Redact before sending: a handler panic value
+					// could carry a provider/config error with a key.
+					msg = security.RedactSecrets(msg)
+				}
 				// Best effort: a failed apology must not kill polling.
 				_ = g.SendMessage(ctx, upd.Message.Chat.ID, msg)
 			}
@@ -1811,10 +2042,11 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		stopTyping()
 
 		if herr != nil {
-			msg := fmt.Sprintf("Sorry, I hit an error: %v", herr)
-			// Redact before sending: a raw provider/config error
-			// could carry an API key or token.
-			msg = security.RedactSecrets(msg)
+			// A vision rejection renders as the honest
+			// cannot-see message, not the raw provider 400
+			// (F-A17-10); anything else keeps the redacted
+			// "Sorry, I hit an error" form.
+			msg := userErrorMessage(herr)
 			// Best effort: a failed apology must not kill polling.
 			_ = g.SendMessage(ctx, chatID, msg)
 			return
@@ -2067,13 +2299,18 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		}
 
 		// Pass 2 — messages, in batch order. A message with no
-		// text is skipped (decided: there is nothing to deliver);
-		// anything else needs a turn slot, so this pass is the one
-		// that blocks when all slots are held. Blocking here is
-		// safe now: every callback in the batch is already
-		// dispatched, and the offset still sits behind any
-		// undispatched or in-flight message (see markDecided),
-		// so a crash or a shutdown mid-pass re-delivers the rest.
+		// text and no photo is skipped (decided: there is nothing
+		// to deliver — a sticker, voice note or location, none of
+		// which Orion handles); a message WITH a photo is answered
+		// with the honest cannot-see reply (F-A17-9, see
+		// handlePhoto), never silently dropped and never run as a
+		// turn on its caption. Anything else needs a turn slot,
+		// so this pass is the one that blocks when all slots are
+		// held. Blocking here is safe now: every callback in the
+		// batch is already dispatched, and the offset still sits
+		// behind any undispatched or in-flight message (see
+		// markDecided), so a crash or a shutdown mid-pass
+		// re-delivers the rest.
 		dispatchMessage := func(upd Update) bool {
 			// Already finished but still behind the watermark:
 			// re-fetched, not new — skip without re-running the
@@ -2082,7 +2319,21 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			if isDecided(upd.UpdateID) {
 				return true
 			}
-			if upd.Message == nil || strings.TrimSpace(upd.Message.Text) == "" {
+			if upd.Message == nil {
+				markDecided(upd.UpdateID)
+				progress++
+				return true
+			}
+			// A photo takes precedence over the text turn: a
+			// photo message's caption lives in "caption", not
+			// "text", so Text is empty for a captioned photo —
+			// and a photo WITH text still shows an image the
+			// model cannot see, so answering the text while
+			// ignoring the photo would mislead. The photo
+			// branch below runs after the allowlist/sender
+			// checks, so a stranger's photo gets no reply.
+			hasPhoto := upd.Message.HasPhoto()
+			if strings.TrimSpace(upd.Message.Text) == "" && !hasPhoto {
 				markDecided(upd.UpdateID)
 				progress++
 				return true
@@ -2112,6 +2363,26 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 					g.logf("telegram poll: dropped message with no sender in chat %d", upd.Message.Chat.ID)
 				}
 				markDecided(upd.UpdateID)
+				progress++
+				return true
+			}
+			// Photo (F-A17-9): answer honestly instead of
+			// running a turn. The sender is already authorised
+			// (above); the reply goes through the same
+			// in-flight/sem discipline as a turn, so a crash
+			// mid-reply re-delivers the photo instead of
+			// confirming and losing it.
+			if hasPhoto {
+				if !markInFlight(upd.UpdateID) {
+					return true
+				}
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					unmarkInFlight(upd.UpdateID)
+					return false
+				}
+				go handlePhoto(upd)
 				progress++
 				return true
 			}
@@ -2182,7 +2453,9 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 
 // Poll loops on GetUpdates until ctx is cancelled, delivering each
 // incoming message with non-empty text to handler and sending the
-// handler's reply back to the same chat. It is a thin wrapper over
+// handler's reply back to the same chat. A photo message is answered
+// with the cannot-see reply inside PollStream and never reaches the
+// handler. It is a thin wrapper over
 // PollStream: the handler receives no progress events and no footer
 // is appended (stats nil). All PollStream semantics apply — backoff
 // on transient GetUpdates errors, fatal 401/403/409, allowlist,

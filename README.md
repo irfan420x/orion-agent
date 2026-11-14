@@ -3,10 +3,11 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc22.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc23.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,254 tests total — 1,250 pass, 0 fail, 4 skip;
-> counts verified by the rc22 release coordinator on the final commit).
+> built and tested (1,327 tests total — 1,323 pass, 0 fail, 4 skip;
+> 24/24 packages; clean-clone recount by the release coordinator,
+> 2026-11-14 — see CHANGELOG for the rc23 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -117,8 +118,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-22/22 packages, 1,254 tests total (1,250 passing, 0 failing, 4 skipped)
-(counts verified by the rc22 release coordinator, 2026-11-14).
+24/24 packages, 1,327 tests total (1,323 passing, 0 failing, 4 skipped)
+(recount by the rc23 W1 worker on the working tree, 2026-11-14 — the
+coordinator sets the final rc23 counts from the clean-clone recount).
 Run the suite with
 `go test ./...` or `make test`.
 

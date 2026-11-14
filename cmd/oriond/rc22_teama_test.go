@@ -1,7 +1,9 @@
-// F-A16-1 / F-A16-5 (rc22, Team A): the shipped systemd unit must
-// restart the daemon on a clean exit 0 (/restart), the live unit
-// must agree, the stale "Restart=on-success" comment must be gone,
-// and a SIGTERM stop must log which signal stopped the daemon.
+// F-A17-2 (rc23, W2; supersedes the F-A16-1 exit-0 rule) / F-A16-5
+// (rc22, Team A): the shipped systemd unit must restart the daemon
+// on /restart's exit 42 (Restart=on-failure +
+// RestartForceExitStatus=42), the live unit must agree, the stale
+// "Restart=on-success" comment must be gone, and a SIGTERM stop must
+// log which signal stopped the daemon.
 package main
 
 import (
@@ -52,19 +54,22 @@ func TestSignalName(t *testing.T) {
 	}
 }
 
-func TestShippedUnitRestartsOnCleanExit(t *testing.T) {
-	// F-A16-1: /restart exits 0. Only Restart=always restarts on
-	// exit 0 — the rc21 unit's Restart=on-failure never did, so
-	// /restart killed the daemon permanently. (The check looks at
-	// directive lines only: the header comment explains the old
-	// policy by name, which is fine.)
-	if got := rc22UnitValue(t, "../../oriond.service", "Restart"); got != "always" {
-		t.Errorf("shipped oriond.service Restart = %q, want %q (exit 0 must restart)", got, "always")
+func TestShippedUnitRestartsOnRestartRequest(t *testing.T) {
+	// F-A17-2 (rc23, supersedes F-A16-1's exit-0 rule): /restart
+	// exits 42 (exitRestartRequested), and the unit restarts it with
+	// Restart=on-failure + RestartForceExitStatus=42. A clean exit 0
+	// (SIGTERM shutdown) no longer restarts: only a fault or an
+	// explicit restart request does. (The check looks at directive
+	// lines only: the header comment explains the old policy by name,
+	// which is fine.)
+	if got := rc22UnitValue(t, "../../oriond.service", "Restart"); got != "on-failure" {
+		t.Errorf("shipped oriond.service Restart = %q, want %q (only faults and /restart exit 42 restart)", got, "on-failure")
 	}
-	for _, key := range []string{"Restart"} {
-		if got := rc22UnitValue(t, "../../oriond.service", key); got == "on-failure" || got == "on-success" {
-			t.Errorf("shipped oriond.service %s = %q — the restart policy must be exactly Restart=always", key, got)
-		}
+	if got := rc22UnitValue(t, "../../oriond.service", "RestartForceExitStatus"); got != "42" {
+		t.Errorf("shipped oriond.service RestartForceExitStatus = %q, want %q (/restart exit code)", got, "42")
+	}
+	if got := rc22UnitValue(t, "../../oriond.service", "Restart"); got == "always" {
+		t.Errorf("shipped oriond.service Restart = %q — Restart=always restarts clean exits too, which is what let /restart burn burst budget (F-A17-2)", got)
 	}
 	// F-A16-6: the start-limit burst was raised 5 -> 12 (matching
 	// the live unit) so a burst of transient failures does not
@@ -75,8 +80,11 @@ func TestShippedUnitRestartsOnCleanExit(t *testing.T) {
 	// The live unit must agree on the restart policy: the two
 	// copies drifted before (shipped on-failure, live always),
 	// which is exactly how F-A16-1 happened.
-	if got := rc22UnitValue(t, "../../systemd/oriond.service", "Restart"); got != "always" {
-		t.Errorf("live systemd/oriond.service Restart = %q, want %q", got, "always")
+	if got := rc22UnitValue(t, "../../systemd/oriond.service", "Restart"); got != "on-failure" {
+		t.Errorf("live systemd/oriond.service Restart = %q, want %q", got, "on-failure")
+	}
+	if got := rc22UnitValue(t, "../../systemd/oriond.service", "RestartForceExitStatus"); got != "42" {
+		t.Errorf("live systemd/oriond.service RestartForceExitStatus = %q, want %q", got, "42")
 	}
 	if got := rc22UnitValue(t, "../../systemd/oriond.service", "StartLimitBurst"); got != "12" {
 		t.Errorf("live systemd/oriond.service StartLimitBurst = %q, want %q", got, "12")
@@ -84,9 +92,11 @@ func TestShippedUnitRestartsOnCleanExit(t *testing.T) {
 }
 
 func TestDaemonRestartCommentIsAccurate(t *testing.T) {
-	// F-A16-1: the old comment claimed "oriond.service with
-	// Restart=on-success" — on-success exists nowhere. The comment
-	// must not name a restart policy the unit does not have.
+	// F-A17-2: the /restart comment must name the real policy —
+	// exit 42 with Restart=on-failure + RestartForceExitStatus=42 —
+	// and the old "Restart=on-success" claim (which existed nowhere)
+	// must stay gone. A comment claiming exit 0 restarts the daemon
+	// would be the F-A16-1 misunderstanding all over again.
 	raw, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatal(err)
@@ -94,8 +104,10 @@ func TestDaemonRestartCommentIsAccurate(t *testing.T) {
 	if strings.Contains(string(raw), "on-success") {
 		t.Errorf("cmd/oriond/main.go still mentions Restart=on-success, which no unit file sets")
 	}
-	if !strings.Contains(string(raw), "Restart=always") {
-		t.Errorf("cmd/oriond/main.go does not mention Restart=always — the /restart comment must name the real policy")
+	for _, want := range []string{"RestartForceExitStatus=42", "Restart=on-failure", "exitRestartRequested"} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("cmd/oriond/main.go does not mention %q — the /restart comment must name the real policy", want)
+		}
 	}
 }
 

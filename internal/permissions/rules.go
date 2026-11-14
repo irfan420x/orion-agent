@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -39,6 +40,12 @@ type RuleStore struct {
 	path    string
 	rules   map[ruleKey]Action
 	loadErr error
+	// warnedLegacy records the tools a legacy-global fallback
+	// warning has already been logged for (F-A17-6 migration):
+	// the first use of a legacy global rule logs once per tool,
+	// so a long-lived global rule does not spam the log on
+	// every turn that consults it.
+	warnedLegacy map[string]bool
 }
 
 // ruleKey is one rule's identity: the chat it applies to (0 =
@@ -81,7 +88,7 @@ func decodeRuleKey(key string) ruleKey {
 // store (used by tests and by hand-built apps): Set persists nowhere
 // and Lookup still works.
 func NewRuleStore(path string) *RuleStore {
-	s := &RuleStore{path: path, rules: map[ruleKey]Action{}}
+	s := &RuleStore{path: path, rules: map[ruleKey]Action{}, warnedLegacy: map[string]bool{}}
 	s.loadErr = s.load()
 	return s
 }
@@ -158,22 +165,43 @@ func (s *RuleStore) Lookup(tool string) (Action, bool) {
 // carries no chat, so it still applies — dropping it would silently
 // revoke a decision the user already made). A chat with neither
 // reports no rule, so the gate prompts as before.
+//
+// F-A17-6 migration: a legacy global rule applying to a chat
+// through this fallback logs a warning the FIRST time it is used
+// for each tool (once per tool per store lifetime), naming the
+// tool and the chat, so the owner learns the pre-rc22 rule is
+// still live everywhere and can scope or delete it with the
+// owner-only /rules command. A chat's own rule never warns, and
+// a direct global lookup (chatID 0) never warns — the warning is
+// about the fallback, not the rule itself.
 func (s *RuleStore) LookupForChat(chatID int64, tool string) (Action, bool) {
 	if s == nil {
 		return "", false
 	}
 	tool = strings.TrimSpace(tool)
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if a, ok := s.rules[ruleKey{chatID: chatID, tool: tool}]; ok {
+		s.mu.RUnlock()
 		return a, true
 	}
-	if chatID != 0 {
-		if a, ok := s.rules[ruleKey{chatID: 0, tool: tool}]; ok {
-			return a, true
-		}
+	a, ok := s.rules[ruleKey{chatID: 0, tool: tool}]
+	s.mu.RUnlock()
+	if !ok || chatID == 0 {
+		return a, ok
 	}
-	return "", false
+	s.mu.Lock()
+	if s.warnedLegacy == nil {
+		s.warnedLegacy = map[string]bool{}
+	}
+	warned := s.warnedLegacy[tool]
+	if !warned {
+		s.warnedLegacy[tool] = true
+	}
+	s.mu.Unlock()
+	if !warned {
+		log.Printf("permissions: legacy global rule for tool %q (action %q) applied to chat %d — global rules predate per-chat rules and apply to every chat; scope it to one chat or delete it with the owner-only /rules command", tool, a, chatID)
+	}
+	return a, true
 }
 
 // Set stores a GLOBAL rule and persists it. An invalid action or an empty

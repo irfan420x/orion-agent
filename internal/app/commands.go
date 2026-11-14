@@ -259,6 +259,52 @@ func (a *App) SwitchProvider(name string) error {
 	return nil
 }
 
+// BudgetInfoForChat returns the per-chat daily token budget for
+// /budget: the configured limit (<= 0 means unlimited) and the
+// tokens this chat has used today (UTC day). A nil Budget
+// (hand-built Apps) reports (0, 0): unbudgeted, which behaves as
+// unlimited — turns are never refused — so the /budget reply
+// honestly says "unlimited" instead of inventing a limit.
+func (a *App) BudgetInfoForChat(chatID int64) (limit int, usedToday int) {
+	if a == nil || a.Budget == nil {
+		return 0, 0
+	}
+	return a.Budget.Limit(), a.Budget.DayUsage(chatID).Total
+}
+
+// SetDailyBudget changes the per-chat daily token limit (0 =
+// unlimited, otherwise 1000–10000000, the range config validation
+// enforces) for /budget, and persists it: the config is saved
+// atomically (0600, like SwitchProvider) BEFORE the live budget
+// is touched, so a save failure leaves the daemon running on the
+// old limit instead of diverging from disk. The new limit takes
+// effect immediately for every chat (the Budget is shared) and
+// survives restarts, because the next Build reads it from the
+// config. Today's recorded usage is untouched: lowering the limit
+// below today's spend makes the next Check fail until the UTC day
+// rolls over, it does not erase the usage.
+func (a *App) SetDailyBudget(limit int) error {
+	if a == nil || a.Config == nil {
+		return errors.New("app: SetDailyBudget called on uninitialised App")
+	}
+	if limit != 0 && (limit < 1000 || limit > 10000000) {
+		return fmt.Errorf("app: daily token budget must be 0 (unlimited) or between 1000 and 10000000, got %d", limit)
+	}
+	a.mu.Lock()
+	old := a.Config.PerChatDailyTokenBudget
+	a.Config.PerChatDailyTokenBudget = limit
+	if err := a.Config.Save(""); err != nil {
+		a.Config.PerChatDailyTokenBudget = old
+		a.mu.Unlock()
+		return fmt.Errorf("app: set daily budget: save config: %w", err)
+	}
+	if a.Budget != nil {
+		a.Budget.SetLimit(limit)
+	}
+	a.mu.Unlock()
+	return nil
+}
+
 // StatusLine returns a multi-line status with real values only:
 // provider, model, step/timeout limits, memory counts, data dir, and
 // uptime when the app knows when it started (Build sets StartedAt; a

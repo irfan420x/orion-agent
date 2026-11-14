@@ -1,0 +1,32 @@
+# systemd/oriond-sampler.service — LIVE system unit for the Orion
+# daemon resource sampler (telemetry) on this VM/container.
+#
+# Committed in rc23 (F-A17-1 / F-A17-7): in rc22 only the sampler
+# script (audit3-daemon-sampler.sh) was in the repo — no sampler
+# .service file existed there, so a fresh checkout could not
+# reproduce the live sampler deployment. This unit runs the
+# sampler's follow mode, which resolves the daemon PID each
+# iteration and records RSS/threads/FDs.
+#
+# Log path (sampler-systemd.log) is stable — no date in the name.
+
+[Unit]
+Description=Orion daemon resource sampler (telemetry)
+After=oriond.service
+Wants=oriond.service
+StartLimitIntervalSec=60
+StartLimitBurst=12
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hatch/workspace/orion-go
+ExecStart=/home/hatch/workspace/orion-go/audit3-daemon-sampler.sh follow auto 0
+Environment=HOME=/home/hatch
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/hatch/workspace/orion-go/sampler-systemd.log
+StandardError=append:/home/hatch/workspace/orion-go/sampler-systemd.log
+
+[Install]
+WantedBy=multi-user.target

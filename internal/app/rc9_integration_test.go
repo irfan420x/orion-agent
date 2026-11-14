@@ -44,7 +44,7 @@ func TestRC9SwitchProviderKeepsSkillsAndHooks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skillsDir, "adder.md"), []byte(adder), 0o600); err != nil {
 		t.Fatalf("write skill: %v", err)
 	}
-	skillReg := loadSkills(dir, log.New(io.Discard, "", 0))
+	skillReg := loadSkills(dir, log.New(io.Discard, "", 0), nil)
 	if _, ok := skillReg.Get("Adder"); !ok {
 		t.Fatalf("skill Adder did not load (have %v)", skillReg.List())
 	}

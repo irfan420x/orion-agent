@@ -170,6 +170,13 @@ type Manager struct {
 	sem           chan struct{}
 	wg            sync.WaitGroup
 	shutdown      bool
+	// storeDir is the persistence directory (F-A17-12): "" means
+	// in-memory-only (NewManager / NewManagerWithExecutor).
+	// persistMu serialises state-file writes; the snapshot is
+	// taken under mu and the file is written outside it, so a
+	// slow disk never blocks task bookkeeping.
+	storeDir  string
+	persistMu sync.Mutex
 	// deadLetterTokens / deadLetterTasks are the dead-letter ledger
 	// (F-A8-P2-1, semantics fixed F-A9-P2-8): tokens of finished
 	// tasks that left the registry through eviction WITHOUT ever
@@ -306,6 +313,9 @@ func (m *Manager) SpawnForChat(chatID int64, brief string, timeout time.Duration
 	// (see DeadLetterTokens).
 	m.evictFinishedLocked()
 	m.mu.Unlock()
+	// Persist the spawn (F-A17-12): a task that is running when
+	// the daemon stops must reload as lost, not vanish.
+	m.persistSnapshot()
 
 	go m.runTask(entry, ctx, cancel)
 	return id, nil
@@ -366,12 +376,16 @@ func (m *Manager) DeadLetterTasks() int {
 // must not count it again.
 func (m *Manager) MarkCharged(id string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	entry, ok := m.entries[id]
 	if !ok || !entry.finished || !entry.result.UsageSettled || entry.charged {
+		m.mu.Unlock()
 		return false
 	}
 	entry.charged = true
+	m.mu.Unlock()
+	// Persist the charge (F-A17-12): a reboot must not re-fold
+	// an already-charged task's tokens into the ledger.
+	m.persistSnapshot()
 	return true
 }
 
@@ -395,10 +409,13 @@ func (m *Manager) MarkCharged(id string) bool {
 // future charge path.
 func (m *Manager) DrainDeadLetter() int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	total := m.deadLetterTokens
 	m.deadLetterTokens = 0
 	m.deadLetterTasks = 0
+	m.mu.Unlock()
+	// Persist the drain (F-A17-12): a reboot must not resurrect
+	// drained tokens.
+	m.persistSnapshot()
 	return total
 }
 
@@ -495,13 +512,17 @@ func (m *Manager) evictLocked(e *taskEntry) {
 // the ledger by awaitLateOutcome instead of being lost.
 func (m *Manager) Forget(id string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	entry, ok := m.entries[id]
 	if !ok || !entry.finished {
+		m.mu.Unlock()
 		return false
 	}
 	entry.detached = true
 	delete(m.entries, id)
+	m.mu.Unlock()
+	// Persist the removal (F-A17-12): a forgotten task must not
+	// come back on restart.
+	m.persistSnapshot()
 	return true
 }
 
@@ -591,6 +612,19 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 		FinishedAt:   finishedAt,
 	}
 	entry.finished = true
+	m.mu.Unlock()
+	// Persist the finish (F-A17-12): the result and its usage
+	// must survive a reboot so the sweep can still charge them.
+	// Persist BEFORE closing done: Wait() returning is the
+	// durability signal — a waiter that returns must be able to
+	// trust the snapshot on disk. Persisting after close(done)
+	// let a concurrent file replacement (or a kill in the gap
+	// between done and the write) lose the finish: a test that
+	// overwrote the file after Wait returned could see its write
+	// clobbered by this still-pending persist, and a daemon
+	// killed in the gap lost the result from disk.
+	m.persistSnapshot()
+	m.mu.Lock()
 	close(entry.done)
 	m.mu.Unlock()
 	if lateUsage {
@@ -626,11 +660,16 @@ func (m *Manager) awaitLateOutcome(entry *taskEntry, ch <-chan outcome) {
 	if entry.detached {
 		m.deadLetterTokens += o.usage.Tokens
 		m.mu.Unlock()
+		// Persist the late fold (F-A17-12).
+		m.persistSnapshot()
 		return
 	}
 	entry.result.Usage = o.usage
 	entry.result.UsageSettled = true
 	m.mu.Unlock()
+	// Persist the settled usage (F-A17-12): a reboot must not
+	// lose tokens that arrived late.
+	m.persistSnapshot()
 }
 
 // Wait blocks until the named task finishes, or ctx is done. It

@@ -80,6 +80,8 @@ func main() {
 		err = cmdDaemon(ctx, os.Args[2:])
 	case "sessions":
 		err = cmdSessions(os.Args[2:])
+	case "backup":
+		err = cmdBackup(os.Args[2:])
 	case "version", "--version", "-v":
 		if len(os.Args) > 2 {
 			fmt.Fprintf(os.Stderr, "version: takes no arguments\n")
@@ -179,6 +181,7 @@ Usage:
   orion sessions              list CLI sessions (transcripts)
   orion sessions resume <id>  resume a CLI session
   orion sessions new          start a fresh CLI session
+  orion backup                snapshot ~/.orion (newest 7 kept)
   orion version               print version
 `, version.Version)
 }
@@ -998,16 +1001,30 @@ func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string,
 	}
 }
 
+// drainTimeout bounds the wait for cancelled in-flight turns to wind
+// down after polling stops (F-A17-17). It MUST be the same value
+// cmd/oriond/main.go uses: the two entrypoints previously disagreed
+// (10s vs 30s) for no reason. 30s keeps the F-A10-5 margin — the
+// only reasoned bound in the codebase — that keeps a turn from racing
+// transcript/memory writes during teardown. If it changes here,
+// change it in cmd/oriond/main.go too. (A shared constant would be
+// cleaner, but Drain lives in internal/app and both call sites are
+// package main in different binaries; the cross-reference comment is
+// the guard until a shared home exists.)
+const drainTimeout = 30 * time.Second
+
 // pollTelegram runs the Telegram gateway until ctx is cancelled,
-// then drains in-flight turns before returning (F-A10-5): Poll
-// returns on ctx cancellation without waiting for the turn
-// handlers it spawned, so without the drain the command returns
-// while a turn is still writing its transcript/memory into the
-// data dir — and a caller that tears the data dir down (a test's
-// TempDir cleanup, a supervisor restarting the daemon) races the
-// write. The drain is bounded: a turn that ignores its
-// (cancelled) context cannot hold shutdown forever, and the
-// command then exits anyway, as it did before the drain.
+// then waits for the cancelled in-flight turns to wind down before
+// returning (F-A10-5): Poll returns on ctx cancellation without
+// waiting for the turn handlers it spawned, so without the wait the
+// command returns while a turn is still writing its transcript/memory
+// into the data dir — and a caller that tears the data dir down (a
+// test's TempDir cleanup, a supervisor restarting the daemon) races
+// the write. The wait is bounded: a turn that ignores its
+// (cancelled) context cannot hold shutdown forever, and the command
+// then exits anyway, as it did before the wait. Honest language
+// (F-A17-17): the turns are already cancelled, so this is wind-down,
+// not "draining" live work — their replies are lost either way.
 func pollTelegram(a *app.App, gw *messaging.TelegramGateway, ctx context.Context) error {
 	// F-A16-5: SIGHUP is ignored on the long-running Telegram loops
 	// (`orion daemon` and `orion telegram poll` share this
@@ -1019,8 +1036,8 @@ func pollTelegram(a *app.App, gw *messaging.TelegramGateway, ctx context.Context
 	signal.Ignore(syscall.SIGHUP)
 	fmt.Fprintln(os.Stderr, "orion: ignoring SIGHUP (terminal close will not stop polling; use SIGTERM/Ctrl+C to stop)")
 	err := gw.Poll(ctx, daemonTurnHandler(a))
-	if !a.Drain(30 * time.Second) {
-		fmt.Fprintln(os.Stderr, "orion: poll stopped with turns still in flight after 30s; exiting anyway")
+	if !a.Drain(drainTimeout) {
+		fmt.Fprintf(os.Stderr, "orion: poll stopped; cancelled turns had not wound down after %s; exiting anyway (their replies are lost)\n", drainTimeout)
 	}
 	return err
 }
@@ -1041,9 +1058,12 @@ func newTelegramGateway(a *app.App) (*messaging.TelegramGateway, error) {
 		}),
 	}
 	if a.Config.AllowAllTelegramChats {
-		// P2-O5: the opt-in is time-boxed — IsChatAllowed refuses
-		// every chat once the window (from daemon start) elapses.
-		gwOpts = append(gwOpts, messaging.WithAllowAll(a.Config.AllowAllWindow()))
+		// P2-O5 / F-A17-4: the opt-in is time-boxed — IsChatAllowed
+		// refuses every chat once the window (from when the window
+		// first opened) elapses. The deadline is persisted in the
+		// data dir, so a restart resumes the recorded window
+		// instead of opening a fresh one.
+		gwOpts = append(gwOpts, messaging.WithAllowAllPersisted(a.Config.AllowAllWindow(), a.Config.DataDir))
 	}
 	return messaging.NewTelegramGateway(a.Config.TelegramToken, gwOpts...)
 }

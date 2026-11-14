@@ -47,10 +47,36 @@ func fakeBotAPI(t *testing.T) *httptest.Server {
 }
 
 // startDaemon runs run(nil) in the background with stdout/stderr
+// daemonOutput is the captured output of a daemon started by
+// startDaemon: the pipe-reader goroutine appends while the daemon
+// runs, and the test reads while it runs too, so every access is
+// locked. A plain strings.Builder is NOT safe for that (the reader
+// and a test's String() call race), and the lock must live with the
+// buffer — startDaemon's old local mutex could not be reached by
+// callers that kept the builder.
+type daemonOutput struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+// String returns everything captured so far.
+func (d *daemonOutput) String() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.buf.String()
+}
+
+// Write appends p to the buffer.
+func (d *daemonOutput) Write(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.buf.Write(p)
+}
+
 // captured, and waits until the daemon reports it is polling (or the
 // test fails). It returns the exit-code channel and the captured
 // output buffer.
-func startDaemon(t *testing.T) (chan int, *strings.Builder) {
+func startDaemon(t *testing.T) (chan int, *daemonOutput) {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -58,17 +84,14 @@ func startDaemon(t *testing.T) (chan int, *strings.Builder) {
 	}
 	oldOut, oldErr := os.Stdout, os.Stderr
 	os.Stdout, os.Stderr = w, w
-	var out strings.Builder
-	var mu sync.Mutex
+	out := &daemonOutput{}
 	done := make(chan struct{})
 	go func() {
 		buf := make([]byte, 4096)
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
-				mu.Lock()
-				out.Write(buf[:n])
-				mu.Unlock()
+				_, _ = out.Write(buf[:n])
 			}
 			if err != nil {
 				close(done)
@@ -87,11 +110,8 @@ func startDaemon(t *testing.T) (chan int, *strings.Builder) {
 	// Wait for the "running as" line: the daemon is polling only then.
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		mu.Lock()
-		s := out.String()
-		mu.Unlock()
-		if strings.Contains(s, "oriond running as @TestBot") {
-			return codeCh, &out
+		if strings.Contains(out.String(), "oriond running as @TestBot") {
+			return codeCh, out
 		}
 		select {
 		case code := <-codeCh:

@@ -194,7 +194,7 @@ func Build(path string) (*App, error) {
 	// parent turn) and pollutes the parent's history. The child
 	// shares only the provider (concurrent-safe) and the typed
 	// memories (read-only view).
-	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, registry.PlanningStore()))
+	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, registry.PlanningStore()), cfg.DataDir)
 
 	// Model-visible subagent tools, registered on the PARENT
 	// registry only (children get a registry without them, so no
@@ -225,7 +225,7 @@ func Build(path string) (*App, error) {
 		}
 	}
 
-	skillReg := loadSkills(cfg.DataDir, logger)
+	skillReg := loadSkills(cfg.DataDir, logger, knownToolNames(registry))
 	// The skill tool is the model's invocation path for skills:
 	// registered on the parent registry (children get a registry
 	// without it — see newChildRegistry — so a subagent cannot
@@ -354,7 +354,7 @@ func BuildLocal(path string) (*Local, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: memory: %w", err)
 	}
-	skillReg := loadSkills(cfg.DataDir, logger)
+	skillReg := loadSkills(cfg.DataDir, logger, knownToolNames(registry))
 	if skillTool, err := tools.NewSkillTool(skillReg); err != nil {
 		return nil, fmt.Errorf("app: skill tool: %w", err)
 	} else if err := registry.Register(skillTool); err != nil {
@@ -402,15 +402,52 @@ func wireMCP(dataDir string, registry *tools.Registry, logger *log.Logger) *mcp.
 	return m
 }
 
+// knownToolNames returns the tool names registered on reg, plus
+// "skill": the skill tool is registered right after loadSkills, so
+// it is not listed yet, but a skill may always name it (the agent
+// loop never blocks it). The daemon passes this into loadSkills so
+// ## Tools validation (F-A17-14) knows the live tools — built-ins,
+// subagent tools and MCP tools — instead of only the built-in set.
+func knownToolNames(reg *tools.Registry) []string {
+	names := []string{"skill"}
+	if reg == nil {
+		return names
+	}
+	for _, t := range reg.List() {
+		names = append(names, t.Name())
+	}
+	return names
+}
+
+// ReloadSkills re-reads the skills directory without restarting
+// the daemon (F-A17-15, wired to /skills reload): new/changed
+// files load, removed files drop. The reload swaps the registry's
+// contents in place, so the agent and the skill tool — which hold
+// the same registry pointer — see the new skills on their next
+// use, with no rebuild. A directory that cannot be read at all
+// leaves the loaded skills untouched (see Registry.Reload).
+func (a *App) ReloadSkills() (int, error) {
+	if a == nil || a.Config == nil {
+		return 0, errors.New("app: ReloadSkills called on uninitialised App")
+	}
+	if a.Skills == nil {
+		return 0, errors.New("app: ReloadSkills: no skills registry")
+	}
+	return a.Skills.Reload(filepath.Join(a.Config.DataDir, "skills"))
+}
+
 // loadSkills loads skills from the user data dir ONLY
 // (<dataDir>/skills) — never from the repo working directory, so a
 // checked-out project can never smuggle skill instructions into the
 // agent. A missing dir means "no skills", not an error. A partially
 // broken dir is logged, not fatal: the skills that parsed still
 // load. A stat failure other than "missing" (e.g. permission denied)
-// is logged instead of silently skipped.
-func loadSkills(dataDir string, logger *log.Logger) *skills.Registry {
+// is logged instead of silently skipped. knownTools extends the
+// ## Tools validation set (F-A17-14): unknown names warn at load
+// instead of silently never matching a tool.
+func loadSkills(dataDir string, logger *log.Logger, knownTools []string) *skills.Registry {
 	reg := skills.NewRegistry()
+	reg.SetKnownTools(knownTools)
 	skillDir := filepath.Join(dataDir, "skills")
 	if _, err := os.Stat(skillDir); err == nil {
 		if _, err := reg.LoadDir(skillDir); err != nil {

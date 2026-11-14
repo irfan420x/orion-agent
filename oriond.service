@@ -28,17 +28,22 @@
 # Notes:
 # - Runs as a user unit (no root needed); oriond reads its config
 #   from ~/.orion/config.json.
-# - Restart=always (F-A16-1): /restart exits 0, and a clean exit 0
-#   is a restart trigger ONLY with Restart=always — the previous
-#   Restart=on-failure never restarted on exit 0, so /restart
-#   killed the daemon permanently. An explicit
+# - Restart=on-failure + RestartForceExitStatus=42 (F-A17-2, rc23 —
+#   supersedes the F-A16-1 Restart=always rule): /restart now exits
+#   42 (exitRestartRequested), NOT 0, and the unit restarts exit 42
+#   explicitly. A clean exit 0 (SIGTERM shutdown) no longer restarts
+#   — only a fault or an explicit restart request does — so an
+#   operator's /restart can no longer burn the start-limit burst the
+#   way a clean exit did under Restart=always, when every exit
+#   counted identically toward the burst. An explicit
 #   `systemctl --user stop` still stops it (a requested stop is
-#   not a restart trigger); any other exit — /restart, a crash,
-#   a stray SIGTERM — restarts it after 5s. RestartSec=5s avoids
-#   a tight loop if the token or provider config is wrong — fix
-#   the config and restart with `systemctl --user restart oriond`.
-#   This fixes the /restart-kills-the-daemon bug; it does NOT
-#   explain the 2026-11-14 ~06:19 silent death (no "restart
+#   not a restart trigger). RestartForceExitStatus does NOT bypass
+#   StartLimitBurst — the burst stays the circuit breaker for
+#   genuine faults, by design. RestartSec=5s avoids a tight loop if
+#   the token or provider config is wrong — fix the config and
+#   restart with `systemctl --user restart oriond`.
+#   This fixes the /restart-kills-the-daemon bug (F-A16-1); it does
+#   NOT explain the 2026-11-14 ~06:19 silent death (no "restart
 #   requested" line in that day's daemon log, and the owner was
 #   asleep), which remains unattributed.
 # - StartLimitBurst=12 in 60s (F-A16-6): give up (and surface the
@@ -72,8 +77,9 @@ StartLimitBurst=12
 Type=simple
 ExecStart=%h/.local/bin/oriond
 WorkingDirectory=%h
-Restart=always
+Restart=on-failure
 RestartSec=5s
+RestartForceExitStatus=42
 
 [Install]
 WantedBy=default.target

@@ -370,6 +370,20 @@ func NewGate(rules *RuleStore, prompter Prompter) *Gate {
 	}
 }
 
+// Rules returns the gate's standing-rule store, or nil when the
+// gate has none (a nil-rules gate prompts for everything). It
+// exists so the daemon can wire the owner-only /rules command
+// (F-A17-6) to the same store the gate consults — list, delete
+// and scope operate on the live rules, never on a copy. The
+// store pointer is fixed at construction, so reading it needs
+// no lock.
+func (g *Gate) Rules() *RuleStore {
+	if g == nil {
+		return nil
+	}
+	return g.rules
+}
+
 // SetLogger replaces the gate's diagnostic logger. A nil logger is
 // ignored. It never blocks on a waiting Check.
 func (g *Gate) SetLogger(l *log.Logger) {

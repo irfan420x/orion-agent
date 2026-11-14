@@ -13,6 +13,9 @@
 #           (default 24 for fixed-PID mode, 0 for follow mode).
 # Fixed-PID mode stops when the PID disappears or max_samples is reached.
 # Follow mode never exits on a missing daemon: it waits 60s and retries.
+# Output paths are overridable for tests / alternate checkouts
+# (F-A17-7): SAMPLER_OUT, SAMPLER_CSV, ORION_BIN — each defaults
+# to the $HOME/workspace/orion-go paths below when unset.
 set -u
 PID_ARG="${1:?usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>}"
 LABEL_ARG="${2:?usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>}"
@@ -25,9 +28,9 @@ if [ "$FOLLOW" -eq 1 ]; then
 else
   MAX="${3:-24}"
 fi
-OUT="$HOME/workspace/orion-go/AUDIT3_DAEMON_MEASUREMENTS.md"
-CSV="$HOME/workspace/orion-go/AUDIT3_DAEMON_SAMPLES.csv"
-ORION_BIN="$HOME/workspace/orion-go/bin/orion"
+OUT="${SAMPLER_OUT:-$HOME/workspace/orion-go/AUDIT3_DAEMON_MEASUREMENTS.md}"
+CSV="${SAMPLER_CSV:-$HOME/workspace/orion-go/AUDIT3_DAEMON_SAMPLES.csv}"
+ORION_BIN="${ORION_BIN:-$HOME/workspace/orion-go/bin/orion}"
 
 # Derive the release label (e.g. rc21) from the built CLI version string.
 # Prints the fixed label unchanged when LABEL_ARG is not "auto".
@@ -45,8 +48,14 @@ resolve_label() {
 }
 
 # Resolve the live daemon PID from systemd (follow mode only).
+# F-A17-7: the shipped deployment is a USER unit
+# (~/.config/systemd/user/oriond.service, installed by
+# install.sh), so this MUST ask the user manager (--user): the
+# bare `systemctl show oriond` queries the system manager, which
+# never sees a user unit, and the sampler then spins in its 60s
+# sleep-loop forever with an empty PID.
 resolve_pid() {
-  systemctl show oriond -p MainPID --value 2>/dev/null | tr -d ' '
+  systemctl --user show oriond -p MainPID --value 2>/dev/null | tr -d ' '
 }
 
 n=0

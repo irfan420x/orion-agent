@@ -373,13 +373,16 @@ func TestParseToolsHeadingVariants(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.heading, func(t *testing.T) {
-			content := "# Variant\n\nDoes things.\n\n" + tc.heading + "\n\n- echo\n"
+			// shell_exec is a real tool (F-A17-14): a placeholder
+			// name here would warn as unknown, which is not
+			// what this heading-variant test is measuring.
+			content := "# Variant\n\nDoes things.\n\n" + tc.heading + "\n\n- shell_exec\n"
 			s, warnings := parseSkill("variant.md", content)
 			if len(warnings) != 0 {
 				t.Errorf("heading %q produced warnings %v, want none", tc.heading, warnings)
 			}
-			if len(s.Tools) != 1 || s.Tools[0] != "echo" {
-				t.Errorf("heading %q: tools = %v, want [echo]", tc.heading, s.Tools)
+			if len(s.Tools) != 1 || s.Tools[0] != "shell_exec" {
+				t.Errorf("heading %q: tools = %v, want [shell_exec]", tc.heading, s.Tools)
 			}
 		})
 	}
