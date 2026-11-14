@@ -21,6 +21,21 @@ import (
 type replyChain struct {
 	mu           sync.RWMutex
 	interceptors []tools.ReplyInterceptor
+	// logf receives the consumption audit log (which interceptor
+	// consumed which update) and panic reports. It is set by the
+	// gateway to its own logf when the chain is created, so the
+	// lines land in the daemon log in production; nil means
+	// silent (tests set it to a recorder).
+	logf func(format string, args ...any)
+}
+
+// log writes one audit line when a logger is installed; it is a
+// no-op otherwise (and nil-safe).
+func (c *replyChain) log(format string, args ...any) {
+	if c == nil || c.logf == nil {
+		return
+	}
+	c.logf(format, args...)
 }
 
 func newReplyChain() *replyChain { return &replyChain{} }
@@ -66,7 +81,13 @@ func (c *replyChain) setQuestion(in *questionReplyInterceptor) {
 
 // tryAnswer runs the interceptors in order on upd. It reports
 // whether any interceptor consumed the update (the caller then
-// returns without starting a turn).
+// returns without starting a turn). Each interceptor runs with
+// panic isolation (F-A20-10): a panicking interceptor is logged
+// and treated as "did not consume", so one broken tool cannot
+// kill the poll loop or swallow the update — the chain continues
+// with the next interceptor. Every consumption is audit-logged
+// (which interceptor, which chat), so a swallowed update is
+// diagnosable instead of silent.
 func (c *replyChain) tryAnswer(upd Update) bool {
 	if c == nil {
 		return false
@@ -74,10 +95,28 @@ func (c *replyChain) tryAnswer(upd Update) bool {
 	c.mu.RLock()
 	interceptors := append([]tools.ReplyInterceptor(nil), c.interceptors...)
 	c.mu.RUnlock()
-	for _, in := range interceptors {
-		if in.TryAnswer(upd) {
+	for i, in := range interceptors {
+		if c.tryOne(i, in, upd) {
 			return true
 		}
+	}
+	return false
+}
+
+// tryOne runs one interceptor with panic isolation: a panic is
+// logged (with the interceptor's type, so the broken tool is
+// identifiable) and the update is left unconsumed, so the chain
+// continues. A consumption is audit-logged the same way.
+func (c *replyChain) tryOne(i int, in tools.ReplyInterceptor, upd Update) (consumed bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.log("reply chain: interceptor %d (%T) panicked: %v (update not consumed; chain continues)", i, in, r)
+			consumed = false
+		}
+	}()
+	if in.TryAnswer(upd) {
+		c.log("reply chain: interceptor %d (%T) consumed update for chat %d", i, in, upd.ChatID())
+		return true
 	}
 	return false
 }
@@ -133,6 +172,12 @@ func (g *TelegramGateway) replyChainFor() *replyChain {
 func (g *TelegramGateway) replyChainForLocked() *replyChain {
 	if g.replyChain == nil {
 		g.replyChain = newReplyChain()
+		// The chain audit-logs through the gateway's logger, so
+		// consumption and panic lines land in the daemon log in
+		// production (F-A20-10). The method value reads
+		// g.logger fresh on every call, so a logger installed
+		// after the chain exists is still honoured.
+		g.replyChain.logf = g.logf
 	}
 	return g.replyChain
 }
