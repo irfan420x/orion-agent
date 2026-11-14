@@ -5,8 +5,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/irfan/orion/internal/model"
@@ -283,6 +287,60 @@ func TestToolClasses(t *testing.T) {
 	var nilReg *Registry
 	if got := nilReg.ToolClasses(); len(got) != 0 {
 		t.Errorf("nil registry ToolClasses = %v, want empty", got)
+	}
+}
+
+// TestReadmeToolsListEqualsFactorySet (F-A21-5) pins the README
+// Tools section to the factory set exactly. The list is manual,
+// and it went stale silently: ask_user_question shipped without
+// ever being added, and plan_mode's two tools were missing too,
+// while `make check-readme-counts` only ever parsed the test-count
+// lines and never looked at the list. A tool added without a
+// README entry now fails loudly here instead of shipping with
+// stale user-facing docs. (The MCP sentence and the size-cap
+// sentence are not a tool list, so the section is cut at "MCP
+// servers configured" before the names are extracted.)
+func TestReadmeToolsListEqualsFactorySet(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	text := string(raw)
+	start := strings.Index(text, "## Tools (all wired into the agent)")
+	if start < 0 {
+		t.Fatal("README.md has no '## Tools (all wired into the agent)' section (heading changed?)")
+	}
+	rest := text[start:]
+	end := strings.Index(rest, "\n## ")
+	if end < 0 {
+		t.Fatal("README.md Tools section has no following '## ' heading (section is last?)")
+	}
+	section := rest[:end]
+	cut := strings.Index(section, "MCP servers configured")
+	if cut < 0 {
+		t.Fatal("README.md Tools section no longer has the 'MCP servers configured' sentence this test cuts the list at; update the test's cut point")
+	}
+	listPart := section[:cut]
+	nameRe := regexp.MustCompile("`([a-z][a-z0-9_]*)`")
+	matches := nameRe.FindAllStringSubmatch(listPart, -1)
+	seen := map[string]bool{}
+	var got []string
+	for _, m := range matches {
+		if seen[m[1]] {
+			t.Errorf("README Tools section names %q twice", m[1])
+		}
+		seen[m[1]] = true
+		got = append(got, m[1])
+	}
+	sort.Strings(got)
+	want := fullBuiltInToolNames(t)
+	if len(got) != len(want) {
+		t.Fatalf("README Tools section lists %d tools %v, want the %d factory tools %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("README Tools section lists %v, want the factory set %v", got, want)
+		}
 	}
 }
 

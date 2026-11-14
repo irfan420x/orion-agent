@@ -5,9 +5,9 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,477 tests total — 1,473 pass, 0 fail, 4 skip;
+> built and tested (1,501 tests total — 1,497 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
-> Audit 20 Step 1 fixes + plan_mode (tool 2 of 14), 2026-11-14 — see CHANGELOG for the rc25 audit fixes).
+> Audit 21 F1 fixes (2026-11-14) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -118,9 +118,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,477 tests total (1,473 passing, 0 failing, 4 skipped)
-(recount in the working tree after the Audit 20 Step 1 fixes +
-plan_mode (tool 2 of 14), 2026-11-14; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
+24/24 packages, 1,501 tests total (1,497 passing, 0 failing, 4 skipped)
+(recount in the working tree after the Audit 21 F1 fixes,
+2026-11-14; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
 `go test ./...` or `make test`.
 
@@ -405,13 +405,17 @@ is never deleted or modified by the migration.
 `shell_exec` (denylist + timeout + 64KB cap; namespace/chroot
 sandbox with seccomp filter by default — see [SECURITY.md](SECURITY.md)), `file_read`,
 `file_write`, `file_edit`, `file_list`, `grep` (confined content
-search — use instead of shell `grep`, which bypasses confinement),
+search — use instead of shell grep, which bypasses confinement),
 `glob` (recursive glob patterns), `web_fetch`, `web_search`
 (real DuckDuckGo search), `calculator` (full expression parser),
 `datetime`, `process_list`, `skill` (invoke a skill from the user
-data dir; lazy body load; allowed-tools enforced), `todo_write`
+data dir; lazy body load; allowed-tools enforced),
+`ask_user_question` (ask the user a question mid-turn and wait for
+the answer), `todo_write`
 (session checklist), `task_create` / `task_get` / `task_list` /
-`task_update` (durable planning tasks, per chat), `subagent_spawn`
+`task_update` (durable planning tasks, per chat),
+`enter_plan_mode` / `exit_plan_mode` (present a plan and work only
+after the user approves it / clear a pending plan), `subagent_spawn`
 (run a brief as a managed child agent), `subagent_list`, `subagent_result`,
 `subagent_stop`. MCP servers configured in the data dir add
 `mcp__<server>__<tool>` tools dynamically. Every tool result is capped at
