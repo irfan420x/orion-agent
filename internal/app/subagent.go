@@ -137,6 +137,13 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 // the old behaviour, which callers that never wired a data dir rely
 // on. The variadic form keeps the existing newChildRegistry(cfg)
 // call sites compiling while the executor wiring passes the store.
+// The cron tools are likewise excluded: scheduling is a
+// parent-chat commitment (recurring turns, token spend, approval
+// prompts in the parent's chat), so a child running a brief must
+// not be able to commit the parent's chat to recurring work, and
+// cron_cancel in a child could drop the parent's jobs. The
+// scheduled turn itself runs on the parent chat's agent, never
+// in a child, so excluding the tools here costs nothing.
 func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore) (*tools.Registry, error) {
 	if cfg == nil {
 		cfg = config.Default()
@@ -154,7 +161,7 @@ func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore
 	// means the default registry changed under us, and failing
 	// here beats silently handing a child a tool it must not
 	// have.
-	for _, name := range []string{"enter_plan_mode", "exit_plan_mode"} {
+	for _, name := range []string{"enter_plan_mode", "exit_plan_mode", "cron_schedule", "cron_list", "cron_cancel"} {
 		if !reg.Remove(name) {
 			return nil, fmt.Errorf("app: newChildRegistry: default registry has no %q to exclude from the child registry", name)
 		}

@@ -100,6 +100,17 @@ type App struct {
 	// before mu, never after.
 	chatsMu sync.Mutex
 	chats   map[int64]*chatSession
+	// turnMu/turnLocks serialise agent turns per chat (cron):
+	// the per-chat agent's runs are serialised by design, and
+	// PollStream holds its own per-chat lock for user turns —
+	// but a scheduled turn fires from the scheduler goroutine,
+	// outside PollStream, so runChatTurn takes this lock for
+	// EVERY chat turn (user or scheduled). Lock order is always
+	// PollStream's chat lock, then this lock, then chatsMu —
+	// never the reverse — so the two locks cannot deadlock.
+	// A nil map (hand-built Apps) is created lazily by turnLock.
+	turnMu    sync.Mutex
+	turnLocks map[int64]*sync.Mutex
 	// gate is the permission/confirmation gate (P1-O2), installed
 	// by the daemon via SetPermissionGate; nil means ungated (the
 	// CLI never installs one). gateMu guards it.

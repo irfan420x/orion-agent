@@ -128,6 +128,9 @@ var networkTools = map[string]bool{
 var safeTools = map[string]bool{
 	"ask_user_question": true,
 	"calculator":        true,
+	"cron_cancel":       true,
+	"cron_list":         true,
+	"cron_schedule":     true,
 	"datetime":          true,
 	"enter_plan_mode":   true,
 	"exit_plan_mode":    true,

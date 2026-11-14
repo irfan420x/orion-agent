@@ -189,6 +189,11 @@ type memBucket struct {
 	// plans.json on disk; the plan tool's load/save helpers in
 	// plan_mode.go read and write it under the store mutex.
 	plan *planState
+	// cronJobs are the scheduled jobs for this bucket (cron.go):
+	// nil means none yet. The in-memory bucket mirrors cron.json
+	// on disk; the cron load/save helpers read and write it under
+	// the store mutex.
+	cronJobs []*CronJob
 }
 
 // PlanningStore is the shared state behind the five planning tools.

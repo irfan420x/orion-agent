@@ -22,6 +22,8 @@ import (
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/sandbox"
+	"github.com/irfan/orion/internal/security"
+	"github.com/irfan/orion/internal/tools"
 	"github.com/irfan/orion/internal/version"
 )
 
@@ -448,6 +450,22 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
 		return 1
 	}
+	// Cron scheduler (tool 3 of 14): fires due scheduled jobs as
+	// normal agent turns in the owning chat. The runner is
+	// runScheduledTurn below; the scheduler itself lives in
+	// internal/tools and only knows the store + the runner, so
+	// the tools package never imports the app layer. It runs
+	// until ctx is cancelled (shutdown); in-flight scheduled
+	// turns are registered runs, so Drain waits for them like
+	// user turns. `orion daemon` / `orion telegram poll` do NOT
+	// start a scheduler — oriond is the daemon; the CLI loops
+	// are turn-only entry points.
+	cronSched := tools.NewCronScheduler(a.PlanningStore())
+	cronSched.SetRunner(func(ctx context.Context, job tools.CronJob) (string, error) {
+		return runScheduledTurn(a, store, gw, ctx, job)
+	})
+	go cronSched.Run(ctx)
+	fmt.Fprintln(os.Stderr, "oriond: cron scheduler started (jobs in <dataDir>/chats/<id>/cron.json, times UTC)")
 	// F-A20-9: pending approvals/questions live only in memory,
 	// so a restart voids every card sent before it — note it at
 	// startup, so a later "no longer pending" toast on a dead
@@ -779,6 +797,57 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 		return "", nil, err
 	}
 	return reply, stats, nil
+}
+
+// runScheduledTurn runs one scheduled cron job as a real agent
+// turn for its chat, and delivers the reply to that chat. It
+// mirrors runTurn, with two deliberate differences:
+//
+//   - It does NOT record the prompt as the chat's last input:
+//     /retry is for the user's last message, and a scheduled
+//     prompt must never hijack it.
+//   - The approval context carries the JOB's requester (the user
+//     who scheduled it), so a destructive action inside the
+//     scheduled turn prompts that user in that chat — exactly as
+//     an interactive turn would. Nobody auto-approves here: an
+//     unanswered approval denies the call after the gate timeout
+//     and the turn completes with the denial recorded.
+//
+// The turn's token usage is recorded in the session like a user
+// turn's. A failed turn notifies the chat (best effort) and
+// returns the error so the scheduler can back off / disable the
+// job. A send failure after a successful turn is logged, not
+// returned as a job failure: the turn ran, and a transport
+// problem must not disable a healthy job.
+func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.TelegramGateway, ctx context.Context, job tools.CronJob) (string, error) {
+	if a == nil {
+		return "", errors.New("oriond: app is nil")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	runCtx = permissions.WithApprovalContext(runCtx, job.ChatID, job.Requester)
+	registered := a.RegisterRun(job.ChatID, runCtx, cancel)
+	if registered {
+		defer a.UnregisterRun(job.ChatID, runCtx)
+	}
+	defer cancel()
+	reply, stats, err := a.HandleStreamForChat(runCtx, job.ChatID, job.Prompt, nil)
+	if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
+		reply = fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err)
+		err = nil
+	}
+	if stats != nil && store != nil {
+		_ = store.AddUsage(job.ChatID, stats.Tokens)
+	}
+	if err != nil {
+		notice := fmt.Sprintf("⏰ Scheduled job %s failed: %v", job.ID, err)
+		_ = gw.SendMessage(ctx, job.ChatID, security.RedactSecrets(notice))
+		return "", err
+	}
+	text := fmt.Sprintf("⏰ Scheduled job %s:\n\n%s", job.ID, reply)
+	if err := gw.SendMessage(ctx, job.ChatID, security.RedactSecrets(text)); err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: cron: job %s ran but its reply could not be sent to chat %d: %v\n", job.ID, job.ChatID, err)
+	}
+	return reply, nil
 }
 
 // buildTurnHandler builds the PollStream TurnFunc: slash commands are

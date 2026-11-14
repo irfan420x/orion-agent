@@ -48,6 +48,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/irfan/orion/internal/config"
@@ -58,6 +59,7 @@ import (
 	"github.com/irfan/orion/internal/security"
 	"github.com/irfan/orion/internal/session"
 	"github.com/irfan/orion/internal/subagent"
+	"github.com/irfan/orion/internal/tools"
 )
 
 // chatStore is a memory.Store that splits the two halves of memory
@@ -416,6 +418,17 @@ func (a *App) permissionGate() *permissions.Gate {
 // polling loop starts (F-A6-3).
 func (a *App) PermissionGate() *permissions.Gate { return a.permissionGate() }
 
+// PlanningStore returns the planning store the registry's tools
+// share (todo/task/plan/cron state, per chat), or nil for a
+// hand-built App. The daemon's cron scheduler reads it to scan
+// for due jobs; it never writes through it directly.
+func (a *App) PlanningStore() *tools.PlanningStore {
+	if a == nil {
+		return nil
+	}
+	return a.planningStore
+}
+
 // HandleForChat runs one user input through the chat's agent (the
 // per-chat equivalent of Handle, for non-streaming callers). The
 // per-chat daily token budget is enforced (see runChatTurn): a chat
@@ -424,6 +437,23 @@ func (a *App) PermissionGate() *permissions.Gate { return a.permissionGate() }
 func (a *App) HandleForChat(ctx context.Context, chatID int64, input string) (string, error) {
 	reply, _, err := a.runChatTurn(ctx, chatID, input, nil)
 	return reply, err
+}
+
+// turnLock returns the serialising mutex for one chat's turns,
+// creating it (and the map) lazily. Hand-built Apps start with a
+// nil map; Build-created Apps get one on first use either way.
+func (a *App) turnLock(chatID int64) *sync.Mutex {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+	if a.turnLocks == nil {
+		a.turnLocks = map[int64]*sync.Mutex{}
+	}
+	l, ok := a.turnLocks[chatID]
+	if !ok {
+		l = &sync.Mutex{}
+		a.turnLocks[chatID] = l
+	}
+	return l
 }
 
 // runChatTurn is the single per-chat turn path behind HandleForChat
@@ -463,6 +493,16 @@ func (a *App) HandleForChat(ctx context.Context, chatID int64, input string) (st
 // prompt/completion/subagent split, so the footer and /usage can
 // show the turn honestly.
 func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	// Per-chat turn serialisation (cron): a scheduled turn fires
+	// from the scheduler goroutine, outside PollStream's per-chat
+	// lock, so this lock — taken here, for every chat turn — is
+	// what keeps a scheduled turn from overlapping a user turn
+	// in the same chat and interleaving that chat's history.
+	// Different chats take different locks and still run in
+	// parallel.
+	lock := a.turnLock(chatID)
+	lock.Lock()
+	defer lock.Unlock()
 	agent, err := a.AgentForChat(chatID)
 	if err != nil {
 		return "", nil, err
