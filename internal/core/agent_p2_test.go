@@ -78,7 +78,7 @@ func TestParseToolArgumentsRequiresObject(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args, ok := parseToolArguments(model.ToolCall{Name: "echo", Arguments: tc.args})
+			args, ok := parseToolArguments(model.ToolCall{Name: "calculator", Arguments: tc.args})
 			if ok != tc.want {
 				t.Fatalf("parseToolArguments(%q) ok = %v, want %v", tc.args, ok, tc.want)
 			}
@@ -104,7 +104,7 @@ func TestRunFeedsNonObjectArgumentsAsError(t *testing.T) {
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "echo", `[1,2]`), nil
+				return toolCallResponse("call-1", "calculator", `[1,2]`), nil
 			}
 			return textResponse("noted"), nil
 		},
@@ -125,14 +125,14 @@ type deadlineTool struct {
 	remaining time.Duration
 }
 
-func (deadlineTool) Name() string        { return "deadline" }
+func (deadlineTool) Name() string        { return "calculator" }
 func (deadlineTool) Description() string { return "Reports its remaining context deadline." }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "deadline" is not in the gate's maps).
+// matching permissions.Classify; "calculator" is in the gate's Safe map).
 func (deadlineTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (deadlineTool) Definition() model.ToolDefinition {
-	return model.ToolDefinition{Name: "deadline", Description: "Reports deadline.", Parameters: map[string]any{"type": "object"}}
+	return model.ToolDefinition{Name: "calculator", Description: "Reports deadline.", Parameters: map[string]any{"type": "object"}}
 }
 func (t *deadlineTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
 	if dl, ok := ctx.Deadline(); ok {
@@ -154,7 +154,7 @@ func TestToolExecutionGetsOwnTimeout(t *testing.T) {
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
 				time.Sleep(800 * time.Millisecond)
-				return toolCallResponse("call-1", "deadline", `{}`), nil
+				return toolCallResponse("call-1", "calculator", `{}`), nil
 			}
 			return textResponse("done"), nil
 		},

@@ -1,6 +1,9 @@
-// SetToolClasses tests (tools framework): the gate consults the
-// installed per-tool declarations before the hardcoded maps, and
-// falls back to Classify for tools the map does not name.
+// SetToolClasses tests (tools framework): the installed
+// per-tool declarations can only RAISE a tool's class above what
+// the hardcoded maps say, never lower it — classify() consults
+// the hardcoded maps first and the installed map only for tools
+// Classify calls Safe — and falls back to Classify for tools the
+// map does not name.
 package permissions
 
 import (

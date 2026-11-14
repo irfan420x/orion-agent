@@ -180,7 +180,7 @@ func TestGateSafeToolRunsWithoutPrompt(t *testing.T) {
 		prompted = true
 		return nil
 	})
-	stub := &gateStubTool{name: "echo"}
+	stub := &gateStubTool{name: "calculator"}
 	reg := tools.NewRegistry()
 	if err := reg.Register(stub); err != nil {
 		t.Fatal(err)
@@ -188,7 +188,7 @@ func TestGateSafeToolRunsWithoutPrompt(t *testing.T) {
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "echo", `{"text":"hi"}`), nil
+				return toolCallResponse("call-1", "calculator", `{"text":"hi"}`), nil
 			}
 			return textResponse("done"), nil
 		},

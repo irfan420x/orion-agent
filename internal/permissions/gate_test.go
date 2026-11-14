@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,12 +23,33 @@ func TestClassify(t *testing.T) {
 		"subagent_spawn": ClassDestructive,
 		"web_fetch":      ClassNetwork,
 		"web_search":     ClassNetwork,
-		"calculator":     ClassSafe,
-		"file_read":      ClassSafe,
-		"subagent_list":  ClassSafe,
-		"subagent_stop":  ClassSafe,
-		"unknown_tool":   ClassSafe,
-		"":               ClassSafe,
+		// Every Safe built-in is Safe because it is listed in the
+		// safeTools map (F-A21-1), never by default.
+		"ask_user_question": ClassSafe,
+		"calculator":        ClassSafe,
+		"datetime":          ClassSafe,
+		"enter_plan_mode":   ClassSafe,
+		"exit_plan_mode":    ClassSafe,
+		"file_list":         ClassSafe,
+		"file_read":         ClassSafe,
+		"glob":              ClassSafe,
+		"grep":              ClassSafe,
+		"process_list":      ClassSafe,
+		"skill":             ClassSafe,
+		"subagent_list":     ClassSafe,
+		"subagent_result":   ClassSafe,
+		"subagent_stop":     ClassSafe,
+		"task_create":       ClassSafe,
+		"task_get":          ClassSafe,
+		"task_list":         ClassSafe,
+		"task_update":       ClassSafe,
+		"todo_write":        ClassSafe,
+		// Unknown names are ClassDestructive — fail-closed
+		// (F-A21-1). There is no "unknown is safe" default: the
+		// old Safe entries here pinned the hole.
+		"unknown_tool": ClassDestructive,
+		"wipe_notes":   ClassDestructive,
+		"":             ClassDestructive,
 		// MCP tools (rc9): any server tool is ClassNetwork — the
 		// server is an external process with unknown capabilities.
 		"mcp__fake__echo": ClassNetwork,
@@ -40,6 +62,73 @@ func TestClassify(t *testing.T) {
 	}
 	if !IsGated("shell_exec") || IsGated("calculator") {
 		t.Error("IsGated disagrees with Classify")
+	}
+	if !IsGated("wipe_notes") {
+		t.Error("IsGated(unknown tool) is false, want true (fail-closed)")
+	}
+}
+
+// TestClassifyKnown pins which names are explicitly classified:
+// every built-in and any mcp__ tool is known; a novel name, an
+// unknown name and the empty name are not — Register rejects them
+// and the gate denies them.
+func TestClassifyKnown(t *testing.T) {
+	for _, name := range KnownTools() {
+		if _, ok := ClassifyKnown(name); !ok {
+			t.Errorf("ClassifyKnown(%q) = unknown, want known", name)
+		}
+	}
+	for _, name := range []string{"mcp__srv__tool", "mcp__fake__echo"} {
+		if class, ok := ClassifyKnown(name); !ok || class != ClassNetwork {
+			t.Errorf("ClassifyKnown(%q) = %v/%v, want network/true", name, class, ok)
+		}
+	}
+	for _, name := range []string{"wipe_notes", "unknown_tool", "brand_new_tool", ""} {
+		if _, ok := ClassifyKnown(name); ok {
+			t.Errorf("ClassifyKnown(%q) = known, want unknown", name)
+		}
+	}
+}
+
+// TestGateDeniesUnknownTool mirrors the auditor's F-A21-1 probe at
+// the gate layer: a wipe_notes-style tool the gate cannot classify
+// is denied outright and the prompter is never called — the user
+// is never asked to approve a tool the system cannot classify.
+func TestGateDeniesUnknownTool(t *testing.T) {
+	prompted := false
+	g := NewGate(NewRuleStore(""), func(ctx context.Context, req ApprovalRequest) error {
+		prompted = true
+		return nil
+	})
+	g.SetTimeout(10 * time.Millisecond)
+	if ok, reason := g.Check(ctxWithChat(t), "wipe_notes", `{}`); ok {
+		t.Error("gate allowed an unclassified tool, want denied")
+	} else if !strings.Contains(reason, "not in the permission-gate classification") {
+		t.Errorf("denial reason = %q, want it to name the missing classification", reason)
+	}
+	if prompted {
+		t.Error("gate prompted for an unclassified tool, want no prompt")
+	}
+	// A gate with no prompter denies it too (deny, not prompt, is
+	// the fail-closed answer either way).
+	g2 := NewGate(NewRuleStore(""), nil)
+	if ok, _ := g2.Check(ctxWithChat(t), "wipe_notes", `{}`); ok {
+		t.Error("prompter-less gate allowed an unclassified tool, want denied")
+	}
+}
+
+// TestGateDeniesUnknownToolDespiteAllowRule pins that the
+// unclassified-name denial comes before the rule lookup: even a
+// persisted "always allow" rule for such a name must never let it
+// run.
+func TestGateDeniesUnknownToolDespiteAllowRule(t *testing.T) {
+	rules := NewRuleStore("")
+	if err := rules.Set("wipe_notes", ActionAllow); err != nil {
+		t.Fatalf("Set allow rule: %v", err)
+	}
+	g := NewGate(rules, func(ctx context.Context, req ApprovalRequest) error { return nil })
+	if ok, _ := g.Check(ctxWithChat(t), "wipe_notes", `{}`); ok {
+		t.Error("gate allowed an unclassified tool with an allow rule, want denied")
 	}
 }
 

@@ -311,13 +311,13 @@ func TestRegistryRegisterGuards(t *testing.T) {
 			t.Fatalf("Register(name %q): expected error, got nil", name)
 		}
 	}
-	if err := r.Register(&namedStubTool{name: "ok"}); err != nil {
+	if err := r.Register(&namedStubTool{name: "calculator"}); err != nil {
 		t.Fatalf("Register(valid tool): %v", err)
 	}
-	if _, ok := r.Get("ok"); !ok {
+	if _, ok := r.Get("calculator"); !ok {
 		t.Fatal("registered tool not retrievable")
 	}
-	if err := r.Register(&namedStubTool{name: "ok"}); err == nil {
+	if err := r.Register(&namedStubTool{name: "calculator"}); err == nil {
 		t.Fatal("Register(duplicate): expected error, got nil")
 	}
 }
@@ -353,16 +353,16 @@ func TestCalcParserPeekNextBounds(t *testing.T) {
 
 type panicTool struct{}
 
-func (panicTool) Name() string { return "panicker" }
+func (panicTool) Name() string { return "calculator" }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "panicker" is not in the gate's maps).
+// matching permissions.Classify; "calculator" is in the gate's Safe map).
 func (panicTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (panicTool) Description() string {
 	return "tool that panics, for the recover test"
 }
 func (panicTool) Definition() model.ToolDefinition {
-	return model.ToolDefinition{Name: "panicker", Description: "panics", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}}
+	return model.ToolDefinition{Name: "calculator", Description: "panics", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}}
 }
 func (panicTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	panic("boom-test-panic")
@@ -375,7 +375,7 @@ func TestRegistryExecuteRecoversToolPanic(t *testing.T) {
 	if err := r.Register(panicTool{}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	_, err := r.Execute(context.Background(), "panicker", json.RawMessage("{}"))
+	_, err := r.Execute(context.Background(), "calculator", json.RawMessage("{}"))
 	if err == nil {
 		t.Fatal("Execute(panicking tool): expected error, got nil (panic escaped)")
 	}
@@ -393,7 +393,7 @@ func TestRegistryExecuteRecoversToolPanic(t *testing.T) {
 	if err := r.Register(&stubTool{output: "alive"}); err != nil {
 		t.Fatalf("Register after panic: %v", err)
 	}
-	out, err := r.Execute(context.Background(), "stub", json.RawMessage("{}"))
+	out, err := r.Execute(context.Background(), "datetime", json.RawMessage("{}"))
 	if err != nil || out != "alive" {
 		t.Fatalf("Execute after panic: out=%q err=%v", out, err)
 	}

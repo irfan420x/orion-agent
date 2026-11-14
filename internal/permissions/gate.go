@@ -13,7 +13,14 @@
 //     destructive tools (shell_exec, file_write, file_edit,
 //     subagent_spawn — a child agent can run shell tools, so spawning
 //     one must be gated or the gate is bypassable) and network tools
-//     (web_fetch, web_search) need approval.
+//     (web_fetch, web_search) need approval. The classification is
+//     explicit and fail-closed (F-A21-1): every safe tool is listed
+//     in the safeTools map, and a name in NO map classifies
+//     ClassDestructive — an unclassified tool is never treated as
+//     safe. Registry.Register additionally rejects unclassified
+//     names outright, and Check denies them before consulting any
+//     persisted rule, so an unknown tool can never execute ungated
+//     even if Register was bypassed.
 //   - A persisted rule store (permissions.json, 0600) holds
 //     per-chat allow/deny rules (F-A16-3): an "always allow" tapped
 //     in one chat applies to that chat only, never to other chats.
@@ -50,6 +57,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,26 +108,120 @@ var networkTools = map[string]bool{
 	"web_search": true,
 }
 
-// Classify returns the risk class of a tool by name. Unknown tools
-// are ClassSafe: the registry rejects them as unknown_tool before
-// they can run, so the gate has nothing to protect there, and
-// classifying an unknown tool as gated would only produce approval
-// prompts for calls that can never execute. MCP tools (mcp__<server>__<tool>)
-// are the exception: they are ClassNetwork — a server is an external
-// process with unknown capabilities, so every MCP tool needs
-// approval when a gate is installed (rc9, audit P0 #7).
+// safeTools are the tools that run without approval. This is an
+// explicit allowlist, not a default: Classify returns
+// ClassDestructive for any name in NONE of the three maps
+// (F-A21-1), so a safe tool that is missing here can neither
+// register nor run. ADD A TOOL HERE when adding a safe built-in
+// tool — the declaration, this map and the factory set must agree
+// (pinned by TestClassifyMapsMatchFactorySet).
+//
+// The entries that write state are safe only because of WHAT they
+// write (F-A21-15): todo_write / task_create / task_update persist
+// solely to Orion's own 0600 per-chat planning files, at paths
+// derived from config and context — never a user-supplied path,
+// never the shell, never the network. subagent_stop is safe
+// because stopping a child is containment, not an effect: gating
+// it would leave a runaway child running while approval is
+// awaited. The remaining entries only read, compute, or manage
+// the agent's own in-memory state.
+var safeTools = map[string]bool{
+	"ask_user_question": true,
+	"calculator":        true,
+	"datetime":          true,
+	"enter_plan_mode":   true,
+	"exit_plan_mode":    true,
+	"file_list":         true,
+	"file_read":         true,
+	"glob":              true,
+	"grep":              true,
+	"process_list":      true,
+	"skill":             true,
+	"subagent_list":     true,
+	"subagent_result":   true,
+	"subagent_stop":     true,
+	"task_create":       true,
+	"task_get":          true,
+	"task_list":         true,
+	"task_update":       true,
+	"todo_write":        true,
+}
+
+// normalizeToolName trims surrounding whitespace from a tool name
+// for classification lookups. Case folding lands here too
+// (F-A21-17): a name that differs from a mapped name only by case
+// must classify as that tool, never as an unknown name.
+func normalizeToolName(tool string) string {
+	return strings.TrimSpace(tool)
+}
+
+// classifyKnown maps a normalised tool name to its explicit risk
+// class. ok is false when the name is in none of the maps and is
+// not an MCP tool: the class returned then is ClassDestructive
+// (fail-closed), and the caller must treat the name as
+// unclassified — Register rejects it, the gate denies it.
+func classifyKnown(name string) (Class, bool) {
+	if destructiveTools[name] {
+		return ClassDestructive, true
+	}
+	if networkTools[name] {
+		return ClassNetwork, true
+	}
+	if safeTools[name] {
+		return ClassSafe, true
+	}
+	if strings.HasPrefix(name, "mcp__") {
+		return ClassNetwork, true
+	}
+	return ClassDestructive, false
+}
+
+// Classify returns the risk class of a tool by name. The class is
+// explicit: a tool in the destructive or network maps (or with the
+// mcp__ prefix) is gated, a tool in the safeTools map runs freely,
+// and a name in NONE of them is ClassDestructive — fail-closed
+// (F-A21-1). There is no "unknown is safe" default: an unmapped
+// name must be gated by every consumer that only consults Classify
+// (the gate's backstop, plan-mode blocking, IsGated), and
+// Registry.Register rejects unclassified names outright, so a new
+// tool whose author forgot the maps can neither register nor run.
+// MCP tools (mcp__<server>__<tool>) are ClassNetwork — a server is
+// an external process with unknown capabilities, so every MCP tool
+// needs approval when a gate is installed (rc9, audit P0 #7).
 func Classify(tool string) Class {
-	tool = strings.TrimSpace(tool)
-	if destructiveTools[tool] {
-		return ClassDestructive
+	class, _ := classifyKnown(normalizeToolName(tool))
+	return class
+}
+
+// ClassifyKnown returns the risk class of a tool by name plus
+// whether the name is explicitly classified — in one of the maps
+// or an MCP (mcp__ prefix) tool. ok is false for an unclassified
+// name (the class is still the fail-closed ClassDestructive).
+// Register uses this to reject names the maps never heard of,
+// instead of accepting them on a vacuous declaration agreement.
+func ClassifyKnown(tool string) (Class, bool) {
+	return classifyKnown(normalizeToolName(tool))
+}
+
+// KnownTools returns the sorted names of every explicitly
+// classified built-in tool (the three maps). MCP tools are not
+// listed: they classify by the mcp__ prefix rule, not by name.
+// The factory-set test pins this list to the built-in tools, so a
+// map entry for a removed tool — or a built-in missing from the
+// maps — fails loudly there.
+func KnownTools() []string {
+	out := make([]string, 0, len(destructiveTools)+len(networkTools)+len(safeTools))
+	for name := range destructiveTools {
+		out = append(out, name)
 	}
-	if networkTools[tool] {
-		return ClassNetwork
+	for name := range networkTools {
+		out = append(out, name)
 	}
-	if strings.HasPrefix(tool, "mcp__") {
-		return ClassNetwork
+	for name := range safeTools {
+		out = append(out, name)
 	}
-	return ClassSafe
+	sort.Strings(out)
+	return out
 }
 
 // IsGated reports whether the tool ever needs approval (i.e. it is
@@ -459,7 +561,7 @@ func (g *Gate) SetToolClasses(classes map[string]Class) {
 	}
 	m := make(map[string]Class, len(classes))
 	for name, class := range classes {
-		if name = strings.TrimSpace(name); name != "" {
+		if name = normalizeToolName(name); name != "" {
 			m[name] = class
 		}
 	}
@@ -476,7 +578,7 @@ func (g *Gate) SetToolClasses(classes map[string]Class) {
 // decides; this is the fail-closed backstop for a hand-built map
 // (a test, or a future caller that bypasses Register).
 func (g *Gate) classify(tool string) Class {
-	tool = strings.TrimSpace(tool)
+	tool = normalizeToolName(tool)
 	base := Classify(tool)
 	if g == nil {
 		return base
@@ -539,14 +641,18 @@ func (g *Gate) Timeout() time.Duration {
 //     denylisted command is denied without ever asking the user and
 //     no "always allow" rule can rescue it. An approval can never
 //     authorise a denylisted command;
-//  2. a persisted rule for this chat (deny rules are never prompted,
+//  2. an unclassified tool name (F-A21-1) — denied outright, before
+//     any rule is consulted and without prompting: the system
+//     cannot classify the tool, so the user cannot meaningfully
+//     approve it;
+//  3. a persisted rule for this chat (deny rules are never prompted,
 //     allow rules never prompt either); a rule from another chat
 //     never applies here (F-A16-3 — per-chat isolation at the
 //     permission layer, matching the history/model/budget layers);
 //     a legacy global rule, written before rules were per-chat,
 //     still applies to every chat;
-//  3. safe tools (allowed outright);
-//  4. the prompter + the user's answer (or the timeout / turn
+//  4. safe tools (allowed outright);
+//  5. the prompter + the user's answer (or the timeout / turn
 //     cancellation, which deny).
 //
 // A nil gate allows everything: "no gate installed" is the CLI
@@ -563,6 +669,19 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 	// independent checks.
 	if tool == "shell_exec" && isDenylistedCommand(args) {
 		return false, "denied: command is blocked by the shell denylist and cannot be approved"
+	}
+	// Fail-closed for unclassified names (F-A21-1): a tool the
+	// gate cannot classify — in none of the maps and not an MCP
+	// tool — is denied outright, BEFORE any persisted rule is
+	// consulted, and is never prompted for. The user cannot
+	// meaningfully approve a tool the system cannot even classify,
+	// and a stale "always allow" rule for such a name must never
+	// rescue it. Register rejects these names too, so reaching
+	// the gate means Register was bypassed or the model
+	// hallucinated the name; the denial tells the model the tool
+	// does not exist in a classified form.
+	if _, ok := ClassifyKnown(tool); !ok {
+		return false, fmt.Sprintf("denied: tool %q is not in the permission-gate classification; add it to the classification maps in internal/permissions/gate.go before it can run", tool)
 	}
 	// The chat comes from the turn's context (set by the daemon's
 	// turn handler from the Telegram update). The rule lookup is

@@ -61,14 +61,19 @@ type chargeTokensTool struct {
 	tokens int
 }
 
-func (t *chargeTokensTool) Name() string        { return "charge" }
+func (t *chargeTokensTool) Name() string        { return "mcp__test__charge" }
 func (t *chargeTokensTool) Description() string { return "Reports subagent tokens to the agent." }
 
-// RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "charge" is not in the gate's maps).
-func (t *chargeTokensTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+// RiskClass declares the tool Network: the name is an MCP-style
+// (mcp__ prefix) name, so permissions.Classify classes it Network
+// and the declaration must agree (F-A21-1). The prefix is the
+// only dynamic-name classification path: the test app's registry
+// already holds every built-in tool, so no built-in name is free
+// for a stub registered alongside them. The test runs without a
+// gate, so the Network class never prompts here.
+func (t *chargeTokensTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
 func (t *chargeTokensTool) Definition() model.ToolDefinition {
-	return model.ToolDefinition{Name: "charge", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
+	return model.ToolDefinition{Name: "mcp__test__charge", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
 }
 func (t *chargeTokensTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
 	t.agent.AddSubagentUsage(t.tokens)
@@ -97,7 +102,7 @@ func TestHandleStreamForChatStatsCarrySubagentSplit(t *testing.T) {
 			return &model.ChatResponse{
 				Message: model.Message{
 					Role:      "assistant",
-					ToolCalls: []model.ToolCall{{ID: "c1", Name: "charge", Arguments: "{}"}},
+					ToolCalls: []model.ToolCall{{ID: "c1", Name: "mcp__test__charge", Arguments: "{}"}},
 				},
 				FinishReason: "tool_calls",
 			}, nil

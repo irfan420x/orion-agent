@@ -55,12 +55,12 @@ func TestEventSequenceMultiStepRun(t *testing.T) {
 	echo := &echoTool{}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				resp := toolCallResponse("call-1", "echo", `{"text":"hi"}`)
+				resp := toolCallResponse("call-1", "calculator", `{"text":"hi"}`)
 				resp.Usage = model.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}
 				return resp, nil
 			}
@@ -105,14 +105,14 @@ func TestEventSequenceMultiStepRun(t *testing.T) {
 	}
 	// ToolCallStarted step 1: name/args exactly as the model sent them,
 	// usage accumulated from step 1's provider call.
-	if evs[1].Step != 1 || evs[1].ToolName != "echo" || evs[1].Arguments != `{"text":"hi"}` {
+	if evs[1].Step != 1 || evs[1].ToolName != "calculator" || evs[1].Arguments != `{"text":"hi"}` {
 		t.Errorf("event 1 = %+v, want ToolCallStarted step 1 echo {\"text\":\"hi\"}", evs[1])
 	}
 	if evs[1].Usage != (model.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}) {
 		t.Errorf("event 1 Usage = %+v, want {10 5 15}", evs[1].Usage)
 	}
 	// ToolCallFinished step 1: duration > 0, no error, same usage.
-	if evs[2].Step != 1 || evs[2].ToolName != "echo" || evs[2].Arguments != `{"text":"hi"}` {
+	if evs[2].Step != 1 || evs[2].ToolName != "calculator" || evs[2].Arguments != `{"text":"hi"}` {
 		t.Errorf("event 2 = %+v, want ToolCallFinished step 1 echo {\"text\":\"hi\"}", evs[2])
 	}
 	if evs[2].Duration <= 0 {
@@ -142,7 +142,7 @@ func TestEventToolErrorSetsFinishedErr(t *testing.T) {
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "boom", `{}`), nil
+				return toolCallResponse("call-1", "datetime", `{}`), nil
 			}
 			return textResponse("recovered after error"), nil
 		},
@@ -195,12 +195,12 @@ func TestEventHandlerPanicDoesNotCrashRun(t *testing.T) {
 	echo := &echoTool{}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "echo", `{"text":"hi"}`), nil
+				return toolCallResponse("call-1", "calculator", `{"text":"hi"}`), nil
 			}
 			return textResponse("done"), nil
 		},
@@ -299,7 +299,7 @@ func TestSetEventHandlerDuringRunDoesNotDeadlock(t *testing.T) {
 func TestTurnFinishedExactlyOnceOnMaxSteps(t *testing.T) {
 	prov := &fakeProvider{
 		chatFn: func(_ int, _ model.ChatRequest) (*model.ChatResponse, error) {
-			return toolCallResponse("c1", "echo", `{"text":"x"}`), nil
+			return toolCallResponse("c1", "calculator", `{"text":"x"}`), nil
 		},
 	}
 	reg := tools.NewRegistry()
@@ -350,12 +350,12 @@ func TestTurnFinishedExactlyOnceOnProviderError(t *testing.T) {
 	echo := &echoTool{}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				resp := toolCallResponse("call-1", "echo", `{"text":"hi"}`)
+				resp := toolCallResponse("call-1", "calculator", `{"text":"hi"}`)
 				resp.Usage = model.Usage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10}
 				return resp, nil
 			}
@@ -464,9 +464,9 @@ func TestEventSequenceViaRunStream(t *testing.T) {
 	prov := &fakeProvider{
 		streamFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "echo", `{"text":"yo"}`), nil
+				return toolCallResponse("call-1", "calculator", `{"text":"yo"}`), nil
 			}
-			return textResponse("the tool said echo:yo"), nil
+			return textResponse("the tool said calculator:yo"), nil
 		},
 	}
 	rec := &recordingHandler{}
@@ -477,8 +477,8 @@ func TestEventSequenceViaRunStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != "the tool said echo:yo" {
-		t.Errorf("RunStream = %q, want %q", out, "the tool said echo:yo")
+	if out != "the tool said calculator:yo" {
+		t.Errorf("RunStream = %q, want %q", out, "the tool said calculator:yo")
 	}
 	wantKinds := []EventKind{
 		EventStepStarted,

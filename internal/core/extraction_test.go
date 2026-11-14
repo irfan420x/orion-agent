@@ -229,7 +229,7 @@ func TestExtractionViaRunCountsToolCalls(t *testing.T) {
 		}
 		if call == 1 {
 			return &model.ChatResponse{
-				Message:      model.Message{Role: "assistant", Content: "", ToolCalls: []model.ToolCall{{ID: "c1", Name: "echo", Arguments: `{"text":"hi"}`}}},
+				Message:      model.Message{Role: "assistant", Content: "", ToolCalls: []model.ToolCall{{ID: "c1", Name: "calculator", Arguments: `{"text":"hi"}`}}},
 				FinishReason: "tool_calls",
 			}, nil
 		}

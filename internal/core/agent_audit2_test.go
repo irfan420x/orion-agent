@@ -28,26 +28,26 @@ func TestDeferredToolCallsSurviveLaterMultiCallTurn(t *testing.T) {
 		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
 			switch call {
 			case 1:
-				// Execute echo "first"; defer boom.
+				// Execute calculator "first"; defer datetime.
 				return &model.ChatResponse{
 					Message: model.Message{
 						Role: "assistant",
 						ToolCalls: []model.ToolCall{
-							{ID: "call-1", Name: "echo", Arguments: `{"text":"first"}`},
-							{ID: "call-2", Name: "boom", Arguments: `{}`},
+							{ID: "call-1", Name: "calculator", Arguments: `{"text":"first"}`},
+							{ID: "call-2", Name: "datetime", Arguments: `{}`},
 						},
 					},
 					FinishReason: "tool_calls",
 				}, nil
 			case 2:
-				// Execute echo "third"; defer echo "fourth".
-				// The earlier deferred boom must survive.
+				// Execute calculator "third"; defer calculator "fourth".
+				// The earlier deferred datetime must survive.
 				return &model.ChatResponse{
 					Message: model.Message{
 						Role: "assistant",
 						ToolCalls: []model.ToolCall{
-							{ID: "call-3", Name: "echo", Arguments: `{"text":"third"}`},
-							{ID: "call-4", Name: "echo", Arguments: `{"text":"fourth"}`},
+							{ID: "call-3", Name: "calculator", Arguments: `{"text":"third"}`},
+							{ID: "call-4", Name: "calculator", Arguments: `{"text":"fourth"}`},
 						},
 					},
 					FinishReason: "tool_calls",
@@ -58,8 +58,8 @@ func TestDeferredToolCallsSurviveLaterMultiCallTurn(t *testing.T) {
 				return textResponse("early answer"), nil
 			case 4:
 				reminderReq = req
-				// After the reminder, complete the deferred boom.
-				return toolCallResponse("call-5", "boom", `{}`), nil
+				// After the reminder, complete the deferred datetime.
+				return toolCallResponse("call-5", "datetime", `{}`), nil
 			default:
 				return textResponse("done"), nil
 			}
@@ -79,22 +79,22 @@ func TestDeferredToolCallsSurviveLaterMultiCallTurn(t *testing.T) {
 		t.Errorf("provider Chat calls = %d, want 5", got)
 	}
 	if got := echo.callCount(); got != 2 {
-		t.Errorf("echo calls = %d, want 2 (first and third; fourth was deferred, never executed)", got)
+		t.Errorf("calculator calls = %d, want 2 (first and third; fourth was deferred, never executed)", got)
 	}
 	if echo.last != "third" {
-		t.Errorf("echo last arg = %q, want %q (fourth must never have run)", echo.last, "third")
+		t.Errorf("calculator last arg = %q, want %q (fourth must never have run)", echo.last, "third")
 	}
 	// The reminder (in the call-4 request) must name both pending
-	// calls: boom (deferred on turn 1) and echo (deferred on turn 2).
+	// calls: datetime (deferred on turn 1) and calculator (deferred on turn 2).
 	reminded := false
 	for _, m := range reminderReq.Messages {
 		if m.Role == "user" && strings.Contains(m.Content, "pending") &&
-			strings.Contains(m.Content, "boom, echo") {
+			strings.Contains(m.Content, "datetime, calculator") {
 			reminded = true
 		}
 	}
 	if !reminded {
-		t.Errorf("reminder does not list both pending calls (boom, echo): %+v", reminderReq.Messages)
+		t.Errorf("reminder does not list both pending calls (datetime, calculator): %+v", reminderReq.Messages)
 	}
 }
 
@@ -115,27 +115,27 @@ func TestDeferredToolCallsSurviveSingleCallTurn(t *testing.T) {
 		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
 			switch call {
 			case 1:
-				// Execute echo "first"; defer boom.
+				// Execute calculator "first"; defer datetime.
 				return &model.ChatResponse{
 					Message: model.Message{
 						Role: "assistant",
 						ToolCalls: []model.ToolCall{
-							{ID: "call-1", Name: "echo", Arguments: `{"text":"first"}`},
-							{ID: "call-2", Name: "boom", Arguments: `{}`},
+							{ID: "call-1", Name: "calculator", Arguments: `{"text":"first"}`},
+							{ID: "call-2", Name: "datetime", Arguments: `{}`},
 						},
 					},
 					FinishReason: "tool_calls",
 				}, nil
 			case 2:
-				// A single, unrelated call: boom must stay pending.
-				return toolCallResponse("call-3", "echo", `{"text":"other"}`), nil
+				// A single, unrelated call: datetime must stay pending.
+				return toolCallResponse("call-3", "calculator", `{"text":"other"}`), nil
 			case 3:
 				// Answer directly: the reminder must still fire
-				// for the deferred boom.
+				// for the deferred datetime.
 				return textResponse("early answer"), nil
 			case 4:
 				reminderReq = req
-				return toolCallResponse("call-4", "boom", `{}`), nil
+				return toolCallResponse("call-4", "datetime", `{}`), nil
 			default:
 				return textResponse("done"), nil
 			}
@@ -152,17 +152,17 @@ func TestDeferredToolCallsSurviveSingleCallTurn(t *testing.T) {
 		t.Errorf("Run = %q, want %q", out, "done")
 	}
 	if got := echo.callCount(); got != 2 {
-		t.Errorf("echo calls = %d, want 2", got)
+		t.Errorf("calculator calls = %d, want 2", got)
 	}
 	reminded := false
 	for _, m := range reminderReq.Messages {
 		if m.Role == "user" && strings.Contains(m.Content, "pending") &&
-			strings.Contains(m.Content, "boom") {
+			strings.Contains(m.Content, "datetime") {
 			reminded = true
 		}
 	}
 	if !reminded {
-		t.Errorf("no reminder for the deferred boom after a single-call turn: %+v", reminderReq.Messages)
+		t.Errorf("no reminder for the deferred datetime after a single-call turn: %+v", reminderReq.Messages)
 	}
 }
 
@@ -182,7 +182,7 @@ func TestRunRepairsDanglingToolCallHistory(t *testing.T) {
 	if err := mem.AddMessage(model.Message{
 		Role:      "assistant",
 		Content:   "",
-		ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: `{"text":"x"}`}},
+		ToolCalls: []model.ToolCall{{ID: "call-1", Name: "calculator", Arguments: `{"text":"x"}`}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -264,11 +264,11 @@ func TestRunKeepsWellFormedToolHistory(t *testing.T) {
 	}
 	if err := mem.AddMessage(model.Message{
 		Role:      "assistant",
-		ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: `{"text":"x"}`}},
+		ToolCalls: []model.ToolCall{{ID: "call-1", Name: "calculator", Arguments: `{"text":"x"}`}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := mem.AddMessage(model.Message{Role: "tool", ToolCallID: "call-1", Content: "echo:x"}); err != nil {
+	if err := mem.AddMessage(model.Message{Role: "tool", ToolCallID: "call-1", Content: "calculator:x"}); err != nil {
 		t.Fatal(err)
 	}
 	var sent model.ChatRequest
@@ -288,7 +288,7 @@ func TestRunKeepsWellFormedToolHistory(t *testing.T) {
 		if m.Role == "assistant" && len(m.ToolCalls) == 1 && m.ToolCalls[0].ID == "call-1" {
 			assistantWithCall = true
 		}
-		if m.Role == "tool" && m.ToolCallID == "call-1" && m.Content == "echo:x" {
+		if m.Role == "tool" && m.ToolCallID == "call-1" && m.Content == "calculator:x" {
 			toolResult = true
 		}
 	}
@@ -307,11 +307,11 @@ func TestRunKeepsWellFormedToolHistory(t *testing.T) {
 func TestRepairHistoryIsPositional(t *testing.T) {
 	msgs := []model.Message{
 		{Role: "user", Content: "first"},
-		{Role: "assistant", ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: `{}`}}},
-		{Role: "tool", ToolCallID: "call-1", Content: "echo:x"},
+		{Role: "assistant", ToolCalls: []model.ToolCall{{ID: "call-1", Name: "calculator", Arguments: `{}`}}},
+		{Role: "tool", ToolCallID: "call-1", Content: "calculator:x"},
 		{Role: "user", Content: "second"},
 		// Same ID, later turn, no result: dangling, must be dropped.
-		{Role: "assistant", ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: `{}`}}},
+		{Role: "assistant", ToolCalls: []model.ToolCall{{ID: "call-1", Name: "calculator", Arguments: `{}`}}},
 	}
 	out, repaired := repairHistory(msgs)
 	if repaired != 1 {
@@ -332,7 +332,7 @@ func TestRepairHistoryIsPositional(t *testing.T) {
 // content whose tool calls are all dangling is kept as plain text.
 func TestRepairHistoryKeepsTextOfStrippedCall(t *testing.T) {
 	msgs := []model.Message{
-		{Role: "assistant", Content: "I'll check that.", ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: `{}`}}},
+		{Role: "assistant", Content: "I'll check that.", ToolCalls: []model.ToolCall{{ID: "call-1", Name: "calculator", Arguments: `{}`}}},
 	}
 	out, repaired := repairHistory(msgs)
 	if repaired != 1 {

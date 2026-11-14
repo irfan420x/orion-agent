@@ -18,10 +18,10 @@ import (
 // stubTool is a minimal Tool returning canned output, for registry tests.
 type stubTool struct{ output string }
 
-func (s *stubTool) Name() string { return "stub" }
+func (s *stubTool) Name() string { return "datetime" }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "stub" is not in the gate's maps).
+// matching permissions.Classify; "datetime" is in the gate's Safe map).
 func (s *stubTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (s *stubTool) Description() string {
 	return "stub tool for tests"
@@ -137,7 +137,7 @@ func TestRegistryRedactsToolOutput(t *testing.T) {
 	if err := r.Register(&stubTool{output: "the key is " + fakeKey + " done"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	out, err := r.Execute(context.Background(), "stub", json.RawMessage("{}"))
+	out, err := r.Execute(context.Background(), "datetime", json.RawMessage("{}"))
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

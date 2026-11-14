@@ -317,7 +317,7 @@ func TestToolInstallQuestionAsker(t *testing.T) {
 	// not an empty one — an empty registry would make the loop
 	// vacuous.
 	without := NewRegistry()
-	if err := without.Register(riskTool{name: "dummy_no_asker", class: permissions.ClassSafe}); err != nil {
+	if err := without.Register(riskTool{name: "calculator", class: permissions.ClassSafe}); err != nil {
 		t.Fatalf("register dummy tool: %v", err)
 	}
 	installTargets := 0
@@ -329,7 +329,7 @@ func TestToolInstallQuestionAsker(t *testing.T) {
 	if installTargets != 0 {
 		t.Errorf("registry without ask_user_question offers %d asker-install target(s), want 0", installTargets)
 	}
-	before, err := without.Execute(context.Background(), "dummy_no_asker", json.RawMessage(`{}`))
+	before, err := without.Execute(context.Background(), "calculator", json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("dummy tool before install loop: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestToolInstallQuestionAsker(t *testing.T) {
 	if installed != 0 {
 		t.Errorf("install loop installed an asker on %d tool(s) in a registry without ask_user_question, want 0", installed)
 	}
-	after, err := without.Execute(context.Background(), "dummy_no_asker", json.RawMessage(`{}`))
+	after, err := without.Execute(context.Background(), "calculator", json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("dummy tool after install loop: %v", err)
 	}

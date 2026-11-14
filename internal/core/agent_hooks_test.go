@@ -60,7 +60,7 @@ func TestHooksPreToolUseBlocksToolCall(t *testing.T) {
 	dir := t.TempDir()
 	writeHookFile(t, dir, hooks.EventPreToolUse, "block.sh", `echo '{"decision":"block","reason":"no echo for you"}'; exit 2`)
 	bus := hooks.NewBus(dir)
-	stub := &gateStubTool{name: "echo"}
+	stub := &gateStubTool{name: "calculator"}
 	a, mem := hookAgent(t, stub, bus)
 	out, err := a.Run(context.Background(), "run echo")
 	if err != nil {
@@ -70,7 +70,7 @@ func TestHooksPreToolUseBlocksToolCall(t *testing.T) {
 		t.Fatalf("Run = %q, want %q (the loop must continue after a hook block, not crash)", out, "done")
 	}
 	if got := stub.callCount(); got != 0 {
-		t.Errorf("echo executions = %d, want 0 (blocked before Execute)", got)
+		t.Errorf("calculator executions = %d, want 0 (blocked before Execute)", got)
 	}
 	// The block must reach the model as a tool result, worded as a
 	// block, so it can explain instead of retrying blindly.
@@ -89,7 +89,7 @@ func TestHooksPreToolUseAllowRunsTool(t *testing.T) {
 	dir := t.TempDir()
 	writeHookFile(t, dir, hooks.EventPreToolUse, "allow.sh", "exit 0")
 	bus := hooks.NewBus(dir)
-	stub := &gateStubTool{name: "echo"}
+	stub := &gateStubTool{name: "calculator"}
 	a, _ := hookAgent(t, stub, bus)
 	out, err := a.Run(context.Background(), "run echo")
 	if err != nil {
@@ -99,7 +99,7 @@ func TestHooksPreToolUseAllowRunsTool(t *testing.T) {
 		t.Fatalf("Run = %q, want %q", out, "done")
 	}
 	if got := stub.callCount(); got != 1 {
-		t.Errorf("echo executions = %d, want 1 (allowing hook lets it run)", got)
+		t.Errorf("calculator executions = %d, want 1 (allowing hook lets it run)", got)
 	}
 }
 
@@ -110,7 +110,7 @@ func TestHooksPostToolUseAndStopFire(t *testing.T) {
 	writeHookFile(t, dir, hooks.EventPostToolUse, "post.sh", "touch "+postMarker)
 	writeHookFile(t, dir, hooks.EventStop, "stop.sh", "touch "+stopMarker)
 	bus := hooks.NewBus(dir)
-	stub := &gateStubTool{name: "echo"}
+	stub := &gateStubTool{name: "calculator"}
 	a, _ := hookAgent(t, stub, bus)
 	if _, err := a.Run(context.Background(), "run echo"); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -122,7 +122,7 @@ func TestHooksPostToolUseAndStopFire(t *testing.T) {
 		t.Errorf("Stop hook did not run: %v", err)
 	}
 	if got := stub.callCount(); got != 1 {
-		t.Errorf("echo executions = %d, want 1", got)
+		t.Errorf("calculator executions = %d, want 1", got)
 	}
 }
 

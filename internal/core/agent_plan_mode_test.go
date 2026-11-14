@@ -20,7 +20,7 @@ import (
 // package and is tested there).
 type planBlockerFake struct{}
 
-func (planBlockerFake) Name() string { return "plancheck_fake" }
+func (planBlockerFake) Name() string { return "calculator" }
 
 func (planBlockerFake) Description() string {
 	return "test-only tool that blocks shell_exec while a plan is pending"
@@ -28,7 +28,7 @@ func (planBlockerFake) Description() string {
 
 func (planBlockerFake) Definition() model.ToolDefinition {
 	return model.ToolDefinition{
-		Name:        "plancheck_fake",
+		Name:        "calculator",
 		Description: "test-only tool that blocks shell_exec while a plan is pending",
 		Parameters: map[string]any{
 			"type":       "object",
@@ -69,7 +69,7 @@ func TestAgentPlanModeBlocksDestructiveTool(t *testing.T) {
 	// The checker itself and other tools are not blocked.
 	got = a.executeTool(context.Background(), model.ToolCall{
 		ID:        "2",
-		Name:      "plancheck_fake",
+		Name:      "calculator",
 		Arguments: `{}`,
 	})
 	if got != "ok" {

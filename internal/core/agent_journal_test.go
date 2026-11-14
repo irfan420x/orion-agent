@@ -89,7 +89,7 @@ func waitJournalRecord(t *testing.T, j *ToolJournal, updateID int64, n int) {
 // without the fix the tool runs twice, proving the test is
 // sensitive to the bug.
 func TestJournalReplaysToolAcrossRestart(t *testing.T) {
-	toolCall := &model.ToolCall{ID: "call-1", Name: "echo", Arguments: `{"text":"hello"}`}
+	toolCall := &model.ToolCall{ID: "call-1", Name: "calculator", Arguments: `{"text":"hello"}`}
 
 	runKilledTurn := func(t *testing.T, agent *Agent, echo *recordingTool, journal *ToolJournal) {
 		t.Helper()
@@ -130,10 +130,10 @@ func TestJournalReplaysToolAcrossRestart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewToolJournal: %v", err)
 		}
-		echo := &recordingTool{name: "echo"}
+		echo := &recordingTool{name: "calculator"}
 		reg := tools.NewRegistry()
 		if err := reg.Register(echo); err != nil {
-			t.Fatalf("Register echo: %v", err)
+			t.Fatalf("Register calculator: %v", err)
 		}
 		prov1 := &journalProvider{steps: []journalStep{
 			{tool: toolCall},
@@ -171,10 +171,10 @@ func TestJournalReplaysToolAcrossRestart(t *testing.T) {
 	})
 
 	t.Run("without journal", func(t *testing.T) {
-		echo := &recordingTool{name: "echo"}
+		echo := &recordingTool{name: "calculator"}
 		reg := tools.NewRegistry()
 		if err := reg.Register(echo); err != nil {
-			t.Fatalf("Register echo: %v", err)
+			t.Fatalf("Register calculator: %v", err)
 		}
 		prov1 := &journalProvider{steps: []journalStep{
 			{tool: toolCall},
@@ -199,18 +199,18 @@ func TestJournalReplaysToolAcrossRestart(t *testing.T) {
 // TestJournalSkillRestrictionSurvivesRedelivery is the F-A10-1
 // regression test: a re-delivered turn must keep the skill
 // restriction. Run 1 invokes the adder skill (Tools: echo), then
-// calls the disallowed tool "other" (refused), then the allowed
-// "echo", and is killed before the provider answers. Run 2
+// calls the disallowed tool "datetime" (refused), then the allowed
+// "calculator", and is killed before the provider answers. Run 2
 // re-delivers the same update with the same script: the skill
 // invoke must re-execute and re-activate (it is excluded from
 // the journal — a replayed invoke would never fire
-// setActiveSkill), so "other" is refused again, and "echo"
+// setActiveSkill), so "datetime" is refused again, and "calculator"
 // replays instead of re-executing.
 //
 // The Audit 10 probe reproduced the bug on rc14: run 2 executed
-// "other" once (the restriction had dropped with the replayed
+// "datetime" once (the restriction had dropped with the replayed
 // invoke) and journalled it, so a third delivery would replay
-// the bypassed call too. On the fixed code "other" runs zero
+// the bypassed call too. On the fixed code "datetime" runs zero
 // times across both runs and the journal holds exactly one
 // record (echo): the skill invoke is never recorded.
 func TestJournalSkillRestrictionSurvivesRedelivery(t *testing.T) {
@@ -224,7 +224,7 @@ func TestJournalSkillRestrictionSurvivesRedelivery(t *testing.T) {
 		Name:        "adder",
 		Description: "Adds numbers with the echo tool.",
 		Content:     "# Adder\nADD-BODY-MARKER-9z\nUse the echo tool to say the answer.",
-		Tools:       []string{"echo"},
+		Tools:       []string{"calculator"},
 	}); err != nil {
 		t.Fatalf("Register adder: %v", err)
 	}
@@ -232,8 +232,8 @@ func TestJournalSkillRestrictionSurvivesRedelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSkillTool: %v", err)
 	}
-	echo := &recordingTool{name: "echo"}
-	other := &recordingTool{name: "other"}
+	echo := &recordingTool{name: "calculator"}
+	other := &recordingTool{name: "datetime"}
 	reg := tools.NewRegistry()
 	for _, tool := range []tools.Tool{skillTool, echo, other} {
 		if err := reg.Register(tool); err != nil {
@@ -242,8 +242,8 @@ func TestJournalSkillRestrictionSurvivesRedelivery(t *testing.T) {
 	}
 	script := []journalStep{
 		{tool: &model.ToolCall{ID: "c1", Name: "skill", Arguments: `{"name":"adder"}`}},
-		{tool: &model.ToolCall{ID: "c2", Name: "other", Arguments: `{"text":"x"}`}},
-		{tool: &model.ToolCall{ID: "c3", Name: "echo", Arguments: `{"text":"hi"}`}},
+		{tool: &model.ToolCall{ID: "c2", Name: "datetime", Arguments: `{"text":"x"}`}},
+		{tool: &model.ToolCall{ID: "c3", Name: "calculator", Arguments: `{"text":"hi"}`}},
 		{block: true},
 	}
 	agent1 := journalTestAgent(t, &journalProvider{steps: script}, reg, j1)
@@ -312,12 +312,12 @@ func TestJournalRepeatsIdenticalCallInOneTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewToolJournal: %v", err)
 	}
-	echo := &recordingTool{name: "echo"}
+	echo := &recordingTool{name: "calculator"}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
-	call := &model.ToolCall{ID: "call-1", Name: "echo", Arguments: `{"text":"a"}`}
+	call := &model.ToolCall{ID: "call-1", Name: "calculator", Arguments: `{"text":"a"}`}
 	script := []journalStep{
 		{tool: call},
 		{tool: call},
@@ -357,13 +357,13 @@ func TestJournalCanonicalisesArguments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewToolJournal: %v", err)
 	}
-	echo := &recordingTool{name: "echo"}
+	echo := &recordingTool{name: "calculator"}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	agent1 := journalTestAgent(t, &journalProvider{steps: []journalStep{
-		{tool: &model.ToolCall{ID: "call-1", Name: "echo", Arguments: `{"b":1,"a":2}`}},
+		{tool: &model.ToolCall{ID: "call-1", Name: "calculator", Arguments: `{"b":1,"a":2}`}},
 		{answer: "done"},
 	}}, reg, j1)
 	if _, err := agent1.Run(WithUpdateID(context.Background(), 100), "order"); err != nil {
@@ -374,7 +374,7 @@ func TestJournalCanonicalisesArguments(t *testing.T) {
 		t.Fatalf("NewToolJournal (restart): %v", err)
 	}
 	agent2 := journalTestAgent(t, &journalProvider{steps: []journalStep{
-		{tool: &model.ToolCall{ID: "call-1", Name: "echo", Arguments: `{"a":2,"b":1}`}},
+		{tool: &model.ToolCall{ID: "call-1", Name: "calculator", Arguments: `{"a":2,"b":1}`}},
 		{answer: "done"},
 	}}, reg, j2)
 	if _, err := agent2.Run(WithUpdateID(context.Background(), 100), "order"); err != nil {

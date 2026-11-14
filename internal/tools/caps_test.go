@@ -70,14 +70,14 @@ type hugeTool struct {
 	errText string
 }
 
-func (h hugeTool) Name() string        { return "huge" }
+func (h hugeTool) Name() string        { return "calculator" }
 func (h hugeTool) Description() string { return "Returns a huge payload for cap tests." }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "huge" is not in the gate's maps).
+// matching permissions.Classify; "calculator" is in the gate's Safe map).
 func (h hugeTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (h hugeTool) Definition() model.ToolDefinition {
-	return model.ToolDefinition{Name: "huge", Description: h.Description(), Parameters: map[string]any{"type": "object"}}
+	return model.ToolDefinition{Name: "calculator", Description: h.Description(), Parameters: map[string]any{"type": "object"}}
 }
 func (h hugeTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
 	if h.errText != "" {
@@ -92,7 +92,7 @@ func TestRegistryCapsHugeResult(t *testing.T) {
 	if err := reg.Register(hugeTool{payload: payload}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	out, err := reg.Execute(context.Background(), "huge", json.RawMessage("{}"))
+	out, err := reg.Execute(context.Background(), "calculator", json.RawMessage("{}"))
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestRegistryCapsHugeErrorText(t *testing.T) {
 	if err := reg.Register(hugeTool{errText: strings.Repeat("e", 2*1024*1024)}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	_, err := reg.Execute(context.Background(), "huge", json.RawMessage("{}"))
+	_, err := reg.Execute(context.Background(), "calculator", json.RawMessage("{}"))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -133,7 +133,7 @@ func TestRegistrySetMaxResultBytes(t *testing.T) {
 	if err := reg.Register(hugeTool{payload: strings.Repeat("q", 100000)}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	out, err := reg.Execute(context.Background(), "huge", json.RawMessage("{}"))
+	out, err := reg.Execute(context.Background(), "calculator", json.RawMessage("{}"))
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

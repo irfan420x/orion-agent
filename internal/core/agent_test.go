@@ -232,16 +232,16 @@ type echoTool struct {
 	last  string
 }
 
-func (t *echoTool) Name() string        { return "echo" }
+func (t *echoTool) Name() string        { return "calculator" }
 func (t *echoTool) Description() string { return "Echoes the text argument back." }
 
 // RiskClass declares the tool Safe: Register requires every tool
-// to declare a class matching permissions.Classify (here Safe,
-// since "echo" is not in the gate's maps).
+// to declare a class matching permissions.Classify — "calculator"
+// is in the gate's Safe map, so Safe is the matching declaration.
 func (t *echoTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (t *echoTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{
-		Name:        "echo",
+		Name:        "calculator",
 		Description: t.Description(),
 		Parameters:  map[string]any{"type": "object"},
 	}
@@ -257,7 +257,7 @@ func (t *echoTool) Execute(_ context.Context, args json.RawMessage) (string, err
 		return "", err
 	}
 	t.last = parsed.Text
-	return "echo:" + parsed.Text, nil
+	return "calculator:" + parsed.Text, nil
 }
 
 func (t *echoTool) callCount() int {
@@ -269,14 +269,14 @@ func (t *echoTool) callCount() int {
 // failingTool always fails, to exercise the feed-error-back path.
 type failingTool struct{}
 
-func (failingTool) Name() string        { return "boom" }
+func (failingTool) Name() string        { return "datetime" }
 func (failingTool) Description() string { return "Always fails." }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "boom" is not in the gate's maps).
+// matching permissions.Classify; "datetime" is in the gate's Safe map).
 func (failingTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (failingTool) Definition() model.ToolDefinition {
-	return model.ToolDefinition{Name: "boom", Description: "Always fails.", Parameters: map[string]any{"type": "object"}}
+	return model.ToolDefinition{Name: "datetime", Description: "Always fails.", Parameters: map[string]any{"type": "object"}}
 }
 func (failingTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
 	return "", errors.New("boom exploded")
@@ -426,14 +426,14 @@ func TestRunExecutesToolCall(t *testing.T) {
 	echo := &echoTool{}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "echo", `{"text":"hi"}`), nil
+				return toolCallResponse("call-1", "calculator", `{"text":"hi"}`), nil
 			}
-			return textResponse("the tool said echo:hi"), nil
+			return textResponse("the tool said calculator:hi"), nil
 		},
 	}
 	mem := newFakeStore()
@@ -443,14 +443,14 @@ func TestRunExecutesToolCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if out != "the tool said echo:hi" {
+	if out != "the tool said calculator:hi" {
 		t.Errorf("Run = %q, want follow-up answer", out)
 	}
 	if got := echo.callCount(); got != 1 {
-		t.Errorf("echo calls = %d, want 1", got)
+		t.Errorf("calculator calls = %d, want 1", got)
 	}
 	if echo.last != "hi" {
-		t.Errorf("echo last arg = %q, want %q", echo.last, "hi")
+		t.Errorf("calculator last arg = %q, want %q", echo.last, "hi")
 	}
 	if got := prov.calls(); got != 2 {
 		t.Errorf("provider Chat calls = %d, want 2", got)
@@ -458,7 +458,7 @@ func TestRunExecutesToolCall(t *testing.T) {
 	// The tool result must be in memory as a tool-role message.
 	found := false
 	for _, m := range mem.allMessages() {
-		if m.Role == "tool" && m.ToolCallID == "call-1" && m.Content == "echo:hi" {
+		if m.Role == "tool" && m.ToolCallID == "call-1" && m.Content == "calculator:hi" {
 			found = true
 		}
 	}
@@ -477,7 +477,7 @@ func TestRunExecutesOnlyFirstToolCallPerTurn(t *testing.T) {
 	echo := &echoTool{}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	prov := &fakeProvider{
 		chatFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
@@ -488,8 +488,8 @@ func TestRunExecutesOnlyFirstToolCallPerTurn(t *testing.T) {
 						Role:    "assistant",
 						Content: "",
 						ToolCalls: []model.ToolCall{
-							{ID: "call-1", Name: "echo", Arguments: `{"text":"first"}`},
-							{ID: "call-2", Name: "echo", Arguments: `{"text":"second"}`},
+							{ID: "call-1", Name: "calculator", Arguments: `{"text":"first"}`},
+							{ID: "call-2", Name: "calculator", Arguments: `{"text":"second"}`},
 						},
 					},
 					FinishReason: "tool_calls",
@@ -497,7 +497,7 @@ func TestRunExecutesOnlyFirstToolCallPerTurn(t *testing.T) {
 			case 2:
 				// Re-plan the deferred second call now that the
 				// first result is in context.
-				return toolCallResponse("call-3", "echo", `{"text":"second"}`), nil
+				return toolCallResponse("call-3", "calculator", `{"text":"second"}`), nil
 			default:
 				return textResponse("done"), nil
 			}
@@ -517,7 +517,7 @@ func TestRunExecutesOnlyFirstToolCallPerTurn(t *testing.T) {
 		t.Errorf("provider Chat calls = %d, want 3 (first call, re-planned call, final answer)", got)
 	}
 	if got := echo.callCount(); got != 2 {
-		t.Errorf("echo calls = %d, want 2", got)
+		t.Errorf("calculator calls = %d, want 2", got)
 	}
 	// The deferred call-2 must never have executed: no tool result
 	// may carry its ID, and the turn-1 assistant message must record
@@ -540,7 +540,7 @@ func TestRunRemindsModelOfDeferredToolCalls(t *testing.T) {
 	echo := &echoTool{}
 	reg := tools.NewRegistry()
 	if err := reg.Register(echo); err != nil {
-		t.Fatalf("Register echo: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	var thirdReq model.ChatRequest
 	prov := &fakeProvider{
@@ -551,8 +551,8 @@ func TestRunRemindsModelOfDeferredToolCalls(t *testing.T) {
 					Message: model.Message{
 						Role: "assistant",
 						ToolCalls: []model.ToolCall{
-							{ID: "call-1", Name: "echo", Arguments: `{"text":"first"}`},
-							{ID: "call-2", Name: "echo", Arguments: `{"text":"second"}`},
+							{ID: "call-1", Name: "calculator", Arguments: `{"text":"first"}`},
+							{ID: "call-2", Name: "calculator", Arguments: `{"text":"second"}`},
 						},
 					},
 					FinishReason: "tool_calls",
@@ -564,7 +564,7 @@ func TestRunRemindsModelOfDeferredToolCalls(t *testing.T) {
 			case 3:
 				thirdReq = req
 				// After the reminder, it completes the deferred call.
-				return toolCallResponse("call-3", "echo", `{"text":"second"}`), nil
+				return toolCallResponse("call-3", "calculator", `{"text":"second"}`), nil
 			default:
 				return textResponse("done"), nil
 			}
@@ -584,12 +584,12 @@ func TestRunRemindsModelOfDeferredToolCalls(t *testing.T) {
 		t.Errorf("provider Chat calls = %d, want 4 (first call, early answer, reminded call, final answer)", got)
 	}
 	if got := echo.callCount(); got != 2 {
-		t.Errorf("echo calls = %d, want 2", got)
+		t.Errorf("calculator calls = %d, want 2", got)
 	}
 	// The third request must carry the reminder about the pending call.
 	reminded := false
 	for _, m := range thirdReq.Messages {
-		if m.Role == "user" && strings.Contains(m.Content, "pending") && strings.Contains(m.Content, "echo") {
+		if m.Role == "user" && strings.Contains(m.Content, "pending") && strings.Contains(m.Content, "calculator") {
 			reminded = true
 		}
 	}
@@ -611,13 +611,13 @@ func TestRunRemindsModelOfDeferredToolCalls(t *testing.T) {
 func TestRunFeedsToolErrorBack(t *testing.T) {
 	reg := tools.NewRegistry()
 	if err := reg.Register(failingTool{}); err != nil {
-		t.Fatalf("Register boom: %v", err)
+		t.Fatalf("Register datetime: %v", err)
 	}
 	var secondReq model.ChatRequest
 	prov := &fakeProvider{
 		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "boom", `{}`), nil
+				return toolCallResponse("call-1", "datetime", `{}`), nil
 			}
 			secondReq = req
 			return textResponse("recovered after error"), nil
@@ -647,7 +647,7 @@ func TestRunFeedsToolErrorBack(t *testing.T) {
 func TestRunRespectsMaxSteps(t *testing.T) {
 	prov := &fakeProvider{
 		chatFn: func(_ int, _ model.ChatRequest) (*model.ChatResponse, error) {
-			return toolCallResponse("c1", "echo", `{"text":"x"}`), nil
+			return toolCallResponse("c1", "calculator", `{"text":"x"}`), nil
 		},
 	}
 	reg := tools.NewRegistry()
@@ -675,7 +675,7 @@ func TestRunRespectsMaxSteps(t *testing.T) {
 	}
 	foundToolCall := false
 	for _, m := range transcript {
-		if m.Role == "assistant" && len(m.ToolCalls) == 1 && m.ToolCalls[0].Name == "echo" {
+		if m.Role == "assistant" && len(m.ToolCalls) == 1 && m.ToolCalls[0].Name == "calculator" {
 			foundToolCall = true
 		}
 	}
@@ -764,9 +764,9 @@ func TestRunStreamWithToolCallThenStream(t *testing.T) {
 	prov := &fakeProvider{
 		streamFn: func(call int, _ model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("call-1", "echo", `{"text":"yo"}`), nil
+				return toolCallResponse("call-1", "calculator", `{"text":"yo"}`), nil
 			}
-			return textResponse("the tool said echo:yo"), nil
+			return textResponse("the tool said calculator:yo"), nil
 		},
 	}
 	mem := newFakeStore()
@@ -780,14 +780,14 @@ func TestRunStreamWithToolCallThenStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunStream: %v", err)
 	}
-	if out != "the tool said echo:yo" {
-		t.Errorf("RunStream = %q, want %q", out, "the tool said echo:yo")
+	if out != "the tool said calculator:yo" {
+		t.Errorf("RunStream = %q, want %q", out, "the tool said calculator:yo")
 	}
-	if strings.Join(got, "") != "the tool said echo:yo" {
+	if strings.Join(got, "") != "the tool said calculator:yo" {
 		t.Errorf("chunks = %q, want the final answer streamed", got)
 	}
 	if echo.callCount() != 1 {
-		t.Errorf("echo calls = %d, want 1", echo.callCount())
+		t.Errorf("calculator calls = %d, want 1", echo.callCount())
 	}
 	if got := prov.calls(); got != 0 {
 		t.Errorf("provider Chat calls = %d, want 0 (RunStream must use Stream only)", got)
@@ -797,7 +797,7 @@ func TestRunStreamWithToolCallThenStream(t *testing.T) {
 	}
 	// The streamed final answer must be stored in memory.
 	msgs := mem.allMessages()
-	if len(msgs) == 0 || msgs[len(msgs)-1].Content != "the tool said echo:yo" {
+	if len(msgs) == 0 || msgs[len(msgs)-1].Content != "the tool said calculator:yo" {
 		t.Errorf("last memory message = %+v, want streamed final answer", msgs)
 	}
 }

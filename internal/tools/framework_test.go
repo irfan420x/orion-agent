@@ -186,9 +186,12 @@ func TestRegisterRejectsMismatchedRiskClass(t *testing.T) {
 
 // TestRegisterAcceptsMatchingRiskClass pins the other side: a
 // tool whose declaration agrees with the gate's maps registers
-// fine, including an MCP-named tool declaring Network and an
-// unknown name declaring Safe (Classify's default for unknown
-// names).
+// fine, including an MCP-named tool declaring Network. Every name
+// here is explicitly classified (in a map or by the mcp__ prefix):
+// an unknown name declaring Safe is NOT accepted — see
+// TestRegisterRejectsNovelNames (F-A21-1). The {"echo", Safe} case
+// this test used to pin was the hole itself: Classify's old
+// default for unknown names let any novel name in as Safe.
 func TestRegisterAcceptsMatchingRiskClass(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -199,12 +202,40 @@ func TestRegisterAcceptsMatchingRiskClass(t *testing.T) {
 		{"calculator", permissions.ClassSafe},
 		{"web_fetch", permissions.ClassNetwork},
 		{"mcp__srv__tool", permissions.ClassNetwork},
-		{"echo", permissions.ClassSafe},
 	}
 	for _, tc := range cases {
 		r := NewRegistry()
 		if err := r.Register(riskTool{name: tc.name, class: tc.class}); err != nil {
 			t.Errorf("Register(%q declaring %v): %v, want accepted", tc.name, tc.class, err)
+		}
+	}
+}
+
+// TestRegisterRejectsNovelNames pins the F-A21-1 fail-closed rule:
+// a tool whose name is in none of the gate's maps is rejected
+// whatever it declares — Safe, Network or Destructive. This is the
+// auditor's wipe_notes probe: a novel destructive tool declaring
+// Safe must not sail through Register on a vacuous agreement with
+// Classify's default. The gate denies such a name too (see
+// TestGateDeniesUnknownTool), so the hole is closed at both layers.
+func TestRegisterRejectsNovelNames(t *testing.T) {
+	cases := []struct {
+		name  string
+		class permissions.Class
+	}{
+		{"wipe_notes", permissions.ClassSafe},
+		{"wipe_notes", permissions.ClassNetwork},
+		{"wipe_notes", permissions.ClassDestructive},
+		{"brand_new_tool", permissions.ClassSafe},
+		{"unknown_tool", permissions.ClassSafe},
+	}
+	for _, tc := range cases {
+		r := NewRegistry()
+		if err := r.Register(riskTool{name: tc.name, class: tc.class}); err == nil {
+			t.Errorf("Register(%q declaring %v): accepted, want a loud error (name is not in the gate's classification)", tc.name, tc.class)
+		}
+		if _, ok := r.Get(tc.name); ok {
+			t.Errorf("Register(%q declaring %v): rejected tool is registered anyway", tc.name, tc.class)
 		}
 	}
 }
@@ -305,18 +336,24 @@ func TestKnownBuiltInToolsMatchesFactorySet(t *testing.T) {
 }
 
 // TestClassifyMapsMatchFactorySet pins the gate's hardcoded maps
-// (permissions.Classify) to the factory set: over every built-in
-// tool name, the Destructive set must be exactly {shell_exec,
-// file_write, file_edit, subagent_spawn} and the Network set
-// exactly {web_fetch, web_search}. A new tool that belongs in a
-// gated class but was never added to the maps — or a map entry
-// for a tool that no longer exists — fails loudly here.
+// (permissions.Classify) to the factory set, in both directions:
+// over every built-in tool name, the Destructive set must be
+// exactly {shell_exec, file_write, file_edit, subagent_spawn} and
+// the Network set exactly {web_fetch, web_search}; every built-in
+// name must be EXPLICITLY classified (ClassifyKnown), so a Safe
+// tool is Safe because it is listed in the safe map, never because
+// Classify defaulted it; and the classified-name set
+// (KnownTools) must equal the factory set exactly, so a map entry
+// for a tool that no longer exists fails loudly here too.
 func TestClassifyMapsMatchFactorySet(t *testing.T) {
 	wantDestructive := map[string]bool{"shell_exec": true, "file_write": true, "file_edit": true, "subagent_spawn": true}
 	wantNetwork := map[string]bool{"web_fetch": true, "web_search": true}
 	gotDestructive := map[string]bool{}
 	gotNetwork := map[string]bool{}
 	for _, name := range fullBuiltInToolNames(t) {
+		if _, ok := permissions.ClassifyKnown(name); !ok {
+			t.Errorf("built-in tool %q is not explicitly classified (not in any gate map): add it to the maps in internal/permissions/gate.go", name)
+		}
 		switch permissions.Classify(name) {
 		case permissions.ClassDestructive:
 			gotDestructive[name] = true
@@ -338,6 +375,18 @@ func TestClassifyMapsMatchFactorySet(t *testing.T) {
 	for name := range wantNetwork {
 		if !gotNetwork[name] {
 			t.Fatalf("Classify Network set = %v, want %v (missing %q)", setKeys(gotNetwork), setKeys(wantNetwork), name)
+		}
+	}
+	// Both directions: the maps must name exactly the built-ins —
+	// a stale entry for a removed/renamed tool fails here.
+	want := fullBuiltInToolNames(t)
+	got := permissions.KnownTools()
+	if len(got) != len(want) {
+		t.Fatalf("KnownTools %v != factory set %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("KnownTools %v != factory set %v", got, want)
 		}
 	}
 }

@@ -19,14 +19,14 @@ type chargeTool struct {
 	tokens int
 }
 
-func (t *chargeTool) Name() string        { return "charge" }
+func (t *chargeTool) Name() string        { return "calculator" }
 func (t *chargeTool) Description() string { return "Reports subagent tokens to the agent." }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "charge" is not in the gate's maps).
+// matching permissions.Classify; "calculator" is in the gate's Safe map).
 func (t *chargeTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (t *chargeTool) Definition() model.ToolDefinition {
-	return model.ToolDefinition{Name: "charge", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
+	return model.ToolDefinition{Name: "calculator", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
 }
 func (t *chargeTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
 	t.agent.AddSubagentUsage(t.tokens)
@@ -41,7 +41,7 @@ func TestSubagentUsageAddedToTurnFinished(t *testing.T) {
 	prov := &fakeProvider{
 		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("c1", "charge", "{}"), nil
+				return toolCallResponse("c1", "calculator", "{}"), nil
 			}
 			return &model.ChatResponse{
 				Message:      model.Message{Role: "assistant", Content: "done"},
@@ -125,7 +125,7 @@ func TestAddSubagentUsageRaceSafe(t *testing.T) {
 	prov := &fakeProvider{
 		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
 			if call == 1 {
-				return toolCallResponse("c1", "racecharge", "{}"), nil
+				return toolCallResponse("c1", "calculator", "{}"), nil
 			}
 			return textResponse("done"), nil
 		},
@@ -158,14 +158,14 @@ type raceChargeTool struct {
 	tokens int
 }
 
-func (t *raceChargeTool) Name() string        { return "racecharge" }
+func (t *raceChargeTool) Name() string        { return "calculator" }
 func (t *raceChargeTool) Description() string { return "Reports subagent tokens concurrently." }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "racecharge" is not in the gate's maps).
+// matching permissions.Classify; "calculator" is in the gate's Safe map).
 func (t *raceChargeTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (t *raceChargeTool) Definition() model.ToolDefinition {
-	return model.ToolDefinition{Name: "racecharge", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
+	return model.ToolDefinition{Name: "calculator", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
 }
 func (t *raceChargeTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
 	var wg sync.WaitGroup

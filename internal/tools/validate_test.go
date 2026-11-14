@@ -20,10 +20,10 @@ type validatingStubTool struct {
 	ran *int
 }
 
-func (t *validatingStubTool) Name() string { return "stub" }
+func (t *validatingStubTool) Name() string { return "calculator" }
 
 // RiskClass declares the tool Safe (Register requires a class
-// matching permissions.Classify; "stub" is not in the gate's maps).
+// matching permissions.Classify; "calculator" is in the gate's Safe map).
 func (t *validatingStubTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *validatingStubTool) Description() string { return "Schema-validation stub." }
@@ -86,20 +86,20 @@ func TestValidateMissingRequired(t *testing.T) {
 	r, ran := newValidatingRegistry(t)
 	ctx := context.Background()
 
-	_, err := r.Execute(ctx, "stub", json.RawMessage(`{}`))
+	_, err := r.Execute(ctx, "calculator", json.RawMessage(`{}`))
 	assertInvalidArgs(t, err, `missing required parameter "name"`)
 	if *ran != 0 {
 		t.Fatalf("tool ran %d time(s) despite missing required parameter", *ran)
 	}
 
-	_, err = r.Execute(ctx, "stub", json.RawMessage(`{"name":"x"}`))
+	_, err = r.Execute(ctx, "calculator", json.RawMessage(`{"name":"x"}`))
 	assertInvalidArgs(t, err, `missing required parameter "count"`)
 	if *ran != 0 {
 		t.Fatalf("tool ran %d time(s) despite missing required parameter", *ran)
 	}
 
 	// Empty arguments mean "no arguments": still missing required.
-	_, err = r.Execute(ctx, "stub", json.RawMessage(``))
+	_, err = r.Execute(ctx, "calculator", json.RawMessage(``))
 	assertInvalidArgs(t, err, `missing required parameter "name"`)
 	if *ran != 0 {
 		t.Fatalf("tool ran %d time(s) despite empty arguments", *ran)
@@ -126,7 +126,7 @@ func TestValidateWrongTypes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+			_, err := r.Execute(ctx, "calculator", json.RawMessage(tc.args))
 			assertInvalidArgs(t, err, tc.want)
 			if *ran != 0 {
 				t.Fatalf("tool ran despite invalid args %s", tc.args)
@@ -152,7 +152,7 @@ func TestValidateAcceptsValidCalls(t *testing.T) {
 		`{"name":"x","count":2,"extra":123}`,  // unknown fields ignored
 	}
 	for _, args := range valid {
-		if _, err := r.Execute(ctx, "stub", json.RawMessage(args)); err != nil {
+		if _, err := r.Execute(ctx, "calculator", json.RawMessage(args)); err != nil {
 			t.Fatalf("Execute(%s): expected success, got %v", args, err)
 		}
 	}
@@ -165,7 +165,7 @@ func TestValidateEnum(t *testing.T) {
 	r, ran := newValidatingRegistry(t)
 	ctx := context.Background()
 
-	_, err := r.Execute(ctx, "stub", json.RawMessage(`{"name":"x","count":2,"mode":"c"}`))
+	_, err := r.Execute(ctx, "calculator", json.RawMessage(`{"name":"x","count":2,"mode":"c"}`))
 	assertInvalidArgs(t, err, `parameter "mode" must be one of`)
 	if *ran != 0 {
 		t.Fatalf("tool ran despite enum violation")
@@ -178,7 +178,7 @@ func TestValidateEnumDoesNotShortCircuitOtherConstraints(t *testing.T) {
 	// and type checks never ran — enum ["a","b"] + pattern
 	// "^[0-9]+$" accepted "a". Enum membership is now one
 	// constraint among others: a value must satisfy all of them.
-	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+	r, ran := newSchemaStubRegistry(t, "calculator", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			// "1" satisfies enum + pattern; "a" is in the enum
@@ -205,7 +205,7 @@ func TestValidateEnumDoesNotShortCircuitOtherConstraints(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+			_, err := r.Execute(ctx, "calculator", json.RawMessage(tc.args))
 			assertInvalidArgs(t, err, tc.want)
 			if *ran != 0 {
 				t.Fatalf("tool ran despite invalid args %s", tc.args)
@@ -215,7 +215,7 @@ func TestValidateEnumDoesNotShortCircuitOtherConstraints(t *testing.T) {
 
 	// Values satisfying every constraint still pass.
 	for _, args := range []string{`{"code":"1"}`, `{"level":5}`, `{"level":10}`} {
-		if _, err := r.Execute(ctx, "stub", json.RawMessage(args)); err != nil {
+		if _, err := r.Execute(ctx, "calculator", json.RawMessage(args)); err != nil {
 			t.Fatalf("Execute(%s): expected success, got %v", args, err)
 		}
 	}
@@ -229,7 +229,7 @@ func TestValidateNonObjectArgs(t *testing.T) {
 	ctx := context.Background()
 
 	for _, args := range []string{`[1,2]`, `"hi"`, `42`, `not json`, `{"name":"x"} trailing`} {
-		_, err := r.Execute(ctx, "stub", json.RawMessage(args))
+		_, err := r.Execute(ctx, "calculator", json.RawMessage(args))
 		assertInvalidArgs(t, err, "arguments must be a JSON object")
 		if *ran != 0 {
 			t.Fatalf("tool ran despite non-object args %q", args)
@@ -239,13 +239,13 @@ func TestValidateNonObjectArgs(t *testing.T) {
 
 func TestValidateNoSchemaMeansNoConstraint(t *testing.T) {
 	r := NewRegistry()
-	tool := &namedStubTool{name: "schemaless"}
+	tool := &namedStubTool{name: "calculator"}
 	// namedStubTool publishes empty properties and no required
 	// fields; validation must not invent constraints for it.
 	if err := r.Register(tool); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if _, err := r.Execute(context.Background(), "schemaless", json.RawMessage(`{"anything":true}`)); err != nil {
+	if _, err := r.Execute(context.Background(), "calculator", json.RawMessage(`{"anything":true}`)); err != nil {
 		t.Fatalf("Execute(schemaless): expected success, got %v", err)
 	}
 }
@@ -297,7 +297,7 @@ func TestValidateEnumStringSlice(t *testing.T) {
 	// Audit 5 F-A5-P2-27: the old code checked the enum only if it
 	// was []any, so a Go-built definition using []string silently
 	// imposed no enum at all.
-	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+	r, ran := newSchemaStubRegistry(t, "calculator", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"mode": map[string]any{"type": "string", "enum": []string{"a", "b"}},
@@ -305,12 +305,12 @@ func TestValidateEnumStringSlice(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	_, err := r.Execute(ctx, "stub", json.RawMessage(`{"mode":"c"}`))
+	_, err := r.Execute(ctx, "calculator", json.RawMessage(`{"mode":"c"}`))
 	assertInvalidArgs(t, err, `parameter "mode" must be one of`)
 	if *ran != 0 {
 		t.Fatalf("tool ran despite []string enum violation")
 	}
-	if _, err := r.Execute(ctx, "stub", json.RawMessage(`{"mode":"a"}`)); err != nil {
+	if _, err := r.Execute(ctx, "calculator", json.RawMessage(`{"mode":"a"}`)); err != nil {
 		t.Fatalf("Execute(mode=a): expected success, got %v", err)
 	}
 	if *ran != 1 {
@@ -322,7 +322,7 @@ func TestValidateEnumNumericNormalisation(t *testing.T) {
 	// reflect.DeepEqual(float64, int) is false, so a JSON-decoded
 	// value 1 (float64) never matched a Go-built int enum entry.
 	// Numbers must be compared by value.
-	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+	r, ran := newSchemaStubRegistry(t, "calculator", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"level": map[string]any{"type": "integer", "enum": []any{1, 2}},
@@ -337,7 +337,7 @@ func TestValidateEnumNumericNormalisation(t *testing.T) {
 		`{"score":20}`,
 		`{"ratio":1.5}`,
 	} {
-		if _, err := r.Execute(ctx, "stub", json.RawMessage(args)); err != nil {
+		if _, err := r.Execute(ctx, "calculator", json.RawMessage(args)); err != nil {
 			t.Fatalf("Execute(%s): expected success, got %v", args, err)
 		}
 	}
@@ -349,7 +349,7 @@ func TestValidateEnumNumericNormalisation(t *testing.T) {
 		{`{"score":15}`, `parameter "score" must be one of`},
 		{`{"ratio":2.5}`, `parameter "ratio" must be one of`},
 	} {
-		_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+		_, err := r.Execute(ctx, "calculator", json.RawMessage(tc.args))
 		assertInvalidArgs(t, err, tc.want)
 	}
 	if *ran != 3 {
@@ -362,7 +362,7 @@ func TestValidateNestedSchemas(t *testing.T) {
 	// properties/required, so nested required fields (e.g.
 	// todo_write's todos[].content/status) were ignored entirely.
 	// The schema below mirrors todo_write's todos shape.
-	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+	r, ran := newSchemaStubRegistry(t, "calculator", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"todos": map[string]any{
@@ -394,7 +394,7 @@ func TestValidateNestedSchemas(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+			_, err := r.Execute(ctx, "calculator", json.RawMessage(tc.args))
 			assertInvalidArgs(t, err, tc.want)
 		})
 	}
@@ -403,7 +403,7 @@ func TestValidateNestedSchemas(t *testing.T) {
 	}
 
 	// A fully valid nested call runs.
-	if _, err := r.Execute(ctx, "stub", json.RawMessage(`{"todos":[{"content":"x","status":"done"},{"content":"y","status":"pending"}]}`)); err != nil {
+	if _, err := r.Execute(ctx, "calculator", json.RawMessage(`{"todos":[{"content":"x","status":"done"},{"content":"y","status":"pending"}]}`)); err != nil {
 		t.Fatalf("Execute(valid nested): expected success, got %v", err)
 	}
 	if *ran != 1 {
@@ -415,7 +415,7 @@ func TestValidateNumericAndStringBounds(t *testing.T) {
 	// Audit 5 F-A5-P2-27: minimum/maximum/pattern/minLength were
 	// never read, though schemas declare them (e.g. shell timeout
 	// 1–120). Bounds use Go ints here, as Go-built definitions do.
-	r, ran := newSchemaStubRegistry(t, "stub", map[string]any{
+	r, ran := newSchemaStubRegistry(t, "calculator", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"timeout": map[string]any{"type": "number", "minimum": 1, "maximum": 120},
@@ -437,7 +437,7 @@ func TestValidateNumericAndStringBounds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := r.Execute(ctx, "stub", json.RawMessage(tc.args))
+			_, err := r.Execute(ctx, "calculator", json.RawMessage(tc.args))
 			assertInvalidArgs(t, err, tc.want)
 		})
 	}
@@ -446,7 +446,7 @@ func TestValidateNumericAndStringBounds(t *testing.T) {
 	}
 
 	for _, args := range []string{`{"timeout":60}`, `{"timeout":1}`, `{"timeout":120}`, `{"code":"abc"}`} {
-		if _, err := r.Execute(ctx, "stub", json.RawMessage(args)); err != nil {
+		if _, err := r.Execute(ctx, "calculator", json.RawMessage(args)); err != nil {
 			t.Fatalf("Execute(%s): expected success, got %v", args, err)
 		}
 	}

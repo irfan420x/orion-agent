@@ -112,9 +112,15 @@ func (r *Registry) PlanModeBlocks(ctx context.Context, tool string) (bool, strin
 // gate's hardcoded maps (permissions.Classify): a mismatch is a
 // programming error — the maps are the authority, and a tool whose
 // declaration disagrees is rejected instead of silently running at
-// the wrong class. Add the tool to the maps in
-// internal/permissions/gate.go (or fix its declaration) and
-// re-register.
+// the wrong class.
+//
+// The name must ALSO be explicitly classified (F-A21-1): in one of
+// the gate's maps, or an MCP tool (mcp__ prefix). A novel name is
+// rejected whatever it declares — Safe, Network or Destructive —
+// because Classify's fail-closed default would otherwise let a
+// declaration agree vacuously with the default. Add the tool to
+// the maps in internal/permissions/gate.go (or fix its
+// declaration) and re-register.
 func (r *Registry) Register(t Tool) error {
 	if t == nil {
 		return fmt.Errorf("tools: cannot register nil tool")
@@ -125,6 +131,9 @@ func (r *Registry) Register(t Tool) error {
 	rc, ok := t.(RiskClasser)
 	if !ok {
 		return fmt.Errorf("tools: tool %q does not implement RiskClasser: declare its risk class explicitly", t.Name())
+	}
+	if _, known := permissions.ClassifyKnown(t.Name()); !known {
+		return fmt.Errorf("tools: tool %q is not in the permission gate's classification (internal/permissions/gate.go): add it to the destructive, network or safe maps (MCP tools use the mcp__ prefix) and declare the same class", t.Name())
 	}
 	if got, want := rc.RiskClass(), permissions.Classify(t.Name()); got != want {
 		return fmt.Errorf("tools: tool %q declares risk class %v but the permission gate classifies it %v: the gate's maps are the authority", t.Name(), got, want)
