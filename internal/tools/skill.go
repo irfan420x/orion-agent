@@ -39,6 +39,7 @@ import (
 	"strings"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/skills"
 )
 
@@ -72,6 +73,13 @@ func NewSkillTool(reg *skills.Registry) (Tool, error) {
 }
 
 func (t *skillTool) Name() string { return "skill" }
+
+// RiskClass declares the tool safe: it only loads skill
+// instructions. (No factory: the skill tool is registered late by
+// app.Build — it needs the skills registry, which is loaded after
+// the agent, which needs the registry. See the framework design's
+// migration notes.)
+func (t *skillTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *skillTool) Description() string {
 	return "Invoke a skill: load its full instructions and follow them as the workflow they describe. " +

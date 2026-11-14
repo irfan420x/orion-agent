@@ -2,7 +2,6 @@
 package tools
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/irfan/orion/internal/sandbox"
@@ -38,47 +37,11 @@ func DefaultRegistryWithSandbox(sandboxCfg sandbox.Config) (*Registry, error) {
 // DefaultRegistryWithSandbox with the deployment's trusted egress
 // CIDRs plumbed into web_fetch (config trusted_egress_cidrs).
 // A malformed CIDR fails registry construction loudly.
+// The tools come from the factories (see framework.go): there is
+// no literal tool list here to edit or forget.
 func DefaultRegistryWithSandboxAndTrustedEgress(sandboxCfg sandbox.Config, trustedEgressCIDRs []string) (*Registry, error) {
-	fetchTool, err := newWebFetchTool(trustedEgressCIDRs)
-	if err != nil {
-		return nil, err
-	}
-	searchTool, err := newWebSearchTool(trustedEgressCIDRs)
-	if err != nil {
-		return nil, err
-	}
-	r := NewRegistry()
-	roots := defaultFileRoots()
-	// Planning tools (todo_write + Task*) share one store. The
-	// store starts in-memory; the daemon points it at the data
-	// dir via Registry.PlanningStore().SetDataDir, after which
-	// state persists per chat under <DataDir>/chats/<chatID>/.
-	// See planning.go for the per-chat resolution.
-	planningTools := NewPlanningTools(NewPlanningStore(""))
-	tools := []Tool{
-		&shellExecTool{sandboxCfg: sandboxCfg},
-		&fileReadTool{roots: roots},
-		&fileWriteTool{roots: roots},
-		&fileEditTool{roots: roots},
-		&fileListTool{roots: roots},
-		&grepTool{roots: roots},
-		&globTool{roots: roots},
-		fetchTool,
-		searchTool,
-		&calculatorTool{},
-		&datetimeTool{},
-		&processListTool{},
-		// ask_user_question starts with no transport: the daemon
-		// installs the Telegram asker via Registry.SetQuestionAsker
-		// after it builds the gateway. Local runs never install
-		// one, so the tool fails cleanly there instead of hanging.
-		&askUserQuestionTool{},
-	}
-	tools = append(tools, planningTools...)
-	for _, t := range tools {
-		if err := r.Register(t); err != nil {
-			return nil, fmt.Errorf("tools: failed to register %q: %w", t.Name(), err)
-		}
-	}
-	return r, nil
+	return DefaultRegistryWithDeps(ToolDeps{
+		SandboxCfg:         sandboxCfg,
+		TrustedEgressCIDRs: trustedEgressCIDRs,
+	})
 }

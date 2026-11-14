@@ -24,9 +24,17 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/sandbox"
 	"github.com/irfan/orion/internal/security"
 )
+
+// The factory for this file's tool (framework auto-discovery).
+func init() {
+	RegisterFactory("shell_exec", func(deps ToolDeps) (Tool, error) {
+		return &shellExecTool{sandboxCfg: deps.SandboxCfg}, nil
+	})
+}
 
 const (
 	defaultShellTimeout = 30
@@ -202,6 +210,9 @@ type shellExecTool struct {
 }
 
 func (t *shellExecTool) Name() string { return "shell_exec" }
+
+// RiskClass declares the tool destructive: it runs shell commands.
+func (t *shellExecTool) RiskClass() permissions.Class { return permissions.ClassDestructive }
 
 func (t *shellExecTool) Description() string {
 	return "Run a shell command via /bin/sh -c and return its combined stdout/stderr plus the exit code. Blocked destructive commands are refused."

@@ -355,6 +355,16 @@ type Gate struct {
 	// SetLogger replaces it. loggerMu guards it.
 	logger   *log.Logger
 	loggerMu sync.RWMutex
+	// toolClasses, when set via SetToolClasses, is the
+	// per-tool risk class the tools framework collected from the
+	// tools' own RiskClass() declarations. It is consulted
+	// before the hardcoded maps (see classify): the tool is the
+	// authority on what it does, and the maps are the fallback
+	// for tools that declare nothing (MCP tools, unknown tools).
+	// toolClassesMu guards it (a dedicated mutex, not mu, so
+	// classify can never deadlock against a caller holding mu).
+	toolClasses   map[string]Class
+	toolClassesMu sync.RWMutex
 }
 
 // NewGate builds a gate over rules (may be nil: no standing rules)
@@ -421,6 +431,52 @@ func (g *Gate) SetTimeout(d time.Duration) {
 		d = DefaultTimeout
 	}
 	g.timeout = d
+}
+
+// SetToolClasses installs the per-tool risk classes the tools
+// framework collected from the tools' own RiskClass()
+// declarations. The map is copied, so later mutation of the
+// caller's map cannot change the gate. A nil/empty map clears the
+// installed classes (the hardcoded maps then decide alone).
+// Installed classes take precedence over the hardcoded maps (see
+// classify); tools absent from the map fall back to Classify, so
+// MCP tools (mcp__ prefix) and unknown tools are unaffected.
+// Safe for concurrent use with Check.
+func (g *Gate) SetToolClasses(classes map[string]Class) {
+	if g == nil {
+		return
+	}
+	g.toolClassesMu.Lock()
+	defer g.toolClassesMu.Unlock()
+	if len(classes) == 0 {
+		g.toolClasses = nil
+		return
+	}
+	m := make(map[string]Class, len(classes))
+	for name, class := range classes {
+		if name = strings.TrimSpace(name); name != "" {
+			m[name] = class
+		}
+	}
+	g.toolClasses = m
+}
+
+// classify returns the risk class of a tool: the installed
+// per-tool declaration first, the hardcoded maps (Classify)
+// second. The two must agree for every built-in tool — a test pins
+// that — so the installed map never changes what the maps already
+// decide; it only makes the declaration explicit and loud.
+func (g *Gate) classify(tool string) Class {
+	tool = strings.TrimSpace(tool)
+	if g != nil {
+		g.toolClassesMu.RLock()
+		class, ok := g.toolClasses[tool]
+		g.toolClassesMu.RUnlock()
+		if ok {
+			return class
+		}
+	}
+	return Classify(tool)
 }
 
 // SetOnExpire installs the hook called when a pending request dies
@@ -509,7 +565,7 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 			return false, fmt.Sprintf("denied by permission rule for tool %q", tool)
 		}
 	}
-	if Classify(tool) == ClassSafe {
+	if g.classify(tool) == ClassSafe {
 		return true, ""
 	}
 	if g.prompter == nil {
@@ -635,7 +691,7 @@ func (g *Gate) applyResult(tool, args string, chatID int64, res pendingResult) (
 	if res.approved {
 		return true, ""
 	}
-	return false, fmt.Sprintf("denied: the user declined the %s tool call %q", Classify(tool), tool)
+	return false, fmt.Sprintf("denied: the user declined the %s tool call %q", g.classify(tool), tool)
 }
 
 // Pending returns the pending request with id, for the callback

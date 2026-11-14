@@ -554,14 +554,15 @@ func TestPlanningDirFuncOverride(t *testing.T) {
 	}
 }
 
-func TestRegistryPlanningStoreSeam(t *testing.T) {
-	r, err := DefaultRegistry()
+func TestRegistryPlanningStoreViaDeps(t *testing.T) {
+	// The planning store is created by the caller and passed in
+	// ToolDeps (framework): the registry's planning tools share
+	// it, and the caller keeps the same object to point it at
+	// the data dir.
+	store := NewPlanningStore("")
+	r, err := DefaultRegistryWithDeps(ToolDeps{PlanningStore: store})
 	if err != nil {
 		t.Fatal(err)
-	}
-	store := r.PlanningStore()
-	if store == nil {
-		t.Fatal("DefaultRegistry must expose its planning store")
 	}
 	dataDir := t.TempDir()
 	if err := store.SetDataDir(dataDir); err != nil {

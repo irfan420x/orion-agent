@@ -26,7 +26,15 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
+
+// The factories for this file's tools (framework auto-discovery):
+// each tool self-registers here, so adding a tool is one file.
+func init() {
+	RegisterFactory("web_fetch", func(deps ToolDeps) (Tool, error) { return newWebFetchTool(deps.TrustedEgressCIDRs) })
+	RegisterFactory("web_search", func(deps ToolDeps) (Tool, error) { return newWebSearchTool(deps.TrustedEgressCIDRs) })
+}
 
 const (
 	// defaultFetchMaxBytes is the default raw-fetch cap: 32KB.
@@ -618,6 +626,9 @@ func newWebFetchTool(trustedCIDRs []string) (*webFetchTool, error) {
 
 func (t *webFetchTool) Name() string { return "web_fetch" }
 
+// RiskClass declares the tool network: it fetches remote content.
+func (t *webFetchTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
+
 func (t *webFetchTool) Description() string {
 	return "Fetch a URL over HTTP(S) and return the extracted text (HTML → clean text, JSON → compact summary; up to 32KB fetched by default, extracted text capped at ~8K chars)."
 }
@@ -759,6 +770,9 @@ func newWebSearchTool(trustedCIDRs []string) (*webSearchTool, error) {
 }
 
 func (t *webSearchTool) Name() string { return "web_search" }
+
+// RiskClass declares the tool network: it queries a remote search API.
+func (t *webSearchTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
 
 func (t *webSearchTool) Description() string {
 	return "Search the web (DuckDuckGo) and return numbered results with titles and links."

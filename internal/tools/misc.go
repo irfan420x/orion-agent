@@ -18,13 +18,25 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
+
+// The factories for this file's tools (framework auto-discovery):
+// each tool self-registers here, so adding a tool is one file.
+func init() {
+	RegisterFactory("calculator", func(deps ToolDeps) (Tool, error) { return &calculatorTool{}, nil })
+	RegisterFactory("datetime", func(deps ToolDeps) (Tool, error) { return &datetimeTool{}, nil })
+	RegisterFactory("process_list", func(deps ToolDeps) (Tool, error) { return &processListTool{}, nil })
+}
 
 // ---------------------------------------------------------------- calculator
 
 type calculatorTool struct{}
 
 func (t *calculatorTool) Name() string { return "calculator" }
+
+// RiskClass declares the tool safe: it only evaluates arithmetic.
+func (t *calculatorTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *calculatorTool) Description() string {
 	return "Evaluate an arithmetic expression: + - * / % ^, parentheses, unary minus, functions sqrt/abs/sin/cos/tan/log/ln, constants pi and e."
@@ -378,6 +390,9 @@ type datetimeTool struct{}
 
 func (t *datetimeTool) Name() string { return "datetime" }
 
+// RiskClass declares the tool safe: it only reports the time.
+func (t *datetimeTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+
 func (t *datetimeTool) Description() string {
 	return "Return the current date and time in a requested IANA timezone (default: local), in RFC3339 and human-readable form."
 }
@@ -427,6 +442,9 @@ func (t *datetimeTool) Execute(ctx context.Context, args json.RawMessage) (strin
 type processListTool struct{}
 
 func (t *processListTool) Name() string { return "process_list" }
+
+// RiskClass declares the tool safe: it only lists processes.
+func (t *processListTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *processListTool) Description() string {
 	return "List running processes (pid, command, state), up to 50, sorted by pid."

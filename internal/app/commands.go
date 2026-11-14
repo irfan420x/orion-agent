@@ -249,7 +249,7 @@ func (a *App) SwitchProvider(name string) error {
 		// agent on every call (see Build), so no re-pointing is
 		// needed here: tokens from consumed results accrue to
 		// this new agent automatically.
-		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger, a.Hooks, a.Tools.PlanningStore()))
+		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger, a.Hooks, a.planningStore))
 	}
 	a.mu.Unlock()
 	// Chats without an override follow the new default; chats with

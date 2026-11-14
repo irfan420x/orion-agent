@@ -113,28 +113,25 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 //
 // The optional parentPlanning argument is the parent's planning
 // store (F-A5-P2-35): when given, the child's planning tools are
-// re-pointed at it, so a child's task_create lands in the chat's
-// files instead of a fresh in-memory store that is discarded when
-// the child exits. Sharing the store is safe — PlanningStore
-// serialises in-process (mutex) and across processes (flock) —
-// and the child still inherits the parent's chat id from the run
-// context, so it lands in the same chat's bucket. Omit it (or pass
-// nil) and the child keeps its own fresh in-memory store, the old
-// behaviour, which callers that never wired a data dir rely on.
-// The variadic form keeps the existing newChildRegistry(cfg) call
-// sites compiling while the executor wiring passes the store.
+// built on it (passed in ToolDeps), so a child's task_create lands
+// in the chat's files instead of a fresh in-memory store that is
+// discarded when the child exits. Sharing the store is safe —
+// PlanningStore serialises in-process (mutex) and across processes
+// (flock) — and the child still inherits the parent's chat id from
+// the run context, so it lands in the same chat's bucket. Omit it
+// (or pass nil) and the child keeps its own fresh in-memory store,
+// the old behaviour, which callers that never wired a data dir rely
+// on. The variadic form keeps the existing newChildRegistry(cfg)
+// call sites compiling while the executor wiring passes the store.
 func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore) (*tools.Registry, error) {
 	if cfg == nil {
 		cfg = config.Default()
 	}
-	reg, err := tools.DefaultRegistryWithSandboxAndTrustedEgress(cfg.Sandbox, cfg.TrustedEgressCIDRs)
-	if err != nil {
-		return nil, err
-	}
+	deps := tools.ToolDeps{SandboxCfg: cfg.Sandbox, TrustedEgressCIDRs: cfg.TrustedEgressCIDRs}
 	if len(parentPlanning) > 0 && parentPlanning[0] != nil {
-		reg.SetPlanningStore(parentPlanning[0])
+		deps.PlanningStore = parentPlanning[0]
 	}
-	return reg, nil
+	return tools.DefaultRegistryWithDeps(deps)
 }
 
 // newSubagentExecutor returns a subagent.Executor that runs each brief

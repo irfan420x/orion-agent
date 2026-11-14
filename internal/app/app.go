@@ -60,8 +60,15 @@ type App struct {
 	// from <dataDir>/mcp.json in Build; nil when no MCP servers
 	// are configured (or for hand-built Apps). Its tools live on
 	// the shared registry, so every agent sees them.
-	MCP    *mcp.Manager
-	Logger *log.Logger
+	MCP *mcp.Manager
+	// planningStore is the planning store (todo_write + Task*),
+	// created in Build and shared by the registry's planning tools
+	// and the subagent executor (children plan into the same
+	// chat's files). Nil for hand-built Apps, which keep the
+	// registry's own in-memory store; the executor then gets nil
+	// (isolated per-child planning, the old behaviour).
+	planningStore *tools.PlanningStore
+	Logger        *log.Logger
 	// StartedAt is when the app was built (zero for a hand-built App);
 	// StatusLine reports uptime from it and omits the line when zero.
 	StartedAt time.Time
@@ -147,17 +154,23 @@ func Build(path string) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: provider %q: %w", active.Name, err)
 	}
-	registry, err := tools.DefaultRegistryWithSandboxAndTrustedEgress(cfg.Sandbox, cfg.TrustedEgressCIDRs)
-	if err != nil {
-		return nil, err
-	}
-	// Point the planning store at the data dir so todo/task state
+	// Planning store: created here so the daemon owns it — it is
+	// passed to the registry in ToolDeps (the planning tools share
+	// it) and to the subagent executor (children plan into the same
+	// chat's files). Pointed at the data dir so todo/task state
 	// persists per chat (rc9 B2 gap: without this the store stays
 	// in-memory and planning state is lost on restart).
-	if ps := registry.PlanningStore(); ps != nil {
-		if err := ps.SetDataDir(cfg.DataDir); err != nil {
-			return nil, fmt.Errorf("app: planning store: %w", err)
-		}
+	planningStore := tools.NewPlanningStore("")
+	if err := planningStore.SetDataDir(cfg.DataDir); err != nil {
+		return nil, fmt.Errorf("app: planning store: %w", err)
+	}
+	registry, err := tools.DefaultRegistryWithDeps(tools.ToolDeps{
+		SandboxCfg:         cfg.Sandbox,
+		TrustedEgressCIDRs: cfg.TrustedEgressCIDRs,
+		PlanningStore:      planningStore,
+	})
+	if err != nil {
+		return nil, err
 	}
 	mem, err := memory.NewFileStore(cfg.DataDir)
 	if err != nil {
@@ -214,7 +227,7 @@ func Build(path string) (*App, error) {
 	// parent turn) and pollutes the parent's history. The child
 	// shares only the provider (concurrent-safe) and the typed
 	// memories (read-only view).
-	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, registry.PlanningStore()), cfg.DataDir)
+	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, planningStore), cfg.DataDir)
 
 	// Model-visible subagent tools, registered on the PARENT
 	// registry only (children get a registry without them, so no
@@ -269,11 +282,12 @@ func Build(path string) (*App, error) {
 	app = &App{
 		Config: cfg, Provider: provider, Tools: registry, Memory: mem,
 		Agent: agent, Subagents: mgr, Skills: skillReg, Audit: audit, Logger: logger,
-		Budget:     budget.New(cfg.PerChatDailyTokenBudget),
-		Hooks:      hookBus,
-		MCP:        mcpMgr,
-		StartedAt:  time.Now(),
-		typedStore: typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
+		Budget:        budget.New(cfg.PerChatDailyTokenBudget),
+		Hooks:         hookBus,
+		MCP:           mcpMgr,
+		planningStore: planningStore,
+		StartedAt:     time.Now(),
+		typedStore:    typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
 	}
 	// Budget persistence (Audit 5 F-A5-P2-19): without a file, a
 	// daemon restart resets every chat's daily spend to zero. The
@@ -367,16 +381,21 @@ func BuildLocal(path string) (*Local, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: %w", err)
 	}
-	registry, err := tools.DefaultRegistryWithSandboxAndTrustedEgress(cfg.Sandbox, cfg.TrustedEgressCIDRs)
-	if err != nil {
-		return nil, err
-	}
 	// Planning store persistence, as in Build: without this the
 	// CLI's todo/task state stays in-memory and is lost on exit.
-	if ps := registry.PlanningStore(); ps != nil {
-		if err := ps.SetDataDir(cfg.DataDir); err != nil {
-			return nil, fmt.Errorf("app: planning store: %w", err)
-		}
+	// The store is created here and passed to the registry in
+	// ToolDeps (the planning tools share it).
+	planningStore := tools.NewPlanningStore("")
+	if err := planningStore.SetDataDir(cfg.DataDir); err != nil {
+		return nil, fmt.Errorf("app: planning store: %w", err)
+	}
+	registry, err := tools.DefaultRegistryWithDeps(tools.ToolDeps{
+		SandboxCfg:         cfg.Sandbox,
+		TrustedEgressCIDRs: cfg.TrustedEgressCIDRs,
+		PlanningStore:      planningStore,
+	})
+	if err != nil {
+		return nil, err
 	}
 	mem, err := memory.NewFileStore(cfg.DataDir)
 	if err != nil {

@@ -28,7 +28,17 @@ import (
 	"unicode/utf8"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
+
+// The factories for this file's tools (framework auto-discovery):
+// each tool self-registers here, so adding a tool is one file.
+func init() {
+	RegisterFactory("file_read", func(deps ToolDeps) (Tool, error) { return &fileReadTool{roots: deps.FileRoots}, nil })
+	RegisterFactory("file_write", func(deps ToolDeps) (Tool, error) { return &fileWriteTool{roots: deps.FileRoots}, nil })
+	RegisterFactory("file_edit", func(deps ToolDeps) (Tool, error) { return &fileEditTool{roots: deps.FileRoots}, nil })
+	RegisterFactory("file_list", func(deps ToolDeps) (Tool, error) { return &fileListTool{roots: deps.FileRoots}, nil })
+}
 
 const (
 	maxFileRead    = 1 * 1024 * 1024 // 1MB
@@ -430,6 +440,9 @@ type fileReadTool struct {
 
 func (t *fileReadTool) Name() string { return "file_read" }
 
+// RiskClass declares the tool safe: it only reads files.
+func (t *fileReadTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+
 func (t *fileReadTool) Description() string {
 	return "Read a text file (up to 1MB) and return its contents. Larger files are truncated to 1MB with a marker stating the true size. Paths are confined to the working directory and the temp directory. Symlinked files are refused."
 }
@@ -513,6 +526,9 @@ type fileWriteTool struct {
 }
 
 func (t *fileWriteTool) Name() string { return "file_write" }
+
+// RiskClass declares the tool destructive: it creates/overwrites files.
+func (t *fileWriteTool) RiskClass() permissions.Class { return permissions.ClassDestructive }
 
 func (t *fileWriteTool) Description() string {
 	return "Write content to a file (up to 1MB), creating parent directories as needed. Overwrites an existing file; refuses paths that are directories. Paths are confined to the working directory and the temp directory. Symlinked files are refused."
@@ -601,6 +617,9 @@ type fileEditTool struct {
 }
 
 func (t *fileEditTool) Name() string { return "file_edit" }
+
+// RiskClass declares the tool destructive: it modifies files.
+func (t *fileEditTool) RiskClass() permissions.Class { return permissions.ClassDestructive }
 
 func (t *fileEditTool) Description() string {
 	return "Replace an exact text match in a file. Fails if old_text is absent or matches more than once. Paths are confined to the working directory and the temp directory. Symlinked files are refused."
@@ -732,6 +751,9 @@ type fileListTool struct {
 }
 
 func (t *fileListTool) Name() string { return "file_list" }
+
+// RiskClass declares the tool safe: it only lists directories.
+func (t *fileListTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *fileListTool) Description() string {
 	return "List the entries of a directory, sorted by name, with type and size. Paths are confined to the working directory and the temp directory. Symlinked directories are refused."

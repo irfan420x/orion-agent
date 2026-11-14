@@ -262,39 +262,70 @@ func TestAskUserQuestionResultShape(t *testing.T) {
 	}
 }
 
-func TestRegistryQuestionAsker(t *testing.T) {
-	// Nil-safe on a nil registry, a nil fn, and a registry
-	// without the tool.
-	var nilReg *Registry
-	if nilReg.QuestionAsker() != nil {
-		t.Error("nil registry QuestionAsker() != nil")
-	}
-	nilReg.SetQuestionAsker(func(context.Context, int64, int64, string, []string, time.Duration) (string, string, int, error) {
+func TestToolInstallQuestionAsker(t *testing.T) {
+	// The framework installs the transport on the tool itself
+	// (InstallQuestionAsker), not through the registry: the
+	// registry-level SetQuestionAsker/QuestionAsker seam is
+	// deleted. Same guarantees, new mechanism.
+	// Nil-safe on a nil tool and a nil fn.
+	var nilTool *askUserQuestionTool
+	nilTool.InstallQuestionAsker(func(context.Context, int64, int64, string, []string, time.Duration) (string, string, int, error) {
 		return "", "", -1, nil
 	})
-	r := NewRegistry()
-	if r.QuestionAsker() != nil {
-		t.Error("registry without the tool QuestionAsker() != nil")
+	// InstallQuestionAsker(nil) keeps the previous asker.
+	fake := &recordingAsker{answer: "kept", source: "button", optionIndex: 1}
+	r := askRegistry(fake.ask)
+	tool, ok := r.Get("ask_user_question")
+	if !ok {
+		t.Fatal("askRegistry has no ask_user_question tool")
 	}
-	r.SetQuestionAsker(func(context.Context, int64, int64, string, []string, time.Duration) (string, string, int, error) {
-		return "", "", -1, nil
-	})
-	if r.QuestionAsker() != nil {
-		t.Error("SetQuestionAsker on a registry without the tool installed one")
+	tool.(QuestionAskerInstaller).InstallQuestionAsker(nil)
+	out, err := r.Execute(askCtx(), "ask_user_question", json.RawMessage(`{"question":"Q?"}`))
+	if err != nil {
+		t.Fatalf("InstallQuestionAsker(nil) cleared the asker: %v", err)
 	}
-	// Round-trip on a registry with the tool.
-	fake := &recordingAsker{}
+	if !strings.Contains(out, `"kept"`) {
+		t.Errorf("InstallQuestionAsker(nil) cleared the asker, got %s", out)
+	}
+	// Round-trip: install a fake asker on a tool that had none
+	// and the tool uses it.
+	fake2 := &recordingAsker{answer: "installed", source: "text", optionIndex: -1}
 	r2 := askRegistry(nil)
-	if r2.QuestionAsker() != nil {
-		t.Error("tool with nil asker QuestionAsker() != nil")
+	tool2, ok := r2.Get("ask_user_question")
+	if !ok {
+		t.Fatal("askRegistry has no ask_user_question tool")
 	}
-	r2.SetQuestionAsker(fake.ask)
-	if r2.QuestionAsker() == nil {
-		t.Fatal("SetQuestionAsker did not install the asker")
+	tool2.(QuestionAskerInstaller).InstallQuestionAsker(fake2.ask)
+	out, err = r2.Execute(askCtx(), "ask_user_question", json.RawMessage(`{"question":"Q?"}`))
+	if err != nil {
+		t.Fatalf("installed asker: %v", err)
 	}
-	r2.SetQuestionAsker(nil)
-	if r2.QuestionAsker() == nil {
-		t.Error("SetQuestionAsker(nil) cleared the asker, want it kept")
+	if !strings.Contains(out, `"installed"`) {
+		t.Errorf("installed asker not used, got %s", out)
+	}
+	// Framework-level: the same install loop WireTelegram runs
+	// (install on every tool implementing QuestionAskerInstaller)
+	// is a no-op on a registry without the tool, and reaches the
+	// tool on a registry that has it.
+	empty := NewRegistry()
+	fake3 := &recordingAsker{answer: "framework", source: "text", optionIndex: -1}
+	for _, tool := range empty.List() {
+		if inst, ok := tool.(QuestionAskerInstaller); ok {
+			inst.InstallQuestionAsker(fake3.ask)
+		}
+	}
+	r3 := askRegistry(nil)
+	for _, tool := range r3.List() {
+		if inst, ok := tool.(QuestionAskerInstaller); ok {
+			inst.InstallQuestionAsker(fake3.ask)
+		}
+	}
+	out, err = r3.Execute(askCtx(), "ask_user_question", json.RawMessage(`{"question":"Q?"}`))
+	if err != nil {
+		t.Fatalf("framework install: %v", err)
+	}
+	if !strings.Contains(out, `"framework"`) {
+		t.Errorf("framework install did not reach the tool, got %s", out)
 	}
 }
 

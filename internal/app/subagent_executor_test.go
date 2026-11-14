@@ -507,13 +507,14 @@ func TestRC9ChildAgentGetsHooks(t *testing.T) {
 // test covers newChildRegistry directly; this one covers the
 // executor call sites in Build / SwitchProviderForChat.)
 func TestSubagentExecutorChildSharesParentPlanningStore(t *testing.T) {
-	parentReg, err := tools.DefaultRegistry()
+	// The parent's planning store is created explicitly and
+	// passed to the parent registry in ToolDeps (framework): the
+	// executor wires the same store into the child registry, so
+	// a child's task_create lands in the parent's store.
+	parentStore := tools.NewPlanningStore("")
+	parentReg, err := tools.DefaultRegistryWithDeps(tools.ToolDeps{PlanningStore: parentStore})
 	if err != nil {
-		t.Fatalf("DefaultRegistry: %v", err)
-	}
-	parentStore := parentReg.PlanningStore()
-	if parentStore == nil {
-		t.Fatal("parent registry has no planning store")
+		t.Fatalf("DefaultRegistryWithDeps: %v", err)
 	}
 	childProv := &scriptedProvider{
 		name: "child",

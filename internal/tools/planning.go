@@ -19,11 +19,10 @@
 // to the tool or model interfaces (the same mechanism the
 // permission gate uses). Subagent children inherit the same
 // context, and the child registry is built on the PARENT's
-// planning store (Registry.SetPlanningStore, wired by
-// newChildRegistry in internal/app/subagent.go), so a child
-// planning for a chat lands in that chat's files, not another
-// chat's — and not in a fresh in-memory store that is discarded
-// when the child exits (F-A5-P2-35).
+// planning store (passed in ToolDeps, wired by newChildRegistry in
+// internal/app/subagent.go), so a child planning for a chat lands
+// in that chat's files, not another chat's — and not in a fresh
+// in-memory store that is discarded when the child exits (F-A5-P2-35).
 //
 // When no chat is in the context (a local CLI run), the state
 // lives in <DataDir>/local/ when a data dir is configured, or in
@@ -43,10 +42,10 @@
 //
 // Wiring: DefaultRegistry registers these tools on an in-memory
 // store. The daemon (or any host that knows the data dir) points
-// the store at it with one call —
-// registry.PlanningStore().SetDataDir(cfg.DataDir) — after which
-// every turn persists per chat as above. NewPlanningTools takes an
-// explicit store for tests and for hosts that want their own.
+// the store at it by passing it in ToolDeps (see
+// DefaultRegistryWithDeps) — after which every turn persists per
+// chat as above. NewPlanningTools takes an explicit store for
+// tests and for hosts that want their own.
 package tools
 
 import (
@@ -69,6 +68,19 @@ import (
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 )
+
+// The factories for this file's tools (framework auto-discovery):
+// each tool self-registers here, so adding a tool is one file.
+// They share the one store from deps.PlanningStore (created by
+// DefaultRegistryWithDeps when deps carries none), so a todo_write
+// in one turn is visible to task_list in the next.
+func init() {
+	RegisterFactory("todo_write", func(deps ToolDeps) (Tool, error) { return &todoWriteTool{store: deps.PlanningStore}, nil })
+	RegisterFactory("task_create", func(deps ToolDeps) (Tool, error) { return &taskCreateTool{store: deps.PlanningStore}, nil })
+	RegisterFactory("task_get", func(deps ToolDeps) (Tool, error) { return &taskGetTool{store: deps.PlanningStore}, nil })
+	RegisterFactory("task_list", func(deps ToolDeps) (Tool, error) { return &taskListTool{store: deps.PlanningStore}, nil })
+	RegisterFactory("task_update", func(deps ToolDeps) (Tool, error) { return &taskUpdateTool{store: deps.PlanningStore}, nil })
+}
 
 const (
 	planningTodosFile = "todos.json"
@@ -617,62 +629,14 @@ func NewPlanningTools(store *PlanningStore) []Tool {
 	}
 }
 
-// PlanningStore returns the planning store behind a registry's
-// todo_write tool, or nil when the registry has no planning tools.
-// The daemon uses it as the one-line wiring seam:
-// registry.PlanningStore().SetDataDir(cfg.DataDir).
-func (r *Registry) PlanningStore() *PlanningStore {
-	t, ok := r.Get("todo_write")
-	if !ok {
-		return nil
-	}
-	tw, ok := t.(*todoWriteTool)
-	if !ok || tw.store == nil {
-		return nil
-	}
-	return tw.store
-}
-
-// SetPlanningStore re-points the registry's planning tools
-// (todo_write, task_create, task_get, task_list, task_update) at
-// store, so a child registry can share the parent's planning state
-// instead of starting with a fresh in-memory store (F-A5-P2-35).
-// A nil store, a nil registry, or a registry without planning tools
-// is a no-op. Call before the registry serves turns: the swap
-// mutates the tool structs, so it must not race Execute. Sharing
-// one store between a parent and a child is safe — PlanningStore
-// methods are mutex-guarded in-process and flock-guarded across
-// processes, so a parent and a child writing the same chat's state
-// serialise instead of losing each other's writes.
-func (r *Registry) SetPlanningStore(store *PlanningStore) {
-	if r == nil || store == nil {
-		return
-	}
-	for _, name := range []string{"todo_write", "task_create", "task_get", "task_list", "task_update"} {
-		t, ok := r.Get(name)
-		if !ok {
-			continue
-		}
-		switch pt := t.(type) {
-		case *todoWriteTool:
-			pt.store = store
-		case *taskCreateTool:
-			pt.store = store
-		case *taskGetTool:
-			pt.store = store
-		case *taskListTool:
-			pt.store = store
-		case *taskUpdateTool:
-			pt.store = store
-		}
-	}
-}
-
 // ---------------------------------------------------------------- todo_write
 
 type todoWriteTool struct{ store *PlanningStore }
 
 func (t *todoWriteTool) Name() string { return "todo_write" }
+
+// RiskClass declares the tool safe: it only manages the plan checklist.
+func (t *todoWriteTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *todoWriteTool) Description() string {
 	return "Set (or read) the session's plan checklist. Pass todos to REPLACE the whole list: each item has content and a status (pending, in_progress, completed) and an optional active_form describing the work while it is in progress. Call it as the plan changes — when starting work, when an item finishes, when the plan is revised. With no todos argument it just returns the current list. The list is per chat/session and persists across turns."
@@ -773,6 +737,9 @@ func (t *todoWriteTool) Execute(ctx context.Context, args json.RawMessage) (stri
 type taskCreateTool struct{ store *PlanningStore }
 
 func (t *taskCreateTool) Name() string { return "task_create" }
+
+// RiskClass declares the tool safe: it only manages the task store.
+func (t *taskCreateTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *taskCreateTool) Description() string {
 	return "Create a durable planning task for this session (a unit of work the agent tracks across turns, with a title, optional description/notes, and a status). Returns the task id — use it with task_get, task_list and task_update. Tasks are per chat/session and persist across turns."
@@ -902,6 +869,9 @@ type taskGetTool struct{ store *PlanningStore }
 
 func (t *taskGetTool) Name() string { return "task_get" }
 
+// RiskClass declares the tool safe: it only reads the task store.
+func (t *taskGetTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+
 func (t *taskGetTool) Description() string {
 	return "Fetch one planning task by id (from task_create or task_list), with its title, description, notes, status and timestamps."
 }
@@ -968,6 +938,9 @@ func (t *taskGetTool) Execute(ctx context.Context, args json.RawMessage) (string
 type taskListTool struct{ store *PlanningStore }
 
 func (t *taskListTool) Name() string { return "task_list" }
+
+// RiskClass declares the tool safe: it only reads the task store.
+func (t *taskListTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *taskListTool) Description() string {
 	return "List this session's planning tasks in creation order, with id, title, status and timestamps. Optionally filter by one status. Returns at most 100 tasks by default (max 500); pass limit and offset to page through more. The response carries count (tasks on this page), total (all matching tasks), offset and limit."
@@ -1066,6 +1039,9 @@ func (t *taskListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 type taskUpdateTool struct{ store *PlanningStore }
 
 func (t *taskUpdateTool) Name() string { return "task_update" }
+
+// RiskClass declares the tool safe: it only manages the task store.
+func (t *taskUpdateTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *taskUpdateTool) Description() string {
 	return "Update one planning task by id: change its title, description, notes and/or status. At least one field besides id must be given. Returns the updated task."

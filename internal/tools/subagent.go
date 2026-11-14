@@ -132,6 +132,15 @@ type subagentSpawnTool struct{ set *subagentTools }
 
 func (t *subagentSpawnTool) Name() string { return "subagent_spawn" }
 
+// RiskClass declares the tool destructive: it spawns a child agent
+// that can mutate the machine. (No factory: subagent tools are
+// registered late by app.Build — they need the Manager, which is
+// built after the agent, which needs the registry. See the
+// framework design's migration notes.)
+func (t *subagentSpawnTool) RiskClass() permissions.Class {
+	return permissions.ClassDestructive
+}
+
 func (t *subagentSpawnTool) Description() string {
 	return "Delegate work to a subagent: spawn a child agent that runs its own agent loop with its own conversation to complete the brief, then fetch its output with subagent_result. " +
 		"Delegate when the work is independent research, parallel work, or a long-running job that does not need the parent's conversation context. " +
@@ -214,6 +223,9 @@ type subagentListTool struct{ set *subagentTools }
 
 func (t *subagentListTool) Name() string { return "subagent_list" }
 
+// RiskClass declares the tool safe: it only lists tasks.
+func (t *subagentListTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+
 func (t *subagentListTool) Description() string {
 	return "List subagent tasks (running and finished): id, status, a short preview of the brief, and duration. Never returns full outputs — use subagent_result with a task id to fetch one. Listing never counts token usage."
 }
@@ -277,6 +289,9 @@ func (t *subagentListTool) Execute(ctx context.Context, args json.RawMessage) (s
 type subagentResultTool struct{ set *subagentTools }
 
 func (t *subagentResultTool) Name() string { return "subagent_result" }
+
+// RiskClass declares the tool safe: it only reads a task result.
+func (t *subagentResultTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *subagentResultTool) Description() string {
 	return "Fetch a subagent task's result by id. Non-blocking: if the task is still running or pending, this returns its status and elapsed time — call again later instead of waiting. If the task finished, it returns the status, duration, tokens used, and the output. The first fetch of a finished task's result charges its tokens to the parent turn; fetching the same result again does not charge twice."
@@ -417,6 +432,9 @@ func (t *subagentResultTool) Execute(ctx context.Context, args json.RawMessage) 
 type subagentStopTool struct{ set *subagentTools }
 
 func (t *subagentStopTool) Name() string { return "subagent_stop" }
+
+// RiskClass declares the tool safe: it only stops a task.
+func (t *subagentStopTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *subagentStopTool) Description() string {
 	return "Cancel a running subagent task by id. Returns whether the task was running and got cancelled, or was already finished (or unknown) and so was not cancelled."

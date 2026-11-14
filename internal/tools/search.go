@@ -27,7 +27,15 @@ import (
 	"unicode/utf8"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
+
+// The factories for this file's tools (framework auto-discovery):
+// each tool self-registers here, so adding a tool is one file.
+func init() {
+	RegisterFactory("grep", func(deps ToolDeps) (Tool, error) { return &grepTool{roots: deps.FileRoots}, nil })
+	RegisterFactory("glob", func(deps ToolDeps) (Tool, error) { return &globTool{roots: deps.FileRoots}, nil })
+}
 
 const (
 	// defaultGrepMaxMatches is the default cap on matching lines a
@@ -114,6 +122,9 @@ type grepTool struct {
 }
 
 func (t *grepTool) Name() string { return "grep" }
+
+// RiskClass declares the tool safe: it only reads files.
+func (t *grepTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *grepTool) Description() string {
 	return "Search file contents for a pattern (regex by default, or literal text), recursively under a directory. Returns matching lines as path:line: text with optional context lines. Paths are confined to the working directory and the temp directory, exactly like file_read: paths outside them, symlinks escaping them, and sensitive directories are refused or skipped, never followed. Use this instead of shell_exec grep, which bypasses file confinement. Binary files and .git are skipped."
@@ -569,6 +580,9 @@ type globTool struct {
 }
 
 func (t *globTool) Name() string { return "glob" }
+
+// RiskClass declares the tool safe: it only lists matching paths.
+func (t *globTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *globTool) Description() string {
 	return "Find files and directories by recursive glob pattern, e.g. \"**/*.go\" or \"src/**/*.ts\", under a directory. Patterns are matched against the path relative to that directory: \"*\" matches within one path segment, \"**\" matches zero or more segments, \"?\" matches one character and \"[...]\" a character class. \"*.go\" matches only the top level; use \"**/*.go\" for all depths. Paths are confined to the working directory and the temp directory, exactly like file_list. Symlinks escaping the directory are skipped, never followed."

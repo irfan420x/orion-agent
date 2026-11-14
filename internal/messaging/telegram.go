@@ -463,12 +463,17 @@ type TelegramGateway struct {
 	// callback-query updates (inline-keyboard taps). It is invoked
 	// outside any per-chat lock (see CallbackHandler).
 	callbackHandler CallbackHandler
-	// questions, when set via SetQuestionRegistry, tracks pending
-	// ask_user_question questions: PollStream's message handler
-	// consults it before the per-chat lock (a typed reply answers
-	// a pending question), and the installed callback handler
-	// routes ask: taps through it. Nil means no questions.
-	questions *QuestionRegistry
+	// router, when installed via InstallCallbackRouter, dispatches
+	// taps by callback_data prefix to the tool that owns the
+	// prefix (framework-registered tools) and falls back to the
+	// approval handler for anything else. It is the installed
+	// callbackHandler's implementation; created on demand.
+	router *callbackRouter
+	// replyChain holds the typed-reply interceptors PollStream
+	// consults before the per-chat lock (a reply that answers a
+	// pending question must not wait on the lock the asking turn
+	// holds). Created on demand.
+	replyChain *replyChain
 	// logger, when set via WithLogger, receives polling-health notes:
 	// transient getUpdates failures and the recovery after them. It is
 	// nil by default (silent). Only redacted errors are ever passed
@@ -836,15 +841,21 @@ func (g *TelegramGateway) SetCallbackHandler(h CallbackHandler) {
 }
 
 // SetQuestionRegistry installs the pending-question registry the
-// gateway consults for ask_user_question: PollStream's message
-// handler answers a pending question from a typed reply before
-// the per-chat lock, and the installed callback handler routes
-// ask: taps through it. A nil registry means "no questions".
-// Call before PollStream starts; it must not race polling.
+// gateway consults for ask_user_question: the reply chain's
+// question interceptor answers a pending question from a typed
+// reply before the per-chat lock, and the callback router routes
+// ask: taps through it. A nil registry means "no questions" (the
+// interceptor is removed). Call before PollStream starts; it must
+// not race polling.
 func (g *TelegramGateway) SetQuestionRegistry(q *QuestionRegistry) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.questions = q
+	chain := g.replyChainForLocked()
+	if q == nil {
+		chain.setQuestion(nil)
+		return
+	}
+	chain.setQuestion(&questionReplyInterceptor{gw: g, questions: q})
 }
 
 // callbackHandlerFor returns the installed callback handler, or nil.
@@ -1550,22 +1561,29 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 // equivalent) or approvals can never be answered — the gate
 // prompts, but no tap reaches it.
 //
-// It also routes ask_user_question taps (callback data
-// "ask:<questionID>:<optionIndex>") through questions to
-// HandleQuestionCallback, so one installed handler serves both
-// the approval gate and the question asker — the gateway holds a
-// single callback handler, and a second installer would overwrite
-// the first. A nil questions registry means "no questions": ask:
-// taps are then answered as expired. Approval behaviour is
+// It is implemented on the callback router: the approval handler
+// is the router's fallback (perm: taps and unparseable data
+// alike), and the question handler is registered under "ask:"
+// (a nil questions registry means "no questions": ask: taps are
+// then answered as expired, exactly as before). One installed
+// handler serves both the approval gate and the question asker —
+// the gateway holds a single callback handler, and a second
+// installer would overwrite the first. Approval behaviour is
 // unchanged: anything that is not an ask: tap goes to
 // HandleApprovalCallback exactly as before.
+//
+// This is the compatibility installer for the test harnesses and
+// for callers that wire approvals directly; the binaries use the
+// framework's WireTelegram, which installs the same router.
 func InstallApprovalCallbackHandler(gw *TelegramGateway, gate *permissions.Gate, ownerID int64, cards *ApprovalCards, questions *QuestionRegistry, logPrefix string) {
-	gw.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
-		if _, _, ok := ParseQuestionCallback(q.Data); ok {
-			return HandleQuestionCallback(ctx, gw, questions, q, logPrefix)
-		}
-		return HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, logPrefix)
-	})
+	gw.SetApprovalFallback(gate, ownerID, cards, logPrefix)
+	// A duplicate "ask:" registration (the framework already
+	// installed one) is ignored: the handler is already there.
+	// The handler is registered even for a nil registry — an
+	// ask: tap with no questions is answered as expired, never
+	// silently dropped.
+	_ = gw.RegisterCallbackHandler(questionCallbackPrefix, questionCallbackHandler{questions: questions, logPrefix: logPrefix})
+	gw.InstallCallbackRouter()
 }
 
 // SendChatAction sends a chat action (e.g. "typing") to chatID, so the
@@ -2209,7 +2227,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// turn would deadlock until the question timed out. The
 		// defers above (markDecided, semaphore release) still run
 		// on this early return, so the update is confirmed.
-		if g.tryAnswerQuestion(upd) {
+		if g.replyChainTryAnswer(upd) {
 			return
 		}
 		lock := chatLock(upd.Message.Chat.ID)

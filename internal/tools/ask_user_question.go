@@ -9,15 +9,16 @@
 // back as the tool result and the agent continues.
 //
 // Transport lives outside this package: the tool holds a
-// QuestionAskFunc, installed by the daemon after it builds the
-// Telegram gateway (Registry.SetQuestionAsker, following the
-// PlanningStore seam). The Telegram implementation is in
-// internal/messaging (TelegramQuestionAsker), which reuses the
-// approval-callback machinery — the same callback_query dispatch,
-// the same requester-or-owner sender check, the same expiry-edit
-// pattern — instead of a second parallel callback system. A nil
-// asker (local CLI runs, which have no Telegram chat) makes the
-// tool fail cleanly with "not available" instead of hanging.
+// QuestionAskFunc, installed by the framework after it builds the
+// Telegram gateway (InstallQuestionAsker, via the
+// QuestionAskerInstaller capability). The Telegram implementation
+// is in internal/messaging (TelegramQuestionAsker), which reuses
+// the approval-callback machinery — the same callback_query
+// dispatch, the same requester-or-owner sender check, the same
+// expiry-edit pattern — instead of a second parallel callback
+// system. A nil asker (local CLI runs, which have no Telegram
+// chat) makes the tool fail cleanly with "not available" instead
+// of hanging.
 package tools
 
 import (
@@ -32,6 +33,17 @@ import (
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 )
+
+// The factory for this file's tool (framework auto-discovery).
+// It starts with no transport: the framework installs the
+// Telegram asker after it builds the gateway (see
+// InstallQuestionAsker). Local runs never install one, so the
+// tool fails cleanly there instead of hanging.
+func init() {
+	RegisterFactory("ask_user_question", func(deps ToolDeps) (Tool, error) {
+		return &askUserQuestionTool{}, nil
+	})
+}
 
 // Question timeouts and limits.
 //
@@ -76,6 +88,25 @@ type askUserQuestionTool struct {
 }
 
 func (t *askUserQuestionTool) Name() string { return "ask_user_question" }
+
+// RiskClass declares the tool safe: asking the user a question
+// never mutates the machine or the network, so the permission
+// gate must never prompt before the tool can ask.
+func (t *askUserQuestionTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+
+// InstallQuestionAsker installs the transport this tool uses to
+// reach the user. A nil fn is a no-op (the tool keeps whatever
+// asker it had, if any). Call before the tool serves turns: the
+// swap mutates the tool struct, so it must not race Execute. The
+// framework installs the Telegram asker after it builds the
+// gateway; local runs never install one, so the tool fails
+// cleanly there instead of hanging.
+func (t *askUserQuestionTool) InstallQuestionAsker(fn QuestionAskFunc) {
+	if t == nil || fn == nil {
+		return
+	}
+	t.ask = fn
+}
 
 func (t *askUserQuestionTool) Description() string {
 	return "Ask the user a clarifying question and wait for their answer instead of guessing. Use it when the task cannot proceed safely without the user's choice or information (ambiguous request, missing detail, a choice between options). The question is sent to the user as a Telegram message; if you supply options they appear as tap buttons, otherwise the user replies with free text. The call blocks until the user answers (default 5 minutes, set timeout_seconds to change it, 10s-30m), then returns the answer as JSON {\"answer\", \"source\" (\"button\" or \"text\"), \"option_index\" (-1 for a typed reply)}. On timeout it returns a timeout error — do not retry the same question immediately; proceed with your best judgement or explain you could not reach the user. Only available in a Telegram chat; in a local run it fails with a clear error."
@@ -179,44 +210,4 @@ func (t *askUserQuestionTool) Execute(ctx context.Context, args json.RawMessage)
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("could not encode the answer: %w", err)}
 	}
 	return string(out), nil
-}
-
-// SetQuestionAsker installs the transport the registry's
-// ask_user_question tool uses to reach the user. A nil fn is a
-// no-op (the tool keeps whatever asker it had, if any). Call
-// before the registry serves turns: the swap mutates the tool
-// struct, so it must not race Execute. The daemon installs the
-// Telegram asker after it builds the gateway; local runs never
-// install one, so the tool fails cleanly there instead of hanging.
-func (r *Registry) SetQuestionAsker(fn QuestionAskFunc) {
-	if r == nil || fn == nil {
-		return
-	}
-	t, ok := r.Get("ask_user_question")
-	if !ok {
-		return
-	}
-	qt, ok := t.(*askUserQuestionTool)
-	if !ok || qt == nil {
-		return
-	}
-	qt.ask = fn
-}
-
-// QuestionAsker returns the transport installed on the registry's
-// ask_user_question tool, or nil when none is installed (or the
-// registry has no such tool).
-func (r *Registry) QuestionAsker() QuestionAskFunc {
-	if r == nil {
-		return nil
-	}
-	t, ok := r.Get("ask_user_question")
-	if !ok {
-		return nil
-	}
-	qt, ok := t.(*askUserQuestionTool)
-	if !ok || qt == nil {
-		return nil
-	}
-	return qt.ask
 }

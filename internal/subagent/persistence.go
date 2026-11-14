@@ -108,10 +108,12 @@ func NewManagerWithStore(maxConcurrent int, dir string) *Manager {
 // persistence directory. WIRING (coordinator, internal/app/app.go):
 // replace the subagent construction with
 //
-//	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, registry.PlanningStore()), cfg.DataDir)
+//	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, planningStore), cfg.DataDir)
 //
-// cfg.DataDir is "" when unset, and "" means in-memory-only, so
-// the change is safe for hand-built Apps with no data dir.
+// where planningStore is the planning store Build creates and
+// passes to the registry in ToolDeps. cfg.DataDir is "" when
+// unset, and "" means in-memory-only, so the change is safe for
+// hand-built Apps with no data dir.
 func NewManagerWithExecutorAndStore(maxConcurrent int, exec Executor, dir string) *Manager {
 	m := NewManagerWithExecutor(maxConcurrent, exec)
 	m.storeDir = dir

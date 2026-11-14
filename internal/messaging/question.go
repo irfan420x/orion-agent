@@ -34,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/irfan/orion/internal/tools"
 )
 
 // questionCallbackPrefix is the callback_data prefix for question
@@ -299,9 +301,10 @@ func QuestionKeyboard(questionID string, options []string) InlineKeyboardMarkup 
 // TelegramQuestionAsker is the Telegram transport for
 // ask_user_question: it sends the question through gw and blocks
 // until the user answers. Its Ask method has the signature of
-// tools.QuestionAskFunc, so the daemon wires it with a method
-// value (registry.SetQuestionAsker(asker.Ask)) without either
-// package importing the other for the type.
+// tools.QuestionAskFunc, so the framework installs it with a
+// method value (WireTelegram passes asker.Ask to the tool's
+// InstallQuestionAsker) without either package importing the
+// other for the type.
 type TelegramQuestionAsker struct {
 	gw        *TelegramGateway
 	questions *QuestionRegistry
@@ -452,42 +455,45 @@ func (a *TelegramQuestionAsker) expireEdit(p *pendingQuestion) {
 // expired question is told so. Every tap is logged: a tap that
 // never arrives and a tap on a dead card must be distinguishable
 // in the log.
-func HandleQuestionCallback(ctx context.Context, gw *TelegramGateway, questions *QuestionRegistry, q TGCallbackQuery, logPrefix string) error {
+//
+// The gateway and query are the narrow tools interfaces (see
+// tools.CallbackGateway / tools.CallbackQuery): the router calls
+// this through the questionCallbackHandler adapter, and direct
+// callers pass the concrete gateway / query, which satisfy the
+// narrow interfaces. The behaviour is identical either way.
+func HandleQuestionCallback(ctx context.Context, gw tools.CallbackGateway, questions *QuestionRegistry, q tools.CallbackQuery, logPrefix string) error {
 	stderr := os.Stderr
-	id, index, ok := ParseQuestionCallback(q.Data)
+	id, index, ok := ParseQuestionCallback(q.CallbackData())
 	if !ok {
 		// The dispatcher only calls this for ask: data, so this
 		// is unreachable in production — but a direct caller
 		// must still get the same "unknown button" answer as
 		// the approval handler gives for unparseable data.
-		fmt.Fprintf(stderr, "%s: question tap: unparseable callback data %q (query %s)\n", logPrefix, q.Data, q.ID)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
+		fmt.Fprintf(stderr, "%s: question tap: unparseable callback data %q (query %s)\n", logPrefix, q.CallbackData(), q.CallbackID())
+		return gw.AnswerCallback(ctx, q.CallbackID(), "Unknown button.")
 	}
 	if questions == nil {
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This question has expired.")
+		return gw.AnswerCallback(ctx, q.CallbackID(), "This question has expired.")
 	}
-	senderID := int64(0)
-	if q.From != nil {
-		senderID = q.From.ID
-	}
+	senderID := q.SenderID()
 	fmt.Fprintf(stderr, "%s: question tap: %s option %d from %d\n", logPrefix, id, index, senderID)
 	p, found := questions.lookup(id)
 	if !found {
 		fmt.Fprintf(stderr, "%s: question tap: question %s expired (no longer pending)\n", logPrefix, id)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This question has expired.")
+		return gw.AnswerCallback(ctx, q.CallbackID(), "This question has expired.")
 	}
 	if !questions.canAnswer(p, senderID) {
 		fmt.Fprintf(stderr, "%s: question tap: question %s refused for sender %d (asker %d, owner %d)\n", logPrefix, id, senderID, p.senderID, questions.ownerID)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "Only the person who was asked can answer this.")
+		return gw.AnswerCallback(ctx, q.CallbackID(), "Only the person who was asked can answer this.")
 	}
 	if index < 0 || index >= len(p.options) {
 		fmt.Fprintf(stderr, "%s: question tap: question %s option %d out of range (%d options)\n", logPrefix, id, index, len(p.options))
-		return gw.AnswerCallbackQuery(ctx, q.ID, "Unknown button.")
+		return gw.AnswerCallback(ctx, q.CallbackID(), "Unknown button.")
 	}
 	answer := p.options[index]
 	if !questions.Resolve(id, questionResult{answer: answer, source: "button", optionIndex: index}) {
 		fmt.Fprintf(stderr, "%s: question tap: question %s expired during resolve\n", logPrefix, id)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This question has expired.")
+		return gw.AnswerCallback(ctx, q.CallbackID(), "This question has expired.")
 	}
 	fmt.Fprintf(stderr, "%s: question tap: question %s answered with option %d\n", logPrefix, id, index)
 	// Edit the question in place to show the answer. The answer
@@ -495,48 +501,79 @@ func HandleQuestionCallback(ctx context.Context, gw *TelegramGateway, questions 
 	// HTML, so it is escaped first — echoing it raw could break
 	// the markup (the same reason the approval outcome edit
 	// never echoes the request summary).
-	if q.Message != nil {
+	if q.HasMessage() {
 		text := "❓ Question: ✅ " + escapeHTML(answer)
-		if err := gw.EditMessageTextMarkup(ctx, q.Message.Chat.ID, q.Message.MessageID, text, InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+		if err := gw.EditTextRemoveKeyboard(ctx, q.MessageChatID(), q.MessageID(), text); err != nil {
 			fmt.Fprintf(stderr, "%s: question tap: question %s outcome edit failed: %v\n", logPrefix, id, err)
 		}
 	}
-	return gw.AnswerCallbackQuery(ctx, q.ID, truncateRunes(answer, 200))
+	return gw.AnswerCallback(ctx, q.CallbackID(), truncateRunes(answer, 200))
 }
 
-// tryAnswerQuestion consumes a text message as the free-text
-// answer to a pending question in its chat, if there is one. It
-// is called from PollStream's message handler BEFORE the per-chat
-// lock: the turn that asked is blocked waiting for the answer
-// and holds that lock, so routing the reply through a turn would
-// deadlock until the question timed out. It reports whether the
-// message was consumed (the caller then returns without starting
-// a turn). Commands ("/...") are never answers — they flow to
-// the normal turn path — and only the asker or the owner may
-// answer, so another chat member's message is never consumed.
-func (g *TelegramGateway) tryAnswerQuestion(upd Update) bool {
-	if g == nil || g.questions == nil || upd.Message == nil {
+// questionCallbackHandler is the tools.CallbackHandler adapter for
+// ask_user_question: the callback router dispatches "ask:" taps to
+// it, and it resolves them through HandleQuestionCallback. It is
+// the question tool's callback capability, expressed in the
+// framework's narrow interfaces — the tool itself (internal/tools)
+// cannot implement it, because the pending-question state lives
+// here (import cycle: tools -> messaging -> core -> tools).
+type questionCallbackHandler struct {
+	questions *QuestionRegistry
+	logPrefix string
+}
+
+// CallbackPrefix is the callback_data prefix this handler owns.
+func (h questionCallbackHandler) CallbackPrefix() string { return questionCallbackPrefix }
+
+// HandleCallback resolves one question option tap.
+func (h questionCallbackHandler) HandleCallback(ctx context.Context, gw tools.CallbackGateway, q tools.CallbackQuery) error {
+	return HandleQuestionCallback(ctx, gw, h.questions, q, h.logPrefix)
+}
+
+// questionReplyInterceptor is the tools.ReplyInterceptor for
+// ask_user_question: it answers pending questions from typed
+// replies. It is the question tool's reply capability, expressed
+// in the framework's narrow interfaces — the tool itself
+// (internal/tools) cannot implement it, because the
+// pending-question state lives here (import cycle: tools ->
+// messaging -> core -> tools). The gateway's reply chain holds it
+// (installed by SetQuestionRegistry); PollStream consults the
+// chain before the per-chat lock.
+type questionReplyInterceptor struct {
+	gw        *TelegramGateway
+	questions *QuestionRegistry
+}
+
+// TryAnswer consumes a text message as the free-text answer to a
+// pending question in its chat, if there is one. It is called from
+// the reply chain BEFORE the per-chat lock: the turn that asked is
+// blocked waiting for the answer and holds that lock, so routing
+// the reply through a turn would deadlock until the question timed
+// out. It reports whether the message was consumed (the caller
+// then returns without starting a turn). Commands ("/...") are
+// never answers — they flow to the normal turn path — and only the
+// asker or the owner may answer, so another chat member's message
+// is never consumed.
+func (in *questionReplyInterceptor) TryAnswer(upd tools.ReplyUpdate) bool {
+	if in == nil || in.questions == nil {
 		return false
 	}
-	text := strings.TrimSpace(upd.Message.Text)
-	if text == "" || strings.HasPrefix(text, "/") {
+	text := strings.TrimSpace(upd.Text())
+	if text == "" || upd.IsCommand() {
 		return false
 	}
-	senderID := int64(0)
-	if upd.Message.From != nil {
-		senderID = upd.Message.From.ID
-	}
-	p, ok := g.questions.PendingForChat(upd.Message.Chat.ID)
+	senderID := upd.SenderID()
+	p, ok := in.questions.PendingForChat(upd.ChatID())
 	if !ok {
 		return false
 	}
-	if !g.questions.canAnswer(p, senderID) {
+	if !in.questions.canAnswer(p, senderID) {
 		return false
 	}
-	if !g.questions.Resolve(p.id, questionResult{answer: text, source: "text", optionIndex: -1}) {
+	if !in.questions.Resolve(p.id, questionResult{answer: text, source: "text", optionIndex: -1}) {
 		return false
 	}
-	fmt.Fprintf(os.Stderr, "question: chat %d question %s answered by typed reply from %d\n", upd.Message.Chat.ID, p.id, senderID)
+	fmt.Fprintf(os.Stderr, "question: chat %d question %s answered by typed reply from %d\n", upd.ChatID(), p.id, senderID)
 	// Edit the question in place to show it was answered and
 	// remove the keyboard, so nobody taps a dead button. The
 	// answer is user text and the edit sends HTML, so it is
@@ -550,16 +587,16 @@ func (g *TelegramGateway) tryAnswerQuestion(upd Update) bool {
 	// instead of silently skipping the edit. The wait is bounded
 	// (1s) and only ever runs when the id is not yet recorded —
 	// in production a human reply always arrives long after.
-	msgID := g.questions.msgID(p)
+	msgID := in.questions.msgID(p)
 	for i := 0; i < 50 && msgID == 0; i++ {
 		time.Sleep(20 * time.Millisecond)
-		msgID = g.questions.msgID(p)
+		msgID = in.questions.msgID(p)
 	}
 	if msgID != 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		text := "❓ Question: ✅ " + escapeHTML(truncateRunes(text, 200))
-		_ = g.EditMessageTextMarkup(ctx, p.chatID, msgID, text, InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}})
+		_ = in.gw.EditTextRemoveKeyboard(ctx, p.chatID, msgID, text)
 	}
 	return true
 }
