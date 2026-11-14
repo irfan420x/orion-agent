@@ -54,6 +54,25 @@
 //     has dropped into the fresh user namespace (see above), so the
 //     user code runs as root inside its own user namespace and never
 //     as the agent's uid in the host user namespace.
+//   - That ordering is tried FIRST, but it is not the only one
+//     (F-A21-3): the probe also tries a second ordering — the user
+//     namespace created BY the clone (CLONE_NEWUSER with uid/gid
+//     mappings, so the child starts as root inside its own user
+//     namespace and holds CAP_SYS_ADMIN over the namespaces the
+//     same clone creates) — when the first ordering fails. On a
+//     plain host an unprivileged user has no CAP_SYS_ADMIN, so the
+//     first clone dies with EPERM and only the second ordering can
+//     work; on this VM's kernel the second ordering's /proc mount
+//     fails, so only the first can work. A wholesale swap to the
+//     second ordering would break the VM sandbox, so the probe
+//     tries both and caches whichever works for the process
+//     lifetime (see Available/Ordering); if neither works the
+//     sandbox stays unavailable and shell_exec refuses commands
+//     (fail-closed). The probe tries the second ordering on ANY
+//     first-ordering failure, not only EPERM: a wrapper-stage
+//     failure (e.g. the /proc mount) is ordering-dependent too,
+//     and a second probe is cheap — the fail-closed outcome is
+//     the same either way.
 //   - A plain chroot is escapable on its own: a process with
 //     CAP_SYS_CHROOT (uid 0 in its user namespace) can chroot to a
 //     subdirectory while its cwd is outside it, walk up past the
@@ -111,10 +130,13 @@
 //     this VM (the cell itself is a user-namespaced container; writing
 //     uid_map as nobody fails with EPERM), so the sandbox only works
 //     when the agent runs as root, or on a host that allows
-//     unprivileged user namespaces. The wrapper does all of its
-//     mounts before the user-namespace switch, while running as the
-//     agent's uid in the host user namespace, so as a non-root agent
-//     the very first mount fails and the probe reports the sandbox
+//     unprivileged user namespaces. With the default ordering the
+//     wrapper does all of its mounts before the user-namespace
+//     switch, while running as the agent's uid in the host user
+//     namespace, so as a non-root agent the very first mount fails;
+//     the probe then tries the userns-at-clone ordering, which
+//     needs no privilege beyond creating a user namespace. When
+//     neither ordering works the probe reports the sandbox
 //     unavailable. Available() probes the real mechanism and reports
 //     false otherwise; shell_exec then refuses the command
 //     (fail-closed) unless the operator explicitly opted into an
@@ -137,6 +159,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -422,9 +445,48 @@ fi
 exec unshare --user --map-root-user unshare --mount /bin/sh -c 'cd /work || exit 126; exec /bin/sh -c "$1"' _ "$CMD"
 `
 
+// sandboxOrdering is which namespace ordering a sandboxed command
+// uses — WHEN the user namespace is created relative to the clone.
+//
+//   - orderingAfterClone (the default, tried first): the clone
+//     requests the mount/PID/IPC/UTS (and network) namespaces but NO
+//     user namespace; the wrapper mounts /proc first and only then
+//     drops into a fresh user namespace with `unshare --user
+//     --map-root-user`. This is the only ordering that works on this
+//     VM's kernel, which refuses procfs mounts from inside a nested
+//     user namespace — and it is the ordering
+//     TestPrepareRequestsPIDNamespace pins (CLONE_NEWUSER NOT set).
+//   - orderingAtClone (the fallback): the user namespace is created
+//     BY the clone (CLONE_NEWUSER with uid/gid mappings), so the
+//     child starts as root inside its own user namespace. This is
+//     the only ordering that works for an unprivileged user on a
+//     plain host, who has no CAP_SYS_ADMIN for the other namespaces.
+type sandboxOrdering int
+
+const (
+	orderingAfterClone sandboxOrdering = iota
+	orderingAtClone
+)
+
+// String names the ordering for logs and `orion config show`.
+func (o sandboxOrdering) String() string {
+	if o == orderingAtClone {
+		return "userns-at-clone"
+	}
+	return "userns-after-clone"
+}
+
 var (
-	probeOnce sync.Once
-	probeErr  error
+	probeOnce     sync.Once
+	probeErr      error
+	probeOrdering sandboxOrdering
+	// probeDone is set (after probeErr/probeOrdering) once the
+	// probe has run. Prepare reads it to pick the probed ordering
+	// WITHOUT running the probe itself — runProbe calls Prepare,
+	// so probing from Prepare would recurse. A Load that observes
+	// true synchronizes with the Store, so the two values above
+	// are safe to read afterwards.
+	probeDone atomic.Bool
 )
 
 // Available reports whether the sandbox mechanism works on this host.
@@ -443,11 +505,70 @@ func AvailabilityError() error {
 	return probeErr
 }
 
+// Ordering reports which namespace ordering the probe selected:
+// "userns-after-clone" or "userns-at-clone". It is "" when the
+// sandbox is unavailable. It runs the probe itself when needed, so
+// it shares Available's process-lifetime cache: an operator fix to
+// the host (e.g. enabling unprivileged user namespaces) needs a
+// daemon restart to re-probe (F-A21-13).
+func Ordering() string {
+	probeOnce.Do(runProbe)
+	if probeErr != nil {
+		return ""
+	}
+	return probeOrdering.String()
+}
+
+// currentOrdering returns the ordering Prepare should use: the one
+// the probe selected, or the default ordering when the probe has not
+// run yet (direct Prepare callers, e.g. tests, and the probe itself
+// — which passes its ordering explicitly — never trigger a probe
+// from here).
+func currentOrdering() sandboxOrdering {
+	if probeDone.Load() && probeErr == nil {
+		return probeOrdering
+	}
+	return orderingAfterClone
+}
+
+// selectOrdering tries the current (after-clone) ordering first and
+// falls back to the userns-at-clone ordering when it fails, returning
+// the first ordering that works. The fallback runs on ANY first
+// failure, not only EPERM: a wrapper-stage failure (e.g. the /proc
+// mount, exit 126) is ordering-dependent too, and a second probe is
+// cheap. When neither works the error names both failures, so the
+// operator can see which ordering died where. The function takes the
+// probe so tests can drive the decision without a live host.
+func selectOrdering(probe func(sandboxOrdering) error) (sandboxOrdering, error) {
+	firstErr := probe(orderingAfterClone)
+	if firstErr == nil {
+		return orderingAfterClone, nil
+	}
+	secondErr := probe(orderingAtClone)
+	if secondErr == nil {
+		return orderingAtClone, nil
+	}
+	return orderingAfterClone, fmt.Errorf("sandbox unavailable: neither namespace ordering works — userns-after-clone ordering: %v; userns-at-clone ordering: %v", firstErr, secondErr)
+}
+
 func runProbe() {
+	o, err := selectOrdering(probeWithOrdering)
+	if err != nil {
+		probeErr = err
+	} else {
+		probeOrdering = o
+		probeErr = nil
+	}
+	probeDone.Store(true)
+}
+
+// probeWithOrdering runs one probe — a trivial command through the
+// full wrapper — with the given ordering, and returns nil when the
+// mechanism works that way.
+func probeWithOrdering(o sandboxOrdering) error {
 	dir, err := os.MkdirTemp("", "orion-sandbox-probe-*")
 	if err != nil {
-		probeErr = fmt.Errorf("sandbox: probe temp dir: %w", err)
-		return
+		return fmt.Errorf("sandbox: probe temp dir: %w", err)
 	}
 	defer os.RemoveAll(dir)
 	// The probe checks namespace/chroot availability only. The
@@ -461,16 +582,69 @@ func runProbe() {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "true")
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
-	if err := cfg.Prepare(cmd, "true"); err != nil {
-		probeErr = fmt.Errorf("sandbox: probe setup: %w", err)
-		return
+	if err := cfg.prepareWithOrdering(cmd, "true", o); err != nil {
+		return fmt.Errorf("sandbox: probe setup (%s): %w", o, err)
 	}
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
-		probeErr = fmt.Errorf("sandbox: probe command failed: %w", err)
-		return
+		return fmt.Errorf("sandbox: probe command failed (%s): %w", o, err)
 	}
+	return nil
+}
+
+// wrapperScriptFor returns the wrapper for the ordering. For
+// userns-at-clone the child is ALREADY root inside its own user
+// namespace (the clone created it and mapped the agent's uid/gid to
+// root), so the late `unshare --user --map-root-user` switch is
+// skipped — a second nested user namespace is not needed and its
+// switch would only re-nest the mounts. The fresh mount namespace
+// after the switch is kept (as a plain `unshare --mount`): the
+// process owns its mount namespace either way, and seccomp — not
+// the lack of a capability — stays what restricts mounts. The
+// comment above the switch is replaced with the at-clone truth so
+// the derived script never describes a switch that does not happen.
+func wrapperScriptFor(o sandboxOrdering) string {
+	if o != orderingAtClone {
+		return wrapperScript
+	}
+	out := strings.ReplaceAll(wrapperScript, "unshare --user --map-root-user unshare --mount", "unshare --mount")
+	out = strings.Replace(out, `# Drop into a fresh user namespace before any user code runs. The
+# wrapper has been running as the agent's uid in the host user
+# namespace until now (that is what allowed the mounts and the /proc
+# mount above); from here on the command runs as root inside its own
+# user namespace, with capabilities only over its own namespaces and
+# none over any host namespace — the same end state as creating the
+# user namespace at clone time, reached one step later so the /proc
+# mount stays possible. unshare --map-root-user maps the agent's
+# uid/gid to root inside (it writes the uid/gid maps for itself;
+# exec keeps this shell as PID 1 of the namespace, so the user shell
+# is PID 1 and reaps orphaned children). If the switch fails,
+# unshare exits non-zero and no user code runs.
+#
+# The mount namespace was created by the clone, so it is owned by
+# the host user namespace — after the switch the process would hold
+# no capabilities over it and could not mount anything at all, not
+# even a tmpfs on /tmp inside its own namespace. That would also
+# void the seccomp control test (mounts would be blocked with or
+# without the filter, so the filter's blocking would be unprovable).
+# So the switch is immediately followed by a fresh mount namespace,
+# a copy of the prepared one, owned by the new user namespace: the
+# process owns its mount namespace again, exactly as when the user
+# namespace was created at clone time, and seccomp — not the lack of
+# a capability — is what restricts mounts.`, `# The user namespace was created by the clone (userns-at-clone
+# ordering), so the wrapper already runs as root inside its own
+# user namespace, with capabilities only over its own namespaces
+# and none over any host namespace — the clone mapped the agent's
+# uid/gid to root inside. This shell is PID 1 of the namespace, so
+# the user shell is PID 1 and reaps orphaned children.
+#
+# The mount namespace was created by the same clone, so it is owned
+# by the new user namespace already; the fresh mount namespace
+# below keeps the shape identical to the after-clone ordering (a
+# copy of the prepared one), and seccomp — not the lack of a
+# capability — is what restricts mounts.`, 1)
+	return out
 }
 
 // resolveRootCanonical returns the canonical (symlink-free) form of
@@ -515,18 +689,27 @@ func resolveRootCanonical(root string) (string, error) {
 // and idempotent, so concurrent sandboxed commands can share one root
 // safely.
 //
-// The user namespace is NOT created here. The wrapper mounts /proc
-// first — the kernel on this host refuses procfs mounts from inside
-// a nested user namespace — and only then drops into a fresh user
+// With the default ordering (userns-after-clone) the user
+// namespace is NOT created here. The wrapper mounts /proc first —
+// the kernel on this host refuses procfs mounts from inside a
+// nested user namespace — and only then drops into a fresh user
 // namespace with `unshare --user --map-root-user` (agent uid/gid
 // mapped to root inside). The clone therefore requests the PID
 // namespace but no user namespace, and sets no uid/gid mappings:
 // the child starts as the agent's uid in the host user namespace
-// and the wrapper switches it before any user code runs. The PID
-// namespace is requested atomically with the other namespaces in
-// the single clone: if its creation fails the clone fails, the child
-// never starts, and the command never runs unconfined — there is no
-// path where the PID namespace is silently missing. See SECURITY.md
+// and the wrapper switches it before any user code runs.
+//
+// With the fallback ordering (userns-at-clone, F-A21-3) the user
+// namespace IS created here: CLONE_NEWUSER plus uid/gid mappings
+// (agent uid/gid mapped to root inside), so the child starts as
+// root inside its own user namespace and the wrapper skips its
+// late switch (see wrapperScriptFor). Prepare uses the ordering the
+// probe selected (currentOrdering); the probe itself passes its
+// ordering explicitly via prepareWithOrdering. The PID namespace is
+// requested atomically with the other namespaces in the single
+// clone: if its creation fails the clone fails, the child never
+// starts, and the command never runs unconfined — there is no path
+// where the PID namespace is silently missing. See SECURITY.md
 // ("PID namespace") for the fail-closed rules.
 //
 // cmd.Env should already hold the caller's scrubbed environment when
@@ -534,6 +717,14 @@ func resolveRootCanonical(root string) (string, error) {
 // in-sandbox values. The caller's SysProcAttr (e.g. Setpgid) is
 // preserved and extended with the namespace clone flags.
 func (c Config) Prepare(cmd *exec.Cmd, command string) error {
+	return c.prepareWithOrdering(cmd, command, currentOrdering())
+}
+
+// prepareWithOrdering is Prepare with an explicit namespace
+// ordering (see Prepare for the full contract). The probe uses it
+// to try each ordering in turn; production callers use Prepare,
+// which supplies the probed ordering.
+func (c Config) prepareWithOrdering(cmd *exec.Cmd, command string, ord sandboxOrdering) error {
 	if !c.Enabled {
 		return errors.New("sandbox: Prepare called on a disabled config")
 	}
@@ -650,15 +841,35 @@ func (c Config) Prepare(cmd *exec.Cmd, command string) error {
 		attr = &syscall.SysProcAttr{}
 	}
 	attr.Cloneflags |= cloneFlags
-	// No UidMappings/GidMappings: the user namespace is created by
-	// the wrapper (after the /proc mount), not by the clone — see
-	// the wrapperScript comment and SECURITY.md ("PID namespace").
+	if ord == orderingAtClone {
+		// The user namespace is created by the clone itself: the
+		// child starts as root inside its own user namespace, so
+		// it holds CAP_SYS_ADMIN over the namespaces this same
+		// clone creates — the only way an unprivileged user on a
+		// plain host can create them at all. The mappings are set
+		// only when the caller set none: a caller-provided mapping
+		// is never silently replaced. (Go writes "deny" to
+		// /proc/self/setgroups before the gid_map write, so the
+		// unprivileged gid mapping is accepted by the kernel.)
+		attr.Cloneflags |= syscall.CLONE_NEWUSER
+		if len(attr.UidMappings) == 0 {
+			attr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}}
+		}
+		if len(attr.GidMappings) == 0 {
+			attr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}}
+		}
+	} else {
+		// No UidMappings/GidMappings: the user namespace is created
+		// by the wrapper (after the /proc mount), not by the clone
+		// — see the wrapperScript comment and SECURITY.md
+		// ("PID namespace").
+	}
 	cmd.SysProcAttr = attr
 
 	// The user command travels as argv, never inside the script
 	// string, so no quoting in it can alter the setup.
 	cmd.Path = "/bin/sh"
-	cmd.Args = []string{"/bin/sh", "-c", wrapperScript, "orion-sandbox", root, command}
+	cmd.Args = []string{"/bin/sh", "-c", wrapperScriptFor(ord), "orion-sandbox", root, command}
 	// No Dir: the host cwd is meaningless after chroot; the wrapper
 	// cds to /work inside.
 	cmd.Dir = ""
