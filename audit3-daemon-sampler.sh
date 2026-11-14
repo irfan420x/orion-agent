@@ -1,17 +1,74 @@
 #!/bin/bash
 # Audit 3 Workstream 4 — daemon resource sampler.
 # Samples /proc/<pid>/status every 5 min and appends to the measurements file.
-# Usage: audit3-daemon-sampler.sh <pid> <label> <max_samples>
-# Stops when the PID disappears or max_samples is reached.
+# Usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>
+#   pid:    a fixed daemon PID to sample (original behaviour).
+#   follow: resolve the daemon PID dynamically each iteration via
+#           `systemctl show oriond -p MainPID --value`, so sampling
+#           survives daemon restarts (systemd service mode).
+#   label:  the release label written to the CSV/MD (e.g. rc21).
+#   auto:   derive the label each iteration from `bin/orion version`
+#           (e.g. "0.2.0-rc21" -> "rc21"); falls back to "unknown".
+#   max_samples: stop after this many samples; 0 = run forever
+#           (default 24 for fixed-PID mode, 0 for follow mode).
+# Fixed-PID mode stops when the PID disappears or max_samples is reached.
+# Follow mode never exits on a missing daemon: it waits 60s and retries.
 set -u
-PID="$1"
-LABEL="$2"
-MAX="${3:-24}"
+PID_ARG="${1:?usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>}"
+LABEL_ARG="${2:?usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>}"
+FOLLOW=0
+if [ "$PID_ARG" = "follow" ]; then
+  FOLLOW=1
+fi
+if [ "$FOLLOW" -eq 1 ]; then
+  MAX="${3:-0}"
+else
+  MAX="${3:-24}"
+fi
 OUT="$HOME/workspace/orion-go/AUDIT3_DAEMON_MEASUREMENTS.md"
 CSV="$HOME/workspace/orion-go/AUDIT3_DAEMON_SAMPLES.csv"
+ORION_BIN="$HOME/workspace/orion-go/bin/orion"
+
+# Derive the release label (e.g. rc21) from the built CLI version string.
+# Prints the fixed label unchanged when LABEL_ARG is not "auto".
+resolve_label() {
+  if [ "$LABEL_ARG" != "auto" ]; then
+    printf '%s' "$LABEL_ARG"
+    return
+  fi
+  ver=$("$ORION_BIN" version 2>/dev/null | awk '{print $2}')
+  if [ -n "$ver" ]; then
+    printf '%s' "$ver" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-//'
+  else
+    printf 'unknown'
+  fi
+}
+
+# Resolve the live daemon PID from systemd (follow mode only).
+resolve_pid() {
+  systemctl show oriond -p MainPID --value 2>/dev/null | tr -d ' '
+}
+
 n=0
-while [ "$n" -lt "$MAX" ]; do
+while :; do
+  if [ "$MAX" -ne 0 ] && [ "$n" -ge "$MAX" ]; then
+    break
+  fi
+  if [ "$FOLLOW" -eq 1 ]; then
+    PID=$(resolve_pid)
+    if [ -z "$PID" ] || [ "$PID" = "0" ]; then
+      sleep 60
+      continue
+    fi
+  else
+    PID="$PID_ARG"
+  fi
+  LABEL=$(resolve_label)
   if [ ! -d "/proc/$PID" ]; then
+    if [ "$FOLLOW" -eq 1 ]; then
+      sleep 60
+      continue
+    fi
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$LABEL] pid $PID gone after $n samples" >> "$OUT"
     exit 0
   fi

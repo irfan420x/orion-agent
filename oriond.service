@@ -28,11 +28,34 @@
 # Notes:
 # - Runs as a user unit (no root needed); oriond reads its config
 #   from ~/.orion/config.json.
-# - Restart=on-failure: a crash (e.g. a transient Telegram/network
-#   error) restarts the daemon after 5s; a clean Ctrl+C / systemctl
-#   stop does not restart it. RestartSec=5s avoids a tight loop if
-#   the token or provider config is wrong — fix the config and
-#   restart with `systemctl --user restart oriond`.
+# - Restart=always (F-A16-1): /restart exits 0, and a clean exit 0
+#   is a restart trigger ONLY with Restart=always — the previous
+#   Restart=on-failure never restarted on exit 0, so /restart
+#   killed the daemon permanently. An explicit
+#   `systemctl --user stop` still stops it (a requested stop is
+#   not a restart trigger); any other exit — /restart, a crash,
+#   a stray SIGTERM — restarts it after 5s. RestartSec=5s avoids
+#   a tight loop if the token or provider config is wrong — fix
+#   the config and restart with `systemctl --user restart oriond`.
+#   This fixes the /restart-kills-the-daemon bug; it does NOT
+#   explain the 2026-11-14 ~06:19 silent death (no "restart
+#   requested" line in that day's daemon log, and the owner was
+#   asleep), which remains unattributed.
+# - StartLimitBurst=12 in 60s (F-A16-6): give up (and surface the
+#   failure) instead of restarting forever on a persistent fault
+#   such as a revoked token; systemd stops trying until the unit
+#   is reset (`systemctl --user reset-failed oriond`) or started
+#   by hand. 12 matches the live unit (systemd/oriond.service).
+# - Linger (F-A16-6): install.sh --systemd runs
+#   `loginctl enable-linger $USER`, so the unit starts at boot
+#   and survives logout. Without linger a user unit stops on
+#   logout and does not start at boot until the user logs in.
+# - No watchdog (WatchdogSec, F-A16-6): a real watchdog needs
+#   sd_notify support in the daemon, which oriond does not have
+#   yet — future work, not a unit-file flag.
+# - Boot recovery is UNTESTED on this VM (no safe way to trigger
+#   a reboot there): the first boot after a laptop install should
+#   be checked with `systemctl --user status oriond`.
 
 [Unit]
 Description=Orion daemon — model-agnostic OS agent (Telegram gateway)
@@ -40,16 +63,16 @@ Documentation=https://github.com/irfan420x/orion-agent
 After=network-online.target
 Wants=network-online.target
 # Give up (and surface the failure) instead of restarting forever on
-# a persistent fault such as a revoked token: 5 restarts in 60s, then
+# a persistent fault such as a revoked token: 12 restarts in 60s, then
 # systemd stops trying until the unit is reset/started by hand.
 StartLimitIntervalSec=60s
-StartLimitBurst=5
+StartLimitBurst=12
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/oriond
 WorkingDirectory=%h
-Restart=on-failure
+Restart=always
 RestartSec=5s
 
 [Install]

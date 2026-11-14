@@ -26,6 +26,19 @@
 // Enabling it does not weaken the sandbox: the server runs in
 // the daemon process, outside any shell_exec sandbox, and touches
 // no sandbox state.
+//
+// Hardening (F-A16-8): the server carries explicit timeouts
+// (ServerReadTimeout / ServerWriteTimeout / ServerIdleTimeout)
+// and the expensive handlers (profile, trace, and the index's
+// delta profiles) cap their `seconds` parameter at
+// MaxProfileSeconds. The cap is what bounds the expensive work:
+// a 30s CPU profile is the stdlib default and the longest
+// profile this endpoint will run, so a request for
+// ?seconds=3600 cannot keep the daemon profiling for an hour.
+// The WriteTimeout does not cut a capped profile short —
+// net/http/pprof extends the write deadline by WriteTimeout +
+// seconds for profile/trace — so 60s of headroom over the 30s
+// cap keeps normal pprof working with room to spare.
 package debug
 
 import (
@@ -47,6 +60,50 @@ const DefaultPprofPort = 6060
 // binds. It is a constant, not a config value: no configuration
 // can make the endpoint listen on 0.0.0.0 or any other interface.
 const LoopbackHost = "127.0.0.1"
+
+// Server timeouts (F-A16-8). ReadTimeout bounds how long a
+// client may take to send a request (pprof requests have no
+// body, so 10s is generous); WriteTimeout bounds a single
+// response write, and pprof's profile/trace handlers extend it
+// by the profile duration, so a capped 30s profile gets a 90s
+// deadline; IdleTimeout reaps idle keep-alive connections so a
+// client cannot hold connections open indefinitely.
+const (
+	ServerReadTimeout  = 10 * time.Second
+	ServerWriteTimeout = 60 * time.Second
+	ServerIdleTimeout  = 60 * time.Second
+)
+
+// MaxProfileSeconds is the longest CPU profile / execution trace
+// (or index delta profile) this endpoint will run. It equals
+// the stdlib's default profile duration, so ordinary pprof use
+// (including `go tool pprof .../profile?seconds=30`) is
+// unaffected; only requests asking for longer are clamped.
+const MaxProfileSeconds = 30
+
+// capProfileSeconds wraps a pprof handler and clamps its
+// `seconds` query parameter to MaxProfileSeconds. A missing,
+// invalid, zero, negative, or in-range value passes through
+// untouched, so the stdlib defaults still apply (profile: 30s,
+// trace: 1s); only a value above the cap is rewritten, to the
+// cap. The request is cloned, so the caller's request is never
+// mutated.
+func capProfileSeconds(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			if v, err := strconv.ParseFloat(s, 64); err == nil && v > MaxProfileSeconds {
+				q := r.URL.Query()
+				q.Set("seconds", strconv.Itoa(MaxProfileSeconds))
+				r2 := r.Clone(r.Context())
+				u := *r.URL
+				u.RawQuery = q.Encode()
+				r2.URL = &u
+				r = r2
+			}
+		}
+		next(w, r)
+	}
+}
 
 // Config is the debug endpoint's configuration.
 type Config struct {
@@ -81,11 +138,11 @@ func Start(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("debug: port %d is out of range (0-65535)", cfg.Port)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/", capProfileSeconds(pprof.Index))
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/profile", capProfileSeconds(pprof.Profile))
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.HandleFunc("/debug/pprof/trace", capProfileSeconds(pprof.Trace))
 	mux.HandleFunc("/debug/pprof", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/debug/pprof/", http.StatusFound)
 	})
@@ -96,6 +153,9 @@ func Start(cfg Config) (*Server, error) {
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       ServerReadTimeout,
+		WriteTimeout:      ServerWriteTimeout,
+		IdleTimeout:       ServerIdleTimeout,
 	}
 	s := &Server{Addr: ln.Addr().String(), srv: srv, ln: ln}
 	go func() {

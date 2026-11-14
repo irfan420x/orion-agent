@@ -220,8 +220,16 @@ func TestGateAlwaysAllowPersistsRule(t *testing.T) {
 	if ok, reason := g.Check(ctxWithChat(t), "web_fetch", `{"url":"https://example.com"}`); !ok {
 		t.Fatalf("always-allow call denied: %s", reason)
 	}
-	if a, ok := rules.Lookup("web_fetch"); !ok || a != ActionAllow {
+	// The rule is per-chat (F-A16-3): it is stored for chat 42
+	// (the ctxWithChat chat), not globally.
+	if a, ok := rules.LookupForChat(42, "web_fetch"); !ok || a != ActionAllow {
 		t.Errorf("rule after always-allow = %q/%v, want allow/true", a, ok)
+	}
+	if _, ok := rules.LookupForChat(43, "web_fetch"); ok {
+		t.Error("always-allow rule for chat 42 leaked into chat 43")
+	}
+	if _, ok := rules.Lookup("web_fetch"); ok {
+		t.Error("always-allow rule for chat 42 leaked into the global rules")
 	}
 	// Second call now passes without prompting.
 	prompted := false
@@ -251,8 +259,12 @@ func TestGateNeverAllowPersistsDenyRule(t *testing.T) {
 	if ok, _ := g.Check(ctxWithChat(t), "shell_exec", `{"command":"echo hi"}`); ok {
 		t.Fatal("never-allow call was allowed")
 	}
-	if a, ok := rules.Lookup("shell_exec"); !ok || a != ActionDeny {
+	// Per-chat (F-A16-3): stored for chat 42 only.
+	if a, ok := rules.LookupForChat(42, "shell_exec"); !ok || a != ActionDeny {
 		t.Errorf("rule after never-allow = %q/%v, want deny/true", a, ok)
+	}
+	if _, ok := rules.LookupForChat(43, "shell_exec"); ok {
+		t.Error("never-allow rule for chat 42 leaked into chat 43")
 	}
 }
 

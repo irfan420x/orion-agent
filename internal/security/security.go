@@ -26,6 +26,7 @@
 package security
 
 import (
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -2267,6 +2268,18 @@ func chmodsSystemPath(skeleton string, strs []string) bool {
 // argument must be refused.
 func blockedInterpreterPayload(code, kind string) bool {
 	a := analyzePayload(code, kind)
+	// Reads of sensitive paths from inline code
+	// (F-A16-9): open('/home/hatch/.orion/config.json') in a
+	// -c/-e one-liner is the same read as `cat` on the shell,
+	// so a string literal naming a sensitive path is refused.
+	// A path built by concatenation or read from a variable is
+	// not visible here — the same known limit as the other
+	// interpreter checks — and is left to the sandbox.
+	for _, s := range a.strings {
+		if isSensitivePath(s, nil) {
+			return true
+		}
+	}
 	// Destructive operations in the code itself.
 	for _, re := range interpreterDestructiveAPIs {
 		if re.MatchString(a.skeleton) {
@@ -2315,6 +2328,271 @@ func blockedInterpreterPayload(code, kind string) bool {
 	return false
 }
 
+// ---------------------------------------------------------------------
+// Sensitive-path reads (F-A16-9, rc22).
+//
+// The file tool already refuses $HOME/.orion, $HOME/.ssh and
+// $HOME/.gnupg (internal/tools/files.go), but shell_exec relied on
+// the sandbox plus env scrubbing alone: with the sandbox on
+// (the default) a read of ~/.orion/config.json fails inside the
+// chroot, yet an operator who explicitly opts out of the sandbox
+// (sandbox.enabled=false, ORION_SANDBOX=off, or
+// allow_unsandboxed_fallback=true plus a sandbox failure) would
+// let `cat ~/.orion/config.json` succeed and up to 64KB of config
+// — Telegram token, API keys — reach the model. This rule is the
+// second layer: any shell operand naming a sensitive path is
+// refused, whatever the binary, so the opt-out cannot re-open
+// P0-O1.
+//
+// The rule mirrors the file tool's set exactly (the three home
+// subdirectories above) and is deliberately tight: ordinary reads
+// (cat README.md, cat /etc/hostname, cat ~/workspace/.orion/x —
+// a directory merely NAMED .orion under the workspace, not the
+// home one) stay allowed. What it covers, per segment, after the
+// usual wrapper/variable resolution:
+//
+//   - `~/.orion/...`, `~/.ssh/...`, `~/.gnupg/...` and `~user/...`
+//     tilde forms, `$HOME/...` and `${HOME}/...` forms, absolute
+//     paths (the current user's home and any /home/<user> or
+//     /root home), relative paths resolved against the working
+//     directory, `cat` with several operands (any one sensitive
+//     operand blocks the whole command), pipes (each segment is
+//     checked), input redirection (`grep x < ~/.orion/...`), and
+//     --flag=<path> forms. A path reached through a variable
+//     (`f=$HOME/.orion/config.json; cat $f`) is checked after
+//     expansion, and a HOME assignment in the command itself
+//     (`HOME=/tmp; cat $HOME/.orion/...`) is honoured the way the
+//     shell would honour it.
+//
+// Deliberate limits (documented, not oversights):
+//
+//   - An operand whose variable cannot be resolved statically
+//     (`cat $X/.orion/config.json` with $X unassigned) is left
+//     to the sandbox: the denylist cannot prove where it points.
+//     $HOME is the exception — it is resolved from the process
+//     environment, so the canonical `cat $HOME/.orion/...` is
+//     caught.
+//   - Symlinks are not resolved: `ln -s ~/.orion /tmp/l; cat
+//     /tmp/l/config.json` names no sensitive path literally, so
+//     the denylist cannot see it; the sandbox (when on) and the
+//     file tool remain the backstop. The same holds for paths
+//     built by string concatenation inside an interpreter, and
+//     for a shell that reads the file without naming it
+//     (e.g. `cat <&3` after an earlier open).
+//   - Merely mentioning a sensitive path is also refused
+//     (e.g. `echo ~/.orion/config.json` prints the path string,
+//     it does not read the file). The denylist cannot prove an
+//     arbitrary binary will not read its operand, so the rule is
+//     fail-closed on any operand; refusing a mention is harmless
+//     and keeps the rule one check instead of a per-binary
+//     read/no-read matrix.
+//   - `~` / $HOME forms are refused even if the command
+//     reassigns HOME first (`HOME=/tmp; cat $HOME/.orion/...`):
+//     the literal form names the operator's real config in the
+//     normal case, and refusing the reassigned edge case costs
+//     nothing. A path reached only through a variable
+//     (`f=$HOME/...; cat $f`) IS resolved with the reassigned
+//     HOME, the way the shell would resolve it.
+// ---------------------------------------------------------------------
+
+// sensitiveDirNames are the home subdirectories whose contents
+// must never be read through shell_exec.
+var sensitiveDirNames = []string{".orion", ".ssh", ".gnupg"}
+
+// isSensitiveDirName reports whether name is one of the
+// sensitive home subdirectories.
+func isSensitiveDirName(name string) bool {
+	for _, n := range sensitiveDirNames {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// sensitiveHomeDirs returns the absolute sensitive directories
+// for the current user's home, or nil when the home cannot be
+// determined (the home-prefixed and /home/<user> checks below
+// still apply then).
+func sensitiveHomeDirs() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	dirs := make([]string, 0, len(sensitiveDirNames))
+	for _, n := range sensitiveDirNames {
+		dirs = append(dirs, filepath.Join(home, n))
+	}
+	return dirs
+}
+
+// homeDirForRead resolves the home directory for a read-path
+// check: a HOME assignment in the command wins (the shell would
+// use it for $HOME and ~), else the process home.
+func homeDirForRead(vars map[string][]string) string {
+	if v, ok := vars["HOME"]; ok && len(v) > 0 {
+		return strings.Join(v, " ")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
+}
+
+// homePrefixedSensitive reports whether s names a sensitive
+// directory directly under a home prefix (~, $HOME, ${HOME})
+// without needing to know where home is, so the rule still holds
+// when the home directory cannot be determined.
+func homePrefixedSensitive(s string) bool {
+	var rest string
+	switch {
+	case strings.HasPrefix(s, "~/"):
+		rest = s[2:]
+	case strings.HasPrefix(s, "$HOME/"):
+		rest = s[len("$HOME/"):]
+	case strings.HasPrefix(s, "${HOME}/"):
+		rest = s[len("${HOME}/"):]
+	default:
+		return false
+	}
+	first, _, _ := strings.Cut(rest, "/")
+	return isSensitiveDirName(first)
+}
+
+// expandReadPath resolves s to a cleaned absolute path, or
+// reports false when it cannot be resolved statically. Tilde,
+// $HOME and ${HOME} prefixes are expanded; other $ variables
+// are resolved through the command's assignments (expandTarget);
+// an unresolvable expansion (unknown variable, command
+// substitution) returns false.
+func expandReadPath(s string, vars map[string][]string) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	home := homeDirForRead(vars)
+	// Loop so a $HOME that only appears after variable
+	// expansion (f=$HOME/.orion/config.json; cat $f) is
+	// expanded too. Bounded: each pass must change s.
+	for i := 0; i < 4; i++ {
+		changed := false
+		// Tilde: ~/... is the current home; ~user/... is that
+		// user's home, which lives under /home on this system.
+		if s == "~" {
+			if home == "" {
+				return "", false
+			}
+			return home, true
+		}
+		if strings.HasPrefix(s, "~/") {
+			if home == "" {
+				return "", false
+			}
+			s = home + s[1:]
+			changed = true
+		} else if strings.HasPrefix(s, "~") {
+			if j := strings.IndexByte(s, '/'); j > 1 {
+				s = filepath.Join("/home", s[1:j], s[j+1:])
+			} else if len(s) > 1 {
+				s = filepath.Join("/home", s[1:])
+			}
+			changed = true
+		}
+		// $HOME / ${HOME} on its own, or as a prefix:
+		// expandTarget cannot resolve $HOME (it is not a
+		// command assignment), so handle it here first.
+		if s == "$HOME" || s == "${HOME}" {
+			if home == "" {
+				return "", false
+			}
+			return home, true
+		}
+		for _, prefix := range []string{"$HOME/", "${HOME}/"} {
+			if strings.HasPrefix(s, prefix) {
+				if home == "" {
+					return "", false
+				}
+				s = home + s[len(prefix)-1:] // keep the "/"
+				changed = true
+				break
+			}
+		}
+		if strings.Contains(s, "$") || strings.Contains(s, "`") {
+			expanded, ok := expandTarget(s, vars)
+			if !ok {
+				return "", false
+			}
+			if expanded != s {
+				s = expanded
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	if filepath.IsAbs(s) {
+		return filepath.Clean(s), true
+	}
+	abs, err := filepath.Abs(s)
+	if err != nil {
+		return "", false
+	}
+	return abs, true
+}
+
+// isSensitivePath reports whether p, after ~/ $HOME / variable
+// expansion and cleaning, is inside a sensitive directory: the
+// current user's $HOME/.orion, $HOME/.ssh or $HOME/.gnupg, or
+// any other user's /home/<user>/.orion|... or /root/.orion|... .
+// A directory merely named .orion/.ssh/.gnupg elsewhere (for
+// example ~/workspace/.orion) is not sensitive.
+func isSensitivePath(p string, vars map[string][]string) bool {
+	if p == "" {
+		return false
+	}
+	if homePrefixedSensitive(p) {
+		return true
+	}
+	abs, ok := expandReadPath(p, vars)
+	if !ok {
+		return false
+	}
+	for _, d := range sensitiveHomeDirs() {
+		if abs == d || strings.HasPrefix(abs, d+string(filepath.Separator)) {
+			return true
+		}
+	}
+	// Other users' homes and root's home. abs is absolute, so
+	// parts[0] is "".
+	parts := strings.Split(abs, string(filepath.Separator))
+	if len(parts) >= 4 && parts[1] == "home" && isSensitiveDirName(parts[3]) {
+		return true
+	}
+	if len(parts) >= 3 && parts[1] == "root" && isSensitiveDirName(parts[2]) {
+		return true
+	}
+	return false
+}
+
+// readsSensitivePath reports whether any operand of seg names a
+// sensitive path (F-A16-9). Every token is checked, whatever the
+// binary, and --flag=<path> values are checked too; see the
+// section comment above for the deliberate limits.
+func readsSensitivePath(seg []string, vars map[string][]string) bool {
+	for _, tok := range seg {
+		if isSensitivePath(tok, vars) {
+			return true
+		}
+		if i := strings.IndexByte(tok, '='); i >= 0 {
+			if isSensitivePath(tok[i+1:], vars) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // IsBlockedCommand reports whether a shell command string must be refused.
 // It is TOKEN-BASED: the binary basename is resolved (so /bin/rm,
 // /usr/bin/rm, ./rm all match "rm"), wrappers and shell keywords are
@@ -2353,7 +2631,7 @@ func isBlockedCommand(cmd string, outer map[string][]string) bool {
 		// it, so `x=rm; $x -rf /` resolves while an assignment in a
 		// later segment does not affect an earlier one.
 		collectSegmentAssignments(seg, vars)
-		if blockedSegment(seg, vars) || blockedRedirect(seg, vars) {
+		if blockedSegment(seg, vars) || blockedRedirect(seg, vars) || readsSensitivePath(seg, vars) {
 			return true
 		}
 	}

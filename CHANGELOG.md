@@ -4,6 +4,156 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc22] — 2026-11-14
+
+### Audit 16 fixes (v0.2.0-rc22) — see `AUDIT16_2026-11-14.md`
+
+Fixes the P1 and all eight P2s from the fresh-eyes audit of rc21
+(0 P0, 1 P1, 8 P2). Audit 15's fixes are all genuinely fixed and
+all earlier fixes still hold; rc8 security holds; pprof 7/7 PASS.
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open. Verified by the release coordinator on the final
+commit: **1,250 tests pass, 0 fail, 4 skip (total 1,254), 22/22
+packages, race clean 22/22, no data race** (rc21: 1,227 total:
+1,223 pass, 0 fail, 4 skip). New
+regression tests: 27 top-level functions — `cmd/oriond/
+rc22_teama_test.go` (4) and `cmd/orion/rc22_teama_test.go` (3),
+`internal/permissions/rc22_teamb_test.go` (7) and
+`internal/messaging/rc22_teamb_test.go` (5),
+`internal/skills/rc22_skills_test.go` (3 functions, 45 subtests),
+`internal/debug/debug_test.go` (3) and
+`internal/security/audit16_fix_test.go` (2).
+
+- **F-A16-1 (P1)** — `/restart` killed the daemon permanently with
+  the SHIPPED unit: `oriond.service` had `Restart=on-failure` while
+  `/restart` exits 0, so systemd never restarted it; the code
+  comment in `cmd/oriond/main.go` claimed a `Restart=on-success`
+  that exists nowhere. The shipped unit is now `Restart=always`
+  (NOT on-success, and `/restart` still exits 0 — one fix, per the
+  auditor's direction), the comment is fixed, and the live unit
+  `./systemd/oriond.service` (already `Restart=always`) is verified
+  in sync. Verified with a scratch dummy unit: exit 0 with
+  `Restart=always` restarts (NRestarts=4 in 10 s); with the old
+  `on-failure` it stays dead (NRestarts=0) — the original bug
+  reproduced. This does NOT explain the 2026-11-14 ~06:19 silent
+  death ("restart requested" appears 0 times in that day's daemon
+  log, and the owner was asleep); it fixes a real bug that WOULD
+  kill the daemon on the laptop, where `install.sh` installs the
+  shipped unit.
+- **F-A16-2** — `allowed_updates` appeared nowhere in rc21, so a
+  stale server-side filter could silently kill approval callbacks
+  again (the rc8 incident). The first successful
+  `fetchUpdatesLocked` call now sends
+  `allowed_updates=["message","callback_query"]`, once per gateway
+  lifetime, which also resets a stale server-side filter. A failed
+  filter can never fail startup or stop polling: the flag is set
+  only after a fetch succeeds, so a failed first fetch retries the
+  filter on the next fetch; on success the gateway logs the filter
+  being set. No extra round-trip, no update consumed.
+- **F-A16-3** — "Always/Never" rules were global (keyed by tool
+  name only), so one chat's decision silenced approval for every
+  chat. Rules are now per-chat (`chatID + tool`); the gate looks
+  up via `LookupForChat` and persists via `SetForChat`. Legacy v1
+  rules on disk load as global (chat 0) and keep applying — the
+  live `shell_exec: allow` rule is NOT silently revoked; every
+  rule written from rc22 on is per-chat (v2 format, same file
+  shape). The approval card now says Always/Never remembers "for
+  this tool in this chat only". The denylist stays absolute and
+  first in `Check`.
+- **F-A16-4** — `neverVerbWords` over-blocked genuine verbs
+  `free`/`slow`: "free the plan", "free users", "slow the
+  rollout", "slow users" all rejected. They are removed from
+  `neverVerbWords` and form a new `transitiveOnlyVerbs` class:
+  no verb reading without an object, so the general shape
+  predicates stay closed to them and only the explicit
+  object rules in `clauseVerbAt` admit them (article, pronoun,
+  and bare-plural branches, gated on a complete subject). Bare
+  clause-final `free`/`slow` still reject, and before a
+  participle they stay modifiers. Two simpler designs were
+  probed and rejected: removing them alone re-opens the F-A15-1
+  fail-open family, and adding them to `baseFormVerbs` breaks
+  rc20's F-A15-3 guard. `busy`/`fast` stay in `neverVerbWords`
+  ("busy the plan", "fast the plan" still reject). D4 from Audit
+  13 §7 ("Activate the tool, the skill and the venv running
+  tests") was verified still loading and is now pinned under the
+  `D4` label (`TestRC22Audit13D4StillLoads`).
+- **F-A16-5** — SIGTERM/SIGINT shut the daemon down with no log
+  line, and SIGHUP was not caught at all. Both binaries now use
+  an explicit signal channel so the shutdown path knows which
+  signal fired and logs `shutting down on SIGTERM...` plus
+  `shutdown complete`; SIGHUP is ignored with a log line (a
+  daemon must outlive its terminal — stopping is via SIGINT/
+  SIGTERM, `/restart`, or `systemctl stop`; in `cmd/orion` the
+  ignore is scoped to long-running `pollTelegram` only). A
+  `signalName()` helper spells SIGTERM/SIGINT/SIGHUP in logs
+  instead of Go's "terminated"/"interrupt".
+- **F-A16-6** — the systemd path: `install.sh --systemd` now
+  does `systemctl --user enable --now` (enable-only left the
+  operator believing the bot runs when it doesn't) and
+  `loginctl enable-linger $USER` (best-effort — warns, never
+  fails the install). `StartLimitBurst` raised 5 → 12 in the
+  60 s window (matches the live unit). A watchdog is NOT
+  implemented — it needs `sd_notify` support in the daemon, a
+  bigger change; documented as future work in the unit header
+  and `ARCHITECTURE.md`. Boot recovery of the shipped user unit
+  on a laptop is still untested (no safe reboot on this VM) and
+  documented as such. NOTE: this VM rebooted 2026-11-14 ~08:19
+  SGT and both live system units came back on their own
+  (oriond PID 2030, sampler PID 2031, ~2 min after boot) —
+  boot auto-start is now live-proven for the LIVE units.
+- **F-A16-7** — `orion telegram poll` never started the pprof
+  endpoint even with `pprof_enabled=true`. The poll path now
+  calls the endpoint via a shared `startDebugEndpoint()` helper
+  used by both `cmdTelegram` poll and `cmdDaemon` (safe when
+  disabled — `debug.Start` returns `(nil, nil)`); the "same …
+  endpoint as oriond" doc comment is now true for all three
+  Telegram polling entrypoints.
+- **F-A16-8** — pprof hardening (not a vuln — loopback-only +
+  opt-in): the server now sets `ReadTimeout` 10 s,
+  `WriteTimeout` 60 s, `IdleTimeout` 60 s, and profile/trace
+  requests are capped at 30 s (`MaxProfileSeconds`, the stdlib
+  default — ordinary pprof use unaffected). WriteTimeout 60 s
+  does not cut off a 30 s profile: the stdlib extends the write
+  deadline by `WriteTimeout + seconds`. No auth added — the
+  existing security model stands.
+- **F-A16-9** — the denylist blocked destructive/write/network
+  ops but not plain reads like `cat ~/.orion/config.json`, so an
+  explicit sandbox opt-out would re-open P0-O1. `IsBlockedCommand`
+  now refuses reads of sensitive paths (`~/.orion`, `~/.ssh`,
+  `~/.gnupg`, plus any other user's `/home/<user>/` and `/root/`
+  equivalents — mirroring the file tool), covering `~`, `$HOME`,
+  absolute/relative paths, pipes, input redirection, `--flag=`
+  forms, globs, and variable indirection. Documented
+  non-coverage (unresolvable variables, symlinks, paths built by
+  string concatenation inside interpreters) stays with the
+  sandbox/file tool as backstop. Tests call `IsBlockedCommand`
+  directly — never a live destructive command.
+
+Also folded into rc22 (not audit findings):
+
+- The uncommitted `audit3-daemon-sampler.sh` follow mode (for the
+  systemd sampler service) is committed as part of rc22.
+- CHANGELOG fix (auditor §8 #1): the rc19 subtest count said
+  "204" — the file has 198 cases (40+21+12+31+51+43), verified by
+  counting. Fixed to 198.
+- Auditor §8 #2 is an auditor error, not a repo gap:
+  `AUDIT11_2026-11-14.md` … `AUDIT15_2026-11-14.md` DO exist at
+  `~/workspace/orion-go/` — the auditor looked in
+  `~/workspace/orion-audit/` (wrong directory). No change needed.
+
+Deliberately NOT done (and why):
+
+- NO WhatsApp gateway. The auditor's §9 "WhatsApp first"
+  recommendation CONTRADICTS Irfan's explicit rule: Telegram
+  ONLY, WhatsApp dropped, do NOT build WhatsApp support or the
+  Baileys bridge.
+- NO cron/scheduler, generic provider adapter, prebuilt-binary
+  pipeline, UI, or browser/calendar/email tools. Those are
+  feature-phase items (only AFTER production-ready) or
+  competitive notes, not rc22.
+- NO audit spawned. Audits are Muse #1's job (via the shared
+  repo, user is the bridge).
+
 ## [0.2.0-rc21] — 2026-11-14
 
 ### F-A3-2 fix (v0.2.0-rc21) — debug/pprof endpoint
@@ -224,7 +374,7 @@ tests pass, 0 fail, 4 skip (total 1,207), 21/21 packages, race clean
   loads — the aux is the verb, F-A13-3). Words that ARE also verbs
   are deliberately absent: "reference", "report", "setting" (R3).
 - Regression tests: `internal/skills/rc19_skills_test.go` — 6 test
-  functions, 204 subtests (F-A14-1 must-load, F-A14-2 must-load,
+  functions, 198 subtests (F-A14-1 must-load, F-A14-2 must-load,
   F-A14-3 must-reject, F-A14-4 must-reject, and two guard functions
   covering the F-A13-1/2/3 behaviours, the F-A12-1 flip cases, the
   F-A12-2 base-form cases, the Audit 12 pin-down and the Audit 13 §7

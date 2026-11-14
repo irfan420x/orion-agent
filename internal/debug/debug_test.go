@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -239,6 +240,105 @@ func TestNoSecretInServedOutput(t *testing.T) {
 		if bytes.Contains(body, []byte(secret)) {
 			t.Errorf("GET %s: served output contains the secret", path)
 		}
+	}
+}
+
+// F-A16-8 (rc22): the debug server must carry explicit
+// Read/Write/Idle timeouts, and the write timeout must leave a
+// capped profile room to finish (WriteTimeout > MaxProfileSeconds).
+func TestServerTimeoutsAreSet(t *testing.T) {
+	srv, err := Start(Config{Enabled: true, Port: 0})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Close()
+	if srv.srv.ReadHeaderTimeout != 5*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want 5s", srv.srv.ReadHeaderTimeout)
+	}
+	if srv.srv.ReadTimeout != ServerReadTimeout {
+		t.Errorf("ReadTimeout = %v, want ServerReadTimeout %v", srv.srv.ReadTimeout, ServerReadTimeout)
+	}
+	if srv.srv.WriteTimeout != ServerWriteTimeout {
+		t.Errorf("WriteTimeout = %v, want ServerWriteTimeout %v", srv.srv.WriteTimeout, ServerWriteTimeout)
+	}
+	if srv.srv.IdleTimeout != ServerIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want ServerIdleTimeout %v", srv.srv.IdleTimeout, ServerIdleTimeout)
+	}
+	// The cap is what bounds the expensive work, so the write
+	// timeout must clear it with headroom: a capped profile
+	// takes MaxProfileSeconds, and pprof extends the write
+	// deadline by WriteTimeout + seconds on top of that.
+	if ServerWriteTimeout <= time.Duration(MaxProfileSeconds)*time.Second {
+		t.Errorf("ServerWriteTimeout %v must exceed MaxProfileSeconds %ds, or a capped profile could be cut off mid-write", ServerWriteTimeout, MaxProfileSeconds)
+	}
+	if ServerReadTimeout <= 0 || ServerIdleTimeout <= 0 {
+		t.Errorf("timeouts must be positive: Read %v Idle %v", ServerReadTimeout, ServerIdleTimeout)
+	}
+}
+
+// F-A16-8 (rc22): the profile/trace `seconds` parameter is
+// clamped to MaxProfileSeconds. Tested against the wrapper
+// directly with a recording handler, so a ?seconds=3600 case
+// does not need a 30s live request to prove the clamp.
+func TestCapProfileSeconds(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"3600", "30"}, // an hour-long profile request is clamped
+		{"300", "30"},
+		{"31", "30"},
+		{"30.5", "30"}, // fractional seconds above the cap too
+		{"30", "30"},   // the default / common case is untouched
+		{"5", "5"},
+		{"1", "1"},
+		{"0", "0"},     // invalid for pprof: left for the stdlib default
+		{"-5", "-5"},   // same
+		{"abc", "abc"}, // unparsable: left for the stdlib default
+		{"", ""},       // missing: left for the stdlib default
+	}
+	for _, tc := range cases {
+		var got string
+		recorder := func(w http.ResponseWriter, r *http.Request) {
+			got = r.FormValue("seconds")
+			w.WriteHeader(http.StatusOK)
+		}
+		url := "/debug/pprof/profile"
+		if tc.in != "" {
+			url += "?seconds=" + tc.in
+		}
+		req := httptest.NewRequest(http.MethodGet, url, nil)
+		rr := httptest.NewRecorder()
+		capProfileSeconds(recorder).ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("seconds=%q: status = %d, want 200", tc.in, rr.Code)
+		}
+		if got != tc.want {
+			t.Errorf("seconds=%q: handler saw %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// F-A16-8 (rc22): with the timeouts and the cap in place, a
+// normal short profile and trace still complete end to end.
+func TestProfileAndTraceComplete(t *testing.T) {
+	srv, err := Start(Config{Enabled: true, Port: 0})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Close()
+	base := "http://" + srv.Addr
+
+	status, body := getUntil(t, base+"/debug/pprof/profile?seconds=1")
+	if status != http.StatusOK {
+		t.Fatalf("GET /debug/pprof/profile?seconds=1: status = %d, want 200", status)
+	}
+	if len(body) == 0 {
+		t.Errorf("GET /debug/pprof/profile?seconds=1: empty body, want a CPU profile")
+	}
+
+	status, _ = getUntil(t, base+"/debug/pprof/trace?seconds=1")
+	if status != http.StatusOK {
+		t.Fatalf("GET /debug/pprof/trace?seconds=1: status = %d, want 200", status)
 	}
 }
 

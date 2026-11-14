@@ -29,7 +29,17 @@ type streamFake struct {
 	keyboards   []string     // raw sendMessage bodies that carried reply_markup
 	updates     []Update
 	updateCalls int
-	nextMsgID   int64
+	// getUpdatesQueries records the allowed_updates query value of
+	// every getUpdates call, in order ("" when the call carried no
+	// filter) — the F-A16-2 tests assert the filter is sent on the
+	// first fetch only.
+	getUpdatesQueries []string
+	// failGetUpdates makes the first that many getUpdates calls
+	// fail with HTTP 500, to prove a failed filter reset neither
+	// kills polling nor loses the reset (it is retried on the
+	// next fetch). 0 (the default) fails nothing.
+	failGetUpdates int
+	nextMsgID      int64
 	// failFirstEdit makes the first editMessageText call fail with a
 	// "message to edit not found" error, to exercise the fallback.
 	failFirstEdit bool
@@ -140,9 +150,16 @@ func (f *streamFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.updateCalls++
 		call := f.updateCalls
+		f.getUpdatesQueries = append(f.getUpdatesQueries, r.URL.Query().Get("allowed_updates"))
+		fail := call <= f.failGetUpdates
 		f.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"ok":false,"error_code":500,"description":"simulated getUpdates failure"}`)
+			return
+		}
 		var out []Update
-		if call == 1 {
+		if call == f.failGetUpdates+1 {
 			out = f.updates
 		} else {
 			out = []Update{}
@@ -164,6 +181,22 @@ func (f *streamFake) snapshot() (sent []streamSent, edits []streamEdit, actions 
 	edits = append([]streamEdit(nil), f.edits...)
 	actions = append([]string(nil), f.actions...)
 	return sent, edits, actions
+}
+
+// getUpdatesQueriesSnapshot returns the recorded allowed_updates
+// query values, in call order.
+func (f *streamFake) getUpdatesQueriesSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getUpdatesQueries...)
+}
+
+// keyboardsSnapshot returns the raw sendMessage bodies that carried
+// reply_markup, in order.
+func (f *streamFake) keyboardsSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.keyboards...)
 }
 
 // waitFor polls cond until it is true or the deadline passes.

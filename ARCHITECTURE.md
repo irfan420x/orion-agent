@@ -133,6 +133,29 @@ Telegram update / CLI line
 - Tests use `t.TempDir()` and `httptest` only. No test touches the
   real home directory, the live network, or a live destructive command.
 
+## Daemon lifecycle (oriond.service, F-A16-1/5/6, rc22)
+
+- `/restart` exits 0, and the shipped unit sets `Restart=always`,
+  so a clean exit 0 IS a restart trigger. (`Restart=on-failure`
+  never restarts on exit 0 — that combination killed the daemon
+  permanently on every /restart before rc22.) An explicit
+  `systemctl stop` is still a stop, not a restart.
+- SIGTERM/SIGINT shut the daemon down with a log line naming the
+  signal (`oriond: shutting down on SIGTERM...`); SIGHUP is
+  ignored, so a closed terminal cannot silently kill the daemon.
+  The same pattern holds for `orion daemon` / `orion telegram poll`.
+- The unit gives up after 12 restarts in 60s (`StartLimitBurst=12`)
+  on a persistent fault such as a revoked token; reset with
+  `systemctl --user reset-failed oriond`.
+- `install.sh --systemd` enables AND starts the unit
+  (`enable --now`) and runs `loginctl enable-linger $USER`, so it
+  starts at boot and survives logout. Without linger a user unit
+  stops on logout and does not start at boot until login.
+- No watchdog yet: a real watchdog needs sd_notify support in the
+  daemon (future work). Boot recovery after a laptop install is
+  untested on this VM (no safe way to trigger a reboot there) —
+  check the first boot with `systemctl --user status oriond`.
+
 ## Provider timeouts (internal/model)
 
 One stalled attempt used to eat the whole agent step: the

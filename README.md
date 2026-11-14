@@ -3,10 +3,10 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc21.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc22.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,227 tests total — 1,223 pass, 0 fail, 4 skip;
-> counts verified by the rc21 release coordinator on the final commit).
+> built and tested (1,254 tests total — 1,250 pass, 0 fail, 4 skip;
+> counts verified by the rc22 release coordinator on the final commit).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -106,8 +106,7 @@ persists in `~/.orion/sessions.json`, while conversation transcripts
 persist separately as per-session JSONL files (see [Sessions](#sessions)).
 
 # Run oriond as a service (systemd user unit, oriond.service):
-./install.sh --systemd                  # installs + enables the unit
-systemctl --user start oriond
+./install.sh --systemd                  # installs + enables + starts the unit
 systemctl --user status oriond
 journalctl --user -u oriond -f
 ```
@@ -118,8 +117,8 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-22/22 packages, 1,227 tests total (1,223 passing, 0 failing, 4 skipped)
-(counts verified by the rc21 release coordinator, 2026-11-14).
+22/22 packages, 1,254 tests total (1,250 passing, 0 failing, 4 skipped)
+(counts verified by the rc22 release coordinator, 2026-11-14).
 Run the suite with
 `go test ./...` or `make test`.
 

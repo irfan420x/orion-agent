@@ -72,6 +72,16 @@ const defaultHTTPTimeout = 35 * time.Second
 // getUpdatesTimeout is the long-poll timeout requested from Telegram.
 const getUpdatesTimeout = 30
 
+// allowedUpdates is the update-type filter Orion subscribes to
+// (F-A16-2). Telegram persists allowed_updates server-side per bot:
+// the rc8 incident was a stale persisted filter of ["message"],
+// which meant Telegram never delivered callback_query and every
+// approval button silently died. Sending this filter on the first
+// successful getUpdates resets any such stale filter, so the bot
+// both receives taps and keeps receiving them. Only "message" and
+// "callback_query" are needed — Orion handles nothing else.
+var allowedUpdates = []string{"message", "callback_query"}
+
 // TGUser is a Telegram user.
 type TGUser struct {
 	ID       int64  `json:"id"`
@@ -159,6 +169,16 @@ type TelegramGateway struct {
 	client  *http.Client
 	offset  int64
 	mu      sync.Mutex
+	// updatesFilterSent records whether a getUpdates call has
+	// already carried allowedUpdates (F-A16-2). It is set only
+	// after a fetch SUCCEEDS: a failed fetch may never have
+	// reached Telegram, so the next fetch retries the filter
+	// instead of assuming it landed. It is read and written only
+	// inside fetchUpdatesLocked, whose callers all hold fetchMu,
+	// so no separate lock is needed. One gateway sends the filter
+	// once per lifetime — a gateway is built once per daemon
+	// start, so that is once per startup.
+	updatesFilterSent bool
 	// fetchMu serialises getUpdates fetches. The offset alone is not
 	// enough: two concurrent fetches could both read the same
 	// offset before either advanced it, and Telegram would return
@@ -963,7 +983,7 @@ func (c *ApprovalCards) Forget(id string) {
 // the button instructions. Shared by both binaries so the card a
 // user sees never depends on which entrypoint is running.
 func ApprovalPromptText(req permissions.ApprovalRequest) string {
-	return fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool.", req.Summary(), req.ChatID, req.SenderID)
+	return fmt.Sprintf("⚠️ Approval needed\n\n%s\n\nChat: %d\nRequested by user: %d\n\nTap ✅ to run it once, ❌ to refuse it, or use Always/Never to remember the choice for this tool in this chat only.", req.Summary(), req.ChatID, req.SenderID)
 }
 
 // ApprovalPrompter builds the gate prompter for gw: it sends the
@@ -1082,10 +1102,10 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 		approved, outcome = false, "❌ Denied."
 	case "always":
 		allow := permissions.ActionAllow
-		persist, approved, outcome = &allow, true, "✅ Approved — I won't ask again for this tool."
+		persist, approved, outcome = &allow, true, "✅ Approved — I won't ask again for this tool in this chat."
 	case "never":
 		deny := permissions.ActionDeny
-		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool."
+		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool in this chat."
 	}
 	if !gate.Resolve(id, approved, persist) {
 		fmt.Fprintf(stderr, "%s: approval tap: request %s expired during resolve\n", logPrefix, id)
@@ -1232,6 +1252,23 @@ func (g *TelegramGateway) SendMessage(ctx context.Context, chatID int64, text st
 // advanceOffsetTo and PollStream's contiguous confirmation. It
 // honours ctx cancellation.
 //
+// The first SUCCESSFUL fetch also carries allowed_updates
+// (F-A16-2): Telegram persists that filter server-side, so sending
+// it once resets a stale filter left by an earlier run (the rc8
+// incident: a persisted ["message"] filter meant callback_query
+// was never delivered and approval buttons silently died). The
+// filter rides on the ordinary long poll rather than a separate
+// pre-loop call: no extra round-trip, no update is consumed by a
+// throwaway call (the offset is not advanced by this call either
+// way, so a discarded batch would be re-fetched — but there is no
+// reason to waste the round-trip), and a failed first fetch simply
+// retries the filter on the next fetch, because
+// updatesFilterSent is set only on success. A failed filter can
+// therefore never fail startup or stop polling: the fetch's own
+// error handling (transient backoff in PollStream) already covers
+// it, and polling continues with the filter unset until a fetch
+// gets through.
+//
 // Splitting the fetch from the advance is what closes the
 // crash-window loss (F-A7-P2-3): GetUpdates used to advance the
 // offset the moment updates arrived, before any of them was
@@ -1256,6 +1293,23 @@ func (g *TelegramGateway) fetchUpdatesLocked(ctx context.Context) ([]Update, err
 	query := url.Values{}
 	query.Set("offset", strconv.FormatInt(offset, 10))
 	query.Set("timeout", strconv.Itoa(getUpdatesTimeout))
+	// F-A16-2: subscribe to message + callback_query updates on
+	// the first fetch (see the method comment). Only while the
+	// filter has not yet been sent successfully; every later
+	// fetch is a plain long poll.
+	sendFilter := !g.updatesFilterSent
+	if sendFilter {
+		allowed, err := json.Marshal(allowedUpdates)
+		if err != nil {
+			// Unreachable in practice (a []string always
+			// marshals); if it ever happened, poll without
+			// the filter rather than failing the fetch.
+			g.logf("telegram poll: allowed_updates filter could not be encoded (%v); polling without it", err)
+			sendFilter = false
+		} else {
+			query.Set("allowed_updates", string(allowed))
+		}
+	}
 
 	result, err := g.call(pollCtx, "getUpdates", query, nil)
 	if err != nil {
@@ -1267,6 +1321,13 @@ func (g *TelegramGateway) fetchUpdatesLocked(ctx context.Context) ([]Update, err
 	}
 	if updates == nil {
 		updates = []Update{}
+	}
+	if sendFilter {
+		// The filter landed: this fetch succeeded, so Telegram
+		// has the subscription. Never send it again on this
+		// gateway (once per startup).
+		g.updatesFilterSent = true
+		g.logf("telegram poll: allowed_updates filter set to [message callback_query]")
 	}
 	return updates, nil
 }

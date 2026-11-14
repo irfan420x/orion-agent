@@ -5,7 +5,7 @@
 #                                otherwise ~/.local/bin
 #   ./install.sh --prefix DIR    install binaries to DIR/bin
 #   ./install.sh --systemd       also install the oriond systemd user unit
-#                                (and enable it, if systemd --user works)
+#                                (and enable + start it, if systemd --user works)
 #   ./install.sh --help          show usage
 #
 # Idempotent: re-running rebuilds and reinstalls the binaries, and
@@ -37,7 +37,8 @@ Options:
   --prefix DIR   install binaries to DIR/bin (default: /usr/local/bin
                  when writable, otherwise ~/.local/bin)
   --systemd      install the oriond systemd user unit
-                 (~/.config/systemd/user/oriond.service) and enable it
+                 (~/.config/systemd/user/oriond.service) and enable
+                 + start it, plus enable linger (see below)
   --help, -h     show this help
 
 The default config is written to ~/.orion/config.json only if no
@@ -343,14 +344,34 @@ if [ "$WITH_SYSTEMD" -eq 1 ]; then
 	STAGE_TMP="${STAGE_TMP% $UNIT_TMP}"
 	echo "installed systemd user unit to $UNIT_DIR/oriond.service"
 	if command -v systemctl >/dev/null 2>&1; then
-		if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable oriond.service 2>/dev/null; then
-			echo "oriond.service enabled — start it with: systemctl --user start oriond"
+		# F-A16-6: enable --now, not just enable — an enabled-but-
+		# never-started unit leaves the operator believing the
+		# bot is running when it is not. (A failed start is still
+		# reported: the whole enable --now must succeed for the
+		# success message.)
+		if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now oriond.service 2>/dev/null; then
+			echo "oriond.service enabled and started"
 		else
-			echo "warning: could not reload/enable the user systemd instance (no user session?)" >&2
+			echo "warning: could not reload/enable/start the user systemd instance (no user session?)" >&2
 			echo "warning: run manually once logged in: systemctl --user daemon-reload && systemctl --user enable --now oriond" >&2
 		fi
 	else
 		echo "warning: systemctl not found — unit installed but not enabled; enable it on a systemd host" >&2
+	fi
+	# F-A16-6: loginctl enable-linger — without it a user unit
+	# stops on logout and does not start at boot until the user
+	# logs in, which silently defeats "the daemon runs as a
+	# service". Best-effort: loginctl may be absent (containers)
+	# or the call may fail, and the unit still works while the
+	# user is logged in — so warn, never fail the install.
+	if command -v loginctl >/dev/null 2>&1; then
+		if loginctl enable-linger "$USER" 2>/dev/null; then
+			echo "linger enabled for $USER — oriond starts at boot and survives logout"
+		else
+			echo "warning: could not enable linger for $USER (oriond will stop on logout and will not start at boot until you log in); enable it by hand: loginctl enable-linger $USER" >&2
+		fi
+	else
+		echo "warning: loginctl not found — linger not enabled (oriond will stop on logout); enable it on a systemd host: loginctl enable-linger $USER" >&2
 	fi
 fi
 

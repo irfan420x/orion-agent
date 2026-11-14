@@ -67,8 +67,37 @@ func run(args []string) int {
 		}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// F-A16-5: SIGHUP is ignored — a daemon outlives its terminal,
+	// and a closed SSH session / terminal must not kill the bot
+	// (previously SIGHUP killed it silently: default action,
+	// terminate, with no log line). Stopping the daemon is
+	// SIGINT/SIGTERM (or /restart, or systemctl stop). The ignore
+	// is process-wide and logged once at startup so the log shows
+	// the choice was deliberate.
+	signal.Ignore(syscall.SIGHUP)
+	fmt.Fprintln(os.Stderr, "oriond: ignoring SIGHUP (terminal close will not stop the daemon)")
+
+	// F-A16-5: the signal is captured explicitly (not
+	// signal.NotifyContext) so the shutdown path can log WHICH
+	// signal stopped the daemon. Before this, SIGTERM/SIGINT
+	// exited 0 with no log line at all — a dead daemon's log
+	// could not tell a stop from a crash.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	shutdownSig := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			// Buffered, so this send cannot block: by the
+			// time ctx.Done fires, the name is already here.
+			shutdownSig <- sig
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	a, err := app.Build("")
 	if err != nil {
@@ -257,10 +286,12 @@ func run(args []string) int {
 		if !a.Drain(10 * time.Second) {
 			fmt.Fprintln(os.Stderr, "oriond: restart: some runs still active after 10s; exiting anyway")
 		}
-		// Exit 0 so a supervisor (systemd, oriond.service with
-		// Restart=on-success) restarts the daemon. Without a
-		// supervisor the daemon simply exits and must be started
-		// manually — see /restart's reply and ARCHITECTURE.md.
+		// Exit 0 so a supervisor restarts the daemon: the shipped
+		// oriond.service sets Restart=always, so a clean exit 0
+		// IS a restart trigger (an explicit `systemctl stop` is
+		// still a stop, not a restart). Without a supervisor the
+		// daemon simply exits and must be started manually — see
+		// /restart's reply and ARCHITECTURE.md.
 		return 0
 	case <-ctx.Done():
 		// SIGINT/SIGTERM: let in-flight turns unwind and persist
@@ -271,10 +302,39 @@ func run(args []string) int {
 		// (their contexts derive from ctx), so this is prompt
 		// unless a run is stuck in a non-cancellable operation;
 		// the 10s bound keeps shutdown from hanging either way.
+		// F-A16-5: log which signal stopped the daemon, so the
+		// log can tell a stop from a crash after the fact.
+		// signalName spells it "SIGTERM", not the os.Signal
+		// String() "terminated" — the log must be readable.
+		sigName := "signal"
+		select {
+		case sig := <-shutdownSig:
+			sigName = signalName(sig)
+		default:
+		}
+		fmt.Fprintf(os.Stderr, "oriond: shutting down on %s...\n", sigName)
 		if !a.Drain(10 * time.Second) {
 			fmt.Fprintln(os.Stderr, "oriond: shutdown: some runs still active after 10s; exiting anyway")
 		}
+		fmt.Fprintln(os.Stderr, "oriond: shutdown complete")
 		return 0
+	}
+}
+
+// signalName spells a shutdown signal the way an operator reads
+// it ("SIGTERM", "SIGINT"): os.Signal's String() says "terminated"
+// / "interrupt", which in a log reads like a crash description,
+// not a signal name. Unknown signals fall back to String().
+func signalName(sig os.Signal) string {
+	switch sig {
+	case os.Interrupt:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	default:
+		return sig.String()
 	}
 }
 

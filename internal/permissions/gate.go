@@ -14,9 +14,13 @@
 //     subagent_spawn — a child agent can run shell tools, so spawning
 //     one must be gated or the gate is bypassable) and network tools
 //     (web_fetch, web_search) need approval.
-//   - A persisted rule store (permissions.json, 0600) holds per-tool
-//     allow/deny rules. A deny rule is never prompted; an allow rule
-//     never prompts either. Rules are the user's standing decisions.
+//   - A persisted rule store (permissions.json, 0600) holds
+//     per-chat allow/deny rules (F-A16-3): an "always allow" tapped
+//     in one chat applies to that chat only, never to other chats.
+//     Rules written before rc22 carry no chat and load as legacy
+//     global rules (see RuleStore); a deny rule is never prompted;
+//     an allow rule never prompts either. Rules are the user's
+//     standing decisions.
 //   - Anything else gated prompts the user through a Prompter — in
 //     the daemon, a Telegram inline-keyboard message with Approve /
 //     Deny / Always allow / Never allow buttons. The gate blocks the
@@ -135,8 +139,12 @@ const (
 // Valid reports whether the action is a known rule action.
 func (a Action) Valid() bool { return a == ActionAllow || a == ActionDeny }
 
-// Rule is one persisted per-tool decision.
+// Rule is one persisted per-chat decision. ChatID 0 is a legacy
+// global rule: it was written before rules were per-chat (rc22)
+// and applies to every chat. Every rule written by rc22 or later
+// carries the chat it was tapped in.
 type Rule struct {
+	ChatID int64  `json:"chat_id,omitempty"`
 	Tool   string `json:"tool"`
 	Action Action `json:"action"`
 }
@@ -447,8 +455,12 @@ func (g *Gate) Timeout() time.Duration {
 //     denylisted command is denied without ever asking the user and
 //     no "always allow" rule can rescue it. An approval can never
 //     authorise a denylisted command;
-//  2. a persisted rule (deny rules are never prompted, allow rules
-//     never prompt either);
+//  2. a persisted rule for this chat (deny rules are never prompted,
+//     allow rules never prompt either); a rule from another chat
+//     never applies here (F-A16-3 — per-chat isolation at the
+//     permission layer, matching the history/model/budget layers);
+//     a legacy global rule, written before rules were per-chat,
+//     still applies to every chat;
 //  3. safe tools (allowed outright);
 //  4. the prompter + the user's answer (or the timeout / turn
 //     cancellation, which deny).
@@ -468,8 +480,15 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 	if tool == "shell_exec" && isDenylistedCommand(args) {
 		return false, "denied: command is blocked by the shell denylist and cannot be approved"
 	}
+	// The chat comes from the turn's context (set by the daemon's
+	// turn handler from the Telegram update). The rule lookup is
+	// per-chat: another chat's "always allow" must never approve
+	// a call here (F-A16-3). A turn with no chat in its context
+	// (a local run, which never installs a gate anyway) falls
+	// back to the global rules only.
+	chatID, senderID, _ := ApprovalContextFrom(ctx)
 	if g.rules != nil {
-		if action, ok := g.rules.Lookup(tool); ok {
+		if action, ok := g.rules.LookupForChat(chatID, tool); ok {
 			if action == ActionAllow {
 				return true, ""
 			}
@@ -482,7 +501,6 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 	if g.prompter == nil {
 		return false, fmt.Sprintf("denied: tool %q needs approval but no approver is configured", tool)
 	}
-	chatID, senderID, _ := ApprovalContextFrom(ctx)
 	req := ApprovalRequest{
 		ID:        newRequestID(),
 		ChatID:    chatID,
@@ -518,7 +536,7 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 	g.mu.Unlock()
 	select {
 	case res := <-pr.ch:
-		return g.applyResult(tool, args, res)
+		return g.applyResult(tool, args, req.ChatID, res)
 	case <-timer.C:
 		// Timer vs Resolve, decided by construction
 		// (F-A6-P2-8): settle claims the request under the
@@ -537,7 +555,7 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 			return false, "denied: approval timed out (no answer within the approval window)"
 		}
 		if res, ok := g.resolvedOutcome(pr); ok {
-			return g.applyResult(tool, args, res)
+			return g.applyResult(tool, args, req.ChatID, res)
 		}
 		return false, "denied: approval timed out (no answer within the approval window)"
 	case <-ctx.Done():
@@ -551,7 +569,7 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 			return false, "denied: approval cancelled (the turn ended before an answer arrived)"
 		}
 		if res, ok := g.resolvedOutcome(pr); ok {
-			return g.applyResult(tool, args, res)
+			return g.applyResult(tool, args, req.ChatID, res)
 		}
 		return false, "denied: approval cancelled (the turn ended before an answer arrived)"
 	}
@@ -577,8 +595,12 @@ func (g *Gate) resolvedOutcome(pr *pendingRequest) (pendingResult, bool) {
 // applyResult applies a delivered approval outcome: it persists an
 // "always allow" / "never allow" rule when one was requested (a
 // denylisted command can never be persisted as allowed — see the
-// re-check below) and reports whether the call may run.
-func (g *Gate) applyResult(tool, args string, res pendingResult) (bool, string) {
+// re-check below) and reports whether the call may run. The rule
+// is persisted for chatID only (F-A16-3): an "always allow" tapped
+// in one chat must never approve the tool in another chat. A
+// chatID of 0 (no chat in the turn's context) falls back to a
+// global rule, the pre-rc22 behaviour.
+func (g *Gate) applyResult(tool, args string, chatID int64, res pendingResult) (bool, string) {
 	if res.persist != nil && g.rules != nil {
 		// Persisting "always allow" for a denylisted
 		// command must be impossible: the check above
@@ -590,7 +612,11 @@ func (g *Gate) applyResult(tool, args string, res pendingResult) (bool, string) 
 		if *res.persist == ActionAllow && tool == "shell_exec" && isDenylistedCommand(args) {
 			return false, "denied: command is blocked by the shell denylist and cannot be approved"
 		}
-		_ = g.rules.Set(tool, *res.persist)
+		if chatID != 0 {
+			_ = g.rules.SetForChat(chatID, tool, *res.persist)
+		} else {
+			_ = g.rules.Set(tool, *res.persist)
+		}
 	}
 	if res.approved {
 		return true, ""

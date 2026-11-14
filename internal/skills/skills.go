@@ -904,11 +904,13 @@ var baseFormNonVerbs = map[string]bool{
 // rule can read it as a verb. It can still be the SUBJECT of a
 // clause ("…the skill analysis is ready" loads — the aux is the
 // verb, F-A13-3), because the aux and following-verb rules do not
-// consult verb shape. Words that ARE also verbs are deliberately
-// absent: "reference" (to reference), "report" (to report),
-// "setting" (an object-region verb, R3) and the ambiguous nouns
-// ("files", "notes", "guides", "training", "learning",
-// "building") are verbs too, so they stay out.
+// consult verb shape. "free" and "slow" are genuine transitive
+// verbs too, so they stay out (see transitiveOnlyVerbs, F-A16-4).
+// Words that ARE also verbs are deliberately absent: "reference"
+// (to reference), "report" (to report), "setting" (an
+// object-region verb, R3) and the ambiguous nouns ("files",
+// "notes", "guides", "training", "learning", "building") are
+// verbs too, so they stay out.
 //
 // F-A15-1/F-A15-2 extend the list with the never-verb classes
 // Audit 15's probe surface shows. A bare noun or adjective after
@@ -921,13 +923,14 @@ var baseFormNonVerbs = map[string]bool{
 //   - adjective/adverb-dominant words whose marginal verb
 //     readings never take a bare-plural or gerund object in
 //     skill-doc positions ("fast" — to fast is intransitive;
-//     "slow", "free" — primarily adjectives here; "busy" — to
-//     busy takes a reflexive, not a bare plural; "very" — a
-//     degree adverb, never a verb). Their transitive verb
-//     readings ("free/slow the plan") are sacrificed: the
-//     adjective reading dominates in the tested positions, and
-//     the validator errs toward rejection for adjective-dominant
-//     words (the D2 precedent);
+//     "busy" — to busy takes a reflexive, not a bare plural;
+//     "very" — a degree adverb, never a verb). "slow" and
+//     "free" are NOT here: they are genuine transitive verbs
+//     ("free the plan", "slow the rollout") and live in
+//     transitiveOnlyVerbs (F-A16-4) — the adjective reading
+//     dominates only where no object follows, and the validator
+//     errs toward rejection for adjective-dominant words (the
+//     D2 precedent);
 //   - pure -ss nouns ("business", "success", "loss", "class",
 //     "glass") — no verb reading; genuine -ss verbs ("boss",
 //     "progress", "process", "address", "access") stay out;
@@ -972,7 +975,7 @@ var neverVerbWords = map[string]bool{
 	"afraid": true, "alive": true, "asleep": true,
 	"aware": true, "able": true,
 	// Adjective/adverb-dominant words (F-A15-1/F-A15-3).
-	"fast": true, "slow": true, "free": true, "busy": true,
+	"fast": true, "busy": true,
 	"very": true,
 	// Pure -ss nouns (F-A15-1).
 	"business": true, "success": true, "loss": true,
@@ -986,6 +989,44 @@ var neverVerbWords = map[string]bool{
 	// Bare nouns (F-A15-1).
 	"notebook": true, "guidebook": true, "keyboard": true,
 	"pencil": true,
+}
+
+// transitiveOnlyVerbs are genuine transitive verbs that are also
+// common adjectives (F-A16-4): "free" (to free the plan, to free
+// users) and "slow" (to slow the rollout, to slow users). They were
+// in neverVerbWords on rc20, which over-blocked their verb +
+// object forms — the auditor's probe showed "free the plan", "free
+// users", "slow the rollout" and "slow users" all rejecting, while
+// the bare forms ("the skills free/slow") correctly reject. They
+// are deliberately NOT in neverVerbWords, baseFormVerbs or
+// isVerbShaped/isVerbShapedAt: a transitive-only verb has no verb
+// reading without an object, so the general following-word rules
+// must not treat it as a verb — only the explicit object rules in
+// clauseVerbAt admit it, and only where the subject is complete
+// (see clauseVerbAt: an article, a pronoun, or a bare plural
+// object after a complete subject). Everywhere else the adjective
+// reading wins, exactly as if the word were still in
+// neverVerbWords:
+//   - clause-final bare ("the skills free", "the skill and the
+//     venv slow") rejects: no intransitive reading, so the plural
+//     base-form rule never fires for it;
+//   - inside the subject noun phrase ("the skill and the free
+//     tools", Audit 13 §7 D2 / rc20 guard) rejects: the adjective
+//     modifies the head noun, so it never takes the guarded
+//     object (see verbTakesGuardedObject);
+//   - before a participle ("the skill and the free running
+//     tests", rc20 F-A15-3 guard; "the skills free running
+//     tests") rejects: it never takes a gerund/participle
+//     complement, so it is a modifier, not a clause head;
+//   - before an adverb, preposition, subordinator or bare
+//     singular noun ("free quickly", "free for beginners",
+//     "free plan") rejects: no object follows.
+//
+// "fast" and "busy" are NOT here and stay in neverVerbWords: to
+// fast is intransitive and to busy takes a reflexive, not a bare
+// plural — "fast the plan" and "busy the plan" still reject.
+var transitiveOnlyVerbs = map[string]bool{
+	"free": true, "slow": true,
 }
 
 // adjectiveVerbs are verbs that are also common adjectives in
@@ -1156,9 +1197,13 @@ func hasVerbSuffix(word string) bool {
 // rules in clauseVerbAt (F-A13-1) require the candidate itself to
 // be verb-shaped before they fire: a noun followed by an article,
 // pronoun, adverb, preposition, subordinating conjunction or bare
-// plural is a noun phrase, not a verb phrase.
+// plural is a noun phrase, not a verb phrase. A transitive-only
+// verb ("free", "slow" — see transitiveOnlyVerbs) is never
+// verb-shaped here either (F-A16-4): it has no verb reading
+// without an object, so the general following-word rules must not
+// admit it — only the explicit object rules in clauseVerbAt do.
 func isVerbShaped(word string) bool {
-	if neverVerbWords[word] {
+	if neverVerbWords[word] || transitiveOnlyVerbs[word] {
 		return false
 	}
 	return hasVerbSuffix(word) || isClauseVerb(word) || baseFormVerbs[word]
@@ -1174,12 +1219,18 @@ func isVerbShaped(word string) bool {
 // shape ("the skill build the plan" is ungrammatical), so only
 // verb morphology, an object-region verb or a listed base-form
 // verb counts. Words that can never be verbs are excluded in both
-// positions. Callers only ever pass words that have already passed
+// positions. A transitive-only verb ("free", "slow" — see
+// transitiveOnlyVerbs) is excluded too (F-A16-4): the plural
+// base-form rule would otherwise read it as a verb before an
+// adverb, preposition or subordinator ("free quickly", "free
+// for beginners"), where no object follows. Only the explicit
+// object rules in clauseVerbAt admit it. Callers only ever pass
+// words that have already passed
 // the early returns in clauseVerbAt (not a pure noun head, not a
 // known non-verb, not a subject modifier or adverb), so a bare
 // word reaching here is a genuine verb candidate.
 func isVerbShapedAt(word string, plural bool) bool {
-	if neverVerbWords[word] {
+	if neverVerbWords[word] || transitiveOnlyVerbs[word] {
 		return false
 	}
 	if plural {
@@ -1217,12 +1268,26 @@ func isVerbShapedAt(word string, plural bool) bool {
 // -ed exclusion would break genuine past-tense verb+object
 // clauses. Only a never-verb -ed adjective ("rugged", "wicked")
 // is excluded, via neverVerbWords.
-func verbTakesGuardedObject(word string, inSubject bool) bool {
+//
+// F-A16-4: a transitive-only verb ("free", "slow" — see
+// transitiveOnlyVerbs) takes a guarded object only as the
+// predicate verb of a complete subject ("the skills free users",
+// "the skill and the venv free tools"), never as an adjective
+// inside the subject noun phrase ("the skill and the free tools",
+// Audit 13 §7 D2 / rc20 guard). subjectComplete says whether a
+// noun head of the (compound) subject has already been seen
+// (compoundSubjectStartsClause passes its sawNoun flag; the direct
+// singular/plural path passes false with inSubject false, so the
+// predicate reading always applies there).
+func verbTakesGuardedObject(word string, inSubject bool, subjectComplete bool) bool {
 	if neverVerbWords[word] {
 		return false
 	}
 	if adjectiveVerbs[word] {
 		return false
+	}
+	if transitiveOnlyVerbs[word] {
+		return !inSubject || subjectComplete
 	}
 	if inSubject && strings.HasSuffix(word, "ing") && len(word) > 4 {
 		return false
@@ -1278,7 +1343,14 @@ func isNounHead(word string) bool {
 //     "documentation tools") is a noun phrase, not a clause
 //     (F-A13-1). A subordinator after an ambiguous noun ("files
 //     that helps") attaches a relative clause, not a subordinate
-//     clause, so it is a noun phrase too;
+//     clause, so it is a noun phrase too. The one exception to the
+//     verb-shaped requirement is a transitive-only verb ("free",
+//     "slow" — see transitiveOnlyVerbs, F-A16-4): it is a verb
+//     only where an object follows (article, pronoun, bare
+//     plural), and only as the predicate verb of a complete
+//     subject — never bare at a clause end, never inside the
+//     subject noun phrase, never before a participle, adverb,
+//     preposition, subordinator or bare singular noun;
 //   - a word followed by a bare plural noun is a verb with a bare
 //     plural object ("serve users", "dance users", "files notes",
 //     "running tests") — unless the following word is a guarded
@@ -1394,6 +1466,15 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		if neverVerbWords[word] {
 			return false, false
 		}
+		if transitiveOnlyVerbs[word] {
+			// A transitive-only verb ("free", "slow") has no
+			// intransitive reading, so the clause-final bare form
+			// is never a verb — not even after a plural subject,
+			// where the base-form rule would otherwise fire
+			// (F-A16-4; rc20:163-165 pins "the skills free" and
+			// "the skill and the venv free").
+			return false, false
+		}
 		if hasVerbSuffix(word) {
 			return true, false
 		}
@@ -1414,7 +1495,16 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// noun phrase, not a verb phrase (F-A13-1). After a
 		// plural or compound subject a bare word is a verb by
 		// shape ("the skills build the plan", F-A14-1), and a
-		// never-verb word is never one.
+		// never-verb word is never one. A transitive-only verb
+		// ("free", "slow") is a verb here too — the article
+		// introduces its object ("free the plan", "slow the
+		// rollout", F-A16-4) — but only as the predicate verb of
+		// a complete subject: inside the subject noun phrase
+		// ("the skill and the free the plan") it is an adjective,
+		// so it stays a subject word and the scan continues.
+		if transitiveOnlyVerbs[word] {
+			return !inSubject || subjectComplete, false
+		}
 		return isVerbShapedAt(word, plural), false
 	}
 	if clausePronouns[after] {
@@ -1424,7 +1514,14 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// before a pronoun ("documentation you") is a noun
 		// phrase, not a verb phrase (F-A13-1). After a plural
 		// or compound subject a bare word is a verb by shape
-		// ("the skills build you", F-A14-1).
+		// ("the skills build you", F-A14-1). A transitive-only
+		// verb ("free", "slow") is a verb here too — the pronoun
+		// is its object ("free you", F-A16-4) — but only as the
+		// predicate verb of a complete subject, as in the
+		// article rule above.
+		if transitiveOnlyVerbs[word] {
+			return !inSubject || subjectComplete, false
+		}
 		return isVerbShapedAt(word, plural), false
 	}
 	if clauseAdverbs[after] || (strings.HasSuffix(after, "ly") && len(after) > 4 && !baseFormVerbs[after]) {
@@ -1485,7 +1582,9 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// users", "make users", "trained users", "files tools",
 		// F-A14-2 — but not a never-verb word, not an
 		// adjective-verb like "open", and not a participle in
-		// subject position, F-A12-1/F-A13-1). A participle in
+		// subject position, F-A12-1/F-A13-1; a transitive-only
+		// verb — "free", "slow" — takes it only as the predicate
+		// verb of a complete subject, F-A16-4). A participle in
 		// subject position ("running tools") is an attributive
 		// adjective (F-A12-1) — but only while the subject noun
 		// phrase is still open ("the running tests"); once a noun
@@ -1502,7 +1601,7 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// checking it as a verb first would misread the candidate
 		// as a subject word and then misread "tests" itself as
 		// the clause verb.
-		if verbFormNonVerbs[after] && !verbTakesGuardedObject(word, inSubject) {
+		if verbFormNonVerbs[after] && !verbTakesGuardedObject(word, inSubject, subjectComplete) {
 			return false, false
 		}
 		if inSubject && (strings.HasSuffix(word, "ing") && len(word) > 4 || strings.HasSuffix(word, "ed") && len(word) > 3) {
@@ -1514,6 +1613,22 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		if isClauseVerb(after) {
 			return true, false
 		}
+		// A transitive-only verb ("free", "slow") is a verb
+		// before a bare plural object ("free users", "slow
+		// guides", F-A16-4) — but only as the predicate verb of
+		// a complete subject: inside the subject noun phrase it
+		// is an adjective ("the skill and the free guides"), so
+		// it stays a subject word and the scan continues. The
+		// carve-out is the only path that admits it here:
+		// isVerbShapedAt below returns false for a
+		// transitive-only verb on either subject (it has no verb
+		// reading without an object), so without the carve-out
+		// even "the skills free users" would reject — while
+		// "the skill free users" loads, as "the skill serve the
+		// team" does for a listed base-form verb.
+		if transitiveOnlyVerbs[word] {
+			return !inSubject || subjectComplete, false
+		}
 		return isVerbShapedAt(word, plural), false
 	}
 	if strings.HasSuffix(after, "ing") && len(after) > 4 || strings.HasSuffix(after, "ed") && len(after) > 3 {
@@ -1522,6 +1637,17 @@ func clauseVerbAt(fields []string, p int, plural bool, inSubject bool, subjectCo
 		// ("tests waiting"). This also comes before the
 		// object-region verb check: a participle like "running"
 		// is a noun phrase head here, not the clause verb.
+		// A transitive-only verb ("free", "slow") never takes a
+		// gerund/participle complement, so before a participle it
+		// is a modifier, not a clause head ("the skill and the
+		// free running tests", rc20 F-A15-3 guard; "the skills
+		// free running tests") — F-A16-4. Without this guard,
+		// removing "free"/"slow" from neverVerbWords would let
+		// the participle-with-object tail below read them as the
+		// head of a participle phrase.
+		if transitiveOnlyVerbs[word] {
+			return false, true
+		}
 		if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 2 && !verbFormAmbiguousNouns[word] && !neverVerbWords[word] {
 			return true, false
 		}

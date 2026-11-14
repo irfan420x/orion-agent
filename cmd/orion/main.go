@@ -29,8 +29,30 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// F-A16-5: the signal is captured explicitly (not
+	// signal.NotifyContext) so a long-running command interrupted
+	// by SIGINT/SIGTERM can log WHICH signal stopped it (below,
+	// before exit). Before this, an interrupted `orion daemon` /
+	// `orion telegram poll` exited 0 silently — the log could not
+	// tell a stop from a crash. SIGHUP is NOT captured here: the
+	// long-running Telegram loops ignore it in pollTelegram, and
+	// short-lived commands keep the default SIGHUP behaviour.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	shutdownSig := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			// Buffered, so this send cannot block: by the
+			// time the command returns, the name is here.
+			shutdownSig <- sig
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	var err error
 	switch os.Args[1] {
@@ -75,6 +97,14 @@ func main() {
 		usageTo(os.Stderr)
 		os.Exit(2)
 	}
+	// F-A16-5: log which signal stopped the command, when a signal
+	// did. (Non-blocking: a command that ran to completion logs
+	// nothing here.)
+	select {
+	case sig := <-shutdownSig:
+		fmt.Fprintf(os.Stderr, "orion: shutting down on %s...\n", signalName(sig))
+	default:
+	}
 	if err != nil {
 		// A command interrupted by SIGINT/SIGTERM is a clean exit:
 		// the user asked to stop, so there is nothing to report and
@@ -98,6 +128,23 @@ func exitCodeFor(err error) int {
 		return 0
 	}
 	return 1
+}
+
+// signalName spells a shutdown signal the way an operator reads
+// it ("SIGTERM", "SIGINT"): os.Signal's String() says "terminated"
+// / "interrupt", which in a log reads like a crash description,
+// not a signal name. Unknown signals fall back to String().
+func signalName(sig os.Signal) string {
+	switch sig {
+	case os.Interrupt:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	default:
+		return sig.String()
+	}
 }
 
 func usage() { usageTo(os.Stdout) }
@@ -793,6 +840,16 @@ func cmdTelegram(ctx context.Context, args []string) error {
 		if _, _, err := wireGate(a, gw); err != nil {
 			return err
 		}
+		// F-A16-7: the same localhost-only pprof endpoint as
+		// `orion daemon` and oriond (see startDebugEndpoint):
+		// off by default, opt-in via config debug.pprof_enabled.
+		// Before rc22 this path polled with no endpoint at all
+		// even when enabled, while the other two Telegram
+		// polling entrypoints served one.
+		dbg := startDebugEndpoint(a)
+		if dbg != nil {
+			defer dbg.Close()
+		}
 		fmt.Println("telegram: polling for messages (Ctrl+C to stop)...")
 		return pollTelegram(a, gw, ctx)
 	}
@@ -850,24 +907,38 @@ Run Telegram polling until interrupted. Takes no arguments.
 	}
 	fmt.Printf("orion daemon running as @%s (provider %s, model %s). Ctrl+C to stop.\n",
 		username, a.Provider.Name(), active.Model)
-	// F-A3-2: the same localhost-only pprof endpoint as oriond
-	// (see cmd/oriond/main.go): off by default, opt-in via config
-	// debug.pprof_enabled, binds 127.0.0.1 only. A bind failure is
-	// a warning, not a startup failure.
-	var dbg *debug.Server
-	if a.Config.Debug.PprofEnabled {
-		srv, err := debug.Start(debug.Config{Enabled: true, Port: a.Config.DebugPprofPort()})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "orion: warning: debug pprof endpoint unavailable: %v (continuing without it)\n", err)
-		} else {
-			dbg = srv
-			fmt.Fprintf(os.Stderr, "orion: debug pprof listening on %s\n", srv.Addr)
-		}
-	}
+	// F-A3-2 / F-A16-7: the localhost-only pprof endpoint — the
+	// same one oriond and `orion telegram poll` serve (see
+	// startDebugEndpoint): off by default, opt-in via config
+	// debug.pprof_enabled, binds 127.0.0.1 only. A bind failure
+	// is a warning, not a startup failure.
+	dbg := startDebugEndpoint(a)
 	if dbg != nil {
 		defer dbg.Close()
 	}
 	return pollTelegram(a, gw, ctx)
+}
+
+// startDebugEndpoint starts the optional localhost-only pprof/debug
+// endpoint (F-A3-2) for the CLI's Telegram loops: `orion daemon`
+// and `orion telegram poll` (oriond has the identical wiring in
+// cmd/oriond). It returns nil — and listens on nothing — when the
+// endpoint is disabled in config (debug.Start returns (nil, nil)
+// then), and also on a bind failure, which is a warning, not a
+// startup failure: the endpoint is observability, and a port
+// conflict must not kill the bot. The caller closes the returned
+// server (defer dbg.Close()) so it stops on every exit path.
+func startDebugEndpoint(a *app.App) *debug.Server {
+	if a == nil || a.Config == nil || !a.Config.Debug.PprofEnabled {
+		return nil
+	}
+	srv, err := debug.Start(debug.Config{Enabled: true, Port: a.Config.DebugPprofPort()})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orion: warning: debug pprof endpoint unavailable: %v (continuing without it)\n", err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "orion: debug pprof listening on %s\n", srv.Addr)
+	return srv
 }
 
 // daemonTurnHandler is the turn function for `orion daemon` AND
@@ -938,6 +1009,15 @@ func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string,
 // (cancelled) context cannot hold shutdown forever, and the
 // command then exits anyway, as it did before the drain.
 func pollTelegram(a *app.App, gw *messaging.TelegramGateway, ctx context.Context) error {
+	// F-A16-5: SIGHUP is ignored on the long-running Telegram loops
+	// (`orion daemon` and `orion telegram poll` share this
+	// function), mirroring oriond: a closed terminal must not
+	// silently kill polling. Short-lived commands never reach here,
+	// so their SIGHUP behaviour is unchanged. The ignore is
+	// process-wide and logged once so the log shows the choice was
+	// deliberate.
+	signal.Ignore(syscall.SIGHUP)
+	fmt.Fprintln(os.Stderr, "orion: ignoring SIGHUP (terminal close will not stop polling; use SIGTERM/Ctrl+C to stop)")
 	err := gw.Poll(ctx, daemonTurnHandler(a))
 	if !a.Drain(30 * time.Second) {
 		fmt.Fprintln(os.Stderr, "orion: poll stopped with turns still in flight after 30s; exiting anyway")
