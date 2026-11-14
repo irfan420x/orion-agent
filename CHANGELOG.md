@@ -58,6 +58,66 @@ declared context window instead of a hardcoded 32768 tokens
   fix batch skips F-A22-15, so this change reworks the test
   first; his batch must re-check against it.
 
+### Cron tool (tool 3 of 14)
+
+Scheduled recurring agent turns: `cron_schedule` / `cron_list` /
+`cron_cancel` (three separate tools, matching the
+enter/exit_plan_mode pattern). Suite: **1,626 tests total
+(1,622 pass, 0 fail, 4 skip), 24/24 packages**.
+
+- **Expressions.** Standard 5-field cron (minute hour
+  day-of-month month day-of-week) with `*`, lists, ranges and
+  steps (`*/15`, `1-30/5`); day-of-week accepts 7 as Sunday;
+  day-of-month/day-of-week use standard OR semantics when both
+  are restricted. Month/day names and `@`-shorthands are rejected
+  with an error naming the bad field. Next-run computation is
+  minute-granular and bounded (5-year search cap).
+- **Persistence + ownership.** Jobs live in the shared
+  PlanningStore (`<dataDir>/chats/<chatID>/cron.json`, 0600,
+  atomic write, flocked load-modify-save — the todo/task/plan
+  pattern), so they survive a daemon restart; a corrupt file is
+  an error, never a silent reset. A job belongs to the chat that
+  created it: list/cancel resolve the caller's bucket, so another
+  chat physically cannot see or cancel it. Scheduling requires a
+  Telegram chat (a CLI run has nowhere to deliver a scheduled
+  turn). At most 20 jobs per chat.
+- **Approval.** The management tools are Safe (they only write
+  Orion's own job files). The scheduled turn is a normal turn on
+  the chat's agent through the same gate, with the approval
+  context set to the job's chat and requester — a destructive
+  action inside a scheduled turn prompts exactly as it would
+  interactively, and is never auto-approved. An unanswered
+  approval denies that call and the turn completes with the
+  denial recorded.
+- **Safety + missed runs.** Exponential backoff on failure (1,
+  2, 4, 8, 16, 32, 60 minutes, capped at 60) and the job is
+  DISABLED after 5 consecutive failures — never a hot loop. A
+  run missed by more than 10 minutes (daemon was down) is
+  SKIPPED, not run late, and does not count as a failure.
+  Times are stored and shown in UTC — the codebase has no
+  per-chat timezone.
+- **Scheduler + serialisation.** `CronScheduler` (in
+  `internal/tools`) scans the store's chat buckets every 30s and
+  runs due jobs through a runner the daemon installs
+  (`oriond` starts it after the Telegram wiring; the runner runs
+  the turn and delivers the reply to the chat). A tick never
+  overlaps a running tick. Turns for one chat are serialised
+  against user turns by a new per-chat turn lock in
+  `app.runChatTurn` (PollStream's per-chat lock does not cover
+  scheduler-fired turns); different chats still run in parallel.
+  The cron tools are excluded from subagent child registries
+  (scheduling is a parent-chat commitment). `orion daemon` /
+  `orion telegram poll` do NOT start a scheduler — oriond is the
+  daemon.
+- **Tests.** 20 new tests: expression parsing (valid/invalid,
+  edge cases incl. Feb 29, 7=Sunday, dom/dow OR), next-run
+  computation, schedule/list/cancel, per-chat cap (20) and
+  isolation, persistence across a store rebuild (restart),
+  corrupt-file failure, scheduler firing, missed-run skip,
+  backoff + disable after 5, no-runner refusal, tick-overlap
+  skip, registry wiring, child-registry exclusion, and same-chat
+  turn serialisation (max 1 concurrent provider call).
+
 ### F1 — Audit 21 fixes (P1 + P2/P3 leftovers)
 
 Fixes Audit 21's P1 and the P2/P3 leftovers, on top of plan_mode.
