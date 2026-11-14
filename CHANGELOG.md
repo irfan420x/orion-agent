@@ -6,6 +6,51 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Audit 20 Step 0 (F0) — fail-closed RiskClass + wired capability discovery
+
+Fixes Audit 20's two P1 findings (which blocked plan_mode) plus
+the two Step-0 P2s. Verified in the working tree: **1,424 tests
+pass, 0 fail, 4 skip (total 1,428), 24/24 packages** (+13 tests
+over the framework build a633ed3).
+
+- **F-A20-2 (P1) — RiskClass is fail-closed.** `Registry.Register`
+  now rejects a tool that does not implement `RiskClasser`, and
+  one whose declared class disagrees with the gate's hardcoded
+  maps (`permissions.Classify`): the maps are the authority, so a
+  wrong Safe declaration can no longer let a destructive tool run
+  without approval. The gate's `classify()` is the fail-closed
+  backstop — the installed map can only raise a tool Classify
+  calls safe, never lower one Classify gates. MCP tools declare
+  ClassNetwork (matching the `mcp__` prefix rule). New tests pin
+  Register's rejection (missing RiskClasser, both mismatch
+  directions) and acceptance, plus the gate's fail-closed
+  direction (an installed Safe cannot downgrade shell_exec).
+- **F-A20-1 (P1) — CallbackHandler/ReplyInterceptor are wired.**
+  `WireTelegram` now discovers the capability interfaces: every
+  tool implementing `tools.CallbackHandler` gets its declared
+  prefix registered on the callback router (fail-first), and every
+  tool implementing `tools.ReplyInterceptor` is added to the reply
+  chain (after the question interceptor). A bad declaration —
+  duplicate prefix, 16-byte cap, `perm:` reservation — fails the
+  whole wiring loudly at startup. The question transport stays
+  messaging-owned (its pending-question state lives in the
+  QuestionRegistry, which the tool cannot hold — import cycle);
+  the discovery loop is the generic path for tools whose
+  handler/interceptor state lives in the tool itself.
+- **F-A20-7 (P2) — WireTelegram has direct tests.** Nil args, a
+  second call on one gateway (duplicate `ask:`), and the
+  partial-failure window (a failed wiring installs no handler, so
+  it can never serve traffic) — all loud fail.
+- **F-A20-16 (P2) — the manual lists are pinned to the factory
+  set.** `skills.KnownBuiltInTools()` (new exported accessor)
+  returns the fallback list, pinned by a test to the full tool
+  set (DefaultRegistry + subagent tools + skill tool = 23 names);
+  a second test pins the gate's Classify maps (Destructive =
+  {shell_exec, file_write, file_edit, subagent_spawn}, Network =
+  {web_fetch, web_search}) over the same set. README counts are
+  pinned by `make check-readme-counts` (which runs the full
+  suite itself).
+
 ### ask_user_question — the first of the 14 advanced tools
 
 The agent can now ask the user a question mid-turn and WAIT for the

@@ -219,3 +219,107 @@ func TestToolClasses(t *testing.T) {
 		t.Errorf("nil registry ToolClasses = %v, want empty", got)
 	}
 }
+
+// --- F-A20-16: the manual lists are pinned to the factory set ---
+
+// fullBuiltInToolNames returns every built-in tool name, built
+// the way production wires them: the factory-registered tools
+// (DefaultRegistry) plus the late-registered subagent tools and
+// the skill tool (app.Build registers those after the agent
+// exists).
+func fullBuiltInToolNames(t *testing.T) []string {
+	t.Helper()
+	reg, err := DefaultRegistry()
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	sub, err := NewSubagentTools(subagent.NewManager(4), UsageSinkFunc(func(int) {}))
+	if err != nil {
+		t.Fatalf("NewSubagentTools: %v", err)
+	}
+	if err := reg.RegisterAll(sub); err != nil {
+		t.Fatalf("RegisterAll subagent tools: %v", err)
+	}
+	skill, err := NewSkillTool(skills.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewSkillTool: %v", err)
+	}
+	if err := reg.Register(skill); err != nil {
+		t.Fatalf("Register skill tool: %v", err)
+	}
+	names := make([]string, 0, len(reg.List()))
+	for _, tool := range reg.List() {
+		names = append(names, tool.Name())
+	}
+	sort.Strings(names)
+	return names
+}
+
+// setKeys returns the sorted keys of a name set, for readable
+// test failures.
+func setKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for name := range set {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestKnownBuiltInToolsMatchesFactorySet pins the skills
+// fallback list (knownBuiltInTools) to the factory set: every
+// built-in tool name must appear in it, and it must contain no
+// extra name. Adding a tool without updating the fallback — or
+// removing one without removing it — fails loudly here instead
+// of silently letting a skill call an unknown tool (or warning
+// about a tool that no longer exists).
+func TestKnownBuiltInToolsMatchesFactorySet(t *testing.T) {
+	want := fullBuiltInToolNames(t)
+	got := skills.KnownBuiltInTools()
+	if len(got) != len(want) {
+		t.Fatalf("KnownBuiltInTools %v != factory set %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("KnownBuiltInTools %v != factory set %v", got, want)
+		}
+	}
+}
+
+// TestClassifyMapsMatchFactorySet pins the gate's hardcoded maps
+// (permissions.Classify) to the factory set: over every built-in
+// tool name, the Destructive set must be exactly {shell_exec,
+// file_write, file_edit, subagent_spawn} and the Network set
+// exactly {web_fetch, web_search}. A new tool that belongs in a
+// gated class but was never added to the maps — or a map entry
+// for a tool that no longer exists — fails loudly here.
+func TestClassifyMapsMatchFactorySet(t *testing.T) {
+	wantDestructive := map[string]bool{"shell_exec": true, "file_write": true, "file_edit": true, "subagent_spawn": true}
+	wantNetwork := map[string]bool{"web_fetch": true, "web_search": true}
+	gotDestructive := map[string]bool{}
+	gotNetwork := map[string]bool{}
+	for _, name := range fullBuiltInToolNames(t) {
+		switch permissions.Classify(name) {
+		case permissions.ClassDestructive:
+			gotDestructive[name] = true
+		case permissions.ClassNetwork:
+			gotNetwork[name] = true
+		}
+	}
+	if len(gotDestructive) != len(wantDestructive) {
+		t.Fatalf("Classify Destructive set = %v, want %v", setKeys(gotDestructive), setKeys(wantDestructive))
+	}
+	for name := range wantDestructive {
+		if !gotDestructive[name] {
+			t.Fatalf("Classify Destructive set = %v, want %v (missing %q)", setKeys(gotDestructive), setKeys(wantDestructive), name)
+		}
+	}
+	if len(gotNetwork) != len(wantNetwork) {
+		t.Fatalf("Classify Network set = %v, want %v", setKeys(gotNetwork), setKeys(wantNetwork))
+	}
+	for name := range wantNetwork {
+		if !gotNetwork[name] {
+			t.Fatalf("Classify Network set = %v, want %v (missing %q)", setKeys(gotNetwork), setKeys(wantNetwork), name)
+		}
+	}
+}

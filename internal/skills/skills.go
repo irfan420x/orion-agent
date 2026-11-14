@@ -100,6 +100,24 @@ var knownBuiltInTools = map[string]bool{
 	"web_fetch":  true, "web_search": true,
 }
 
+// KnownBuiltInTools returns the names of every built-in tool
+// Orion ships, sorted — the fallback list above. The live set is
+// derived from the tool registry at startup (app.loadSkills
+// calls SetKnownTools with the registry's names); this fallback
+// exists only for hand-built registries that never load skills.
+// A test in internal/tools pins it to the factory set, so adding
+// a tool without updating the fallback fails loudly instead of
+// silently letting a skill call an unknown tool. The returned
+// slice is a copy: mutating it cannot change the set.
+func KnownBuiltInTools() []string {
+	out := make([]string, 0, len(knownBuiltInTools))
+	for name := range knownBuiltInTools {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // SetKnownTools extends the tool-name set ## Tools entries are
 // validated against (F-A17-14): names is added to the built-in set
 // (never replaces it — "skill" and the built-ins stay known), so a
