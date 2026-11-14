@@ -184,6 +184,11 @@ type memBucket struct {
 	todos    []TodoItem
 	todosSet bool
 	tasks    []*Task
+	// plan is the pending plan for this bucket (plan_mode.go):
+	// nil means no plan is pending. The in-memory bucket mirrors
+	// plans.json on disk; the plan tool's load/save helpers in
+	// plan_mode.go read and write it under the store mutex.
+	plan *planState
 }
 
 // PlanningStore is the shared state behind the five planning tools.

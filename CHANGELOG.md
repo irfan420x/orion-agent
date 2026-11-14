@@ -6,6 +6,63 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### plan_mode (tool 2 of 14) + Audit 20 Step 1 fixes
+
+plan_mode is the second of the 14 advanced tools: the agent enters
+a planning state, presents a plan (goal, steps, files, risks) to
+the user, and works only after the user approves it. Verified in
+the working tree: **1,473 tests pass, 0 fail, 4 skip (total
+1,477), 24/24 packages** (+49 tests over the F0 build 3a6a498:
+16 Step-1 tests + 33 plan_mode tests).
+
+- **enter_plan_mode / exit_plan_mode.** Enter stores the plan
+  per-chat (persisted via the PlanningStore, so a restart does
+  not lose the record — only the live wait), sends it as a
+  Telegram message with Approve / Reject / Revise buttons, and
+  BLOCKS the tool call until the user taps a button, types
+  approve / reject / revise, or the timeout fires (default 5
+  minutes, max 30). On approval the agent executes the plan in
+  the same turn; on revise the stored plan is discarded and the
+  tool returns the user's feedback; on rejection the plan is
+  discarded. Exit clears the pending plan (the escape hatch, and
+  the way to unstick a plan orphaned by a restart) and is
+  idempotent. One plan per chat; different chats are isolated.
+- **No execution while planning (agent-loop state machine).**
+  The enter tool implements `PlanModeChecker`, auto-discovered
+  by `Registry.Register` and consulted by `Agent.executeTool`
+  after the skill restriction and before `Registry.Execute`:
+  while a plan is pending for the chat, ClassDestructive tools
+  are refused (Safe and Network tools stay allowed, so the agent
+  can research while planning). A refused call never executed,
+  so it is not journalled — a re-delivered turn re-decides it.
+  The check consults the PERSISTED plan, so it holds across a
+  restart until the plan expires.
+- **Approval boundary reuses the callback router** (prefix
+  `plan:`, wired by WireTelegram's F0 auto-discovery) with the
+  same patterns as approvals and questions: prefix dispatch,
+  sender check (requester or owner), single-winner settle, the
+  message edited in place on decision. No second callback
+  system, and no synthetic gate approval request (the gate's
+  approve / deny / always / never semantics do not map to plan
+  approve / reject / revise). A tap on a plan message from
+  before a restart gets the honest no-longer-pending notice
+  (the F-A20-9 pattern). The plan message send is plain text;
+  the outcome edit sends HTML and is escaped here.
+- **Audit 20 Step 1 (all nine P2s):** F-A20-3 (dead
+  `ToolDeps.DataDir` removed), F-A20-12 (the 2 dropped
+  QuestionAsker checks restored), F-A20-5 + F-A20-6 + F-A20-8
+  (router hardening: fallback/handler replacement fails loudly,
+  `perm:` reserved and pinned by tests, 8 router unit tests),
+  F-A20-10 (reply-chain panic isolation + consumption audit
+  log), F-A20-9 (one deterministic no-longer-pending notice for
+  orphaned approval/question cards, plus a startup log line),
+  F-A20-11 (prompter Notes the approval card before sending;
+  10/10 runs), F-A20-4 (TestOffsetNoDoubleExecutionAfterRelease
+  made load-insensitive: 30s waits in that test only, 5s
+  quiesce sleep; the flake never reproduced this session —
+  10/10 isolation, full-suite -count=2 and -count=5 green —
+  so this is a hardening, not a proven fix).
+
 ### Audit 20 Step 0 (F0) — fail-closed RiskClass + wired capability discovery
 
 Fixes Audit 20's two P1 findings (which blocked plan_mode) plus
