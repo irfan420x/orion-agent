@@ -304,16 +304,54 @@ func TestToolInstallQuestionAsker(t *testing.T) {
 		t.Errorf("installed asker not used, got %s", out)
 	}
 	// Framework-level: the same install loop WireTelegram runs
-	// (install on every tool implementing QuestionAskerInstaller)
-	// is a no-op on a registry without the tool, and reaches the
-	// tool on a registry that has it.
-	empty := NewRegistry()
-	fake3 := &recordingAsker{answer: "framework", source: "text", optionIndex: -1}
-	for _, tool := range empty.List() {
-		if inst, ok := tool.(QuestionAskerInstaller); ok {
-			inst.InstallQuestionAsker(fake3.ask)
+	// (install on every tool implementing QuestionAskerInstaller).
+	// Restored F-A20-12: the old TestRegistryQuestionAsker had 7
+	// checks; the rewrite kept 5 and dropped the 2
+	// registry-without-the-tool checks. In the new mechanism
+	// (installer on the tool, not the registry) they are:
+	// (3) a registry without the tool offers NO install target —
+	// no tool in it implements QuestionAskerInstaller; (4) the
+	// install loop over such a registry installs nothing and
+	// leaves the tools it holds untouched. Both are asserted
+	// here, against a registry holding a real (non-asker) tool,
+	// not an empty one — an empty registry would make the loop
+	// vacuous.
+	without := NewRegistry()
+	if err := without.Register(riskTool{name: "dummy_no_asker", class: permissions.ClassSafe}); err != nil {
+		t.Fatalf("register dummy tool: %v", err)
+	}
+	installTargets := 0
+	for _, tool := range without.List() {
+		if _, ok := tool.(QuestionAskerInstaller); ok {
+			installTargets++
 		}
 	}
+	if installTargets != 0 {
+		t.Errorf("registry without ask_user_question offers %d asker-install target(s), want 0", installTargets)
+	}
+	before, err := without.Execute(context.Background(), "dummy_no_asker", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("dummy tool before install loop: %v", err)
+	}
+	installed := 0
+	fake3 := &recordingAsker{answer: "framework", source: "text", optionIndex: -1}
+	for _, tool := range without.List() {
+		if inst, ok := tool.(QuestionAskerInstaller); ok {
+			inst.InstallQuestionAsker(fake3.ask)
+			installed++
+		}
+	}
+	if installed != 0 {
+		t.Errorf("install loop installed an asker on %d tool(s) in a registry without ask_user_question, want 0", installed)
+	}
+	after, err := without.Execute(context.Background(), "dummy_no_asker", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("dummy tool after install loop: %v", err)
+	}
+	if after != before {
+		t.Errorf("install loop changed a tool it must not touch: dummy output %q before, %q after", before, after)
+	}
+	// And the loop reaches the tool on a registry that has it.
 	r3 := askRegistry(nil)
 	for _, tool := range r3.List() {
 		if inst, ok := tool.(QuestionAskerInstaller); ok {
