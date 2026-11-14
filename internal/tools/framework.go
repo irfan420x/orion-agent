@@ -33,7 +33,10 @@
 //     CallbackGateway, and messaging's TGCallbackQuery / Update
 //     satisfy CallbackQuery / ReplyUpdate. The Telegram gateway's
 //     router and reply chain (internal/messaging) hold these
-//     interfaces and dispatch by prefix / in order.
+//     interfaces and dispatch by prefix / in order. WireTelegram
+//     discovers tools implementing them and registers each on
+//     the router/chain — a tool that implements one is wired
+//     automatically, with no per-tool call site.
 package tools
 
 import (
