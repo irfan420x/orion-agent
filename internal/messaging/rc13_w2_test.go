@@ -256,11 +256,13 @@ func TestOffsetNotAdvancedPastInFlightCallback(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
 	var cbEntered atomic.Int32
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		cbEntered.Add(1)
 		<-release
 		return g.AnswerCallbackQuery(ctx, q.ID, "ok")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	// Turns return immediately; the test is about the callback.
 	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "done", nil, nil
@@ -390,10 +392,12 @@ func TestOffsetNoDoubleExecutionAfterRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	cbDone := make(chan TGCallbackQuery, 1)
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		cbDone <- q
 		return g.AnswerCallbackQuery(ctx, q.ID, "ok")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	cancel, errCh, _, releaseAll, entered := fillTurnSlots(t, fake, g)
 	defer func() {

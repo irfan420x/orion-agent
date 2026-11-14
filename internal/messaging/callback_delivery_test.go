@@ -194,10 +194,12 @@ func TestCallbackDeliveredWhileTurnSlotsFull(t *testing.T) {
 		return "done", nil, nil
 	}
 	cbDone := make(chan TGCallbackQuery, 1)
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		cbDone <- q
 		return g.AnswerCallbackQuery(ctx, q.ID, "ok")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	cancel, errCh := runPollStream(t, g, turnHandler)
 	defer func() {

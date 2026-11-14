@@ -469,6 +469,11 @@ type TelegramGateway struct {
 	// approval handler for anything else. It is the installed
 	// callbackHandler's implementation; created on demand.
 	router *callbackRouter
+	// callbackRouterInstalled records that InstallCallbackRouter
+	// installed the router dispatch (F-A20-6): a second install
+	// is a no-op instead of a silent replacement, and a
+	// pre-installed different handler fails loudly.
+	callbackRouterInstalled bool
 	// replyChain holds the typed-reply interceptors PollStream
 	// consults before the per-chat lock (a reply that answers a
 	// pending question must not wait on the lock the asking turn
@@ -832,12 +837,18 @@ func OwnerIDFromAllowlist(allowedChats []int64) int64 {
 
 // SetCallbackHandler installs the handler for callback-query
 // updates (inline-keyboard taps). A nil handler removes it (taps
-// are then answered with "not handled" and dropped). Safe for
-// concurrent use with PollStream.
-func (g *TelegramGateway) SetCallbackHandler(h CallbackHandler) {
+// are then answered with "not handled" and dropped). Replacing an
+// installed handler is a loud error (F-A20-6): a second installer
+// would silently re-route every tap. Safe for concurrent use with
+// PollStream.
+func (g *TelegramGateway) SetCallbackHandler(h CallbackHandler) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if h != nil && g.callbackHandler != nil {
+		return fmt.Errorf("messaging: SetCallbackHandler: a callback handler is already installed: refusing to replace it")
+	}
 	g.callbackHandler = h
+	return nil
 }
 
 // SetQuestionRegistry installs the pending-question registry the
@@ -1568,22 +1579,30 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 // then answered as expired, exactly as before). One installed
 // handler serves both the approval gate and the question asker —
 // the gateway holds a single callback handler, and a second
-// installer would overwrite the first. Approval behaviour is
-// unchanged: anything that is not an ask: tap goes to
-// HandleApprovalCallback exactly as before.
+// installer fails loudly instead of overwriting the first
+// (F-A20-5/F-A20-6). Approval behaviour is unchanged: anything
+// that is not an ask: tap goes to HandleApprovalCallback exactly
+// as before.
 //
 // This is the compatibility installer for the test harnesses and
 // for callers that wire approvals directly; the binaries use the
 // framework's WireTelegram, which installs the same router.
-func InstallApprovalCallbackHandler(gw *TelegramGateway, gate *permissions.Gate, ownerID int64, cards *ApprovalCards, questions *QuestionRegistry, logPrefix string) {
-	gw.SetApprovalFallback(gate, ownerID, cards, logPrefix)
+func InstallApprovalCallbackHandler(gw *TelegramGateway, gate *permissions.Gate, ownerID int64, cards *ApprovalCards, questions *QuestionRegistry, logPrefix string) error {
+	if err := gw.SetApprovalFallback(gate, ownerID, cards, logPrefix); err != nil {
+		return fmt.Errorf("messaging: InstallApprovalCallbackHandler: %w", err)
+	}
 	// A duplicate "ask:" registration (the framework already
-	// installed one) is ignored: the handler is already there.
-	// The handler is registered even for a nil registry — an
-	// ask: tap with no questions is answered as expired, never
-	// silently dropped.
-	_ = gw.RegisterCallbackHandler(questionCallbackPrefix, questionCallbackHandler{questions: questions, logPrefix: logPrefix})
-	gw.InstallCallbackRouter()
+	// installed one) is a loud error (F-A20-5): silently
+	// ignoring it hid a double-wiring bug. The handler is
+	// registered even for a nil registry — an ask: tap with no
+	// questions is answered as expired, never silently dropped.
+	if err := gw.RegisterCallbackHandler(questionCallbackPrefix, questionCallbackHandler{questions: questions, logPrefix: logPrefix}); err != nil {
+		return fmt.Errorf("messaging: InstallApprovalCallbackHandler: %w", err)
+	}
+	if err := gw.InstallCallbackRouter(); err != nil {
+		return fmt.Errorf("messaging: InstallApprovalCallbackHandler: %w", err)
+	}
+	return nil
 }
 
 // SendChatAction sends a chat action (e.g. "typing") to chatID, so the

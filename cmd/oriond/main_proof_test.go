@@ -197,9 +197,11 @@ func TestScratchProofGateAndIsolation(t *testing.T) {
 		return err
 	})
 	a.SetPermissionGate(gate)
-	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
+	if err := gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
 		return messaging.HandleApprovalCallback(ctx, gw, gate, ownerID, q, nil, "oriond")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	allowed := map[int64]bool{ownerID: true, 111: true, 222: true}
 	restart := func() {}

@@ -64,7 +64,9 @@ func newQuestionHarness(t *testing.T) *questionHarness {
 	questions := NewQuestionRegistry(77)
 	gw.SetQuestionRegistry(questions)
 	InstallApprovalExpiry(gate, gw, cards, "test")
-	InstallApprovalCallbackHandler(gw, gate, 77, cards, questions, "test")
+	if err := InstallApprovalCallbackHandler(gw, gate, 77, cards, questions, "test"); err != nil {
+		t.Fatal(err)
+	}
 	if gw.callbackHandlerFor() == nil {
 		t.Fatal("InstallApprovalCallbackHandler did not install a callback handler on the gateway")
 	}

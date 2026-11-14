@@ -34,11 +34,13 @@ func TestPollStreamWaitsForCallbackHandler(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		close(started)
 		<-release
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "ok", nil, nil

@@ -100,8 +100,12 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 			}
 		}
 	}
-	gw.SetApprovalFallback(gate, ownerID, cards, logPrefix)
-	gw.InstallCallbackRouter()
+	if err := gw.SetApprovalFallback(gate, ownerID, cards, logPrefix); err != nil {
+		return fmt.Errorf("messaging: WireTelegram: %w", err)
+	}
+	if err := gw.InstallCallbackRouter(); err != nil {
+		return fmt.Errorf("messaging: WireTelegram: %w", err)
+	}
 	gw.SetQuestionRegistry(questions)
 	asker := NewTelegramQuestionAsker(gw, questions, ownerID, logPrefix)
 	host := &tools.ToolHost{Gateway: gw, OwnerID: ownerID, LogPrefix: logPrefix}

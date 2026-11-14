@@ -78,10 +78,12 @@ func TestCallbackDispatchedBeforeMessageInSameBatchWhileTurnSlotsFull(t *testing
 		t.Fatal(err)
 	}
 	cbDone := make(chan TGCallbackQuery, 1)
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		cbDone <- q
 		return g.AnswerCallbackQuery(ctx, q.ID, "ok")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	cancel, errCh, _, releaseAll, entered := fillTurnSlots(t, fake, g)
 	defer func() {
@@ -139,10 +141,12 @@ func TestOffsetNotAdvancedPastUndispatchedMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	cbDone := make(chan TGCallbackQuery, 1)
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		cbDone <- q
 		return g.AnswerCallbackQuery(ctx, q.ID, "ok")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	cancel, errCh, _, releaseAll, entered := fillTurnSlots(t, fake, g)
 	defer func() {

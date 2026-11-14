@@ -260,7 +260,9 @@ func newW6Harness(t *testing.T, gateTimeout time.Duration) *w6Harness {
 		h.gate.SetTimeout(gateTimeout)
 	}
 	InstallApprovalExpiry(h.gate, h.gw, h.cards, "w6")
-	InstallApprovalCallbackHandler(h.gw, h.gate, w6OwnerID, h.cards, nil, "w6")
+	if err := InstallApprovalCallbackHandler(h.gw, h.gate, w6OwnerID, h.cards, nil, "w6"); err != nil {
+		t.Fatal(err)
+	}
 	return h
 }
 
@@ -626,10 +628,12 @@ func TestW6CallbackSameBatchAsMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gw.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := gw.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		cbCount.Add(1)
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)

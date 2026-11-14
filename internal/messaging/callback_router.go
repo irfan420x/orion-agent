@@ -82,14 +82,24 @@ func (r *callbackRouter) register(prefix string, h tools.CallbackHandler) error 
 
 // setFallback installs the handler for anything that is not a
 // registered tool prefix (the approval handler). Replacing it is
-// allowed (the last install wins, like SetCallbackHandler).
-func (r *callbackRouter) setFallback(h CallbackHandler) {
+// a loud error (F-A20-6): the fallback IS the approval handler,
+// so a second install would silently re-route every unclaimed
+// tap — including perm: approvals — to a different handler. A
+// nil handler is an error, never a silent clear.
+func (r *callbackRouter) setFallback(h CallbackHandler) error {
 	if r == nil {
-		return
+		return fmt.Errorf("messaging: callback router: nil router")
+	}
+	if h == nil {
+		return fmt.Errorf("messaging: callback router: nil fallback handler")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.fallback != nil {
+		return fmt.Errorf("messaging: callback router: approval fallback already installed: refusing to replace it")
+	}
 	r.fallback = h
+	return nil
 }
 
 // dispatch routes one tap: a registered tool prefix goes to that
@@ -230,26 +240,42 @@ func (g *TelegramGateway) RegisterCallbackHandler(prefix string, h tools.Callbac
 // router's fallback (anything that is not a registered tool
 // prefix — perm: taps and unparseable data alike). It closes over
 // the gateway, gate, cards and log prefix exactly as
-// InstallApprovalCallbackHandler did.
-func (g *TelegramGateway) SetApprovalFallback(gate *permissions.Gate, ownerID int64, cards *ApprovalCards, logPrefix string) {
+// InstallApprovalCallbackHandler did. A second install is a loud
+// error (F-A20-6): the fallback must never be silently replaced.
+func (g *TelegramGateway) SetApprovalFallback(gate *permissions.Gate, ownerID int64, cards *ApprovalCards, logPrefix string) error {
 	if g == nil {
-		return
+		return fmt.Errorf("messaging: SetApprovalFallback: nil gateway")
 	}
 	gw := g
-	g.callbackRouterFor().setFallback(func(ctx context.Context, q TGCallbackQuery) error {
+	return g.callbackRouterFor().setFallback(func(ctx context.Context, q TGCallbackQuery) error {
 		return HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, logPrefix)
 	})
 }
 
 // InstallCallbackRouter installs the router dispatch as the
 // gateway's callback handler, so PollStream taps reach it. It is
-// idempotent (re-installing just replaces the same dispatch).
-func (g *TelegramGateway) InstallCallbackRouter() {
+// idempotent: a second call is a no-op (the dispatch is already
+// installed). It fails loudly when a DIFFERENT callback handler
+// is already installed (F-A20-6): silently replacing a handler
+// would re-route every tap.
+func (g *TelegramGateway) InstallCallbackRouter() error {
 	if g == nil {
-		return
+		return fmt.Errorf("messaging: InstallCallbackRouter: nil gateway")
 	}
+	g.mu.Lock()
+	if g.callbackRouterInstalled {
+		g.mu.Unlock()
+		return nil
+	}
+	g.mu.Unlock()
 	gw := g
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		return gw.callbackRouterFor().dispatch(ctx, gw, q)
-	})
+	}); err != nil {
+		return fmt.Errorf("messaging: InstallCallbackRouter: %w", err)
+	}
+	g.mu.Lock()
+	g.callbackRouterInstalled = true
+	g.mu.Unlock()
+	return nil
 }

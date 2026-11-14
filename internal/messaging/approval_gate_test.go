@@ -67,7 +67,9 @@ func TestSharedApprovalWiringPromptsAndResolvesViaInstalledHandler(t *testing.T)
 	cards := NewApprovalCards()
 	gate := permissions.NewGate(permissions.NewRuleStore(""), ApprovalPrompter(gw, cards, "test"))
 	InstallApprovalExpiry(gate, gw, cards, "test")
-	InstallApprovalCallbackHandler(gw, gate, 77, cards, nil, "test")
+	if err := InstallApprovalCallbackHandler(gw, gate, 77, cards, nil, "test"); err != nil {
+		t.Fatal(err)
+	}
 	if gw.callbackHandlerFor() == nil {
 		t.Fatal("InstallApprovalCallbackHandler did not install a callback handler on the gateway")
 	}

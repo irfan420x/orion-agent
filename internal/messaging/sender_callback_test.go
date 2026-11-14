@@ -233,7 +233,7 @@ func TestCallbackQueryReachesHandler(t *testing.T) {
 	var mu sync.Mutex
 	var got []TGCallbackQuery
 	var gotSender int64
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		mu.Lock()
 		got = append(got, q)
 		id, _ := SenderIDFromContext(ctx)
@@ -242,7 +242,9 @@ func TestCallbackQueryReachesHandler(t *testing.T) {
 		// A real handler answers the query (clearing the button
 		// spinner); the gateway does not answer for it.
 		return g.AnswerCallbackQuery(ctx, q.ID, "Approved")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	cancel, errCh := runPollStream(t, g, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "unexpected turn", nil, nil
 	})
@@ -287,10 +289,12 @@ func TestCallbackQueryFromStrangerDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := make(chan struct{}, 1)
-	g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+	if err := g.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
 		called <- struct{}{}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	cancel, errCh := runPollStream(t, g, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "unexpected turn", nil, nil
 	})

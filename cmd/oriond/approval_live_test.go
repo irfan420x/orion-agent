@@ -228,12 +228,14 @@ func TestApprovalCallbackLiveShape(t *testing.T) {
 	// the tap below still lands well inside it.
 	gate.SetTimeout(25 * time.Second)
 	a.SetPermissionGate(gate)
-	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
+	if err := gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
 		t.Logf("callback handler invoked: id=%s data=%q from=%v", q.ID, q.Data, q.From)
 		err := messaging.HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, "oriond")
 		t.Logf("callback handler returned err=%v pending=%d", err, gate.PendingCount())
 		return err
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	allowed := map[int64]bool{ownerID: true}
 	restart := func() {}
@@ -403,12 +405,14 @@ func TestApprovalCallbackWhileTurnSlotsFull(t *testing.T) {
 	}
 	gate.SetTimeout(25 * time.Second)
 	a.SetPermissionGate(gate)
-	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
+	if err := gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
 		t.Logf("callback handler invoked: id=%s data=%q from=%v", q.ID, q.Data, q.From)
 		err := messaging.HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, "oriond")
 		t.Logf("callback handler returned err=%v pending=%d", err, gate.PendingCount())
 		return err
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	allowed := map[int64]bool{ownerID: true}
 	restart := func() {}
@@ -581,9 +585,11 @@ func TestApprovalCardExpiresOnTimeout(t *testing.T) {
 	// Short window (live is 90s) so the test runs in ~12s.
 	gate.SetTimeout(8 * time.Second)
 	a.SetPermissionGate(gate)
-	gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
+	if err := gw.SetCallbackHandler(func(ctx context.Context, q messaging.TGCallbackQuery) error {
 		return messaging.HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, "oriond")
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	allowed := map[int64]bool{ownerID: true}
 	restart := func() {}
