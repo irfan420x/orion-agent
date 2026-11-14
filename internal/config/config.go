@@ -31,12 +31,16 @@ import (
 // result costs at most ~64K estimated tokens and can never by
 // itself exhaust a provider context window.
 //
-// DefaultMaxHistoryTokens is the token budget for the history fed to
-// the provider on each step. 32K: DeepSeek (the default provider)
-// offers a 64K window, so 32K of history leaves headroom for the
-// tool definitions, the completion, and the ~4 chars/token estimate
-// being rough (CountTokens under-counts dense text). Local Ollama
-// models with smaller windows should set this lower in config.
+// DefaultMaxHistoryTokens is the FAIL-CLOSED fallback history
+// budget (32768 tokens) used only when the active provider
+// declares no context window at all (internal/core
+// maxHistoryTokens, leg 3). It is NOT the default budget any
+// more: config defaults MaxHistoryTokens to 0 (auto), and the
+// agent derives half the provider's declared window instead.
+// The old rationale generalises: half a window leaves headroom
+// for the tool definitions, the completion, and the ~4
+// chars/token estimate being rough (CountTokens under-counts
+// dense text).
 const (
 	DefaultMaxToolResultBytes = 256 * 1024
 	DefaultMaxHistoryTokens   = 32768
@@ -169,9 +173,13 @@ type Config struct {
 	// MaxHistoryTokens caps the estimated tokens of the conversation
 	// history fed to the provider on each step (system prompt +
 	// recent history + recall injection + in-turn messages).
-	// Over-budget history is trimmed oldest-first in the agent loop
-	// (never the system prompt, never the latest user turn, never
-	// breaking a tool-call/tool-result pair).
+	// 0 means AUTO: the agent derives half the active provider's
+	// declared context window (see internal/model ContextWindow
+	// and internal/core maxHistoryTokens); an explicit value
+	// overrides the derivation. Over-budget history is trimmed
+	// oldest-first in the agent loop (never the system prompt,
+	// never the latest user turn, never breaking a
+	// tool-call/tool-result pair).
 	MaxHistoryTokens int `json:"max_history_tokens"`
 	// PerChatDailyTokenBudget caps the tokens one Telegram chat may
 	// consume per UTC day (P2-O9; enforced by internal/budget). The
@@ -351,7 +359,7 @@ func defaultConfig(dataDir string) *Config {
 		MaxSteps:           20,
 		TimeoutSeconds:     120,
 		MaxToolResultBytes: DefaultMaxToolResultBytes,
-		MaxHistoryTokens:   DefaultMaxHistoryTokens,
+		MaxHistoryTokens:   0, // auto: half the provider's window
 		// P2-O5/P2-O9 defaults: a 10-minute allow-all window and a
 		// 100K-token per-chat daily budget.
 		AllowAllTelegramChatsWindowMinutes: DefaultAllowAllTelegramWindowMinutes,
@@ -471,8 +479,10 @@ func (c *Config) Validate() error {
 	if c.MaxToolResultBytes < minMaxToolResultBytes || c.MaxToolResultBytes > maxMaxToolResultBytes {
 		return fmt.Errorf("config: max_tool_result_bytes must be between %d and %d", minMaxToolResultBytes, maxMaxToolResultBytes)
 	}
-	if c.MaxHistoryTokens < minMaxHistoryTokens || c.MaxHistoryTokens > maxMaxHistoryTokens {
-		return fmt.Errorf("config: max_history_tokens must be between %d and %d", minMaxHistoryTokens, maxMaxHistoryTokens)
+	// 0 is auto (derive from the provider's window); a non-zero
+	// value must be 1024–1M like before.
+	if c.MaxHistoryTokens != 0 && (c.MaxHistoryTokens < minMaxHistoryTokens || c.MaxHistoryTokens > maxMaxHistoryTokens) {
+		return fmt.Errorf("config: max_history_tokens must be 0 (auto) or between %d and %d", minMaxHistoryTokens, maxMaxHistoryTokens)
 	}
 	if c.Temperature != nil && (*c.Temperature < 0 || *c.Temperature > 2) {
 		return errors.New("config: temperature must be between 0 and 2")

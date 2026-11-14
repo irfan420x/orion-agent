@@ -246,9 +246,10 @@ func NewAgent(cfg *config.Config, provider model.Provider, registry *tools.Regis
 	if cfg.MaxToolResultBytes <= 0 {
 		cfg.MaxToolResultBytes = config.DefaultMaxToolResultBytes
 	}
-	if cfg.MaxHistoryTokens <= 0 {
-		cfg.MaxHistoryTokens = config.DefaultMaxHistoryTokens
-	}
+	// MaxHistoryTokens is NOT filled here: 0 means auto — derive
+	// half the provider's declared window in maxHistoryTokens().
+	// (Filling 32768 would silently defeat the derivation.)
+	// Keep the MaxToolResultBytes fill — unrelated.
 	// Push the tool-result cap into the registry: Registry.Execute
 	// is the central choke point for result size, and the agent is
 	// where config meets the registry. A registry shared by several
@@ -492,13 +493,52 @@ func (a *Agent) maxSteps() int {
 	return a.cfg.MaxSteps
 }
 
+// historyBudgetFraction is the share of the provider's context
+// window the history may use: half the window leaves headroom
+// for the system prompt, tool definitions, the completion, and
+// the token estimate being rough. The old 32768-token budget was
+// this same rule for the old (incorrect) 64K DeepSeek window.
+const historyBudgetFraction = 1.0 / 2
+
+// historyBudgetMinTokens / historyBudgetMaxTokens clamp a derived
+// budget to the same bounds config validation uses for explicit
+// values (internal/config min/maxMaxHistoryTokens).
+const (
+	historyBudgetMinTokens = 1024
+	historyBudgetMaxTokens = 1000000
+)
+
 // maxHistoryTokens returns the token budget for the history fed to
-// the provider on each step.
+// the provider on each step, in order:
+//  1. an explicit cfg.MaxHistoryTokens > 0 is returned as-is
+//     (validated 1024–1M by config.Validate);
+//  2. otherwise half the active provider's declared window,
+//     clamped to [1024, 1000000];
+//  3. otherwise config.DefaultMaxHistoryTokens (32768): the
+//     fail-closed legacy fallback for a provider that declares
+//     no window at all — exactly today's behaviour, never worse.
 func (a *Agent) maxHistoryTokens() int {
-	if a.cfg.MaxHistoryTokens <= 0 {
-		return config.DefaultMaxHistoryTokens
+	if a.cfg.MaxHistoryTokens > 0 {
+		return a.cfg.MaxHistoryTokens
 	}
-	return a.cfg.MaxHistoryTokens
+	if w, ok := model.ContextWindow(a.provider); ok && w > 0 {
+		budget := int(float64(w) * historyBudgetFraction)
+		if budget < historyBudgetMinTokens {
+			budget = historyBudgetMinTokens
+		}
+		if budget > historyBudgetMaxTokens {
+			budget = historyBudgetMaxTokens
+		}
+		return budget
+	}
+	return config.DefaultMaxHistoryTokens
+}
+
+// HistoryBudget returns the effective history budget in tokens
+// for this agent (maxHistoryTokens): the explicit override, the
+// provider-derived half-window, or the 32768 fallback.
+func (a *Agent) HistoryBudget() int {
+	return a.maxHistoryTokens()
 }
 
 // Run executes one user turn: it sends the user input (with system prompt

@@ -133,14 +133,19 @@ func (p *ollamaProvider) buildRequest(req ChatRequest, stream bool) (ollamaChatR
 	// field would overwrite the other. num_predict is set only
 	// when MaxTokens > 0, so an uncapped request sends no cap,
 	// exactly like the OpenAI/DeepSeek providers omit max_tokens.
-	if req.Temperature != nil || req.MaxTokens > 0 {
-		r.Options = map[string]any{}
-		if req.Temperature != nil {
-			r.Options["temperature"] = *req.Temperature
-		}
-		if req.MaxTokens > 0 {
-			r.Options["num_predict"] = req.MaxTokens
-		}
+	//
+	// num_ctx is ALWAYS set to the declared window for the
+	// configured model (ContextWindow): Ollama's server default
+	// (4096 per the current official FAQ; older docs said 2048)
+	// would otherwise silently truncate a history budget derived
+	// from a much larger window. Passing it explicitly makes the
+	// declared window real on every request, Chat and Stream.
+	r.Options = map[string]any{"num_ctx": p.ContextWindow()}
+	if req.Temperature != nil {
+		r.Options["temperature"] = *req.Temperature
+	}
+	if req.MaxTokens > 0 {
+		r.Options["num_predict"] = req.MaxTokens
 	}
 	return r, nil
 }

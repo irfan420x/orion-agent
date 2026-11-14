@@ -15,8 +15,12 @@ func TestCapsDefaults(t *testing.T) {
 	if cfg.MaxToolResultBytes != DefaultMaxToolResultBytes {
 		t.Fatalf("MaxToolResultBytes = %d, want default %d", cfg.MaxToolResultBytes, DefaultMaxToolResultBytes)
 	}
-	if cfg.MaxHistoryTokens != DefaultMaxHistoryTokens {
-		t.Fatalf("MaxHistoryTokens = %d, want default %d", cfg.MaxHistoryTokens, DefaultMaxHistoryTokens)
+	// MaxHistoryTokens defaults to 0 (auto): the agent derives
+	// half the active provider's declared window. 32768 is now
+	// only the fail-closed fallback for a provider that declares
+	// no window (config.DefaultMaxHistoryTokens).
+	if cfg.MaxHistoryTokens != 0 {
+		t.Fatalf("MaxHistoryTokens = %d, want default 0 (auto)", cfg.MaxHistoryTokens)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("default config should validate with caps: %v", err)
@@ -32,7 +36,6 @@ func TestCapsValidation(t *testing.T) {
 		{"tool result negative", func(c *Config) { c.MaxToolResultBytes = -1 }},
 		{"tool result below minimum", func(c *Config) { c.MaxToolResultBytes = 1023 }},
 		{"tool result above maximum", func(c *Config) { c.MaxToolResultBytes = 10*1024*1024 + 1 }},
-		{"history 0", func(c *Config) { c.MaxHistoryTokens = 0 }},
 		{"history negative", func(c *Config) { c.MaxHistoryTokens = -5 }},
 		{"history below minimum", func(c *Config) { c.MaxHistoryTokens = 1023 }},
 		{"history above maximum", func(c *Config) { c.MaxHistoryTokens = 1000001 }},
@@ -52,6 +55,10 @@ func TestCapsValidation(t *testing.T) {
 	}{
 		{"tool result minimum", func(c *Config) { c.MaxToolResultBytes = 1024 }},
 		{"tool result maximum", func(c *Config) { c.MaxToolResultBytes = 10 * 1024 * 1024 }},
+		// "history 0" is now VALID: 0 means auto-derive from the
+		// provider's window (moved here from the bad list when
+		// the default changed from 32768 to 0/auto).
+		{"history 0 (auto)", func(c *Config) { c.MaxHistoryTokens = 0 }},
 		{"history minimum", func(c *Config) { c.MaxHistoryTokens = 1024 }},
 		{"history maximum", func(c *Config) { c.MaxHistoryTokens = 1000000 }},
 		{"both small", func(c *Config) { c.MaxToolResultBytes = 4096; c.MaxHistoryTokens = 2048 }},
@@ -88,6 +95,28 @@ func TestCapsSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCapsSaveLoadRoundTripZeroHistoryIsAuto(t *testing.T) {
+	// 0 (auto) must survive a save/load round-trip as 0, not be
+	// silently filled with the old 32768 default.
+	dir := t.TempDir()
+	cfg := Default()
+	cfg.MaxHistoryTokens = 0
+	path := filepath.Join(dir, "config.json")
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.MaxHistoryTokens != 0 {
+		t.Fatalf("MaxHistoryTokens = %d, want 0 (auto) after round-trip", loaded.MaxHistoryTokens)
+	}
+	if err := loaded.Validate(); err != nil {
+		t.Fatalf("loaded auto config should validate: %v", err)
+	}
+}
+
 func TestCapsLoadMissingFieldsUseDefaults(t *testing.T) {
 	// A config file written before the caps existed (or one that
 	// simply omits them) must load with the defaults, not zeroes:
@@ -106,8 +135,11 @@ func TestCapsLoadMissingFieldsUseDefaults(t *testing.T) {
 	if cfg.MaxToolResultBytes != DefaultMaxToolResultBytes {
 		t.Fatalf("MaxToolResultBytes = %d, want default %d", cfg.MaxToolResultBytes, DefaultMaxToolResultBytes)
 	}
-	if cfg.MaxHistoryTokens != DefaultMaxHistoryTokens {
-		t.Fatalf("MaxHistoryTokens = %d, want default %d", cfg.MaxHistoryTokens, DefaultMaxHistoryTokens)
+	// MaxHistoryTokens now defaults to 0 (auto), not 32768:
+	// a config file that never set it gets the provider-derived
+	// budget on next load.
+	if cfg.MaxHistoryTokens != 0 {
+		t.Fatalf("MaxHistoryTokens = %d, want default 0 (auto)", cfg.MaxHistoryTokens)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("loaded config should validate: %v", err)

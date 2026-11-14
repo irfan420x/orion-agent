@@ -194,9 +194,14 @@ func TestNewAgentAppliesCapsToRegistry(t *testing.T) {
 	cfg2.MaxToolResultBytes = 0
 	cfg2.MaxHistoryTokens = 0
 	reg2 := tools.NewRegistry()
-	newTestAgent(t, cfg2, &fakeProvider{}, reg2, newFakeStore())
+	a2 := newTestAgent(t, cfg2, &fakeProvider{}, reg2, newFakeStore())
 	if got := reg2.MaxResultBytes(); got != config.DefaultMaxToolResultBytes {
 		t.Fatalf("registry cap = %d, want default %d", got, config.DefaultMaxToolResultBytes)
+	}
+	// Zero history with a non-declaring provider pins the
+	// fallback: 32768 (config.DefaultMaxHistoryTokens), not 0.
+	if got := a2.HistoryBudget(); got != config.DefaultMaxHistoryTokens {
+		t.Fatalf("zero history, non-declaring provider: budget = %d, want fallback %d", got, config.DefaultMaxHistoryTokens)
 	}
 }
 

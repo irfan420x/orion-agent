@@ -75,7 +75,10 @@ import (
 // Auto-compaction thresholds, as fractions of the history budget.
 // The trigger sits at 80% (the audit's "~80% of the history
 // budget"); the warning band opens at 70% so the user sees it
-// coming.
+// coming. The budget itself is provider-derived (half the active
+// provider's window; internal/core maxHistoryTokens), so these
+// fractions are provider-relative automatically — no numeric
+// change was needed here for the provider-auto window.
 const (
 	// AutoCompactThreshold is the history pressure at which a
 	// turn auto-compacts before running.

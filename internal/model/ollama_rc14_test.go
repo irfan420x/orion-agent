@@ -80,20 +80,28 @@ func TestRC14OllamaMaxTokensWithoutTemperature(t *testing.T) {
 }
 
 // TestRC14OllamaNoMaxTokensOmitsNumPredict: an uncapped request
-// sends no num_predict, and with no temperature either the
-// options object is omitted entirely.
+// sends no num_predict. NOTE (provider-auto context window):
+// options is NO LONGER omitted entirely when nothing is set —
+// num_ctx is now always sent (the declared window for the
+// configured model; "test-model" is unknown, so the 32768
+// fallback), so the server default can never silently apply.
+// Only the num_predict absence is asserted here now.
 func TestRC14OllamaNoMaxTokensOmitsNumPredict(t *testing.T) {
 	req := sampleRequest()
 	req.Temperature = nil
 	req.MaxTokens = 0
 	body := rc14OllamaCapture(t, req)
-	if _, ok := body["options"]; ok {
-		t.Fatalf("wire request options = %v, want absent (nothing set)", body["options"])
+	opts := rc14OllamaOptions(t, body)
+	if got, ok := opts["num_ctx"]; !ok || got != float64(32768) {
+		t.Fatalf("options.num_ctx = %v (present=%v), want 32768 (unknown-model fallback)", got, ok)
+	}
+	if _, ok := opts["num_predict"]; ok {
+		t.Fatalf("options.num_predict present = %v, want absent (MaxTokens=0)", opts["num_predict"])
 	}
 
 	req2 := sampleRequest()
 	req2.MaxTokens = 0
-	opts := rc14OllamaOptions(t, rc14OllamaCapture(t, req2))
+	opts = rc14OllamaOptions(t, rc14OllamaCapture(t, req2))
 	if _, ok := opts["num_predict"]; ok {
 		t.Fatalf("options.num_predict present = %v, want absent (MaxTokens=0)", opts["num_predict"])
 	}

@@ -22,7 +22,7 @@
 //     every later provider call)
 //   - history integrity: every request the loop sends to the provider
 //     is validated here (tool-call/tool-result pairing, token budget)
-//   - a dedicated 32768-token budget test (TestAudit3HistoryBudget32768)
+//   - a dedicated 32768-token budget test (TestAudit3HistoryBudgetOverride32768)
 //
 // Safety: the only shell commands any scenario requests are "echo ..."
 // and one denied "rm -rf /" (denylist path only — never executed).
@@ -963,8 +963,10 @@ func TestAudit3ReliabilityHarness(t *testing.T) {
 	}
 }
 
-// TestAudit3HistoryBudget32768 drives one turn against the real
-// 32768-token history budget: seeded history plus a 3 MiB file read
+// TestAudit3HistoryBudgetOverride32768 drives one turn against an
+// explicit 32768-token history budget (the override path: with
+// MaxHistoryTokens set, the provider-derived budget must NOT
+// apply): seeded history plus a 3 MiB file read
 // (capped to 256 KiB by the registry) far exceeds the budget, and the
 // loop must keep going — trimming the request to budget without
 // breaking tool-call pairing — and the turn after must still work.
@@ -1013,7 +1015,7 @@ func TestAudit3EmptyFinalAnswerIsError(t *testing.T) {
 	}
 }
 
-func TestAudit3HistoryBudget32768(t *testing.T) {
+func TestAudit3HistoryBudgetOverride32768(t *testing.T) {
 	dir := t.TempDir()
 	bigPath := filepath.Join(dir, "big.txt")
 	if err := os.WriteFile(bigPath, []byte(strings.Repeat("w", 3*1024*1024)), 0o600); err != nil {
@@ -1034,11 +1036,11 @@ func TestAudit3HistoryBudget32768(t *testing.T) {
 	prov := &scriptedModel{dir: dir}
 	cfg := config.Default()
 	cfg.MaxSteps = 5
-	cfg.TimeoutSeconds = 5
-	cfg.MaxHistoryTokens = 32768 // the real production budget
+	cfg.TimeoutSeconds = 10      // F-A22-15: 5s was too tight under -race
+	cfg.MaxHistoryTokens = 32768 // explicit override: the production budget
 	agent := newTestAgent(t, cfg, prov, reg, mem)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	t0 := time.Now()
 	out, err := agent.Run(ctx, "BIG big.txt")
@@ -1081,7 +1083,7 @@ func TestAudit3HistoryBudget32768(t *testing.T) {
 	t.Logf("AUDIT3 BUDGET: turn over 32768-token budget completed in %v; largest request %d tokens; oldest filler dropped, newest kept", dur, maxTokens)
 
 	// The loop must stay alive after the trimmed turn.
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
 	out2, err := agent.Run(ctx2, "CALC 11*11")
 	if err != nil {
