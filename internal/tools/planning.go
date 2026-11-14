@@ -640,7 +640,15 @@ type todoWriteTool struct{ store *PlanningStore }
 
 func (t *todoWriteTool) Name() string { return "todo_write" }
 
-// RiskClass declares the tool safe: it only manages the plan checklist.
+// RiskClass declares the tool safe (F-A21-15, kept Safe
+// deliberately): it persists only Orion's own 0600 per-chat
+// planning files (todos.json/tasks.json, paths derived from config
+// and context — never a user-supplied path), never user files,
+// never the shell, never the network. Raising it would prompt on
+// every checklist update and break plan-mode flows: plan_mode
+// blocks Destructive tools while a plan is pending, and planning
+// updates are part of that workflow. The Safe classification is
+// explicit — the name is listed in the gate's safeTools map.
 func (t *todoWriteTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *todoWriteTool) Description() string {
@@ -743,7 +751,15 @@ type taskCreateTool struct{ store *PlanningStore }
 
 func (t *taskCreateTool) Name() string { return "task_create" }
 
-// RiskClass declares the tool safe: it only manages the task store.
+// RiskClass declares the tool safe (F-A21-15, kept Safe
+// deliberately): it persists only Orion's own 0600 per-chat
+// planning files (todos.json/tasks.json, paths derived from config
+// and context — never a user-supplied path), never user files,
+// never the shell, never the network. Raising it would prompt on
+// every task creation and break plan-mode flows: plan_mode blocks
+// Destructive tools while a plan is pending, and planning updates
+// are part of that workflow. The Safe classification is explicit
+// — the name is listed in the gate's safeTools map.
 func (t *taskCreateTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *taskCreateTool) Description() string {
@@ -1045,7 +1061,15 @@ type taskUpdateTool struct{ store *PlanningStore }
 
 func (t *taskUpdateTool) Name() string { return "task_update" }
 
-// RiskClass declares the tool safe: it only manages the task store.
+// RiskClass declares the tool safe (F-A21-15, kept Safe
+// deliberately): it persists only Orion's own 0600 per-chat
+// planning files (todos.json/tasks.json, paths derived from config
+// and context — never a user-supplied path), never user files,
+// never the shell, never the network. Raising it would prompt on
+// every task update and break plan-mode flows: plan_mode blocks
+// Destructive tools while a plan is pending, and planning updates
+// are part of that workflow. The Safe classification is explicit
+// — the name is listed in the gate's safeTools map.
 func (t *taskUpdateTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *taskUpdateTool) Description() string {
