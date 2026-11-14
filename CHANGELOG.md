@@ -4,6 +4,42 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### ask_user_question — the first of the 14 advanced tools
+
+The agent can now ask the user a question mid-turn and WAIT for the
+answer instead of guessing. The question goes out as a Telegram
+message with inline-button options (tap) and/or a free-text reply;
+the tool call blocks until the user answers or the timeout expires
+(default 5 min, configurable 10 s–30 min). Verified in the working
+tree: **1,407 tests pass, 0 fail, 4 skip (total 1,411), 24/24
+packages, race clean 24/24, no data race** (+22 tests over rc25).
+
+- **Transport reuses the approval-callback machinery** — one
+  installed callback handler serves both the permission gate and
+  questions (`ask:<questionID>:<optionIndex>`; the index only,
+  never the option text, since Telegram caps callback_data at 64
+  bytes). Same requester-or-owner sender check, same expiry-edit
+  pattern, same single-winner settle.
+- **No deadlock** — a typed reply is intercepted in PollStream
+  BEFORE the per-chat lock (the asking turn holds that lock while
+  it waits), and taps run on the separate callback semaphore, so
+  the poller keeps running while the tool waits. A regression test
+  proves a turn that asks and blocks is unblocked by a typed reply
+  in the same chat.
+- **Per-chat isolation** — a question is answerable only from its
+  own chat, by the asker or the owner. Commands (`/...`) are never
+  answers; a non-asker's tap is refused with a toast.
+- **Timeout + cancellation** — a timeout edits the question in
+  place as expired (keyboard removed) and returns a timeout
+  ToolError; cancelling the turn (including a daemon restart)
+  settles the question, so a waiting tool never hangs forever.
+- **Safe by default** — `ask_user_question` is ClassSafe, so the
+  gate never prompts before the tool can ask. With no Telegram
+  transport installed (local CLI runs) it fails cleanly instead of
+  hanging. Wired in both binaries (`orion` and `oriond`).
+
 ## [0.2.0-rc25] — 2026-11-14
 
 ### Audit 19 fixes (v0.2.0-rc25) — see `AUDIT19_2026-11-14.md`

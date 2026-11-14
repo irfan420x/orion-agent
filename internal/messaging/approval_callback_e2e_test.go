@@ -260,7 +260,7 @@ func newW6Harness(t *testing.T, gateTimeout time.Duration) *w6Harness {
 		h.gate.SetTimeout(gateTimeout)
 	}
 	InstallApprovalExpiry(h.gate, h.gw, h.cards, "w6")
-	InstallApprovalCallbackHandler(h.gw, h.gate, w6OwnerID, h.cards, "w6")
+	InstallApprovalCallbackHandler(h.gw, h.gate, w6OwnerID, h.cards, nil, "w6")
 	return h
 }
 

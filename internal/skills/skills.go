@@ -87,7 +87,8 @@ type Registry struct {
 // the tools package, because tools imports skills (the skill tool
 // looks skills up), so skills cannot import tools back.
 var knownBuiltInTools = map[string]bool{
-	"calculator": true, "datetime": true,
+	"ask_user_question": true,
+	"calculator":        true, "datetime": true,
 	"file_edit": true, "file_list": true, "file_read": true, "file_write": true,
 	"glob": true, "grep": true,
 	"process_list":  true,

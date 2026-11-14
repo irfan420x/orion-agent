@@ -463,6 +463,12 @@ type TelegramGateway struct {
 	// callback-query updates (inline-keyboard taps). It is invoked
 	// outside any per-chat lock (see CallbackHandler).
 	callbackHandler CallbackHandler
+	// questions, when set via SetQuestionRegistry, tracks pending
+	// ask_user_question questions: PollStream's message handler
+	// consults it before the per-chat lock (a typed reply answers
+	// a pending question), and the installed callback handler
+	// routes ask: taps through it. Nil means no questions.
+	questions *QuestionRegistry
 	// logger, when set via WithLogger, receives polling-health notes:
 	// transient getUpdates failures and the recovery after them. It is
 	// nil by default (silent). Only redacted errors are ever passed
@@ -827,6 +833,18 @@ func (g *TelegramGateway) SetCallbackHandler(h CallbackHandler) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.callbackHandler = h
+}
+
+// SetQuestionRegistry installs the pending-question registry the
+// gateway consults for ask_user_question: PollStream's message
+// handler answers a pending question from a typed reply before
+// the per-chat lock, and the installed callback handler routes
+// ask: taps through it. A nil registry means "no questions".
+// Call before PollStream starts; it must not race polling.
+func (g *TelegramGateway) SetQuestionRegistry(q *QuestionRegistry) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.questions = q
 }
 
 // callbackHandlerFor returns the installed callback handler, or nil.
@@ -1212,6 +1230,16 @@ func (g *TelegramGateway) SendMessageHTML(ctx context.Context, chatID int64, htm
 	return g.sendMessageRaw(ctx, chatID, htmlText, "HTML")
 }
 
+// SendMessageReturningID sends one plain-text message to chatID and
+// returns the new message's id, so the caller can edit it in place
+// later. It is SendMessage for callers that need the id (the
+// ask_user_question transport, for its expiry edit) without an
+// inline keyboard: unlike SendMessage it does not split, so
+// callers must keep the text under 4096 runes.
+func (g *TelegramGateway) SendMessageReturningID(ctx context.Context, chatID int64, text string) (int64, error) {
+	return g.sendMessageRaw(ctx, chatID, text, "")
+}
+
 // SendMessageWithKeyboard sends one plain-text message with an inline
 // keyboard to chatID and returns the new message's id. It is the
 // approval prompt's transport: the keyboard's buttons carry
@@ -1521,8 +1549,21 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 // HandleApprovalCallback). Callers must install this (or an
 // equivalent) or approvals can never be answered — the gate
 // prompts, but no tap reaches it.
-func InstallApprovalCallbackHandler(gw *TelegramGateway, gate *permissions.Gate, ownerID int64, cards *ApprovalCards, logPrefix string) {
+//
+// It also routes ask_user_question taps (callback data
+// "ask:<questionID>:<optionIndex>") through questions to
+// HandleQuestionCallback, so one installed handler serves both
+// the approval gate and the question asker — the gateway holds a
+// single callback handler, and a second installer would overwrite
+// the first. A nil questions registry means "no questions": ask:
+// taps are then answered as expired. Approval behaviour is
+// unchanged: anything that is not an ask: tap goes to
+// HandleApprovalCallback exactly as before.
+func InstallApprovalCallbackHandler(gw *TelegramGateway, gate *permissions.Gate, ownerID int64, cards *ApprovalCards, questions *QuestionRegistry, logPrefix string) {
 	gw.SetCallbackHandler(func(ctx context.Context, q TGCallbackQuery) error {
+		if _, _, ok := ParseQuestionCallback(q.Data); ok {
+			return HandleQuestionCallback(ctx, gw, questions, q, logPrefix)
+		}
 		return HandleApprovalCallback(ctx, gw, gate, ownerID, q, cards, logPrefix)
 	})
 }
@@ -2161,6 +2202,16 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				_ = g.SendMessage(ctx, upd.Message.Chat.ID, msg)
 			}
 		}()
+		// A text message that answers a pending ask_user_question
+		// in this chat is consumed as the answer (no turn, no
+		// lock): the turn that asked is blocked waiting for it and
+		// holds the chat's lock, so routing the reply through a
+		// turn would deadlock until the question timed out. The
+		// defers above (markDecided, semaphore release) still run
+		// on this early return, so the update is confirmed.
+		if g.tryAnswerQuestion(upd) {
+			return
+		}
 		lock := chatLock(upd.Message.Chat.ID)
 		lock.Lock()
 		defer lock.Unlock()

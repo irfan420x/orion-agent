@@ -421,7 +421,17 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
 		return 1
 	}
-	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, "oriond")
+	// ask_user_question transport: the question registry tracks
+	// pending questions (callback taps + typed replies), and the
+	// asker is installed on the app's tool registry so per-chat
+	// agents can ask the user mid-turn. The gateway consults the
+	// registry before the per-chat lock (a typed reply answers a
+	// pending question); the installed callback handler routes
+	// ask: taps through it.
+	questions := messaging.NewQuestionRegistry(ownerID)
+	gw.SetQuestionRegistry(questions)
+	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, questions, "oriond")
+	a.Tools.SetQuestionAsker(messaging.NewTelegramQuestionAsker(gw, questions, ownerID, "oriond").Ask)
 
 	// Daily budget threshold alert (F-A18-11, rc24): when a
 	// chat's usage today reaches the configured threshold, the

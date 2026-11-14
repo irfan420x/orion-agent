@@ -68,6 +68,11 @@ func DefaultRegistryWithSandboxAndTrustedEgress(sandboxCfg sandbox.Config, trust
 		&calculatorTool{},
 		&datetimeTool{},
 		&processListTool{},
+		// ask_user_question starts with no transport: the daemon
+		// installs the Telegram asker via Registry.SetQuestionAsker
+		// after it builds the gateway. Local runs never install
+		// one, so the tool fails cleanly there instead of hanging.
+		&askUserQuestionTool{},
 	}
 	tools = append(tools, planningTools...)
 	for _, t := range tools {

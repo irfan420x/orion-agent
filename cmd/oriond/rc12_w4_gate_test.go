@@ -82,7 +82,7 @@ func TestW4BuildApprovalGateInstallsGateAndCallbackHandler(t *testing.T) {
 	if cards == nil {
 		t.Fatal("buildApprovalGate returned a nil card tracker — expiry could never edit a card in place")
 	}
-	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, "oriond")
+	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, nil, "oriond")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

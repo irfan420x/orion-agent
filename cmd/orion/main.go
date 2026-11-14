@@ -1230,7 +1230,16 @@ func wireGate(a *app.App, gw *messaging.TelegramGateway) (*permissions.Gate, *me
 		return nil, nil, err
 	}
 	messaging.InstallApprovalExpiry(gate, gw, cards, "orion")
-	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, "orion")
+	// ask_user_question transport (same as oriond): the question
+	// registry tracks pending questions, the gateway consults it
+	// before the per-chat lock (a typed reply answers a pending
+	// question), the installed callback handler routes ask: taps
+	// through it, and the asker is installed on the app's tool
+	// registry so per-chat agents can ask the user mid-turn.
+	questions := messaging.NewQuestionRegistry(ownerID)
+	gw.SetQuestionRegistry(questions)
+	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, questions, "orion")
+	a.Tools.SetQuestionAsker(messaging.NewTelegramQuestionAsker(gw, questions, ownerID, "orion").Ask)
 	if ownerID != 0 {
 		fmt.Fprintf(os.Stderr, "orion: owner chat %d (first telegram_allowed_chats entry)\n", ownerID)
 	}
