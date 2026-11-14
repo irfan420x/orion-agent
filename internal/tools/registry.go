@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -100,10 +101,30 @@ func (r *Registry) PlanModeBlocks(ctx context.Context, tool string) (bool, strin
 	return pm.PlanModeBlocks(ctx, tool)
 }
 
+// isNilTool reports whether t is nil, including a typed nil (a
+// nil pointer stored in the Tool interface): the t == nil check
+// misses those, and the t.Name() call in Register would panic on
+// the nil receiver (F-A21-8 — the auditor's probe was
+// Register((*wireCallbackTool)(nil))).
+func isNilTool(t Tool) bool {
+	if t == nil {
+		return true
+	}
+	v := reflect.ValueOf(t)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice, reflect.UnsafePointer:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
 // Register adds a tool; duplicate names are an error. A nil tool or a
 // tool with an empty (or whitespace-only) name is rejected instead of
 // panicking later on a nil dereference or registering an uncallable
-// entry.
+// entry. A typed nil (a nil pointer in the Tool interface) is
+// rejected the same way (F-A21-8): t == nil misses it, so the
+// check is isNilTool, not a plain nil comparison.
 //
 // A tool must implement RiskClasser (declare its permission-gate
 // risk class explicitly): a tool that forgets to declare would
@@ -122,7 +143,7 @@ func (r *Registry) PlanModeBlocks(ctx context.Context, tool string) (bool, strin
 // the maps in internal/permissions/gate.go (or fix its
 // declaration) and re-register.
 func (r *Registry) Register(t Tool) error {
-	if t == nil {
+	if isNilTool(t) {
 		return fmt.Errorf("tools: cannot register nil tool")
 	}
 	if strings.TrimSpace(t.Name()) == "" {

@@ -322,6 +322,49 @@ func TestRegistryRegisterGuards(t *testing.T) {
 	}
 }
 
+// nilReceiverTool is a Tool with pointer receivers that dereference
+// the receiver, for pinning that Register rejects a typed nil
+// instead of panicking on it (F-A21-8): t.Name() on a nil
+// *nilReceiverTool panics, so without the isNilTool guard the
+// auditor's probe (Register of a nil pointer in the Tool
+// interface) would crash the caller.
+type nilReceiverTool struct{ name string }
+
+func (t *nilReceiverTool) Name() string { return t.name }
+func (t *nilReceiverTool) Description() string {
+	return "test tool with a nil receiver"
+}
+func (t *nilReceiverTool) Definition() model.ToolDefinition {
+	return model.ToolDefinition{Name: t.name, Description: t.Description(), Parameters: map[string]any{"type": "object"}}
+}
+func (t *nilReceiverTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	return "ok", nil
+}
+func (t *nilReceiverTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+
+// TestRegisterRejectsTypedNilTool pins the F-A21-8 guard: a typed
+// nil (a nil pointer stored in the Tool interface) is rejected
+// with a clean error, not a panic — the t == nil check misses it.
+// The registry stays usable afterwards.
+func TestRegisterRejectsTypedNilTool(t *testing.T) {
+	r := NewRegistry()
+	var nilTool *nilReceiverTool
+	if err := r.Register(nilTool); err == nil {
+		t.Fatal("Register(typed nil): expected error, got nil (want a clean rejection, not a panic)")
+	}
+	if _, ok := r.Get(""); ok {
+		t.Fatal("typed-nil tool is registered anyway")
+	}
+	if err := r.Register(&namedStubTool{name: "calculator"}); err != nil {
+		t.Fatalf("Register(valid tool) after typed nil: %v", err)
+	}
+	// RegisterAll stops at the same guard (it loops Register).
+	r2 := NewRegistry()
+	if err := r2.RegisterAll([]Tool{nilTool}); err == nil {
+		t.Fatal("RegisterAll(typed nil): expected error, got nil")
+	}
+}
+
 // --- P2-27: calculator parser bounds + registry recover ---
 
 // TestCalcParserPeekNextBounds: peek/next past the EOF token return the

@@ -122,7 +122,7 @@ func DefaultRegistryWithDeps(deps ToolDeps) (*Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tools: factory %q: %w", e.name, err)
 		}
-		if t == nil {
+		if isNilTool(t) {
 			return nil, fmt.Errorf("tools: factory %q returned a nil tool", e.name)
 		}
 		if t.Name() != e.name {
