@@ -172,6 +172,7 @@ func TestRegisterRejectsMismatchedRiskClass(t *testing.T) {
 		{"calculator", permissions.ClassDestructive}, // safe name, Destructive declaration
 		{"web_fetch", permissions.ClassSafe},         // network name, Safe declaration
 		{"mcp__srv__tool", permissions.ClassSafe},    // MCP name, Safe declaration
+		{"SHELL_EXEC", permissions.ClassSafe},        // case folding (F-A21-17): mixed-case gated name, Safe declaration
 	}
 	for _, tc := range cases {
 		r := NewRegistry()
@@ -202,6 +203,9 @@ func TestRegisterAcceptsMatchingRiskClass(t *testing.T) {
 		{"calculator", permissions.ClassSafe},
 		{"web_fetch", permissions.ClassNetwork},
 		{"mcp__srv__tool", permissions.ClassNetwork},
+		// Case folding (F-A21-17): a mixed-case spelling of a
+		// mapped name agrees with the folded classification.
+		{"SHELL_EXEC", permissions.ClassDestructive},
 	}
 	for _, tc := range cases {
 		r := NewRegistry()
@@ -228,6 +232,10 @@ func TestRegisterRejectsNovelNames(t *testing.T) {
 		{"wipe_notes", permissions.ClassDestructive},
 		{"brand_new_tool", permissions.ClassSafe},
 		{"unknown_tool", permissions.ClassSafe},
+		// Case folding (F-A21-17): a mixed-case spelling of an
+		// unmapped name is still unmapped, whatever it declares.
+		{"WIPE_NOTES", permissions.ClassSafe},
+		{"WIPE_NOTES", permissions.ClassDestructive},
 	}
 	for _, tc := range cases {
 		r := NewRegistry()

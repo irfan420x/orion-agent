@@ -54,6 +54,15 @@ func TestClassify(t *testing.T) {
 		// server is an external process with unknown capabilities.
 		"mcp__fake__echo": ClassNetwork,
 		"mcp__fs__write":  ClassNetwork,
+		// Case folding (F-A21-17): a name that differs from a
+		// mapped name only by case classifies as that tool —
+		// SHELL_EXEC is shell_exec, never an unknown name.
+		"SHELL_EXEC":     ClassDestructive,
+		"Shell_Exec":     ClassDestructive,
+		"CALCULATOR":     ClassSafe,
+		"Calculator":     ClassSafe,
+		"Web_Fetch":      ClassNetwork,
+		"MCP__srv__tool": ClassNetwork,
 	}
 	for tool, want := range cases {
 		if got := Classify(tool); got != want {
@@ -81,6 +90,19 @@ func TestClassifyKnown(t *testing.T) {
 	for _, name := range []string{"mcp__srv__tool", "mcp__fake__echo"} {
 		if class, ok := ClassifyKnown(name); !ok || class != ClassNetwork {
 			t.Errorf("ClassifyKnown(%q) = %v/%v, want network/true", name, class, ok)
+		}
+	}
+	// Case folding (F-A21-17): mixed-case spellings of mapped
+	// names are known as those names; mixed-case spellings of
+	// unmapped names are still unknown.
+	for _, name := range []string{"SHELL_EXEC", "Shell_Exec", "CALCULATOR", "MCP__srv__tool"} {
+		if _, ok := ClassifyKnown(name); !ok {
+			t.Errorf("ClassifyKnown(%q) = unknown, want known (case-folded)", name)
+		}
+	}
+	for _, name := range []string{"WIPE_NOTES", "Unknown_Tool"} {
+		if _, ok := ClassifyKnown(name); ok {
+			t.Errorf("ClassifyKnown(%q) = known, want unknown", name)
 		}
 	}
 	for _, name := range []string{"wipe_notes", "unknown_tool", "brand_new_tool", ""} {

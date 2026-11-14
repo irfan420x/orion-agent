@@ -148,11 +148,13 @@ var safeTools = map[string]bool{
 }
 
 // normalizeToolName trims surrounding whitespace from a tool name
-// for classification lookups. Case folding lands here too
+// and folds it to lower case for classification lookups
 // (F-A21-17): a name that differs from a mapped name only by case
-// must classify as that tool, never as an unknown name.
+// must classify as that tool, never as an unknown name —
+// SHELL_EXEC declaring Safe must be rejected exactly like
+// shell_exec declaring Safe, not sail through as unclassified.
 func normalizeToolName(tool string) string {
-	return strings.TrimSpace(tool)
+	return strings.ToLower(strings.TrimSpace(tool))
 }
 
 // classifyKnown maps a normalised tool name to its explicit risk

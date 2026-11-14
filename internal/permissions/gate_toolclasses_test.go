@@ -55,6 +55,22 @@ func TestGateSetToolClasses(t *testing.T) {
 	if ok, _ := g.Check(ctx, "calculator", `{}`); !ok {
 		t.Fatal("calculator after clearing installed classes: Check denied, want allowed")
 	}
+	// Case folding (F-A21-17): installed-map keys and the
+	// checked name are both normalised, so a mixed-case key
+	// raises the lower-case tool and a mixed-case call is
+	// raised by a lower-case key.
+	g.SetToolClasses(map[string]Class{"CALCULATOR": ClassDestructive})
+	if ok, _ := g.Check(ctx, "calculator", `{}`); ok {
+		t.Fatal("calculator with installed CALCULATOR=Destructive: Check allowed, want gated")
+	}
+	if ok, _ := g.Check(ctx, "CALCULATOR", `{}`); ok {
+		t.Fatal("CALCULATOR with installed CALCULATOR=Destructive: Check allowed, want gated")
+	}
+	g.SetToolClasses(map[string]Class{"calculator": ClassDestructive})
+	if ok, _ := g.Check(ctx, "CALCULATOR", `{}`); ok {
+		t.Fatal("CALCULATOR with installed calculator=Destructive: Check allowed, want gated")
+	}
+	g.SetToolClasses(nil)
 	// Nil gate: no-op, never panics.
 	var nilGate *Gate
 	nilGate.SetToolClasses(map[string]Class{"calculator": ClassDestructive})
