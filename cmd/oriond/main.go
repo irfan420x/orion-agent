@@ -125,10 +125,19 @@ func run(args []string) int {
 			cfg, err := config.Load("")
 			if err != nil {
 				cfg = config.Default()
+				// F-A19-2 (rc25): the file's data_dir is
+				// unknown (the config could not be loaded),
+				// so say so plainly — "default data dir" was
+				// misleading when ORION_DATA_DIR pointed
+				// elsewhere, and the operator restores
+				// precisely because the data dir is damaged.
+				// The dir named here is the one actually used.
+				src := "default data dir"
 				if dir := os.Getenv("ORION_DATA_DIR"); dir != "" {
 					cfg.DataDir = dir
+					src = "data dir from ORION_DATA_DIR"
 				}
-				fmt.Fprintf(os.Stderr, "oriond: warning: cannot load config (%v); restoring with default data dir %s\n", err, cfg.DataDir)
+				fmt.Fprintf(os.Stderr, "oriond: warning: cannot load config (%v); the config file's data_dir is unknown, restoring with %s %s\n", err, src, cfg.DataDir)
 			}
 			// F-A18-2: take the instance lock BEFORE restoring.
 			// A running daemon re-saves sessions + memory on
@@ -158,15 +167,19 @@ func run(args []string) int {
 				fmt.Fprintf(os.Stderr, "oriond: restore failed: %v\n", err)
 				return 1
 			}
-			// F-A18-2: a snapshot usually carries its own
-			// oriond.lock, copied via temp file + rename, so the
-			// path we locked may now be a different file — and
-			// flock follows the inode, not the path. Re-take the
-			// lock on the current file so no daemon can start
-			// alongside the rest of the restore. A failure here
-			// means another process took the new file's lock
-			// mid-restore; the restore itself already succeeded,
-			// so warn loudly instead of failing it.
+			// F-A18-2 (corrected F-A19-5): Restore never replaces
+			// oriond.lock (it skips it in the verify and copy
+			// loops), so the path we locked is the same file —
+			// but re-check it anyway, in case anything else
+			// replaced it mid-restore: flock follows the inode,
+			// not the path, so a replaced file would leave us
+			// holding a lock nobody else opens, and a daemon
+			// could start alongside the rest of the restore.
+			// Re-take the lock on the current file if it
+			// changed. A failure here means another process
+			// took the new file's lock mid-restore; the restore
+			// itself already succeeded, so warn loudly instead
+			// of failing it.
 			if refreshed, rerr := refreshInstanceLock(lockFile, cfg.DataDir); rerr != nil {
 				fmt.Fprintf(os.Stderr, "oriond: warning: restore succeeded but the instance lock was taken by another process during the restore (%v); check no daemon started mid-restore before starting one\n", rerr)
 				lockFile = nil
@@ -416,11 +429,12 @@ func run(args []string) int {
 	// the day. The App decides when an alert fires and formats
 	// it; this closure only delivers it through the gateway.
 	// With no owner configured there is nobody to notify, so
-	// the delivery fails loudly (logged by the App, retried on
-	// the next record) instead of silently dropping the alert.
+	// the delivery fails with ErrBudgetAlertNoOwner (F-A19-6):
+	// the App logs it once per chat and does not retry it,
+	// instead of silently dropping the alert.
 	a.SetBudgetAlertNotifier(func(ctx context.Context, chatID int64, text string) error {
 		if ownerID == 0 {
-			return errors.New("oriond: no owner configured; budget alert not sent")
+			return fmt.Errorf("oriond: %w", app.ErrBudgetAlertNoOwner)
 		}
 		return gw.SendMessage(ctx, ownerID, text)
 	})
@@ -583,16 +597,22 @@ func acquireInstanceLock(dataDir string) (*os.File, error) {
 }
 
 // refreshInstanceLock re-establishes the instance lock on the current
-// lock file after a restore (F-A18-2): a snapshot usually contains
-// its own oriond.lock, and Restore copies it via temp file + rename,
-// replacing the path the caller locked — but flock follows the inode,
-// not the path, so after the replace the caller would hold a lock on
-// a file nobody else opens, and a daemon starting then could poll
-// alongside the restore. When the path still points at the locked
-// file this returns f unchanged; when it was replaced it closes f
-// and takes the lock on the current file. An error means another
-// process took the new file's lock mid-restore: f is already closed
-// then, and the caller must not pretend the lock is still held.
+// lock file after a restore (F-A18-2, corrected F-A19-5): Restore
+// never replaces oriond.lock — backup.Restore skips it in both the
+// verify and the copy loops, so a snapshot's lock file (if one is
+// present at all) is never copied over the live one. The premise
+// this comment used to state — that a snapshot carries its own
+// lock and Restore copies it via temp file + rename — was false.
+// The refresh stays as a defensive guard: if the lock file was
+// replaced by anything else between the lock and the restore (an
+// operator, or another process), flock follows the inode, not the
+// path, so the caller would hold a lock on a file nobody else
+// opens, and a daemon starting then could poll alongside the
+// restore. When the path still points at the locked file this
+// returns f unchanged; when it was replaced it closes f and takes
+// the lock on the current file. An error means another process took
+// the new file's lock mid-restore: f is already closed then, and
+// the caller must not pretend the lock is still held.
 func refreshInstanceLock(f *os.File, dataDir string) (*os.File, error) {
 	if !instanceLockReplaced(f, dataDir) {
 		return f, nil

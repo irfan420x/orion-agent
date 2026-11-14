@@ -4,6 +4,89 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc25] — 2026-11-14
+
+### Audit 19 fixes (v0.2.0-rc25) — see `AUDIT19_2026-11-14.md`
+
+Fixes all seven P3s from the fresh-eyes audit of rc24 (0 P0, 0 P1,
+0 P2, 7 P3). Audit 18's fixes all still hold; rc8 security holds.
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open. Verified by the release coordinator on the final
+commit: **1,385 tests pass, 0 fail, 4 skip (total 1,389), 24/24
+packages, race clean 24/24, no data race** (clean-clone recount;
+the coordinator corrects these numbers here if the recount differs).
+
+- **F-A19-1 (P3)** — the remaining media kinds (animation / audio /
+  video_note / contact / poll / venue / dice / game) now get an
+  honest per-kind reply instead of being silently dropped
+  (TGMessage carries the fields; bytes are never downloaded). A
+  captioned animation no longer runs a turn on the caption while
+  the model never got the GIF — media takes precedence over text,
+  as with a captioned video.
+- **F-A19-2 (P3)** — `orion backup`'s corrupt-config fallback now
+  honours ORION_DATA_DIR (it used config.Default(), which ignores
+  the env override), so a backup never silently targets ~/.orion
+  while the daemon runs on another dir; the warning names the dir
+  actually used. The `oriond --restore` fallback warning now says
+  plainly that the config file's data_dir is unknown.
+- **F-A19-3 (P3)** — the shipped oriond.service header now names
+  the real CapabilityBoundingSet gate (CAP_SYS_ADMIN + CAP_SETFCAP,
+  CAP_SETUID is NOT the gate), matching the live unit. A test pins
+  the wording in both unit files, so the drift-guard test's blind
+  spot (it pins directives, not comments) cannot let this regress.
+- **F-A19-4 (P3)** — the sampler's pinned scope ("system"/"user")
+  returning "0" (unit known but not running) now falls back to the
+  other manager, like the unset-scope path — it no longer returns
+  "0" raw and leaves the sampler spinning in its retry loop. The
+  pin still controls the PREFERRED order.
+- **F-A19-5 (P3)** — the refreshInstanceLock comments are corrected:
+  Restore never replaces oriond.lock (it skips it in the verify and
+  copy loops), so the premise that a snapshot carries its own lock
+  and Restore copies it was false. The refresh stays as a defensive
+  guard for any other replacement of the file. The Snapshot-skip
+  option was deliberately NOT taken: an existing test relies on
+  snapshots containing the lock to prove Restore skips it. No
+  behavior change.
+- **F-A19-6 (P3)** — a permanent "no owner" budget-alert failure
+  is now distinguished from a transient delivery failure: it is
+  logged once per chat for the process and never retried, instead
+  of being retried (and logged) on every record until UTC midnight.
+  It is deliberately NOT marked alerted, so a restart with an owner
+  configured can still fire the alert. A transient failure still
+  retries (the rc24 retry test still passes).
+- **F-A19-7 (P3)** — the Makefile GO fallback now includes the
+  audit toolchain path
+  ($(HOME)/workspace/orion-audit/toolchain/go/bin/go), and the
+  parse-time $(error) no longer breaks Go-free targets: `make clean`
+  and `make version` work on a Go-less host (a goal that needs Go
+  still fails at parse time with the locations checked).
+- **Verification-blocking data race fix (found during the rc25
+  clean-clone -race run, rc12/rc21 code, not an audit finding)** —
+  PollStream spawned its reply handlers (callback, photo, media)
+  as detached goroutines and never waited for them, so a handler
+  could log via g.logf (which reads the global os.Stderr at call
+  time) AFTER PollStream returned — the race detector caught
+  TestW4's callback handler logging "context canceled" after
+  return, racing TestDaemonDebugEndpointEnabled's capture() swap
+  of os.Stderr. The first clean-clone -race run failed on ENOSPC
+  (the /tmp GOCACHE grew to 364M on the 512M tmpfs — no data race,
+  no code failure); the re-run with the GOCACHE on the home disk
+  exposed this race. The fix tracks the three g.logf handlers in
+  a WaitGroup (Add before spawn, Done on return; PollStream waits
+  in a defer), so no handler logs after return. The turn handler
+  is deliberately NOT tracked: it never calls g.logf, so it cannot
+  race on os.Stderr, and waiting for it would delay shutdown for
+  the whole turn. Regression test
+  `TestPollStreamWaitsForCallbackHandler` (deterministic: fails
+  without the wait, passes with it).
+
+Residuals (rc25, carried forward): the live sampler CSV rows are
+still only in the live working tree, not the repo (Audit 19 §2.3
+correction — the F-A18-3 code fix is verified by tests, not by the
+committed CSV); the budget threshold is still config-file-only (no
+`/budget threshold N` setter, rc24 residual); the F-A19-5 Snapshot
+skip was deliberately not taken (see above).
+
 ## [0.2.0-rc24] — 2026-11-14
 
 ### Audit 18 fixes (v0.2.0-rc24) — see `AUDIT18_2026-11-14.md`

@@ -125,6 +125,22 @@ func mediaUpdate(id, chatID, fromID int64, kind string) Update {
 		msg.Document = &TGDocument{FileID: "doc-1", FileName: "notes.pdf", MimeType: "application/pdf"}
 	case "location":
 		msg.Location = &TGLocation{Longitude: 103.85, Latitude: 1.29}
+	case "animation":
+		msg.Animation = &TGAnimation{FileID: "anim-1", FileName: "funny.gif", MimeType: "video/mp4", Width: 320, Height: 240, Duration: 5}
+	case "audio":
+		msg.Audio = &TGAudio{FileID: "audio-1", Duration: 180, Performer: "singer", Title: "song", MimeType: "audio/mpeg"}
+	case "video_note":
+		msg.VideoNote = &TGVideoNote{FileID: "vn-1", Length: 360, Duration: 10}
+	case "contact":
+		msg.Contact = &TGContact{PhoneNumber: "+1234567890", FirstName: "Irfan"}
+	case "poll":
+		msg.Poll = &TGPoll{ID: "poll-1", Question: "which one?", TotalVoterCount: 3}
+	case "venue":
+		msg.Venue = &TGVenue{Location: TGLocation{Longitude: 103.85, Latitude: 1.29}, Title: "Marina Bay", Address: "Singapore"}
+	case "dice":
+		msg.Dice = &TGDice{Emoji: "🎲", Value: 4}
+	case "game":
+		msg.Game = &TGGame{Title: "Chess", Description: "A game"}
 	default:
 		panic("mediaUpdate: unknown kind " + kind)
 	}

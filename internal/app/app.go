@@ -105,6 +105,19 @@ type App struct {
 	// polling starts and only read afterwards, like the gate's
 	// prompter, so it needs no lock.
 	budgetAlertNotifier BudgetAlertNotifier
+	// budgetAlertNoOwnerLogged records, per chat, that the
+	// permanent "no owner" budget-alert failure has already been
+	// logged once in this process (F-A19-6). maybeAlertBudget
+	// logs a no-owner failure only the first time for a chat,
+	// then stays quiet — retrying (and logging) it on every
+	// record until UTC midnight would spam the log for a failure
+	// that cannot succeed until the daemon restarts with an owner
+	// configured. It is deliberately NOT the persisted "alerted"
+	// state: the owner was never notified, so a restart with an
+	// owner configured must still be able to fire the alert.
+	// Guarded by budgetAlertNoOwnerMu.
+	budgetAlertNoOwnerMu     sync.Mutex
+	budgetAlertNoOwnerLogged map[int64]bool
 	// globalTranscript/globalSessionID are the CLI/global live
 	// session transcript and id (see sessions.go); nil/"" until
 	// wireGlobalTranscript runs in Build, or when the transcript

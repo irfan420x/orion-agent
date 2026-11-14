@@ -70,15 +70,30 @@ resolve_label() {
 # ignored with a stderr warning (fail open to the default
 # system-first order, never fail the sample). A "0" MainPID
 # (unit known but not running) is treated as empty so the
-# fallback still gets a chance.
+# fallback still gets a chance. F-A19-4: that is true for a PINNED
+# scope too — a pinned scope returning "0" falls back to the other
+# manager, it does not return "0" raw (the old pinned branches
+# returned it raw, so the sampler spun in its retry loop even when
+# the other manager had a running unit). The pin still controls the
+# PREFERRED order.
 resolve_pid() {
   case "${ORION_SYSTEMD_SCOPE:-}" in
     system)
-      systemctl show oriond -p MainPID --value 2>/dev/null | tr -d ' '
+      pid=$(systemctl show oriond -p MainPID --value 2>/dev/null | tr -d ' ')
+      if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+        printf '%s' "$pid"
+        return
+      fi
+      systemctl --user show oriond -p MainPID --value 2>/dev/null | tr -d ' '
       return
       ;;
     user)
-      systemctl --user show oriond -p MainPID --value 2>/dev/null | tr -d ' '
+      pid=$(systemctl --user show oriond -p MainPID --value 2>/dev/null | tr -d ' ')
+      if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+        printf '%s' "$pid"
+        return
+      fi
+      systemctl show oriond -p MainPID --value 2>/dev/null | tr -d ' '
       return
       ;;
     "")

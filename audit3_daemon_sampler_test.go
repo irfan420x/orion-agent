@@ -199,6 +199,37 @@ func TestSamplerResolvePidSystemFirst(t *testing.T) {
 			wantUser:  true,
 		},
 		{
+			// F-A19-4 (rc25): a PINNED scope returning "0" (unit
+			// known but not running) falls back to the other
+			// manager, like the unset-scope path — it must not
+			// return "0" raw and leave the sampler spinning.
+			name:       "scope=system with system MainPID 0 falls back to user",
+			systemPID:  "0",
+			userPID:    userPID,
+			scope:      "system",
+			wantPID:    userPID,
+			wantUser:   true,
+			wantSystem: true,
+		},
+		{
+			name:       "scope=system with empty system MainPID falls back to user",
+			systemPID:  "",
+			userPID:    userPID,
+			scope:      "system",
+			wantPID:    userPID,
+			wantUser:   true,
+			wantSystem: true,
+		},
+		{
+			name:       "scope=user with user MainPID 0 falls back to system",
+			systemPID:  systemPID,
+			userPID:    "0",
+			scope:      "user",
+			wantPID:    systemPID,
+			wantUser:   true,
+			wantSystem: true,
+		},
+		{
 			name:       "scope=system pins the system manager even when user has a PID",
 			systemPID:  systemPID,
 			userPID:    userPID,

@@ -63,10 +63,11 @@
 #   write. Likewise ProtectHome must NOT be added (the data dir is
 #   in $HOME), and CapabilityBoundingSet must NOT be added either:
 #   any restriction of the bounding set breaks the sandbox — the
-#   sandbox runs every shell_exec via `unshare --user
-#   --map-root-user`, whose uid_map write needs effective
-#   CAP_SETUID at exec (see the live unit's header for the
-#   9-unit matrix that proved this). The three applied directives
+#   sandbox runs every shell_exec via `unshare --user --map-root-user`,
+#   whose uid_map write needs CAP_SYS_ADMIN + CAP_SETFCAP in the
+#   bounding set — BOTH are required, and CAP_SETUID is NOT the gate
+#   (see the live unit's header for the 9-unit matrix that proved
+#   this). The three applied directives
 #   were each verified not to break the daemon (systemd-analyze
 #   verify clean; the live unit runs under exactly this set).
 # - Linger (F-A16-6): install.sh --systemd runs

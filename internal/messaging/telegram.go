@@ -147,6 +147,77 @@ type TGLocation struct {
 	Latitude  float64 `json:"latitude"`
 }
 
+// TGAnimation is an animation (GIF or H.264/MPEG-4 AVC video
+// without sound) attached to a message (F-A19-1). Orion cannot
+// see it; the bytes are never fetched.
+type TGAnimation struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	Duration int    `json:"duration"`
+}
+
+// TGAudio is an audio file attached to a message (F-A19-1). Orion
+// cannot hear it; the bytes are never fetched.
+type TGAudio struct {
+	FileID    string `json:"file_id"`
+	Duration  int    `json:"duration"`
+	Performer string `json:"performer,omitempty"`
+	Title     string `json:"title,omitempty"`
+	MimeType  string `json:"mime_type,omitempty"`
+}
+
+// TGVideoNote is a round video message attached to a message
+// (F-A19-1). Orion cannot see or hear it; the bytes are never
+// fetched.
+type TGVideoNote struct {
+	FileID   string `json:"file_id"`
+	Length   int    `json:"length"`
+	Duration int    `json:"duration"`
+}
+
+// TGContact is a contact shared in a message (F-A19-1). Orion
+// cannot read the contact card.
+type TGContact struct {
+	PhoneNumber string `json:"phone_number"`
+	FirstName   string `json:"first_name"`
+	LastName    string `json:"last_name,omitempty"`
+	UserID      int64  `json:"user_id,omitempty"`
+}
+
+// TGPoll is a poll attached to a message (F-A19-1). Orion cannot
+// see the question, options or votes.
+type TGPoll struct {
+	ID              string `json:"id"`
+	Question        string `json:"question"`
+	TotalVoterCount int    `json:"total_voter_count"`
+	IsClosed        bool   `json:"is_closed"`
+}
+
+// TGVenue is a venue shared in a message (F-A19-1). Orion has no
+// maps support.
+type TGVenue struct {
+	Location TGLocation `json:"location"`
+	Title    string     `json:"title"`
+	Address  string     `json:"address"`
+}
+
+// TGDice is a dice roll attached to a message (F-A19-1). Orion
+// cannot see the result.
+type TGDice struct {
+	Emoji string `json:"emoji"`
+	Value int    `json:"value"`
+}
+
+// TGGame is a game attached to a message (F-A19-1). Orion cannot
+// play or see it.
+type TGGame struct {
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+}
+
 // TGMessage is a Telegram message.
 type TGMessage struct {
 	MessageID int64   `json:"message_id"`
@@ -159,17 +230,26 @@ type TGMessage struct {
 	// — HasPhoto is the only reliable photo test. The photo bytes
 	// are never fetched: Orion has no vision support.
 	Photo []TGPhotoSize `json:"photo,omitempty"`
-	// Sticker, Voice, Video, Document and Location hold a
-	// non-photo attachment, if any (F-A18-9). Like a photo, the
-	// bytes are never fetched — see MediaKind and
+	// Sticker, Voice, Video, Document, Location, Animation, Audio,
+	// VideoNote, Contact, Poll, Venue, Dice and Game hold a
+	// non-photo attachment, if any (F-A18-9, F-A19-1). Like a photo,
+	// the bytes are never fetched — see MediaKind and
 	// cannotProcessMediaMessage. A message carries at most one
 	// of these in practice; MediaKind reports the first in a
 	// fixed order when several are somehow present.
-	Sticker  *TGSticker  `json:"sticker,omitempty"`
-	Voice    *TGVoice    `json:"voice,omitempty"`
-	Video    *TGVideo    `json:"video,omitempty"`
-	Document *TGDocument `json:"document,omitempty"`
-	Location *TGLocation `json:"location,omitempty"`
+	Sticker   *TGSticker   `json:"sticker,omitempty"`
+	Voice     *TGVoice     `json:"voice,omitempty"`
+	Video     *TGVideo     `json:"video,omitempty"`
+	Document  *TGDocument  `json:"document,omitempty"`
+	Location  *TGLocation  `json:"location,omitempty"`
+	Animation *TGAnimation `json:"animation,omitempty"`
+	Audio     *TGAudio     `json:"audio,omitempty"`
+	VideoNote *TGVideoNote `json:"video_note,omitempty"`
+	Contact   *TGContact   `json:"contact,omitempty"`
+	Poll      *TGPoll      `json:"poll,omitempty"`
+	Venue     *TGVenue     `json:"venue,omitempty"`
+	Dice      *TGDice      `json:"dice,omitempty"`
+	Game      *TGGame      `json:"game,omitempty"`
 }
 
 // HasPhoto reports whether the message carries a photo attachment.
@@ -178,9 +258,11 @@ func (m *TGMessage) HasPhoto() bool {
 }
 
 // MediaKind returns the kind of non-photo media attached to the
-// message ("sticker", "voice", "video", "document" or "location"),
-// or "" when the message carries no non-photo media (F-A18-9). A
-// photo is not media here — HasPhoto covers it.
+// message ("sticker", "voice", "video", "document", "location",
+// "animation", "audio", "video_note", "contact", "poll", "venue",
+// "dice" or "game"), or "" when the message carries no non-photo
+// media (F-A18-9, F-A19-1). A photo is not media here — HasPhoto
+// covers it.
 func (m *TGMessage) MediaKind() string {
 	if m == nil {
 		return ""
@@ -196,6 +278,22 @@ func (m *TGMessage) MediaKind() string {
 		return "document"
 	case m.Location != nil:
 		return "location"
+	case m.Animation != nil:
+		return "animation"
+	case m.Audio != nil:
+		return "audio"
+	case m.VideoNote != nil:
+		return "video_note"
+	case m.Contact != nil:
+		return "contact"
+	case m.Poll != nil:
+		return "poll"
+	case m.Venue != nil:
+		return "venue"
+	case m.Dice != nil:
+		return "dice"
+	case m.Game != nil:
+		return "game"
 	default:
 		return ""
 	}
@@ -225,6 +323,22 @@ func cannotProcessMediaMessage(kind string) string {
 		return "📄 I can't process documents yet — Orion can't read files sent here. Please paste the text you need help with and I'll help from that."
 	case "location":
 		return "📍 I can't process locations yet — Orion has no maps support, so please type the place name or address in words and I'll help from that."
+	case "animation":
+		return "🎞️ I can't process animations yet — Orion can't see GIFs or video clips sent here, so please describe what's in it in words and I'll help from that."
+	case "audio":
+		return "🎵 I can't process audio files yet — Orion has no speech-to-text support, so please type what's in the audio in words and I'll help from that."
+	case "video_note":
+		return "🎥 I can't process video messages yet — Orion can't see or hear round video messages, so please describe what's in it in words and I'll help from that."
+	case "contact":
+		return "👤 I can't process shared contacts yet — Orion can't read contact cards, so please type the name and number in words and I'll help from that."
+	case "poll":
+		return "📊 I can't process polls yet — Orion can't see the question, options or votes, so please type the question and options in words and I'll help from that."
+	case "venue":
+		return "🏢 I can't process shared venues yet — Orion has no maps support, so please type the venue name and address in words and I'll help from that."
+	case "dice":
+		return "🎲 I can't process dice rolls yet — Orion can't see the result, so please type the result in words and I'll help from that."
+	case "game":
+		return "🎮 I can't process games yet — Orion can't play or see games sent here, so please describe what you need in words and I'll help from that."
 	default:
 		return "I can't process that kind of message yet — please send it in words and I'll help from that."
 	}
@@ -1784,6 +1898,19 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// for every chat (the live rc10 incident, cards 245 and 253).
 	// Callbacks must never wait behind turns.
 	cbSem := make(chan struct{}, maxPollHandlers)
+	// handlers tracks the spawned reply handlers (callback, photo,
+	// media) that log via g.logf (rc25, found by the -race run:
+	// TestW4's callback handler logged "context canceled" AFTER
+	// PollStream returned, racing TestDaemonDebugEndpointEnabled's
+	// capture() swap of the global os.Stderr — g.logf reads that
+	// global at call time). PollStream waits for these handlers
+	// before returning (defer handlers.Wait()), so no handler logs
+	// after return. The turn handler (handle) is NOT tracked: it
+	// runs the full turn and never calls g.logf, so it cannot race
+	// on os.Stderr, and waiting for it would delay shutdown for
+	// the whole turn.
+	var handlers sync.WaitGroup
+	defer handlers.Wait()
 	var chatLocks [64]sync.Mutex
 	chatLock := func(chatID int64) *sync.Mutex {
 		return &chatLocks[uint64(chatID)%uint64(len(chatLocks))]
@@ -1972,6 +2099,10 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// send is best-effort, like every other reply: a failed send
 	// must not kill polling.
 	handlePhoto := func(upd Update) {
+		// Registered first, so it runs LAST: the handler is
+		// fully done (reply sent, update confirmed, slot
+		// released) before PollStream's wait returns (rc25).
+		defer handlers.Done()
 		defer markDecided(upd.UpdateID)
 		defer func() { <-sem }()
 		lock := chatLock(upd.Message.Chat.ID)
@@ -1990,6 +2121,9 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// the same chat. The send is best-effort, like every other
 	// reply: a failed send must not kill polling.
 	handleMedia := func(upd Update, kind string) {
+		// Registered first, so it runs LAST (rc25; see
+		// handlePhoto).
+		defer handlers.Done()
 		defer markDecided(upd.UpdateID)
 		defer func() { <-sem }()
 		lock := chatLock(upd.Message.Chat.ID)
@@ -2194,7 +2328,12 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	// (even when no handler is installed) so the button's spinner
 	// clears instead of hanging.
 	handleCallback := func(q TGCallbackQuery, updateID int64) {
-		// Registered first, so it runs LAST (LIFO): after the
+		// handlers.Done is registered first, so it runs LAST:
+		// the handler is fully done (query answered, update
+		// confirmed, slot released) before PollStream's wait
+		// returns (rc25).
+		defer handlers.Done()
+		// markDecided runs second-to-last (LIFO): after the
 		// query is answered (or the tap failed and was logged),
 		// after the panic recovery, and after the cbSem slot is
 		// released. The update is confirmed only once this
@@ -2414,6 +2553,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				unmarkInFlight(upd.UpdateID)
 				return false
 			}
+			handlers.Add(1)
 			go handleCallback(*q, upd.UpdateID)
 			// No markDecided here: the update is confirmed
 			// only when handleCallback completes (its defer).
@@ -2511,6 +2651,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 					unmarkInFlight(upd.UpdateID)
 					return false
 				}
+				handlers.Add(1)
 				go handlePhoto(upd)
 				progress++
 				return true
@@ -2534,6 +2675,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 					unmarkInFlight(upd.UpdateID)
 					return false
 				}
+				handlers.Add(1)
 				go handleMedia(upd, mediaKind)
 				progress++
 				return true

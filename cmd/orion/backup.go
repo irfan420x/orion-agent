@@ -56,8 +56,20 @@ cross-file instant. The manifest records this (quiesced=false).
 		// ~/.orion) and say so on stderr, so the fallback is
 		// visible, never silent. The fallback only needs the
 		// data dir — no provider is constructed here.
+		//
+		// F-A19-2 (rc25): the fallback must honour
+		// ORION_DATA_DIR, the same env override Load applies
+		// — a corrupt config must not make a backup silently
+		// target ~/.orion while the daemon runs on another
+		// dir. The warning names the dir actually used, and
+		// where it came from, so the fallback is visible.
 		cfg = config.Default()
-		fmt.Fprintf(os.Stderr, "backup: cannot load config %s (%v); using default data dir %s\n", defaultPath, err, cfg.DataDir)
+		src := "default data dir"
+		if dir := os.Getenv("ORION_DATA_DIR"); dir != "" {
+			cfg.DataDir = dir
+			src = "data dir from ORION_DATA_DIR"
+		}
+		fmt.Fprintf(os.Stderr, "backup: cannot load config %s (%v); the config file's data_dir is unknown, using %s %s\n", defaultPath, err, src, cfg.DataDir)
 	}
 	dir := backup.DefaultDir(cfg.DataDir)
 	path, err := backup.Snapshot(cfg.DataDir, dir)

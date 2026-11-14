@@ -1239,12 +1239,13 @@ func wireGate(a *app.App, gw *messaging.TelegramGateway) (*permissions.Gate, *me
 	// the configured threshold, the owner is notified once for
 	// the day. The App decides when an alert fires and formats
 	// it; this closure only delivers it through the gateway.
-	// With no owner configured the delivery fails loudly
-	// (logged by the App, retried on the next record) instead
-	// of silently dropping the alert.
+	// With no owner configured the delivery fails with
+	// ErrBudgetAlertNoOwner (F-A19-6): the App logs it once
+	// per chat and does not retry it, instead of silently
+	// dropping the alert.
 	a.SetBudgetAlertNotifier(func(ctx context.Context, chatID int64, text string) error {
 		if ownerID == 0 {
-			return errors.New("orion: no owner configured; budget alert not sent")
+			return fmt.Errorf("orion: %w", app.ErrBudgetAlertNoOwner)
 		}
 		return gw.SendMessage(ctx, ownerID, text)
 	})

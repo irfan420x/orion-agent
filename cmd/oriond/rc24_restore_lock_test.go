@@ -124,8 +124,10 @@ func TestRestoreWithCorruptConfigFallsBackToDefaults(t *testing.T) {
 // a marker file and (unless state is "") an allow-all-until state
 // file, snapshots it, then damages the marker — so a restore has
 // something visible to put back. The snapshot also contains an
-// oriond.lock, which exercises the post-restore lock refresh
-// (Restore replaces the path the restore locked).
+// oriond.lock (the data dir had one at snapshot time) — but Restore
+// never copies it over the live lock (F-A19-5), so the post-restore
+// lock refresh is a no-op here: it re-checks the path and finds the
+// same file still locked.
 func restoreAllowAllFixture(t *testing.T, state string) (home, snap string) {
 	t.Helper()
 	scratchHome(t)
@@ -224,11 +226,12 @@ func TestRestoreNeutralizesFutureAllowAll(t *testing.T) {
 	}
 }
 
-// TestRefreshInstanceLock: the lock survives a restore that replaces
-// the lock file. With no replacement the same file comes back still
-// held; after a temp-file + rename (what Restore does with a
-// snapshot's oriond.lock) the old lock is stale — a new locker
-// succeeds on the new file — until refresh re-takes it.
+// TestRefreshInstanceLock: refreshInstanceLock re-takes the lock
+// when the lock file was replaced out from under the holder. With
+// no replacement the same file comes back still held; after a
+// temp-file + rename (done here by hand — Restore itself never
+// replaces oriond.lock, F-A19-5) the old lock is stale — a new
+// locker succeeds on the new file — until refresh re-takes it.
 func TestRefreshInstanceLock(t *testing.T) {
 	dir := t.TempDir()
 	f, err := acquireInstanceLock(dir)

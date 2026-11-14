@@ -25,20 +25,36 @@
 # internal/version/version.go (never "dev", never a stale tag).
 
 GO ?= go
-# Go toolchain resolution (rc24, Audit 18 §10 step 6): fall back to
-# the per-user Go installs this VM/container setup is known to use
-# when `go` is not on PATH (/usr/local/go does not survive restores
-# here, so it is only a last resort). Each candidate is verified by
-# actually RUNNING it (`go version`), not just by `command -v` /
-# file existence — a stale, broken or wrong-arch binary must not be
-# picked up silently. When no candidate runs, fail here with the
-# locations checked, instead of failing later with a cryptic
-# "go: command not found" from a recipe. An explicitly supplied GO
-# (make GO=...) is honoured as-is: a command-line assignment cannot
-# be reassigned by the fallback chain, so a GO that does not run
-# fails below with the locations checked, instead of silently
-# falling back to a different toolchain than the operator asked
-# for. (A GO from the environment falls back like the default.)
+# Go toolchain resolution (rc24, Audit 18 §10 step 6; rc25 F-A19-7
+# adds the audit toolchain): fall back to the per-user Go installs
+# this VM/container setup is known to use when `go` is not on PATH
+# (/usr/local/go does not survive restores here, so it is only a
+# last resort), plus the auditor's toolchain
+# ($(HOME)/workspace/orion-audit/toolchain/go/bin/go — the audit
+# VM's Go lives there, and it was missing from this list, so `make`
+# without GO failed at parse time on that VM). Each candidate is
+# verified by actually RUNNING it (`go version`), not just by
+# `command -v` / file existence — a stale, broken or wrong-arch
+# binary must not be picked up silently. When no candidate runs,
+# fail here with the locations checked, instead of failing later
+# with a cryptic "go: command not found" from a recipe. An
+# explicitly supplied GO (make GO=...) is honoured as-is: a
+# command-line assignment cannot be reassigned by the fallback
+# chain, so a GO that does not run fails below with the locations
+# checked, instead of silently falling back to a different
+# toolchain than the operator asked for. (A GO from the environment
+# falls back like the default.)
+#
+# F-A19-7: the parse-time failure below must not break Go-free
+# targets (`make clean`, `make version`) on a Go-less host, so it
+# only fires when a goal actually needs Go. An empty goal list is
+# the default target (release-check), which needs Go.
+GO_FREE_GOALS := clean version
+ifeq ($(strip $(MAKECMDGOALS)),)
+_NEEDS_GO := yes
+else
+_NEEDS_GO := $(filter-out $(GO_FREE_GOALS),$(MAKECMDGOALS))
+endif
 ifeq ($(shell $(GO) version >/dev/null 2>&1 && echo ok),)
 GO := $(HOME)/go1.27.4/bin/go
 endif
@@ -46,7 +62,12 @@ ifeq ($(shell $(GO) version >/dev/null 2>&1 && echo ok),)
 GO := /usr/local/go/bin/go
 endif
 ifeq ($(shell $(GO) version >/dev/null 2>&1 && echo ok),)
-$(error Go toolchain not found or not runnable: checked 'go' on PATH, $(HOME)/go1.27.4/bin/go and /usr/local/go/bin/go (need Go 1.27+); install Go from https://go.dev/dl or pass a working toolchain with make GO=/path/to/go)
+GO := $(HOME)/workspace/orion-audit/toolchain/go/bin/go
+endif
+ifeq ($(shell $(GO) version >/dev/null 2>&1 && echo ok),)
+ifneq ($(_NEEDS_GO),)
+$(error Go toolchain not found or not runnable: checked 'go' on PATH, $(HOME)/go1.27.4/bin/go, /usr/local/go/bin/go and $(HOME)/workspace/orion-audit/toolchain/go/bin/go (need Go 1.27+); install Go from https://go.dev/dl or pass a working toolchain with make GO=/path/to/go)
+endif
 endif
 VERSION_PKG := github.com/irfan/orion/internal/version
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)

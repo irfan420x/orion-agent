@@ -28,9 +28,19 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrBudgetAlertNoOwner is returned by a budget-alert notifier when
+// there is no owner to notify (F-A19-6). It is permanent for the
+// current process — the owner is fixed at startup, so no retry can
+// succeed until the daemon restarts with an owner configured —
+// unlike a transient Telegram delivery failure, which maybeAlertBudget
+// retries on the next record. Notifiers return it (wrapped) when
+// ownerID == 0 so the App can tell the two apart.
+var ErrBudgetAlertNoOwner = errors.New("budget alert: no owner configured")
 
 // BudgetAlertNotifier sends one budget-threshold alert to the
 // owner. chatID is the chat whose usage crossed the threshold;
@@ -39,6 +49,10 @@ import (
 // send text to the owner chat via their Telegram gateway. A
 // returned error means "not delivered" — the caller logs it and
 // retries on the next record instead of marking the chat alerted.
+// A notifier with no owner configured returns ErrBudgetAlertNoOwner
+// (wrapped); that failure is permanent for the process, so the
+// caller logs it once per chat and stays quiet instead of retrying
+// (and logging) on every record until UTC midnight.
 type BudgetAlertNotifier func(ctx context.Context, chatID int64, text string) error
 
 // SetBudgetAlertNotifier installs the owner-alert sender for daily
@@ -91,7 +105,15 @@ func FormatBudgetAlertMessage(chatID int64, used, threshold, limit int) string {
 // crossing — an alert is a notification, never a reason to fail
 // the turn that just completed. A delivery failure is logged and
 // retried on the next record; a successful delivery is marked
-// (persisted) so the chat is not alerted again today.
+// (persisted) so the chat is not alerted again today. The one
+// exception is a permanent "no owner" failure
+// (ErrBudgetAlertNoOwner): it is logged once per chat for this
+// process and never retried — retrying (and logging) it on every
+// record until UTC midnight would spam the log for a failure that
+// cannot succeed until the daemon restarts with an owner. It is
+// deliberately NOT marked alerted: the owner was never notified,
+// so a restart with an owner configured must still be able to
+// fire the alert.
 func (a *App) maybeAlertBudget(ctx context.Context, chatID int64) {
 	if a == nil || a.Budget == nil || a.budgetAlertNotifier == nil {
 		return
@@ -100,8 +122,29 @@ func (a *App) maybeAlertBudget(ctx context.Context, chatID int64) {
 	if !crossed {
 		return
 	}
+	// F-A19-6: a permanent "no owner" failure is logged once per
+	// chat and never retried — if this chat already hit it, stay
+	// quiet instead of calling the notifier (and logging) again.
+	a.budgetAlertNoOwnerMu.Lock()
+	alreadyLogged := a.budgetAlertNoOwnerLogged[chatID]
+	a.budgetAlertNoOwnerMu.Unlock()
+	if alreadyLogged {
+		return
+	}
 	text := FormatBudgetAlertMessage(chatID, used, threshold, a.Budget.Limit())
 	if err := a.budgetAlertNotifier(ctx, chatID, text); err != nil {
+		if errors.Is(err, ErrBudgetAlertNoOwner) {
+			a.budgetAlertNoOwnerMu.Lock()
+			if a.budgetAlertNoOwnerLogged == nil {
+				a.budgetAlertNoOwnerLogged = make(map[int64]bool)
+			}
+			a.budgetAlertNoOwnerLogged[chatID] = true
+			a.budgetAlertNoOwnerMu.Unlock()
+			if a.Logger != nil {
+				a.Logger.Printf("app: chat %d: budget alert not delivered (used %d, threshold %d): no owner configured; will not retry until restart", chatID, used, threshold)
+			}
+			return
+		}
 		if a.Logger != nil {
 			a.Logger.Printf("app: chat %d: budget alert not delivered (used %d, threshold %d): %v", chatID, used, threshold, err)
 		}
