@@ -18,19 +18,30 @@ import (
 
 // TestSweepChargesLateUsageFromIgnoringExecutor is the end-to-end
 // port of Audit 7's probe (F-A7-2a): an executor that ignores ctx,
-// works 300 ms past a 20 ms deadline and returns 700 tokens must
+// works 2 s past a 20 ms deadline and returns 700 tokens must
 // have those 700 tokens charged — by a later turn, once the usage
 // has settled. A turn that runs BEFORE the late usage arrives
 // charges only its own tokens and must NOT mark the task swept
 // (charging zero and marking it would lose the 700 forever); the
 // next turn charges them, exactly once.
+//
+// The 2 s window is deliberate, not the race (F-A21-18): the
+// executor used to sleep only 320 ms, so turn 1 had to start
+// inside a ~300 ms window after the deadline — on this contended
+// 1.5-CPU VM turn-1 startup exceeds that under parallel load and
+// the test failed 2 of 3 full runs, even though the invariant
+// (late tokens charged exactly once, never lost, never
+// double-charged) held either way. What the test proves is
+// ordering, not a 300 ms deadline: the executor still ignores ctx
+// and returns only after the deadline, so turn 1 still runs while
+// the usage is unsettled and turn 2 still charges the late 700.
 func TestSweepChargesLateUsageFromIgnoringExecutor(t *testing.T) {
 	a := testApp(t)
 	defer a.Close()
 	a.Budget = budget.New(100000)
 	mgr := subagent.NewManagerWithExecutor(4, func(ctx context.Context, brief string) (string, subagent.Usage, error) {
-		// Ignores ctx entirely: works 300 ms past the deadline.
-		time.Sleep(320 * time.Millisecond)
+		// Ignores ctx entirely: works 2 s past the deadline.
+		time.Sleep(2 * time.Second)
 		return "late", subagent.Usage{Tokens: 700}, nil
 	})
 	a.Subagents = mgr
@@ -74,7 +85,7 @@ func TestSweepChargesLateUsageFromIgnoringExecutor(t *testing.T) {
 		t.Fatalf("timed-out task %s was marked swept by turn 1 while its usage was still unsettled (the late 700 tokens would be lost)", id)
 	}
 
-	// The executor returns ~300 ms after the deadline; wait for the
+	// The executor returns ~2 s after the deadline; wait for the
 	// Manager to record the late usage.
 	deadline = time.Now().Add(5 * time.Second)
 	for {
