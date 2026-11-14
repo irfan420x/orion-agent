@@ -41,9 +41,15 @@ packages**.
   set by a test, so the next added tool fails loudly instead of
   shipping with stale docs. README counts are pinned the same way
   (F-A21-10).
+- **F-A21-6 (P3) — Split-proposal refresh, third refresh**
+  (`0ca7a5c`): `docs/file-structure-split-proposal.md` re-measured
+  against `c174f0d` — `skills.go` 2,731 (+1), `security.go` 2,736
+  (0), `telegram.go` 2,945 (+109, approval work only), `question.go`
+  616 allocated as its own file; the split tables are the next
+  builder's starting point, not a split performed.
 - **F-A21-7 (P3) — WireTelegram is validate-then-install:**
   every callback prefix is pre-checked before any is
-  registered, so a failed wiring leaves a clean router and a
+  registered, so a failed prefix check leaves a clean router and a
   retry on the same gateway can succeed.
 - **F-A21-9 (P3) — BuildLocal wires MCP before loading skills,**
   as Build does, so a skill naming an MCP tool no longer warns
@@ -52,6 +58,12 @@ packages**.
   sandbox availability at startup, `orion config show` prints
   the probe result, `install.sh` warns when the probe fails, and
   the README Sandbox section states the host requirement.
+- **F-A21-16 (P3) — Subagent-gating design note** (`20ada9a`):
+  `docs/subagent-gating-note.md` records that subagent children
+  run ungated — no `SetPermissionGate`, so one `subagent_spawn`
+  approval buys a whole child turn of destructive/network calls,
+  bounded only by the denylist, the hook bus and the missing
+  MCP/skill tools. Design note only; no code or behaviour change.
 - **F-A21-18 (P3) — Sweep test window widened** (320 ms to 2 s)
   so turn 1 no longer has to start inside ~300 ms on a contended
   VM; the race the test guards is unchanged. Comment/wording
@@ -94,6 +106,146 @@ reply. Suite: **1,523 tests total (1,519 pass, 0 fail, 4 skip),
   `io.Pipe` multipart upload on a dedicated client with a
   10-minute per-file deadline (not the 35 s `g.client` timeout);
   the whole file is never held in memory.
+
+### Fix batch — Audit 22 docs fixes
+
+Docs-only batch (F-A22-3, F-A22-10, F-A22-11, F-A22-12, F-A22-17,
+F-A22-20): no behaviour change; the `reply_chain.go` log lines are
+untouched (F-A22-19: `%q` stays). Suite after the full fix batch
+(this section + the code-fixes section below):
+**1,593 tests total (1,589 pass, 0 fail, 4 skip), 24/24 packages**
+(+70 vs the MEDIA base `a907d3e`, +92 vs the F1 baseline `20ada9a`).
+Pinned by `TestRegistryCountsAndMenu` (menu count) and
+`TestChangelogFixBatchEntries` (this file's entries).
+
+- **F-A22-3 (P2) — README "/" menu count corrected, 19 → 22.**
+  The live menu has 22 commands (23 registered minus the Bengali
+  alias `/বাজেট`, which the Bot API rejects); the README listed
+  19 in three spots and omitted `/budget`, `/rules`, `/skills`.
+  All three spots plus `ARCHITECTURE.md` now say 22 with the full
+  list, and the menu count is pinned by a test so it cannot go
+  stale silently again.
+- **F-A22-10 (P3) — F-A21-7 CHANGELOG wording qualified.**
+  The "failed wiring leaves a clean router" claim now reads
+  "a failed prefix check leaves a clean router": the conclusion
+  holds only for prefix pre-check failures, not for a later
+  `InstallTransport` failure (see `wire.go` package doc).
+- **F-A22-11 (P3) — Split-proposal attribution corrected.**
+  Of the +109 `telegram.go` lines since `3a6a498`, 98 are in the
+  approval area and 11 are not (5-line gateway-struct field,
+  6 net lines for `SetCallbackHandler` returning an error), so
+  `approval.go` is revised ~390 → ~379 and `gateway.go` ~370 →
+  ~381. Totals (2,945, +109) were already correct.
+- **F-A22-12 (P3) — SECURITY.md + unit files describe the F1
+  sandbox mechanism.** The dual-ordering probe (userns-after-clone
+  first, userns-at-clone fallback) replaces the pre-F1
+  "namespace is never created at clone time" wording, and the
+  Limits section no longer claims a first-mount failure reports
+  the sandbox unavailable. Same correction in `oriond.service`
+  and `systemd/oriond.service`.
+- **F-A22-17 (P3) — Split-proposal skills table arithmetic
+  fixed.** The table summed to 2,425 against `skills.go` 2,731
+  (306 short): the eight segment/negation helpers
+  (`skills.go:2161–2412`, 252 lines) were never allocated and the
+  43-line file header was never counted. They are now allocated
+  to `clause.go` (~580 → ~830) with a shared-header row; the
+  residual ~11 lines are rounding slack in the `~` estimates.
+- **F-A22-20 (P3) — CHANGELOG F1 omissions added + gate.**
+  The F1 section now records F-A21-6 (split-proposal refresh,
+  `0ca7a5c`) and F-A21-16 (subagent-gating note, `20ada9a`), and
+  `TestChangelogFixBatchEntries` fails if a fixed finding ID is
+  missing from the Unreleased section, so a missing entry can no
+  longer ship silently.
+
+### Fix batch — Audit 22 code fixes
+
+The behaviour fixes from the Audit 22 fix batch (same batch as the
+docs fixes above; the `reply_chain.go` log lines are untouched,
+F-A22-19: `%q` stays). Suite after the full fix batch:
+**1,593 tests total (1,589 pass, 0 fail, 4 skip), 24/24 packages**
+(+70 vs the MEDIA base `a907d3e`, +92 vs the F1 baseline `20ada9a`).
+
+- **F-A22-1 (P3) — web_fetch empty success is now a typed
+  failure.** A fetch that returns nothing is a typed result with
+  the cause, never an empty success string.
+- **F-A22-2 (P3) — web_search silent "No results" is now a typed
+  failure.** A search that finds nothing reports why (backend
+  challenged, empty, or error) instead of a bare "No results".
+- **F-A22-4 (P3) — Approval e2e waits race-scaled.** `waitFor`
+  5s → 25s under `-race` plus three scaled `time.After(5s)`
+  selects; the `cards.Take` Note-before-send production fix was
+  already live (`1459a44`) — Audit 22's point was that it was
+  unproven, and it is now proven (10/10 in isolation).
+- **F-A22-5 (P3) — Flaky-test waits race-scaled.**
+  `waitForLong` 30s → 150s under `-race`, `cbDone` selects
+  scaled; the 5s quiesce is kept.
+- **F-A22-6 (P2) — SHELL_EXEC denylist folds case.** One
+  normaliser, `permissions.NormalizeToolName`, is routed through
+  Register, the duplicate check, RegisterFactory, Gate.Check's
+  denylist, applyResult and classification — a mixed-case
+  spelling can no longer dodge the denylist.
+- **F-A22-7 (P3) — Calculator duplicate rejected.** The
+  duplicate check folds the name, so "Calculator" after
+  "calculator" is a duplicate, not a second entry sharing one
+  folded classification.
+- **F-A22-8 (P2) — WireTelegram is transport-first.** The
+  transport install now happens before any gateway mutation, so
+  a failed wiring leaves a clean router and a retry succeeds;
+  the interceptor-poisoning variant is pinned by a test.
+- **F-A22-9 (P3) — Typed-nil tools dropped + logged at
+  registration**, with no per-message panic log; `tools.IsNilValue`
+  is the shared helper and `WireTelegram` skips typed-nil tools.
+- **F-A22-13 (P3) — selectOrdering narrowed to an EPERM/exit-126
+  allowlist.** Anything else is a distinct error with no
+  fallback attempted.
+- **F-A22-14 (P3) — `orion config show` prints a restart hint**
+  on the probe line, so a changed sandbox probe result is
+  visible without re-reading the docs.
+- **F-A22-15 — SKIPPED, superseded.** The history-budget test
+  rework is Muse #2's context-window AUTO build (provider-window
+  budgets replace the hardcoded 32768); the fix batch does not
+  touch it.
+- **F-A22-16 (P3) — Plan-mode tools excluded from the child
+  registry.** New `Registry.Remove()` takes the callable tools
+  away; the plan block survives via the kept checker, so a
+  pending plan still blocks destructive tools.
+- **F-A22-18 (P3) — Corrupt plans file fails CLOSED.** A
+  corrupt plans file no longer opens a plan silently; repair is
+  via `exit_plan_mode`, which discards without parsing.
+- **F-A22-21 (P3) — Question-scoped matcher.** Option questions
+  only consume replies naming an option — an "approve" reply no
+  longer leaks into the plan, and a "blue" reply reaches the
+  question, not the plan.
+- **F-A22-22 (P3) — DDG fan-out.** The `html` endpoint is
+  queried alongside `api` + `lite` (live proof: `html` returned
+  real 200 results while `api` + `lite` were challenged), with
+  structural challenge detection against real DDG challenge
+  pages.
+- **F-A22-23 (P3) — Fetch truncation is marked, never silent.**
+  Hermes-shaped truncation (75% head / 25% tail, line
+  boundaries, `[TRUNCATED]` banner, "showing X+Y of Z" footer)
+  plus `fetch_id` + `offset` paging — the direct fix for the
+  reported half-information search (a >1 MB lite page truncated
+  mid-results with no marker).
+- **F-A22-24 (P3) — Missing search path is a hard
+  `invalid_args` error**, not a silent empty result.
+- **F-A22-25 (P3) — Glob notes before a zero-match return**,
+  so an empty result says what was searched.
+- **F-A22-26 (P3) — Grep counts walk/read errors** and notes
+  binary/truncated files instead of silently skipping them.
+- **F-A22-27 (P3) — Binary detection + DNS classification.**
+  Fetched content is sniffed by magic bytes (a binary is never
+  presented as text), and a DNS failure is classified as an
+  execution error, not a fetch failure.
+- **Poller retry (no finding number — the 2026-11-15 01:28
+  incident, 26 failed getUpdates).** Split HTTP/1.1-only poll
+  client, 45s window+grace deadline, transport rebuilt on the
+  3rd consecutive timeout, 120s watchdog as the backstop for
+  non-consecutive-timeout stalls, plus `PollHealth()` and
+  `GET /debug/poll-health` so a poller in rebuild/backoff never
+  reports healthy. In a pure slow-timeout black hole the N=3
+  path fires first (live-measured 2m18.2s); the watchdog's first
+  loop-top opportunity is ~142s.
 
 ### plan_mode (tool 2 of 14) + Audit 20 Step 1 fixes
 

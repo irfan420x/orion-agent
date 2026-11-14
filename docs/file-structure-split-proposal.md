@@ -56,13 +56,21 @@ production lines 48,240.
    plan_mode added one more line to the same map. The
    `registry.go` estimate below is revised ~445 → ~465 to absorb
    it. The rest of the Audit 19 skills table still holds.
-2. **`telegram.go` — the +109 all lands in one allocation.**
-   Every hunk since 3a6a498 is in the approval area
+2. **`telegram.go` — the +109 does NOT all land in one allocation.**
+   98 of the +109 net lines since 3a6a498 are in the approval area
    (`telegram.go:1303–1699`: `ApprovalCards.Note`,
    `ApprovalPrompter`, `HandleApprovalCallback`,
-   `ParsePermissionCallback`, one gateway-struct field). All of it
-   belongs in the proposed `approval.go`, revised ~280 → ~390.
-   Nothing else in telegram.go moved.
+   `ParsePermissionCallback`) and belong in the proposed
+   `approval.go`, revised ~280 → ~379. The other **11 lines are
+   outside it**: `telegram.go:469` (+5, the `callbackRouterInstalled`
+   bool field — gateway/router state, not approval logic) and
+   `telegram.go:832–837` (+6 net, `SetCallbackHandler` now returns
+   an error — F-A20-6 callback-router hardening), which belong in
+   the proposed `gateway.go`, revised ~370 → ~381 (F-A22-11
+   corrects the third refresh, which put all 109 in `approval.go`).
+   Nothing else in telegram.go moved. Totals (2,945, +109) were
+   already correct — only the allocation between the two files
+   changes.
 3. **`question.go` — now allocated.** It is its own file already
    (`internal/messaging/question.go`, 616 lines, under the 700
    target) holding the question registry, the reply interceptor
@@ -84,8 +92,24 @@ production lines 48,240.
 | `markers.go` | ~120 | Unchanged |
 | `activation.go` | ~550 | Unchanged |
 | `clause_words.go` | ~410 | Unchanged |
-| `clause.go` | ~580 | Unchanged — `clauseVerbAt` is still AST-exact 345 lines (`skills.go:1565–1909`); phase 2 must break it, phase 1 must not |
+| `clause.go` | ~830 | Was ~580; +252 for the eight segment/negation helpers the Audit 19 table never allocated (`skills.go:2161–2412`: `segmentNamesSkillAsActivateObject`, `segmentNamesSkillForActivationNoun`, `isNegationWord`, `clauseNegatesVerb`, `clauseHasNegation`, `clauseGovernorIsDirectiveVerb`, `prevWordIs`, `isQuotedSkillReference`) — clause helpers, so they belong here, not in `parse.go` (F-A22-17). `clauseVerbAt` is still AST-exact 345 lines (`skills.go:1565–1909`); phase 2 must break it, phase 1 must not |
 | `parse.go` | ~300 | Unchanged |
+| *shared file header* | ~45 | NEW row: the file header counted once, not per file — package doc (`skills.go:1–26`) + imports (`skills.go:28–43`), 43 lines. The old table counted it nowhere; each split file gets its own header on top of this (F-A22-17) |
+
+**Correction (Audit 22 F-A22-17):** the old table summed to
+2,425 against `skills.go` 2,731 — 306 lines (~11%) short,
+unacknowledged. The gap decomposes exactly, measured from the
+file: 252 lines of never-allocated helpers (listed in the
+`clause.go` row above) + 43 lines of never-counted file header
+(the row above) + ~11 lines of rounding slack in the `~`
+estimates (measured content 2,436 vs estimates 2,425). Revised
+sum: 465+120+550+410+830+300 = 2,675, + ~45 header = 2,720
+against 2,731 — the residual ~11 is rounding slack, now stated
+instead of hidden. The other two giants' tables are unchanged:
+`security.go` sums 2,765 vs 2,736 (+29 over) and `telegram.go`
+sums 2,855 vs 2,945 (90 short) — estimate slack of that size is
+plausible for `~` numbers, but 306 was not, which is why only
+the skills table is corrected here.
 
 ### `security.go` (2,736) → 8 files — unchanged, Audit 19 table verbatim
 
@@ -104,16 +128,20 @@ production lines 48,240.
 
 | Proposed file | Estimate | Drift note |
 |---|---|---|
-| `gateway.go` | ~370 | Unchanged since Audit 19 |
+| `gateway.go` | ~381 | Was ~370; +11 since 3a6a498, router state not approval logic (F-A22-11): the `callbackRouterInstalled` gateway-struct field (+5, `telegram.go:469`) and `SetCallbackHandler` returning an error (+6 net, `telegram.go:832–837`, F-A20-6 hardening) |
 | `options.go` | ~420 | Unchanged |
 | `api.go` | ~350 | Unchanged |
-| `approval.go` | **~390** | Was ~280; +109, all Step-1 approval work (see §"What is stale" item 2) |
+| `approval.go` | **~379** | Was ~280; +98, all Step-1 approval work (see §"What is stale" item 2) — the other 11 lines of the +109 belong to `gateway.go` (F-A22-11, correcting the third refresh's ~390) |
 | `send.go` | ~135 | Unchanged |
 | `updates.go` | ~150 | Unchanged |
 | `poll.go` | **~1,040** | Was ~960 at rc24 (Audit 20 measured the span 998 on a slightly different boundary); content unchanged since 3a6a498 — the +109 approval growth sits above it and only shifts line numbers. Measured span now: `advanceOffset` through end of file, `telegram.go:1905–2945` = 1,041 lines, of which `PollStream` is 880. Still the exception — see below |
 
 Unassigned items: none. Every function, type and field in the
-three giants is allocated above, and `question.go` is allocated
+three giants is allocated above — for `skills.go` only after the
+F-A22-17 correction (the eight helpers + shared-header row); the
+`security.go` (+29 over) and `telegram.go` (90 short) tables still
+carry estimate slack, stated in the skills-table correction above
+rather than hidden — and `question.go` is allocated
 as its own file.
 
 ## PollStream — the phase-2 split (logic change, not move-only)

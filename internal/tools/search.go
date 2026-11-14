@@ -256,9 +256,23 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
+	// A missing walk root is a hard error (F-A22-24): confinePath
+	// tolerates a missing leaf (resolveSymlinks follows the
+	// longest existing ancestor), so without this check the walk
+	// below would call back once with the root error, swallow it,
+	// and report "(no matches)" for a path that does not exist at
+	// all. The error names the path, like the other path-argument
+	// errors in this function (invalid_args).
+	info, err := os.Lstat(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q does not exist", root)}
+		}
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot stat path %q: %w", root, err)}
+	}
 	// A single file is searched directly (no walk): grep over a
 	// file path must behave like grep over a directory holding it.
-	if info, err := os.Lstat(root); err == nil && !info.IsDir() {
+	if !info.IsDir() {
 		// Fail fast on symlinks and non-regular files
 		// (fifo/socket/device): the safe read below would block
 		// on a writer-less fifo until the read timeout
@@ -266,8 +280,8 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		// This is only a fast path: the read itself still goes
 		// through the O_NOFOLLOW open + fd verification, so a
 		// swap between this check and the read cannot redirect
-		// it; and a missing file (Lstat error) falls through to
-		// the walk, which reports it.
+		// it; a missing path never reaches here — the Lstat
+		// above errors first (F-A22-24).
 		if info.Mode()&os.ModeSymlink != 0 {
 			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q is a symlink; symlinked files are refused", root)}
 		}
@@ -281,12 +295,24 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	scanned := 0
 	skippedSymlink := 0
 	scanCapped := false
+	walkErrors := 0
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// An unreadable entry must not abort the whole
-			// search; it is skipped and counted below via the
-			// walk error note. Returning the error would make
-			// one bad file fail every match.
+			// A root error means the walk root vanished (or
+			// became unreadable) between the Lstat above and
+			// the walk: fail the call, it is not a skipped
+			// entry. Any other unreadable entry must not abort
+			// the whole search; it is skipped and counted
+			// here, and reported in the footer below
+			// (F-A22-26). The old comment claimed the skip
+			// was "counted below via the walk error note",
+			// but there was no counter and no note — walkErr
+			// stayed nil because the callback swallowed
+			// everything.
+			if p == root {
+				return err
+			}
+			walkErrors++
 			return nil
 		}
 		if scanned%256 == 0 {
@@ -371,6 +397,9 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if skippedSymlink > 0 {
 		out += fmt.Sprintf("\n[skipped %d symlinked path(s) outside the searched directory]", skippedSymlink)
 	}
+	if walkErrors > 0 {
+		out += fmt.Sprintf("\n[skipped %d unreadable path(s) during the search]", walkErrors)
+	}
 	return out, nil
 }
 
@@ -412,6 +441,7 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 	binarySkipped := 0
 	truncatedFiles := 0
 	hardlinkSkipped := 0
+	readSkipped := 0
 	totalBytes := 0
 	capped := false
 	bytesCapped := false
@@ -444,9 +474,15 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 			// One unreadable file must not fail the search.
 			// A hardlink refusal is counted separately so the
 			// footer can say why the file was not searched
-			// (F-A5-P2-30).
+			// (F-A5-P2-30); any other read failure is counted
+			// too, so a tree whose only matching file is
+			// unreadable does not report a bare "(no matches)"
+			// (F-A22-26). A cancelled context is not a skipped
+			// file — the loop breaks on it at the top.
 			if errors.Is(err, errHardlinkRefused) {
 				hardlinkSkipped++
+			} else if ctx.Err() == nil {
+				readSkipped++
 			}
 			continue
 		}
@@ -529,13 +565,26 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 	if matchCount == 0 {
 		// A scan that found nothing still reports why it
 		// stopped early, when it did: otherwise a capped scan
-		// looks identical to an empty tree.
+		// looks identical to an empty tree. Every skip counter
+		// is listed here, not just the byte/hardlink ones: a
+		// tree of only binary files, or of only over-1MB files,
+		// or whose only matching file could not be read, must
+		// not report a bare "(no matches)" (F-A22-26).
 		var notes []string
 		if bytesCapped {
 			notes = append(notes, fmt.Sprintf("stopped after scanning %d bytes (cap %d MB)", totalBytes, maxGrepTotalBytes/(1024*1024)))
 		}
 		if hardlinkSkipped > 0 {
 			notes = append(notes, fmt.Sprintf("skipped %d file(s) with multiple hard links; refusing to read", hardlinkSkipped))
+		}
+		if binarySkipped > 0 {
+			notes = append(notes, fmt.Sprintf("skipped %d binary file(s)", binarySkipped))
+		}
+		if truncatedFiles > 0 {
+			notes = append(notes, fmt.Sprintf("%d file(s) over 1MB searched only in the first 1MB", truncatedFiles))
+		}
+		if readSkipped > 0 {
+			notes = append(notes, fmt.Sprintf("skipped %d file(s) that could not be read", readSkipped))
 		}
 		if len(notes) > 0 {
 			return "(no matches)\n[" + strings.Join(notes, "; ") + "]"
@@ -568,6 +617,9 @@ func (t *grepTool) grepFiles(ctx context.Context, paths []string, match grepMatc
 	}
 	if truncatedFiles > 0 {
 		fmt.Fprintf(&sb, "; %d file(s) over 1MB searched only in the first 1MB", truncatedFiles)
+	}
+	if readSkipped > 0 {
+		fmt.Fprintf(&sb, "; skipped %d file(s) that could not be read", readSkipped)
 	}
 	sb.WriteString("]")
 	return strings.TrimRight(sb.String(), "\n")
@@ -730,9 +782,20 @@ func (t *globTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if err := ctx.Err(); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "timeout", Err: err}
 	}
+	// A missing walk root is a hard error, not "(no matches)"
+	// (F-A22-24; see grep Execute for why the walk cannot report
+	// it on its own). The error names the path, like the other
+	// path-argument errors in this function (invalid_args).
+	info, err := os.Lstat(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("path %q does not exist", root)}
+		}
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot stat path %q: %w", root, err)}
+	}
 	// A single file as the base matches only when the pattern
 	// matches its own name.
-	if info, err := os.Lstat(root); err == nil && !info.IsDir() {
+	if !info.IsDir() {
 		if matchGlobSegments(pat, []string{filepath.Base(root)}) {
 			return root, nil
 		}
@@ -746,6 +809,16 @@ func (t *globTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	scanCapped := false
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// A root error means the walk root vanished (or
+			// became unreadable) between the Lstat above and
+			// the walk: fail the call (F-A22-24). Other
+			// entries are skipped as before; glob only lists
+			// paths, so an unreadable entry costs nothing a
+			// note could explain — unlike grep, which reads
+			// the entries it lists (F-A22-26).
+			if p == root {
+				return err
+			}
 			return nil
 		}
 		if scanned%256 == 0 {
@@ -808,19 +881,32 @@ func (t *globTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		}
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("cannot walk %q: %w", root, walkErr)}
 	}
+	// The footer notes are built BEFORE the zero-match early
+	// return: a capped scan with zero matches must still say the
+	// scan stopped early, exactly like grep does (F-A22-25). The
+	// capped note can only fire with matches (the cap trips while
+	// appending one), but it is built here too so the two
+	// branches can never drift apart again.
+	var notes []string
+	if capped {
+		notes = append(notes, fmt.Sprintf("showing first %d matches; refine the pattern to see more", maxResults))
+	}
+	if scanCapped {
+		notes = append(notes, fmt.Sprintf("stopped after scanning %d entries; refine path/pattern to search more", maxGlobFilesScanned))
+	}
+	if skippedSymlink > 0 {
+		notes = append(notes, fmt.Sprintf("skipped %d symlinked path(s) outside the searched directory", skippedSymlink))
+	}
 	if len(matches) == 0 {
+		if len(notes) > 0 {
+			return "(no matches)\n[" + strings.Join(notes, "; ") + "]", nil
+		}
 		return "(no matches)", nil
 	}
 	sort.Strings(matches)
 	out := strings.Join(matches, "\n")
-	if capped {
-		out += fmt.Sprintf("\n[showing first %d matches; refine the pattern to see more]", maxResults)
-	}
-	if scanCapped {
-		out += fmt.Sprintf("\n[stopped after scanning %d entries; refine path/pattern to search more]", maxGlobFilesScanned)
-	}
-	if skippedSymlink > 0 {
-		out += fmt.Sprintf("\n[skipped %d symlinked path(s) outside the searched directory]", skippedSymlink)
+	for _, n := range notes {
+		out += "\n[" + n + "]"
 	}
 	return out, nil
 }

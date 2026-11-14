@@ -1007,7 +1007,7 @@ func TestPlanModeExitExpiredPlan(t *testing.T) {
 	}
 }
 
-func TestPlanModeBlocksFailOpenOnCorruptFile(t *testing.T) {
+func TestPlanModeBlocksFailClosedOnCorruptFile(t *testing.T) {
 	dir := t.TempDir()
 	store := NewPlanningStore("")
 	if err := store.SetDataDir(dir); err != nil {
@@ -1017,6 +1017,7 @@ func TestPlanModeBlocksFailOpenOnCorruptFile(t *testing.T) {
 	env.enter = &enterPlanModeTool{store: store, waiters: map[int64]*planWaiter{}}
 	env.exit = &exitPlanModeTool{store: store}
 	gw := &planFakeGateway{nextMsgID: 41}
+	env.gw = gw
 	if err := env.enter.InstallTransport(&ToolHost{Gateway: gw, OwnerID: 999}); err != nil {
 		t.Fatalf("InstallTransport: %v", err)
 	}
@@ -1026,19 +1027,102 @@ func TestPlanModeBlocksFailOpenOnCorruptFile(t *testing.T) {
 	if err := os.MkdirAll(chatDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(chatDir, planningPlansFile), []byte("{not json"), 0o600); err != nil {
+	plansPath := filepath.Join(chatDir, planningPlansFile)
+	if err := os.WriteFile(plansPath, []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	// Fail open: a corrupt file must not block the chat forever.
+	// Fail CLOSED (F-A22-18): a corrupt file must NOT silently
+	// unblock destructive tools. The block reason names the
+	// corruption and the repair.
+	if blocked, reason := env.enter.PlanModeBlocks(ctx, "shell_exec"); !blocked {
+		t.Error("PlanModeBlocks with a corrupt plans file = false, want true (fail closed)")
+	} else if !strings.Contains(reason, "exit_plan_mode") {
+		t.Errorf("block reason = %q, want it to name exit_plan_mode as the repair", reason)
+	}
+	// Safe tools stay allowed, so the repair path is open — the
+	// block only covers destructive tools, and exit itself is
+	// Safe.
+	if blocked, _ := env.enter.PlanModeBlocks(ctx, "file_read"); blocked {
+		t.Error("PlanModeBlocks(file_read) with a corrupt plans file = true, want false (safe tools stay allowed)")
+	}
+	if blocked, _ := env.enter.PlanModeBlocks(ctx, "exit_plan_mode"); blocked {
+		t.Error("PlanModeBlocks(exit_plan_mode) with a corrupt plans file = true, want false (the repair tool must stay callable)")
+	}
+	// Enter surfaces the corruption and points at the repair.
+	if _, err := env.enter.Execute(ctx, planArgs("Do a thing", []string{"Do it"}, 0)); err == nil || !strings.Contains(err.Error(), "corrupt plans file") || !strings.Contains(err.Error(), "exit_plan_mode") {
+		t.Errorf("enter with a corrupt plans file: err = %v, want the corrupt-file error naming exit_plan_mode", err)
+	}
+	// Exit REPAIRS it: the corrupt file is discarded WITHOUT
+	// being parsed, and the chat is unstuck.
+	res, err := env.exit.Execute(ctx, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("exit (corrupt plans file): %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(res), &out); err != nil {
+		t.Fatalf("exit result %q is not JSON: %v", res, err)
+	}
+	if out["exited"] != true || out["corrupt"] != true {
+		t.Errorf("exit (corrupt) = %v, want exited=true with corrupt=true", out)
+	}
+	if _, err := os.Stat(plansPath); !os.IsNotExist(err) {
+		t.Errorf("plans file after repair: stat err = %v, want the file removed", err)
+	}
 	if blocked, _ := env.enter.PlanModeBlocks(ctx, "shell_exec"); blocked {
-		t.Error("PlanModeBlocks with a corrupt plans file = true, want false (fail open)")
+		t.Error("PlanModeBlocks after repair = true, want false")
 	}
-	// But the plan tools surface the corruption honestly.
-	if _, err := env.enter.Execute(ctx, planArgs("Do a thing", []string{"Do it"}, 0)); err == nil || !strings.Contains(err.Error(), "corrupt plans file") {
-		t.Errorf("enter with a corrupt plans file: err = %v, want the corrupt-file error", err)
+	// Full recovery: entering a fresh plan works again.
+	ch := runEnter(t, env.enter, ctx, planArgs("Do a thing", []string{"Do it"}, 0))
+	waitPlanSend(t, env.gw, 5*time.Second)
+	if !env.enter.TryAnswer(planFakeReplyUpdate{chat: 100, sender: 100, text: "yes"}) {
+		t.Fatal("TryAnswer after repair: not consumed")
 	}
-	if _, err := env.exit.Execute(ctx, json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "corrupt plans file") {
-		t.Errorf("exit with a corrupt plans file: err = %v, want the corrupt-file error", err)
+	r := waitEnterResult(t, ch, 5*time.Second)
+	if r.err != nil || decodePlanResult(t, r.res)["decision"] != "approved" {
+		t.Errorf("result after repair = %v / %v, want an approval", r.res, r.err)
+	}
+}
+
+// TestRegistryRemoveKeepsPlanModeBlock pins the Registry.Remove
+// contract the child registry relies on (F-A22-16): removing the
+// plan-mode tools takes away the callable tools, but the
+// installed PlanModeChecker stays, so a pending plan still
+// blocks destructive tools.
+func TestRegistryRemoveKeepsPlanModeBlock(t *testing.T) {
+	env := newPlanTestEnv(t)
+	ctx := planCtx(100, 100)
+	ch := runEnter(t, env.enter, ctx, planArgs("Do a thing", []string{"Do it"}, 0))
+	waitPlanSend(t, env.gw, 5*time.Second)
+	if !env.reg.Remove("enter_plan_mode") || !env.reg.Remove("exit_plan_mode") {
+		t.Fatal("Remove(plan-mode tool) = false, want true")
+	}
+	if env.reg.Remove("enter_plan_mode") {
+		t.Error("second Remove(enter_plan_mode) = true, want false")
+	}
+	if env.reg.Remove("no_such_tool") {
+		t.Error("Remove(no_such_tool) = true, want false")
+	}
+	for _, name := range []string{"enter_plan_mode", "exit_plan_mode"} {
+		if _, ok := env.reg.Get(name); ok {
+			t.Errorf("registry still has %q after Remove", name)
+		}
+		if _, err := env.reg.Execute(ctx, name, json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "unknown tool") {
+			t.Errorf("Execute(%q) after Remove: err = %v, want an unknown-tool error", name, err)
+		}
+	}
+	if blocked, _ := env.reg.PlanModeBlocks(ctx, "shell_exec"); !blocked {
+		t.Error("registry PlanModeBlocks after removing the plan tools = false, want true (checker retained)")
+	}
+	// The live wait still settles through the tool instance.
+	if !env.enter.TryAnswer(planFakeReplyUpdate{chat: 100, sender: 100, text: "yes"}) {
+		t.Fatal("TryAnswer: not consumed")
+	}
+	r := waitEnterResult(t, ch, 5*time.Second)
+	if r.err != nil || decodePlanResult(t, r.res)["decision"] != "approved" {
+		t.Errorf("result = %v / %v, want an approval", r.res, r.err)
+	}
+	if blocked, _ := env.reg.PlanModeBlocks(ctx, "shell_exec"); blocked {
+		t.Error("registry PlanModeBlocks after approval = true, want false")
 	}
 }
 

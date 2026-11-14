@@ -147,13 +147,18 @@ var safeTools = map[string]bool{
 	"todo_write":        true,
 }
 
-// normalizeToolName trims surrounding whitespace from a tool name
-// and folds it to lower case for classification lookups
-// (F-A21-17): a name that differs from a mapped name only by case
-// must classify as that tool, never as an unknown name —
-// SHELL_EXEC declaring Safe must be rejected exactly like
-// shell_exec declaring Safe, not sail through as unclassified.
-func normalizeToolName(tool string) string {
+// NormalizeToolName is the ONE tool-name normaliser (research
+// §4 rec. 1): trim surrounding whitespace and fold to lower
+// case. Every tool-name entry point routes through it —
+// Register and its duplicate check, RegisterFactory, the gate's
+// Check denylist and applyResult, the rule store, and
+// classification — so a name that differs from a mapped name
+// only by case is that tool everywhere, never a second,
+// unguarded identity (F-A22-6, F-A22-7). The folded form is the
+// identity: map keys and every comparison use it, and the
+// original display spelling is kept only on the tool itself
+// (Tool.Name), never as a key. There is no second parallel map.
+func NormalizeToolName(tool string) string {
 	return strings.ToLower(strings.TrimSpace(tool))
 }
 
@@ -191,7 +196,7 @@ func classifyKnown(name string) (Class, bool) {
 // an external process with unknown capabilities, so every MCP tool
 // needs approval when a gate is installed (rc9, audit P0 #7).
 func Classify(tool string) Class {
-	class, _ := classifyKnown(normalizeToolName(tool))
+	class, _ := classifyKnown(NormalizeToolName(tool))
 	return class
 }
 
@@ -202,7 +207,7 @@ func Classify(tool string) Class {
 // Register uses this to reject names the maps never heard of,
 // instead of accepting them on a vacuous declaration agreement.
 func ClassifyKnown(tool string) (Class, bool) {
-	return classifyKnown(normalizeToolName(tool))
+	return classifyKnown(NormalizeToolName(tool))
 }
 
 // KnownTools returns the sorted names of every explicitly
@@ -343,6 +348,9 @@ func RequestSummary(tool, argsJSON string) string {
 
 // summaryArg picks the human-meaningful argument for a tool.
 func summaryArg(tool string, raw map[string]json.RawMessage) string {
+	// Fold for the switch (F-A22-6): a case-variant spelling
+	// must still surface its command/path/URL in the prompt.
+	tool = NormalizeToolName(tool)
 	key := ""
 	switch tool {
 	case "shell_exec", "subagent_spawn":
@@ -563,7 +571,7 @@ func (g *Gate) SetToolClasses(classes map[string]Class) {
 	}
 	m := make(map[string]Class, len(classes))
 	for name, class := range classes {
-		if name = normalizeToolName(name); name != "" {
+		if name = NormalizeToolName(name); name != "" {
 			m[name] = class
 		}
 	}
@@ -580,7 +588,7 @@ func (g *Gate) SetToolClasses(classes map[string]Class) {
 // decides; this is the fail-closed backstop for a hand-built map
 // (a test, or a future caller that bypasses Register).
 func (g *Gate) classify(tool string) Class {
-	tool = normalizeToolName(tool)
+	tool = NormalizeToolName(tool)
 	base := Classify(tool)
 	if g == nil {
 		return base
@@ -663,12 +671,15 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 	if g == nil {
 		return true, ""
 	}
-	tool = strings.TrimSpace(tool)
+	tool = NormalizeToolName(tool)
 	// The denylist is absolute and is checked FIRST — before any
 	// persisted rule, so an "always allow" rule for shell_exec can
 	// never rescue a denylisted command. The tool layer enforces
 	// the same denylist underneath, so this is the first of two
-	// independent checks.
+	// independent checks. The name is folded above (F-A22-6):
+	// the comparison below is on the normalised name, so
+	// SHELL_EXEC is denylisted exactly like shell_exec and can
+	// never reach the user as an approval question.
 	if tool == "shell_exec" && isDenylistedCommand(args) {
 		return false, "denied: command is blocked by the shell denylist and cannot be approved"
 	}
@@ -806,6 +817,12 @@ func (g *Gate) resolvedOutcome(pr *pendingRequest) (pendingResult, bool) {
 // chatID of 0 (no chat in the turn's context) falls back to a
 // global rule, the pre-rc22 behaviour.
 func (g *Gate) applyResult(tool, args string, chatID int64, res pendingResult) (bool, string) {
+	// Fold first (F-A22-6): applyResult is also reached with the
+	// tool name as Check received it, so the denylist re-check
+	// below must compare on the normalised name — a SHELL_EXEC
+	// approval must never persist an allow rule for a denylisted
+	// command. Persisted rules are keyed by the folded name too.
+	tool = NormalizeToolName(tool)
 	if res.persist != nil && g.rules != nil {
 		// Persisting "always allow" for a denylisted
 		// command must be impossible: the check above

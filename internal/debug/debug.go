@@ -12,9 +12,10 @@
 // any other interface — and serves ONLY the standard
 // net/http/pprof handlers under /debug/pprof/ (index, goroutine,
 // heap, threadcreate, block, mutex, cmdline, profile, symbol,
-// trace). There is no other route: a request outside
-// /debug/pprof/ gets 404, and no config, secret, or application
-// data is ever served.
+// trace). There is no other route except the optional /debug/poll-health
+// below: a request outside /debug/pprof/ (and /debug/poll-health, when
+// enabled) gets 404, and no config, secret, or application data is ever
+// served.
 //
 // A note on what pprof can show: the profiles are runtime
 // diagnostics (stack traces, allocation sizes, GC stats). The
@@ -113,6 +114,15 @@ type Config struct {
 	// DefaultPprofPort before calling Start, so a daemon always
 	// listens on a known port; 0 is the test-friendly form.
 	Port int
+	// PollHealth, when non-nil, renders the Telegram getUpdates
+	// poller's health snapshot (consecutive timeouts, rebuilds,
+	// last completed poll) for GET /debug/poll-health. It is
+	// nil when the daemon has no poller (or the caller does not
+	// want the route): the route is then absent and the request
+	// gets 404 like any other unknown path. The snapshot carries
+	// counts and timestamps only — no token, no message content —
+	// so serving it on the localhost-only endpoint is safe.
+	PollHealth func() string
 }
 
 // Server is a running debug endpoint. Addr is the actual listen
@@ -146,6 +156,16 @@ func Start(cfg Config) (*Server, error) {
 	mux.HandleFunc("/debug/pprof", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/debug/pprof/", http.StatusFound)
 	})
+	if cfg.PollHealth != nil {
+		mux.HandleFunc("/debug/poll-health", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintln(w, cfg.PollHealth())
+		})
+	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(LoopbackHost, strconv.Itoa(cfg.Port)))
 	if err != nil {
 		return nil, fmt.Errorf("debug: listen %s:%d: %w", LoopbackHost, cfg.Port, err)

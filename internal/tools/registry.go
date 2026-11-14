@@ -101,25 +101,43 @@ func (r *Registry) PlanModeBlocks(ctx context.Context, tool string) (bool, strin
 	return pm.PlanModeBlocks(ctx, tool)
 }
 
-// isNilTool reports whether t is nil, including a typed nil (a
-// nil pointer stored in the Tool interface): the t == nil check
-// misses those, and the t.Name() call in Register would panic on
-// the nil receiver (F-A21-8 — the auditor's probe was
-// Register((*wireCallbackTool)(nil))).
-func isNilTool(t Tool) bool {
-	if t == nil {
+// IsNilValue reports whether v is nil, including a typed nil (a
+// nil pointer stored in an interface): a plain v == nil check
+// misses those. It is the ONE typed-nil guard for the tools
+// framework and the reply chain (F-A22-9): the shape matches
+// testify's isNil and samber/lo's IsNil — v == nil first, then
+// reflect.ValueOf, then IsNil() ONLY for the nil-capable kinds
+// (Chan, Func, Interface, Map, Ptr, Slice, UnsafePointer). The
+// Kind guard is load-bearing: reflect.Value.IsNil panics on any
+// other kind, so calling it unguarded would turn a check into a
+// crash on ordinary values like 0 or "".
+func IsNilValue(v any) bool {
+	if v == nil {
 		return true
 	}
-	v := reflect.ValueOf(t)
-	switch v.Kind() {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice, reflect.UnsafePointer:
-		return v.IsNil()
+		return rv.IsNil()
 	default:
 		return false
 	}
 }
 
-// Register adds a tool; duplicate names are an error. A nil tool or a
+// isNilTool reports whether t is nil, including a typed nil (a
+// nil pointer stored in the Tool interface): the t == nil check
+// misses those, and the t.Name() call in Register would panic on
+// the nil receiver (F-A21-8 — the auditor's probe was
+// Register((*wireCallbackTool)(nil))). It is IsNilValue over the
+// Tool interface; there is exactly one kind list, here.
+func isNilTool(t Tool) bool {
+	return IsNilValue(t)
+}
+
+// Register adds a tool; duplicate names are an error — the
+// duplicate check folds the name (F-A22-7), so a mixed-case
+// spelling of an already-registered tool is a duplicate, not a
+// second entry. A nil tool or a
 // tool with an empty (or whitespace-only) name is rejected instead of
 // panicking later on a nil dereference or registering an uncallable
 // entry. A typed nil (a nil pointer in the Tool interface) is
@@ -161,10 +179,16 @@ func (r *Registry) Register(t Tool) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.tools[t.Name()]; ok {
+	// Folded identity (F-A22-7): the map key and the duplicate
+	// check use the normalised name, so "Calculator" after
+	// "calculator" is a duplicate, not a second entry sharing
+	// one folded classification. The tool keeps its own display
+	// spelling in t.Name(); the key is folded.
+	key := permissions.NormalizeToolName(t.Name())
+	if _, ok := r.tools[key]; ok {
 		return fmt.Errorf("tools: duplicate tool %q", t.Name())
 	}
-	r.tools[t.Name()] = t
+	r.tools[key] = t
 	// The plan-mode checker is installed on first sight (see
 	// PlanModeChecker): exactly one tool per registry implements
 	// it, so first-wins is unambiguous in practice.
@@ -197,12 +221,45 @@ func (r *Registry) RegisterAll(ts []Tool) error {
 // MCP children can never drift from the shell child's scrub.
 func ScrubEnv() []string { return scrubEnv() }
 
-// Get returns a tool by name.
+// Get returns a tool by name. The lookup folds the name
+// (F-A22-7): the store is keyed by the normalised name, so a
+// mixed-case lookup must find the one entry instead of
+// reporting "unknown tool".
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	t, ok := r.tools[name]
+	t, ok := r.tools[permissions.NormalizeToolName(name)]
 	return t, ok
+}
+
+// Remove detaches the named tool from the registry so the model
+// can no longer call it; it reports whether a tool was removed.
+// It is the mechanism newChildRegistry uses to keep tools that
+// cannot work in a child out of the child registry (F-A22-16:
+// enter_plan_mode needs a gateway the child never gets, and
+// exit_plan_mode would clear the PARENT's pending plan from the
+// shared store).
+//
+// The installed PlanModeChecker is deliberately LEFT in place:
+// the checker is consulted by the agent loop
+// (Registry.PlanModeBlocks), never called by the model, so
+// removing the plan-mode tool keeps the pending-plan block — a
+// child must still be refused destructive tools while the
+// parent's plan is pending — while taking away the callable
+// tools. A registry that never had a plan-mode tool is
+// unaffected.
+func (r *Registry) Remove(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// The store is keyed by the normalised name (F-A22-7), so
+	// removal must fold too — Remove("Calculator") removes the
+	// "calculator" entry instead of reporting "not present".
+	key := permissions.NormalizeToolName(name)
+	if _, ok := r.tools[key]; !ok {
+		return false
+	}
+	delete(r.tools, key)
+	return true
 }
 
 // List returns all tools in registration order (sorted by name).

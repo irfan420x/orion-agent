@@ -5,9 +5,9 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,523 tests total — 1,519 pass, 0 fail, 4 skip;
+> built and tested (1,593 tests total — 1,589 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
-> Audit 21 F1 fixes (2026-11-14) — see CHANGELOG for the rc25 audit fixes).
+> MEDIA delivery and the Audit 22 fix batch (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -89,7 +89,7 @@ and the rest go to the agent as plain text, not as commands.
 `/restart` owner-only therefore holds vacuously there (there is no
 `/restart` command to refuse, only a text turn about restarting).
 `oriond` is the only entrypoint with the full command framework —
-the 19-command `/` menu below. Use `oriond` for a bot that answers
+the 22-command `/` menu below. Use `oriond` for a bot that answers
 `/commands`.
 
 While a turn runs, the bot streams a live "💻 terminal" card into
@@ -98,10 +98,10 @@ a block with its command, file writes as ✍️ lines, repeats collapse
 to (×N). Displayed commands are redacted, so secrets never leak
 into the chat. The final reply is a structured message in your
 language, with a runtime footer (model, tokens, steps, duration)
-you can toggle with `/footer`. On `oriond`, the `/` menu offers 19 commands
+you can toggle with `/footer`. On `oriond`, the `/` menu offers 22 commands
 (`/help`, `/new`, `/sessions`, `/resume`, `/stop`, `/status`, `/model`,
-`/usage`, `/undo`, `/retry`, `/pause`, `/agents`, `/title`, `/compress`,
-`/save`, `/restart`, `/whoami`, `/footer`, `/memory`); per-chat
+`/usage`, `/budget`, `/undo`, `/retry`, `/pause`, `/agents`, `/title`, `/compress`,
+`/save`, `/restart`, `/rules`, `/whoami`, `/footer`, `/memory`, `/skills`); per-chat
 command state (title, footer preference, pause flag, usage totals)
 persists in `~/.orion/sessions.json`, while conversation transcripts
 persist separately as per-session JSONL files (see [Sessions](#sessions)).
@@ -118,9 +118,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,523 tests total (1,519 passing, 0 failing, 4 skipped)
-(recount in the working tree after the Audit 21 F1 fixes,
-2026-11-14; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
+24/24 packages, 1,593 tests total (1,589 passing, 0 failing, 4 skipped)
+(recount in the working tree after the MEDIA delivery and the
+Audit 22 fix batch, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
 `go test ./...` or `make test`.
 
@@ -432,7 +432,7 @@ is never deleted or modified by the migration.
 | `orion sessions new` | Start a fresh CLI session (old transcript stays saved) |
 | `orion telegram test/poll` | Verify token / start gateway (turn-only — no slash commands; see above) |
 | `orion daemon` | Telegram polling daemon (turn-only — no slash commands; see above) |
-| `oriond` | Telegram polling daemon with the full slash-command framework (19-command `/` menu) |
+| `oriond` | Telegram polling daemon with the full slash-command framework (22-command `/` menu) |
 | `orion version` | Print version |
 
 ## Tools (all wired into the agent)

@@ -306,9 +306,9 @@ func TestWebSearchViaAPI(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	oldAPI, oldLite := searchAPIBase, searchLiteBase
-	searchAPIBase, searchLiteBase = srv.URL, srv.URL
-	defer func() { searchAPIBase, searchLiteBase = oldAPI, oldLite }()
+	oldAPI, oldLite, oldHTML := searchAPIBase, searchLiteBase, searchHTMLBase
+	searchAPIBase, searchLiteBase, searchHTMLBase = srv.URL, srv.URL, srv.URL
+	defer func() { searchAPIBase, searchLiteBase, searchHTMLBase = oldAPI, oldLite, oldHTML }()
 
 	s := &webSearchTool{}
 	out, err := s.Execute(context.Background(), mustJSON(t, map[string]any{"query": "go language", "count": 3}))
@@ -336,9 +336,9 @@ func TestWebSearchLiteFallback(t *testing.T) {
 	}))
 	defer liteSrv.Close()
 
-	oldAPI, oldLite := searchAPIBase, searchLiteBase
-	searchAPIBase, searchLiteBase = apiSrv.URL, liteSrv.URL
-	defer func() { searchAPIBase, searchLiteBase = oldAPI, oldLite }()
+	oldAPI, oldLite, oldHTML := searchAPIBase, searchLiteBase, searchHTMLBase
+	searchAPIBase, searchLiteBase, searchHTMLBase = apiSrv.URL, liteSrv.URL, apiSrv.URL
+	defer func() { searchAPIBase, searchLiteBase, searchHTMLBase = oldAPI, oldLite, oldHTML }()
 
 	s := &webSearchTool{}
 	out, err := s.Execute(context.Background(), mustJSON(t, map[string]any{"query": "fallback test"}))

@@ -49,9 +49,9 @@ func TestAudit4SearchRedirectToPrivateRefused(t *testing.T) {
 	}, calls: map[string]int{}}
 	useScriptedResolver(t, resolver)
 
-	oldAPI, oldLite := searchAPIBase, searchLiteBase
-	searchAPIBase, searchLiteBase = "http://public.example:"+apiPort, "http://public.example:"+apiPort
-	defer func() { searchAPIBase, searchLiteBase = oldAPI, oldLite }()
+	oldAPI, oldLite, oldHTML := searchAPIBase, searchLiteBase, searchHTMLBase
+	searchAPIBase, searchLiteBase, searchHTMLBase = "http://public.example:"+apiPort, "http://public.example:"+apiPort, "http://public.example:"+apiPort
+	defer func() { searchAPIBase, searchLiteBase, searchHTMLBase = oldAPI, oldLite, oldHTML }()
 
 	tool, err := newWebSearchTool([]string{"127.0.0.1/32"})
 	if err != nil {

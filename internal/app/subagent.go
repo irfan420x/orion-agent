@@ -53,6 +53,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 
 	"github.com/irfan/orion/internal/config"
@@ -111,6 +112,19 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 // parent — but WITHOUT the subagent tools, which are only registered
 // on the parent registry. A child therefore cannot spawn subagents.
 //
+// The plan-mode tools are likewise excluded (F-A22-16):
+// enter_plan_mode needs a Telegram gateway, which a child never
+// gets (it would guaranteed-fail), and exit_plan_mode touches the
+// shared planning store, so a child calling it would clear the
+// PARENT chat's pending plan — the approval boundary plan mode
+// exists to enforce. Neither tool can work in a child, so neither
+// is listed there. The exclusion is loud: if a future rename
+// drops one of the names from the default registry, construction
+// fails instead of silently re-exposing the tool. The plan-mode
+// BLOCK is not removed with the tools: Registry.Remove leaves
+// the installed PlanModeChecker in place, so a pending parent
+// plan still refuses the child's destructive tools.
+//
 // The optional parentPlanning argument is the parent's planning
 // store (F-A5-P2-35): when given, the child's planning tools are
 // built on it (passed in ToolDeps), so a child's task_create lands
@@ -131,7 +145,21 @@ func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore
 	if len(parentPlanning) > 0 && parentPlanning[0] != nil {
 		deps.PlanningStore = parentPlanning[0]
 	}
-	return tools.DefaultRegistryWithDeps(deps)
+	reg, err := tools.DefaultRegistryWithDeps(deps)
+	if err != nil {
+		return nil, err
+	}
+	// F-A22-16: the plan-mode tools are not child tools (see the
+	// doc comment above). Remove them loudly: a missing name
+	// means the default registry changed under us, and failing
+	// here beats silently handing a child a tool it must not
+	// have.
+	for _, name := range []string{"enter_plan_mode", "exit_plan_mode"} {
+		if !reg.Remove(name) {
+			return nil, fmt.Errorf("app: newChildRegistry: default registry has no %q to exclude from the child registry", name)
+		}
+	}
+	return reg, nil
 }
 
 // newSubagentExecutor returns a subagent.Executor that runs each brief

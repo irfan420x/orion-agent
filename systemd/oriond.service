@@ -36,7 +36,10 @@
 # NO CapabilityBoundingSet — DELIBERATELY OMITTED (rc23, verified
 # 2026-11-14; reason CORRECTED rc24, F-A18-12): any restriction of
 # the bounding set breaks the sandbox. The sandbox runs every
-# shell_exec via `unshare --user --map-root-user`, whose uid_map
+# shell_exec via `unshare --user --map-root-user` under the default
+# userns-after-clone ordering (the fallback ordering creates the
+# namespace at clone time instead and skips that switch — see
+# SECURITY.md); the switch's uid_map
 # write needs CAP_SYS_ADMIN + CAP_SETFCAP in the bounding set —
 # BOTH are required, and CAP_SETUID is NOT the gate: the rc23
 # systemd matrix showed {SETUID,SETGID,SYS_ADMIN} still fails with

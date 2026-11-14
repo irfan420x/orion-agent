@@ -25,7 +25,11 @@
 // two tools' interceptors is therefore decided by tool name,
 // visibly: every consumption is audit-logged (interceptor
 // type/index, chat, text), so a misroute is diagnosable from the
-// daemon log instead of silent.
+// daemon log instead of silent. The question interceptor
+// additionally scopes its own consumption (F-A22-21): with
+// options it only takes a reply naming one of them, so a plan
+// "approve" typed while a question pends is not eaten by the
+// question — the plan interceptor behind it still sees it.
 package messaging
 
 import (
@@ -63,10 +67,16 @@ func (c *replyChain) log(format string, args ...any) {
 
 func newReplyChain() *replyChain { return &replyChain{} }
 
-// add appends an interceptor (nil is a no-op). Interceptors run
-// in the order added, first true wins — that order IS the
-// priority control (F-A21-22): there is no priority field, and
-// the question interceptor is installed first by SetQuestionRegistry
+// add appends an interceptor (nil is a no-op). A typed-nil
+// interceptor is dropped, not appended (F-A22-9): the same
+// isNilTool-style check Register already uses, shared as
+// tools.IsNilValue — a nil *T stored in the interface would
+// otherwise be appended and panic (nil deref) inside TryAnswer
+// on every later message. The drop is logged: add returns
+// nothing, so the log line is the only observable the caller
+// gets. Interceptors run in the order added, first true wins —
+// that order IS the priority control (F-A21-22): there is no
+// priority field, and the question interceptor is installed first by SetQuestionRegistry
 // (setQuestion puts it at the front), so it runs before any
 // tool's. Tool interceptors follow in registry List() order,
 // which is alphabetical by tool name and deterministic: a
@@ -75,6 +85,16 @@ func newReplyChain() *replyChain { return &replyChain{} }
 // misroute is diagnosable from the daemon log.
 func (c *replyChain) add(in tools.ReplyInterceptor) {
 	if c == nil || in == nil {
+		return
+	}
+	if tools.IsNilValue(in) {
+		// Dropped, not appended: a typed nil here is a
+		// programming error at the call site, and the chain
+		// must never carry an interceptor that panics on
+		// every message. (The single production caller,
+		// WireTelegram, skips typed-nil interceptors too —
+		// this guard is the defence that holds regardless.)
+		c.log("reply chain: dropped nil reply interceptor (typed nil); not registered")
 		return
 	}
 	c.mu.Lock()

@@ -531,18 +531,52 @@ func currentOrdering() sandboxOrdering {
 	return orderingAfterClone
 }
 
+// isOrderingDependent reports whether a probe failure could differ
+// between namespace orderings, so the other ordering is worth
+// trying: EPERM (the clone/unshare was refused — the laptop case,
+// where the after-clone clone itself fails EPERM) or the wrapper
+// exiting 126 (a wrapper-stage failure such as a mount). Any other
+// failure — temp-dir creation, a missing binary, a probe timeout —
+// is ordering-independent: the second probe would fail the same
+// way, so selectOrdering does not run it (F-A22-13). The outcome
+// stays fail-closed either way; skipping the retry saves up to a
+// second 15s probe and keeps the error naming the real cause
+// instead of "neither namespace ordering works".
+func isOrderingDependent(err error) bool {
+	if errors.Is(err, syscall.EPERM) {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 126 {
+		return true
+	}
+	return false
+}
+
 // selectOrdering tries the current (after-clone) ordering first and
-// falls back to the userns-at-clone ordering when it fails, returning
-// the first ordering that works. The fallback runs on ANY first
-// failure, not only EPERM: a wrapper-stage failure (e.g. the /proc
-// mount, exit 126) is ordering-dependent too, and a second probe is
-// cheap. When neither works the error names both failures, so the
-// operator can see which ordering died where. The function takes the
-// probe so tests can drive the decision without a live host.
+// falls back to the userns-at-clone ordering when it fails with an
+// ordering-dependent error (EPERM or wrapper exit 126), returning
+// the first ordering that works. A first failure that is
+// ordering-independent (temp-dir creation, missing binary, probe
+// timeout) is NOT retried: the other ordering would fail the same
+// way, so the error names the first failure and says no fallback
+// was attempted. When both orderings fail the error names both
+// failures, so the operator can see which ordering died where.
+// The function takes the probe so tests can drive the decision
+// without a live host.
 func selectOrdering(probe func(sandboxOrdering) error) (sandboxOrdering, error) {
 	firstErr := probe(orderingAfterClone)
 	if firstErr == nil {
 		return orderingAfterClone, nil
+	}
+	// Narrow fallback (F-A22-13): only an ordering-dependent
+	// failure is worth a second probe. Anything else failed for a
+	// reason the other ordering shares, so retrying would only
+	// burn a second 15s probe and bury the real cause under
+	// "neither ordering works". Fail-closed either way: the
+	// sandbox stays unavailable.
+	if !isOrderingDependent(firstErr) {
+		return orderingAfterClone, fmt.Errorf("sandbox unavailable: userns-after-clone probe failed with an ordering-independent error, no fallback attempted: %v", firstErr)
 	}
 	secondErr := probe(orderingAtClone)
 	if secondErr == nil {

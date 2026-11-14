@@ -417,7 +417,7 @@ func TestOffsetNoDoubleExecutionAfterRelease(t *testing.T) {
 	}})
 	select {
 	case <-cbDone:
-	case <-time.After(30 * time.Second):
+	case <-time.After(scaledTimeout(30 * time.Second)):
 		t.Fatal("callback in the batch never reached the handler")
 	}
 

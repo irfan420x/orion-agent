@@ -3,9 +3,19 @@
 // web_fetch performs a plain HTTP GET with redirect and size caps
 // and returns EXTRACTED text (HTML → clean text, JSON → compact
 // summary), never a raw dump — a raw 68KB API response cost
-// ~17,900 tokens in one turn (rc23 fetch-cost fix).
-// web_search is a real search: it queries the DuckDuckGo Instant Answer
-// API and falls back to the DuckDuckGo lite HTML results page.
+// ~17,900 tokens in one turn (rc23 fetch-cost fix). Long pages are
+// shown head+tail with exact counts, and the full extracted text is
+// retained for paging (web_fetch fetch_id+offset). Binary bodies are
+// rejected with the kind named; an empty extraction is reported,
+// never returned as a bare "".
+// web_search is a real search: it fans out to the DuckDuckGo Instant
+// Answer API and the lite and html HTML results pages concurrently,
+// dedupes by URL, ranks by corroboration, and renders a typed
+// envelope (results + per-backend status + degraded/truncated
+// flags) into the model-facing string. An empty result set with any
+// backend failure, parse failure or truncation is an error (or a
+// degraded result with an explicit warning), never a bare
+// "No results found" success.
 package tools
 
 import (
@@ -53,12 +63,23 @@ const (
 	userAgent            = "Orion/0.1"
 )
 
-// searchAPIBase and searchLiteBase are package-level vars so tests can
-// point them at an httptest server. Production defaults are DuckDuckGo.
+// searchAPIBase, searchLiteBase and searchHTMLBase are package-level
+// vars so tests can point them at an httptest server. Production
+// defaults are DuckDuckGo. The html endpoint is the second key-free
+// backend (Audit 22 fix batch): search fans out to all three and
+// merges, so one endpoint's markup drift cannot sink search.
 var (
 	searchAPIBase  = "https://api.duckduckgo.com"
 	searchLiteBase = "https://lite.duckduckgo.com"
+	searchHTMLBase = "https://html.duckduckgo.com"
 )
+
+// searchMaxBodyBytes is the safety cap on one search response body
+// (1 MiB, as before). A body past the cap is still parsed, but the
+// parse is marked torn and the model is told the list may be
+// incomplete — the cap is a safety valve with a warning, never a
+// silent mid-results cut (half-info item, user report 2026-11-15).
+const searchMaxBodyBytes = 1 << 20
 
 // searchHTTPClient is a dedicated client for DuckDuckGo searches, with
 // its own timeout. Search must not use http.DefaultClient: it has no
@@ -242,6 +263,14 @@ func (s *fetchSession) trustedCIDRString() string {
 	return strings.Join(parts, ", ")
 }
 
+// errNonPublicAddress marks an SSRF refusal from resolveHost: the
+// host (or one of its addresses) is not public. It is the ONLY
+// resolveHost failure that maps to Kind "denied" — a plain DNS
+// failure ("cannot resolve host", "has no addresses") is an
+// execution failure, not a refusal (F-A22-23). Callers use
+// errors.Is(err, errNonPublicAddress) to tell the two apart.
+var errNonPublicAddress = errors.New("refusing to fetch a non-public address")
+
 func (s *fetchSession) resolveHost(ctx context.Context, host string) error {
 	h := stripFetchHost(host)
 	if ips, ok := s.pinned(h); ok && len(ips) > 0 {
@@ -249,7 +278,7 @@ func (s *fetchSession) resolveHost(ctx context.Context, host string) error {
 	}
 	if ip := net.ParseIP(h); ip != nil {
 		if !allowPrivateFetchHosts && !isPublicIP(ip, s.trusted) {
-			return fmt.Errorf("refusing to fetch non-public address %q (trusted egress CIDRs: %s)", h, s.trustedCIDRString())
+			return fmt.Errorf("%w %q (trusted egress CIDRs: %s)", errNonPublicAddress, h, s.trustedCIDRString())
 		}
 		s.setPin(h, []net.IP{ip})
 		return nil
@@ -264,7 +293,7 @@ func (s *fetchSession) resolveHost(ctx context.Context, host string) error {
 	if !allowPrivateFetchHosts {
 		for _, ip := range ips {
 			if !isPublicIP(ip, s.trusted) {
-				return fmt.Errorf("host %q resolves to non-public address %s (trusted egress CIDRs: %s)", h, ip, s.trustedCIDRString())
+				return fmt.Errorf("%w: host %q resolves to %s (trusted egress CIDRs: %s)", errNonPublicAddress, h, ip, s.trustedCIDRString())
 			}
 		}
 	}
@@ -405,15 +434,22 @@ func parseTrustedEgressCIDRs(cidrs []string) ([]*net.IPNet, error) {
 //     summarised), streamed element-by-element so a body cut off
 //     by the raw cap still yields the complete items before the
 //     cut instead of failing to parse at all.
-//   - JSON object/scalar → minified, then truncated to budget.
-//   - Anything else → plain text, truncated to budget.
+//   - JSON object/scalar → minified.
+//   - Anything else → plain text.
 //
-// A body that is not HTML or JSON (or JSON that will not parse
-// even tolerantly) falls back to plain text, so extraction can
-// never turn a fetch into an error. Every truncation carries a
-// "[truncated]" marker naming the remedy (a larger max_bytes),
-// and the marker text always contains the literal "[truncated]"
-// for the existing cap tests.
+// Extraction itself is capped only at the stored-copy cap (2M
+// chars, see capStoredText); the per-call presentation budget
+// (roughly maxBytes/4 chars) is applied by Execute as a head+tail
+// window with exact counts and a stored copy the model can page
+// (web_fetch fetch_id+offset), never as a silent cut to the first
+// N chars. A body that is not HTML or JSON (or JSON that will not
+// parse even tolerantly) falls back to plain text, so extraction
+// can never turn a fetch into an error — except for binary bodies,
+// which Execute rejects with the kind named (see detectBinaryKind).
+// Every truncation carries a "[TRUNCATED]" banner (or "[truncated]"
+// marker on the JSON/compact paths) naming the remedy, and the
+// marker text always contains the literal "[truncated]" or
+// "[TRUNCATED]" for the existing cap tests.
 
 var (
 	htmlCommentRe     = regexp.MustCompile(`(?is)<!--.*?-->`)
@@ -443,11 +479,18 @@ func truncateExtracted(s string, budget int) string {
 	return string(r[:budget]) + fmt.Sprintf("\n[truncated] (showing first %d of %d chars; re-fetch with a larger max_bytes for more)", budget, len(r))
 }
 
-// extractFetchBody converts a fetched body into the text the
-// model sees. contentType is the response Content-Type header
-// (sniffed from the body when it is empty or generic).
-func extractFetchBody(body []byte, contentType string, maxBytes int) string {
-	budget := extractOutputBudget(maxBytes)
+// extractFetchText converts a fetched body into the text the model
+// sees, WITHOUT the per-call budget cap: it returns the full
+// extraction, capped only at maxStoredFetchChars (the stored-copy
+// cap, 2M chars). The caller applies the presentation budget
+// (head+tail window) and retains this text for continuation, so a
+// long page is never silently cut to its first N chars — the model
+// can page the rest with web_fetch fetch_id+offset.
+//
+// The JSON path streams array elements up to the same store cap, so
+// a body cut off by the raw cap still yields the complete items
+// before the cut instead of failing the whole parse.
+func extractFetchText(body []byte, contentType string) string {
 	ct := strings.ToLower(contentType)
 	trimmed := bytes.TrimSpace(body)
 	isHTML := strings.Contains(ct, "html")
@@ -461,15 +504,24 @@ func extractFetchBody(body []byte, contentType string, maxBytes int) string {
 		}
 	}
 	if isHTML {
-		return truncateExtracted(extractHTMLText(body), budget)
+		return capStoredText(extractHTMLText(body))
 	}
 	if isJSON {
-		if out, ok := compactJSON(trimmed, budget); ok {
+		if out, ok := compactJSON(trimmed, maxStoredFetchChars); ok {
 			return out
 		}
 		// Unparseable JSON falls through to plain text.
 	}
-	return truncateExtracted(string(body), budget)
+	return capStoredText(string(body))
+}
+
+// extractFetchBody converts a fetched body into the text the model
+// sees, capped at the per-call budget (extractOutputBudget). Kept
+// for the budget-capped shape: full extraction, then
+// truncateExtracted — so a short fetch keeps its exact text and a
+// long one carries the "[truncated]" marker naming the remedy.
+func extractFetchBody(body []byte, contentType string, maxBytes int) string {
+	return truncateExtracted(extractFetchText(body, contentType), extractOutputBudget(maxBytes))
 }
 
 // extractHTMLText strips a page down to its visible text:
@@ -630,7 +682,7 @@ func (t *webFetchTool) Name() string { return "web_fetch" }
 func (t *webFetchTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
 
 func (t *webFetchTool) Description() string {
-	return "Fetch a URL over HTTP(S) and return the extracted text (HTML → clean text, JSON → compact summary; up to 32KB fetched by default, extracted text capped at ~8K chars)."
+	return "Fetch a URL over HTTP(S) and return the extracted text (HTML → clean text, JSON → compact summary; up to 32KB fetched by default, extracted text capped at ~8K chars). Long pages are shown head+tail with exact counts and a fetch_id you can page with (fetch_id + offset). This tool does not execute JavaScript: a page with no visible text may need a browser — use a browser for JS-rendered pages. Binary content (PDF, images, archives, ...) is rejected with its kind named."
 }
 
 func (t *webFetchTool) Definition() model.ToolDefinition {
@@ -643,9 +695,18 @@ func (t *webFetchTool) Definition() model.ToolDefinition {
 				"url": map[string]any{"type": "string", "description": "HTTP or HTTPS URL to fetch."},
 				"max_bytes": map[string]any{
 					"type":        "integer",
-					"description": "Maximum response bytes to fetch (default 32768, max 10485760). The returned text is extracted (HTML → clean text, JSON → compact summary) and capped at roughly max_bytes/4 characters; raise max_bytes when the full page is genuinely needed.",
+					"description": "Maximum response bytes to fetch (default 32768, max 10485760). The returned text is extracted (HTML → clean text, JSON → compact summary) and capped at roughly max_bytes/4 characters; long pages are shown head+tail with a fetch_id for paging, and raising max_bytes returns more.",
 					"minimum":     1,
 					"maximum":     10485760,
+				},
+				"fetch_id": map[string]any{
+					"type":        "string",
+					"description": "Id of a previously truncated fetch (returned in its [TRUNCATED] footer) whose stored text to page through. Mutually exclusive with url: pass fetch_id and offset, no url.",
+				},
+				"offset": map[string]any{
+					"type":        "integer",
+					"description": "Character offset into a stored fetch (with fetch_id) to continue reading from. The previous reply names the next offset; 0 reads from the start.",
+					"minimum":     0,
 				},
 			},
 			"required": []string{"url"},
@@ -656,12 +717,58 @@ func (t *webFetchTool) Definition() model.ToolDefinition {
 type webFetchArgs struct {
 	URL      string `json:"url"`
 	MaxBytes *int   `json:"max_bytes,omitempty"`
+	FetchID  string `json:"fetch_id,omitempty"`
+	Offset   *int   `json:"offset,omitempty"`
 }
+
+// noVisibleTextMarker is returned (as a success string, not an
+// error) when a non-empty body extracts to no visible text at all:
+// the fetch worked, the page is not empty, but there is nothing to
+// show — most commonly a JavaScript-rendered page, which this tool
+// cannot execute. It is a marker, never a bare "" (F-A22-1).
+const noVisibleTextMarker = "[no visible text extracted — the page may require JavaScript] (this tool does not execute JavaScript; use a browser for JS-rendered pages)"
 
 func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a webFetchArgs
 	if err := decodeArgs(t.Name(), args, &a); err != nil {
 		return "", err
+	}
+	maxBytes := defaultFetchMaxBytes
+	if a.MaxBytes != nil {
+		maxBytes = *a.MaxBytes
+	}
+	if maxBytes < 1 || maxBytes > maxFetchMaxBytes {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("max_bytes must be between 1 and %d", maxFetchMaxBytes)}
+	}
+	// Continuation: page through a previously truncated fetch's
+	// stored text. No network call, no re-fetch — the stored copy
+	// is the page as fetched (see storeFetch).
+	if a.FetchID != "" {
+		if strings.TrimSpace(a.URL) != "" {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("fetch_id and url are mutually exclusive: pass fetch_id and offset to continue a fetch, or url to start one")}
+		}
+		offset := 0
+		if a.Offset != nil {
+			offset = *a.Offset
+		}
+		if offset < 0 {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("offset must not be negative, got %d", offset)}
+		}
+		stored, ok := loadStoredFetch(a.FetchID)
+		if !ok {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("unknown fetch_id %q (stored fetches are kept in memory only: the id was never stored, was evicted, or the daemon restarted; re-fetch the URL)", a.FetchID)}
+		}
+		runes := []rune(stored.text)
+		total := len(runes)
+		if offset > total {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("offset %d is past the end of the stored fetch (%d chars); the stored text ends at %d", offset, total, total)}
+		}
+		budget := extractOutputBudget(maxBytes)
+		end := offset + budget
+		if end > total {
+			end = total
+		}
+		return continuationHeader(a.FetchID, offset, end, total) + "\n" + string(runes[offset:end]), nil
 	}
 	raw := strings.TrimSpace(a.URL)
 	if raw == "" {
@@ -677,13 +784,6 @@ func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if parsed.Host == "" {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("url has no host")}
 	}
-	maxBytes := defaultFetchMaxBytes
-	if a.MaxBytes != nil {
-		maxBytes = *a.MaxBytes
-	}
-	if maxBytes < 1 || maxBytes > maxFetchMaxBytes {
-		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("max_bytes must be between 1 and %d", maxFetchMaxBytes)}
-	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
@@ -693,9 +793,18 @@ func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	// between this check and the dial. When a proxy is configured
 	// for the URL the dial goes to the proxy instead and this
 	// pre-check is the guard (see fetchSession.newClient).
+	//
+	// Kind: only an SSRF refusal is "denied". A DNS/resolve
+	// failure is an execution failure (F-A22-23) — the agent loop
+	// must not log it as a denial, and the model must not read a
+	// refusal where the cause is DNS.
 	session := newFetchSession(t.trusted)
 	if err := session.resolveHost(reqCtx, parsed.Host); err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "denied", Err: err}
+		kind := "execution"
+		if errors.Is(err, errNonPublicAddress) {
+			kind = "denied"
+		}
+		return "", &ToolError{Tool: t.Name(), Kind: kind, Err: err}
 	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, raw, nil)
 	if err != nil {
@@ -737,13 +846,48 @@ func (t *webFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	if truncated {
 		body = body[:maxBytes]
 	}
+	// Binary bodies are an error, never raw bytes as text (F-A22-22):
+	// magic bytes name the kind, and the error names what to do
+	// instead — Orion has no tool that reads PDF/images/archives,
+	// so the file must be downloaded (shell_exec) and opened with
+	// a reader for that format. Content-Type alone is not trusted:
+	// servers lie, the bytes do not.
+	if kind, ok := detectBinaryKind(body); ok {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("fetch returned binary content (%s) from %s; web_fetch returns text only — download the file with shell_exec and open it with a reader for that format (file_read handles plain text only)", kind, parsed.Redacted())}
+	}
+	// An empty body is an error, never a bare "" success (F-A22-1):
+	// the model cannot tell "the page is empty" from "the fetch
+	// silently produced nothing".
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("fetch returned an empty body (HTTP 200 with no content) from %s; the page may be empty or may require JavaScript — try a browser for JS-rendered pages", parsed.Redacted())}
+	}
 	// Extracted text, not a raw dump (rc23 fetch-cost fix): the
 	// model sees clean text / a compact JSON summary, capped at
 	// roughly maxBytes/4 chars, instead of up to maxBytes of raw
 	// markup or API metadata.
-	out := extractFetchBody(body, resp.Header.Get("Content-Type"), maxBytes)
+	full := extractFetchText(body, resp.Header.Get("Content-Type"))
+	// A non-empty body that extracts to nothing is reported with
+	// the marker, never as a bare "" (F-A22-1): the fetch worked,
+	// the page is not empty, but there is no visible text — most
+	// commonly a JavaScript-rendered page.
+	if strings.TrimSpace(full) == "" {
+		return noVisibleTextMarker, nil
+	}
+	budget := extractOutputBudget(maxBytes)
+	out, headChars, _, totalChars, cut := truncateHeadTail(full, budget)
+	if !cut {
+		if truncated {
+			out += "\n[truncated] (response exceeded max_bytes; re-fetch with a larger max_bytes for more)"
+		}
+		return out, nil
+	}
+	// Over budget: retain the full extracted text and give the
+	// model the way to page it (Hermes' shape — head+tail on line
+	// boundaries, exact counts, stored copy + paging call).
+	fetchID := storeFetch(raw, full)
+	out += fmt.Sprintf("\n[continue: web_fetch {\"fetch_id\": %q, \"offset\": %d} shows chars %d-%d of %d]", fetchID, headChars, headChars, min(headChars+budget, totalChars), totalChars)
 	if truncated {
-		out += "\n[truncated] (response exceeded max_bytes; re-fetch with a larger max_bytes for more)"
+		out += "\n[truncated] (response exceeded max_bytes; only the first bytes were fetched — re-fetch with a larger max_bytes for more of the page)"
 	}
 	return out, nil
 }
@@ -775,7 +919,7 @@ func (t *webSearchTool) Name() string { return "web_search" }
 func (t *webSearchTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
 
 func (t *webSearchTool) Description() string {
-	return "Search the web (DuckDuckGo) and return numbered results with titles and links."
+	return "Search the web (DuckDuckGo) and return numbered results with titles and links. The Instant Answer API and the lite and html results pages are queried concurrently and merged (deduplicated, ranked by corroboration); if a backend fails, the reply says which one and how, instead of claiming no results."
 }
 
 func (t *webSearchTool) Definition() model.ToolDefinition {
@@ -819,14 +963,184 @@ type searchResult struct {
 // IP, and it usually clears on its own.
 var errDDGCaptcha = errors.New("search backend is blocking automated requests right now (DuckDuckGo bot challenge)")
 
-// isDDGChallengeBody reports whether a lite results page is a
-// bot-challenge page rather than results: a challenge page has
-// no result links and names the challenge. Checked only when the
-// page parses to zero results, so a real results page that
-// happens to mention the word "challenge" in a snippet is never
-// misread.
-func isDDGChallengeBody(body []byte) bool {
-	return strings.Contains(strings.ToLower(string(body)), "challenge")
+// searchBackendStatus is one backend's outcome in the search
+// envelope (research §1: a typed result envelope — results +
+// per-backend status + degraded/truncated flags — rendered into the
+// model-facing string). err == nil is a clean answer, which may
+// legitimately hold zero results; err != nil is a backend failure.
+// torn means the response body hit the byte safety cap, so the
+// parse may be incomplete (half-info item).
+type searchBackendStatus struct {
+	name    string // "api", "lite" or "html"
+	results []searchResult
+	err     error
+	torn    bool
+}
+
+// challenged reports whether the backend answered with a DuckDuckGo
+// bot challenge.
+func (s searchBackendStatus) challenged() bool { return errors.Is(s.err, errDDGCaptcha) }
+
+// failed reports whether the backend failed (challenge included).
+func (s searchBackendStatus) failed() bool { return s.err != nil }
+
+// searchEnvelope is the merged result of the fan-out: deduped,
+// corroboration-ranked results capped at count, plus the
+// per-backend status the model-facing string is rendered from.
+// degraded is true when any backend failed, reported a challenge,
+// or parsed torn — i.e. whenever the result set is weaker evidence
+// than a clean three-backend answer. A backend that answered
+// cleanly with zero results does NOT degrade the envelope: the
+// Instant Answer API is legitimately empty for most queries, and
+// flagging every search degraded would be noise. (Documented
+// convention, per research §6: "all backends answered cleanly +
+// zero results = genuine no-results".)
+type searchEnvelope struct {
+	results      []searchResult
+	totalFound   int
+	contributors []string // backends contributing ≥1 shown result
+	failed       []searchBackendStatus
+	challenged   []string
+	torn         []string
+	degraded     bool
+}
+
+// mergeSearchResults merges the backends' results: dedupe by URL,
+// rank by corroboration (results seen by more backends first,
+// first-seen order breaking ties), then cap by count AFTER parsing
+// — the count cap is applied to results, never to raw HTML bytes.
+func mergeSearchResults(statuses []searchBackendStatus, count int) searchEnvelope {
+	var env searchEnvelope
+	type merged struct {
+		r         searchResult
+		backends  int
+		firstSeen int
+	}
+	seen := map[string]*merged{}
+	var order []*merged
+	seenAt := 0
+	for _, st := range statuses {
+		switch {
+		case st.challenged():
+			env.challenged = append(env.challenged, st.name)
+			env.degraded = true
+		case st.err != nil:
+			env.failed = append(env.failed, st)
+			env.degraded = true
+		}
+		if st.torn {
+			env.torn = append(env.torn, st.name)
+			env.degraded = true
+		}
+		for _, r := range st.results {
+			key := dedupeSearchURL(r.URL)
+			if m, ok := seen[key]; ok {
+				m.backends++
+				continue
+			}
+			m := &merged{r: r, backends: 1, firstSeen: seenAt}
+			seenAt++
+			seen[key] = m
+			order = append(order, m)
+		}
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		if order[i].backends != order[j].backends {
+			return order[i].backends > order[j].backends
+		}
+		return order[i].firstSeen < order[j].firstSeen
+	})
+	env.totalFound = len(order)
+	contribSet := map[string]bool{}
+	for _, m := range order {
+		if len(env.results) >= count {
+			break
+		}
+		env.results = append(env.results, m.r)
+		// Contributors are the backends behind the SHOWN results.
+		for _, st := range statuses {
+			for _, r := range st.results {
+				if dedupeSearchURL(r.URL) == dedupeSearchURL(m.r.URL) {
+					contribSet[st.name] = true
+				}
+			}
+		}
+	}
+	// Stable backend order in the note: api, lite, html.
+	for _, name := range []string{"api", "lite", "html"} {
+		if contribSet[name] {
+			env.contributors = append(env.contributors, name)
+		}
+	}
+	return env
+}
+
+// joinBackendNames renders backend names the way the model reads
+// them: "the API backend", "the lite and html backends".
+func joinBackendNames(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return "the " + names[0] + " backend"
+	case 2:
+		return "the " + names[0] + " and " + names[1] + " backends"
+	default:
+		return "the " + strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1] + " backends"
+	}
+}
+
+// render renders the envelope into the model-facing string: the
+// numbered results, then — when degraded — one explicit note naming
+// every failed/challenged/torn backend and the backends the shown
+// results were rescued from (Hermes' rescued_from + original error,
+// in prose; there is no backend pin and no cache, so a rescued
+// result can never be cached or silently re-pinned).
+func (e searchEnvelope) render(query string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Search results for %q:\n", query)
+	for i, r := range e.results {
+		fmt.Fprintf(&sb, "\n%d. %s\n", i+1, r.Title)
+		if r.URL != "" {
+			fmt.Fprintf(&sb, "   %s\n", r.URL)
+		}
+		if r.Text != "" && r.Text != r.Title {
+			fmt.Fprintf(&sb, "   %s\n", r.Text)
+		}
+	}
+	if !e.degraded {
+		return sb.String()
+	}
+	var bits []string
+	for _, f := range e.failed {
+		bits = append(bits, fmt.Sprintf("%s backend failed: %v", f.name, f.err))
+	}
+	for _, name := range e.challenged {
+		bits = append(bits, fmt.Sprintf("%s backend reported a bot challenge", name))
+	}
+	for _, name := range e.torn {
+		bits = append(bits, fmt.Sprintf("%s page exceeded the 1 MB safety cap and may be incomplete", name))
+	}
+	sb.WriteString("\nNote (degraded): " + strings.Join(bits, "; ") + ".")
+	if len(e.contributors) > 0 {
+		sb.WriteString(" The results above are rescued from " + joinBackendNames(e.contributors) + ".")
+	}
+	return sb.String()
+}
+
+// errSearchBackendsFailed is the shape of the zero-result error:
+// every failed backend named with its error. Torn backends are
+// listed the same way (a torn parse that yielded nothing may have
+// cut the results off).
+func (e searchEnvelope) zeroResultError() error {
+	var bits []string
+	for _, f := range e.failed {
+		bits = append(bits, fmt.Sprintf("%s: %v", f.name, f.err))
+	}
+	for _, name := range e.torn {
+		bits = append(bits, fmt.Sprintf("%s: page exceeded the 1 MB safety cap and no results could be parsed (the result list may have been cut off)", name))
+	}
+	return fmt.Errorf("web search failed (%s)", strings.Join(bits, "; "))
 }
 
 func (t *webSearchTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -846,44 +1160,56 @@ func (t *webSearchTool) Execute(ctx context.Context, args json.RawMessage) (stri
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("count must be between 1 and 20")}
 	}
 
-	results, apiErr := t.searchViaAPI(ctx, query, count)
-	if len(results) == 0 {
-		// Fall back to the lite HTML results page.
-		liteResults, liteErr := t.searchViaLite(ctx, query, count)
-		if len(liteResults) > 0 {
-			results = liteResults
-		} else if errors.Is(apiErr, errDDGCaptcha) || errors.Is(liteErr, errDDGCaptcha) {
-			// The backend is refusing automated requests
-			// (DDG bot challenge, HTTP 202) — say so
-			// instead of "no results", which would be a lie:
-			// the results exist, this egress IP is blocked
-			// from seeing them right now. A plain reply,
-			// not an error: it is a transient backend
-			// condition, not a bad query.
-			return "Search backend is blocking automated requests right now (DuckDuckGo bot challenge). Try again later.", nil
-		} else if apiErr != nil {
-			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("web search failed (API: %v; lite fallback: %v)", apiErr, liteErr)}
-		} else if liteErr != nil {
-			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("web search failed (lite fallback: %v)", liteErr)}
-		} else {
-			return fmt.Sprintf("No results found for %q.", query), nil
-		}
+	// Fan-out (ddgs' shape): all three backends run concurrently,
+	// each with its own searchTimeout budget, and the envelope
+	// merges them. One backend's failure is never fatal on its own;
+	// only an all-backends failure (or a challenged/failed empty
+	// set) fails the call.
+	statuses := make([]searchBackendStatus, 3)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); statuses[0] = t.searchViaAPIStatus(ctx, query, count) }()
+	go func() { defer wg.Done(); statuses[1] = t.searchViaLiteStatus(ctx, query, count) }()
+	go func() { defer wg.Done(); statuses[2] = t.searchViaHTMLStatus(ctx, query, count) }()
+	wg.Wait()
+	env := mergeSearchResults(statuses, count)
+
+	if len(env.results) > 0 {
+		return env.render(query), nil
 	}
-	if len(results) > count {
-		results = results[:count]
+	// Zero results. The backend is refusing automated requests
+	// (DDG bot challenge) — say so instead of "no results", which
+	// would be a lie: the results exist, this egress IP is blocked
+	// from seeing them right now. A plain reply, not an error: it
+	// is a transient backend condition, not a bad query (rc23,
+	// deliberate — see W7 §10).
+	if len(env.challenged) > 0 {
+		return "Search backend is blocking automated requests right now (DuckDuckGo bot challenge). Try again later.", nil
 	}
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Search results for %q:\n", query)
-	for i, r := range results {
-		fmt.Fprintf(&sb, "\n%d. %s\n", i+1, r.Title)
-		if r.URL != "" {
-			fmt.Fprintf(&sb, "   %s\n", r.URL)
+	if len(env.failed) > 0 || len(env.torn) > 0 {
+		// An empty result set with any backend failure, parse
+		// failure or truncation is an error, never a bare success
+		// string (F-A22-2). Kind: "denied" only when every failure
+		// is an SSRF refusal (F-A22-23's rule, applied here too);
+		// any other failure is "execution".
+		kind := "execution"
+		if len(env.failed) > 0 && len(env.torn) == 0 {
+			allRefusals := true
+			for _, f := range env.failed {
+				if !errors.Is(f.err, errNonPublicAddress) {
+					allRefusals = false
+					break
+				}
+			}
+			if allRefusals {
+				kind = "denied"
+			}
 		}
-		if r.Text != "" && r.Text != r.Title {
-			fmt.Fprintf(&sb, "   %s\n", r.Text)
-		}
+		return "", &ToolError{Tool: t.Name(), Kind: kind, Err: env.zeroResultError()}
 	}
-	return sb.String(), nil
+	// Every backend answered cleanly and found nothing: genuine
+	// no-results (the documented convention — see searchEnvelope).
+	return fmt.Sprintf("No results found for %q.", query), nil
 }
 
 // ddgAPIResponse is the subset of the DuckDuckGo Instant Answer JSON we use.
@@ -914,10 +1240,17 @@ type ddgAPIResponse struct {
 // shape for tests; production code goes through the tool (which
 // carries the trusted egress CIDRs).
 func searchViaAPI(ctx context.Context, query string, count int) ([]searchResult, error) {
-	return (&webSearchTool{}).searchViaAPI(ctx, query, count)
+	st := (&webSearchTool{}).searchViaAPIStatus(ctx, query, count)
+	return st.results, st.err
 }
 
 func (t *webSearchTool) searchViaAPI(ctx context.Context, query string, count int) ([]searchResult, error) {
+	st := t.searchViaAPIStatus(ctx, query, count)
+	return st.results, st.err
+}
+
+func (t *webSearchTool) searchViaAPIStatus(ctx context.Context, query string, count int) searchBackendStatus {
+	st := searchBackendStatus{name: "api"}
 	var trusted []*net.IPNet
 	if t != nil {
 		trusted = t.trusted
@@ -927,22 +1260,26 @@ func (t *webSearchTool) searchViaAPI(ctx context.Context, query string, count in
 	u := searchAPIBase + "/?q=" + url.QueryEscape(query) + "&format=json&no_html=1"
 	parsed, err := url.Parse(u)
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	session := newFetchSession(trusted)
 	if err := session.resolveHost(reqCtx, parsed.Host); err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	req.Header.Set("User-Agent", userAgent)
 	client := session.newClient()
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusAccepted {
@@ -950,18 +1287,22 @@ func (t *webSearchTool) searchViaAPI(ctx context.Context, query string, count in
 		// automated requests with HTTP 202 and a challenge
 		// page instead of JSON. Surface it as the captcha
 		// sentinel, never as an empty result set.
-		return nil, errDDGCaptcha
+		st.err = errDDGCaptcha
+		return st
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("DuckDuckGo API returned status %d", resp.StatusCode)
+		st.err = fmt.Errorf("DuckDuckGo API returned status %d", resp.StatusCode)
+		return st
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, searchMaxBodyBytes))
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	var ddg ddgAPIResponse
 	if err := json.Unmarshal(body, &ddg); err != nil {
-		return nil, fmt.Errorf("cannot parse DuckDuckGo response: %w", err)
+		st.err = fmt.Errorf("cannot parse DuckDuckGo response: %w", err)
+		return st
 	}
 	var results []searchResult
 	if ddg.AbstractText != "" {
@@ -997,7 +1338,8 @@ func (t *webSearchTool) searchViaAPI(ctx context.Context, query string, count in
 			results = append(results, searchResult{Title: firstSentence(r.Text), URL: r.FirstURL, Text: r.Text})
 		}
 	}
-	return results, nil
+	st.results = results
+	return st
 }
 
 func firstSentence(s string) string {
@@ -1018,16 +1360,10 @@ func firstSentence(s string) string {
 	return string(runes)
 }
 
+// htmlTagRe strips tags in extractHTMLText (extraction only —
+// result parsing uses the tokenizer in web_parse.go, never regex).
 var (
-	// liteAnchorRe matches any anchor tag; the result-link class and
-	// href are extracted per anchor (see liteHrefRe/liteClassRe), so
-	// a match does not depend on attribute order — DuckDuckGo markup
-	// puts class before href, but href before class is equally valid
-	// HTML and must be recognised too.
-	liteAnchorRe = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
-	liteHrefRe   = regexp.MustCompile(`(?i)\bhref="([^"]*)"`)
-	liteClassRe  = regexp.MustCompile(`(?i)\bclass="([^"]*)"`)
-	htmlTagRe    = regexp.MustCompile(`<[^>]+>`)
+	htmlTagRe = regexp.MustCompile(`<[^>]+>`)
 )
 
 // hasClass reports whether a class attribute value contains want as a
@@ -1041,16 +1377,44 @@ func hasClass(classAttr, want string) bool {
 	return false
 }
 
+// readCappedBody reads at most cap+1 bytes: it returns the body
+// (cut to cap) and torn=true when the body ran past the cap. The
+// cap is a safety valve only — the caller must surface torn, never
+// silently parse a cut document as complete.
+func readCappedBody(r io.Reader, cap int) ([]byte, bool, error) {
+	body, err := io.ReadAll(io.LimitReader(r, int64(cap)+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(body) > cap {
+		return body[:cap], true, nil
+	}
+	return body, false, nil
+}
+
 // searchViaLite queries the DuckDuckGo lite HTML results page. Like
 // searchViaAPI it routes through a fetchSession (pinned dialer +
 // redirect validation), so a lite endpoint cannot bounce the request
 // onto a private address. The package-level wrapper keeps the old
 // call shape for tests; production code goes through the tool.
+//
+// Parsing uses the stdlib HTML tokenizer (web_parse.go), not regex:
+// any quote style and any attribute order parse, a block whose href
+// is missing is skipped instead of failing the whole parse, and the
+// page must positively look like a results page before zero results
+// may mean "no results" (F-A22-2).
 func searchViaLite(ctx context.Context, query string, count int) ([]searchResult, error) {
-	return (&webSearchTool{}).searchViaLite(ctx, query, count)
+	st := (&webSearchTool{}).searchViaLiteStatus(ctx, query, count)
+	return st.results, st.err
 }
 
 func (t *webSearchTool) searchViaLite(ctx context.Context, query string, count int) ([]searchResult, error) {
+	st := t.searchViaLiteStatus(ctx, query, count)
+	return st.results, st.err
+}
+
+func (t *webSearchTool) searchViaLiteStatus(ctx context.Context, query string, count int) searchBackendStatus {
+	st := searchBackendStatus{name: "lite"}
 	var trusted []*net.IPNet
 	if t != nil {
 		trusted = t.trusted
@@ -1060,72 +1424,158 @@ func (t *webSearchTool) searchViaLite(ctx context.Context, query string, count i
 	u := strings.TrimRight(searchLiteBase, "/") + "/lite/?q=" + url.QueryEscape(query)
 	parsed, err := url.Parse(u)
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	session := newFetchSession(trusted)
 	if err := session.resolveHost(reqCtx, parsed.Host); err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	req.Header.Set("User-Agent", userAgent)
 	client := session.newClient()
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusAccepted {
 		// DuckDuckGo bot challenge (rc23): see searchViaAPI.
-		return nil, errDDGCaptcha
+		st.err = errDDGCaptcha
+		return st
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("DuckDuckGo lite returned status %d", resp.StatusCode)
+		st.err = fmt.Errorf("DuckDuckGo lite returned status %d", resp.StatusCode)
+		return st
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, torn, err := readCappedBody(resp.Body, searchMaxBodyBytes)
 	if err != nil {
-		return nil, err
+		st.err = err
+		return st
 	}
-	var results []searchResult
-	for _, m := range liteAnchorRe.FindAllStringSubmatch(string(body), -1) {
-		attrs, inner := m[1], m[2]
-		class := liteClassRe.FindStringSubmatch(attrs)
-		if class == nil || !hasClass(class[1], "result-link") {
-			continue
+	st.torn = torn
+	toks := tokenizeHTML(body)
+	st.results = parseLiteResults(toks, count)
+	if len(st.results) == 0 {
+		// Zero parsed results: the page must prove it is a
+		// results page (or a challenge page) before "no results"
+		// is ever uttered — markup drift, an empty body, a
+		// non-results page and a challenge page all parse to
+		// zero, and they are backend failures, not empty
+		// answers (F-A22-2, F-A22-27).
+		analysis := analyzeDDGPage(toks)
+		if isDDGChallengePage(analysis, body) {
+			// A challenge page with no results (rc23): see
+			// searchViaAPI — report the block, not "no results".
+			st.err = errDDGCaptcha
+			return st
 		}
-		hrefM := liteHrefRe.FindStringSubmatch(attrs)
-		if hrefM == nil {
-			continue
+		if hasUnrecognizedResultLinks(toks) {
+			// Result-shaped links the parser did not
+			// recognize: the backend's markup drifted.
+			st.err = fmt.Errorf("lite results page contains result links that could not be parsed (the backend's markup may have changed); refusing to report no results")
+			return st
 		}
-		href := htmlUnescape(hrefM[1])
-		title := strings.TrimSpace(htmlTagRe.ReplaceAllString(htmlUnescape(inner), ""))
-		if title == "" || href == "" {
-			continue
-		}
-		// Lite links may be wrapped in /l/?uddg=<urlencoded target>.
-		if strings.HasPrefix(href, "/l/?") {
-			if parsed, err := url.Parse(href); err == nil {
-				if target := parsed.Query().Get("uddg"); target != "" {
-					href = target
-				}
-			}
-		} else if strings.HasPrefix(href, "//") {
-			href = "https:" + href
-		}
-		results = append(results, searchResult{Title: title, URL: href})
-		if len(results) >= count {
-			break
+		if !analysis.hasSearchForm && !analysis.hasLinksContainer && !analysis.hasResultsContainer {
+			st.err = fmt.Errorf("lite results page did not look like a search results page (no search form or results container found); the backend may have changed its markup or returned an unexpected page")
+			return st
 		}
 	}
-	if len(results) == 0 && isDDGChallengeBody(body) {
-		// A challenge page with no results (rc23): see
-		// searchViaAPI — report the block, not "no results".
-		return nil, errDDGCaptcha
+	return st
+}
+
+// searchViaHTML queries the DuckDuckGo html results page — the
+// second key-free backend (Audit 22 fix batch). Same SSRF routing,
+// same zero-result rules as searchViaLite; the html endpoint's
+// result blocks are <div class="result__body"> (or "links_main")
+// with <a class="result__a"> title links. The package-level
+// wrapper keeps the old call shape for tests.
+func searchViaHTML(ctx context.Context, query string, count int) ([]searchResult, error) {
+	st := (&webSearchTool{}).searchViaHTMLStatus(ctx, query, count)
+	return st.results, st.err
+}
+
+func (t *webSearchTool) searchViaHTML(ctx context.Context, query string, count int) ([]searchResult, error) {
+	st := t.searchViaHTMLStatus(ctx, query, count)
+	return st.results, st.err
+}
+
+func (t *webSearchTool) searchViaHTMLStatus(ctx context.Context, query string, count int) searchBackendStatus {
+	st := searchBackendStatus{name: "html"}
+	var trusted []*net.IPNet
+	if t != nil {
+		trusted = t.trusted
 	}
-	return results, nil
+	reqCtx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
+	u := strings.TrimRight(searchHTMLBase, "/") + "/html/?q=" + url.QueryEscape(query)
+	parsed, err := url.Parse(u)
+	if err != nil {
+		st.err = err
+		return st
+	}
+	session := newFetchSession(trusted)
+	if err := session.resolveHost(reqCtx, parsed.Host); err != nil {
+		st.err = err
+		return st
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
+	if err != nil {
+		st.err = err
+		return st
+	}
+	req.Header.Set("User-Agent", userAgent)
+	client := session.newClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
+	if err != nil {
+		st.err = err
+		return st
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		// DuckDuckGo bot challenge (rc23): see searchViaAPI.
+		st.err = errDDGCaptcha
+		return st
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		st.err = fmt.Errorf("DuckDuckGo html returned status %d", resp.StatusCode)
+		return st
+	}
+	body, torn, err := readCappedBody(resp.Body, searchMaxBodyBytes)
+	if err != nil {
+		st.err = err
+		return st
+	}
+	st.torn = torn
+	toks := tokenizeHTML(body)
+	st.results = parseHTMLResults(toks, count)
+	if len(st.results) == 0 {
+		// Same zero-result rules as the lite backend (F-A22-2,
+		// F-A22-27): challenge first, then drift, then
+		// results-page validation.
+		analysis := analyzeDDGPage(toks)
+		if isDDGChallengePage(analysis, body) {
+			st.err = errDDGCaptcha
+			return st
+		}
+		if hasUnrecognizedResultLinks(toks) {
+			st.err = fmt.Errorf("html results page contains result links that could not be parsed (the backend's markup may have changed); refusing to report no results")
+			return st
+		}
+		if !analysis.hasSearchForm && !analysis.hasLinksContainer && !analysis.hasResultsContainer {
+			st.err = fmt.Errorf("html results page did not look like a search results page (no search form or results container found); the backend may have changed its markup or returned an unexpected page")
+			return st
+		}
+	}
+	return st
 }
 
 func htmlUnescape(s string) string {

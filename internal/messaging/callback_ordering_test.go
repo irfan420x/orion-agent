@@ -109,7 +109,7 @@ func TestCallbackDispatchedBeforeMessageInSameBatchWhileTurnSlotsFull(t *testing
 		if q.ID != "cb-tap-2" {
 			t.Errorf("callback id = %q, want cb-tap-2", q.ID)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(scaledTimeout(5 * time.Second)):
 		t.Fatal("callback later in the same batch never reached the handler while all 8 turn slots were held behind the earlier message (F-A7-P2-3)")
 	}
 	waitFor(t, "callback answered", func() bool {
@@ -169,7 +169,7 @@ func TestOffsetNotAdvancedPastUndispatchedMessage(t *testing.T) {
 	}})
 	select {
 	case <-cbDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(scaledTimeout(5 * time.Second)):
 		t.Fatal("callback in the batch never reached the handler")
 	}
 	// The callback completed, but turns 1-8 are still in flight

@@ -124,7 +124,7 @@ func TestSharedApprovalWiringPromptsAndResolvesViaInstalledHandler(t *testing.T)
 		if !ok {
 			t.Error("Check returned false after the requester's approve tap, want true")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(scaledTimeout(5 * time.Second)):
 		t.Fatal("Check did not return after the approve tap delivered through PollStream")
 	}
 	if _, found := gate.Pending(reqID); found {
@@ -215,7 +215,7 @@ func TestSharedApprovalCallbackRejectsStranger(t *testing.T) {
 		if !ok {
 			t.Error("Check returned false after the requester's approve tap, want true")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(scaledTimeout(5 * time.Second)):
 		t.Fatal("Check did not return after the approve tap")
 	}
 
@@ -275,7 +275,7 @@ func TestSharedApprovalExpiryEditsCard(t *testing.T) {
 		if ok {
 			t.Error("Check returned true for an unanswered request, want false (expired)")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(scaledTimeout(5 * time.Second)):
 		t.Fatal("Check did not return after the approval window")
 	}
 	waitFor(t, "expired card edited in place", func() bool {

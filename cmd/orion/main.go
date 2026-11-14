@@ -414,7 +414,13 @@ func cmdConfig(args []string) error {
 		if sandbox.Available() {
 			fmt.Printf("sandbox_probe:   available (ordering %s)\n", sandbox.Ordering())
 		} else {
-			fmt.Printf("sandbox_probe:   unavailable: %v\n", sandbox.AvailabilityError())
+			// F-A22-14: say the probe is cached — the operator
+			// reading this line gets no hint otherwise, and
+			// re-running config show after fixing the host
+			// shows the same unavailable (the daemon's probe
+			// result is cached for its lifetime) with no
+			// pointer to the restart that re-probes.
+			fmt.Printf("sandbox_probe:   unavailable: %v (cached for the process lifetime — restart oriond to re-probe)\n", sandbox.AvailabilityError())
 		}
 		fmt.Println("providers:")
 		names := make([]string, 0, len(cfg.Providers))

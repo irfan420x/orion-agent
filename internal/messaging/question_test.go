@@ -741,3 +741,192 @@ func TestHandleQuestionCallbackUnknownIDGetsRestartNotice(t *testing.T) {
 		t.Error("stale tap left a pending question behind")
 	}
 }
+
+// --- F-A22-21: question-first ordering vs a pending plan ----------
+
+// TestQuestionInterceptorOptionScopedTypedReply pins the scoped
+// consumption: a question WITH options only takes a typed reply
+// that names one of the options. Anything else declines, so the
+// reply chain can hand it to the next interceptor (a pending
+// plan) or a normal turn instead of the question eating it.
+func TestQuestionInterceptorOptionScopedTypedReply(t *testing.T) {
+	questions := NewQuestionRegistry(77)
+	in := &questionReplyInterceptor{gw: nil, questions: questions}
+	upd := func(text string) Update {
+		return Update{Message: &TGMessage{Chat: TGChat{ID: 77}, Text: text, From: &TGUser{ID: 77}}}
+	}
+	// An option question: a reply naming no option declines.
+	p := &pendingQuestion{id: "q-opt", chatID: 77, senderID: 77, options: []string{"red", "blue"}, ch: make(chan questionResult, 1)}
+	questions.register(p)
+	if in.TryAnswer(upd("approve")) {
+		t.Error("TryAnswer(\"approve\") consumed it for an option question, want it declined (it names no option)")
+	}
+	if _, ok := questions.PendingForChat(77); !ok {
+		t.Error("option question stopped pending after a declined reply, want it still pending")
+	}
+	// Option matches are case-insensitive, with trailing
+	// punctuation stripped.
+	if !in.TryAnswer(upd("Blue.")) {
+		t.Error("TryAnswer(\"Blue.\") did not consume it, want the option match to answer the question")
+	}
+	if _, ok := questions.PendingForChat(77); ok {
+		t.Error("option question still pending after its answer, want it resolved")
+	}
+	// A question with NO options has no scoped vocabulary: any
+	// non-command reply is still its answer (the genuinely
+	// ambiguous overlap stays question-first).
+	p2 := &pendingQuestion{id: "q-free", chatID: 77, senderID: 77, ch: make(chan questionResult, 1)}
+	questions.register(p2)
+	if !in.TryAnswer(upd("approve")) {
+		t.Error("TryAnswer(\"approve\") did not consume it for a free-text question, want it answered")
+	}
+}
+
+type overlapPlanResult struct {
+	res string
+	err error
+}
+
+// startOverlapPlan wires a real enter_plan_mode tool (built the
+// real way, with the harness gateway as its transport — the
+// wiring WireTelegram does for the parent registry) into the
+// harness reply chain BEHIND the question interceptor, starts a
+// plan wait, and returns the plan registry, its interceptor, and
+// the plan result channel. The caller must resolve the plan so
+// the background Execute returns.
+func startOverlapPlan(t *testing.T, h *questionHarness) (*tools.Registry, tools.ReplyInterceptor, chan overlapPlanResult) {
+	t.Helper()
+	ctx := permissions.WithApprovalContext(context.Background(), 77, 77)
+	planReg, err := tools.DefaultRegistryWithDeps(tools.ToolDeps{PlanningStore: tools.NewPlanningStore("")})
+	if err != nil {
+		t.Fatalf("DefaultRegistryWithDeps: %v", err)
+	}
+	enterTool, ok := planReg.Get("enter_plan_mode")
+	if !ok {
+		t.Fatal("registry has no enter_plan_mode")
+	}
+	planInterceptor, ok := enterTool.(tools.ReplyInterceptor)
+	if !ok {
+		t.Fatal("enter_plan_mode does not implement ReplyInterceptor")
+	}
+	if ta, ok := enterTool.(tools.TransportAware); ok {
+		if err := ta.InstallTransport(&tools.ToolHost{Gateway: h.gw, OwnerID: 77}); err != nil {
+			t.Fatalf("InstallTransport: %v", err)
+		}
+	} else {
+		t.Fatal("enter_plan_mode does not implement TransportAware")
+	}
+	h.gw.AddReplyInterceptor(planInterceptor)
+	planArgs, _ := json.Marshal(map[string]any{"goal": "Do a thing", "steps": []string{"Step one"}, "timeout_seconds": 10})
+	planCh := make(chan overlapPlanResult, 1)
+	go func() {
+		res, err := planReg.Execute(ctx, "enter_plan_mode", planArgs)
+		planCh <- overlapPlanResult{res, err}
+	}()
+	waitFor(t, "plan message", func() bool { return countSent(h.fake, 77, "📋 Plan:") > 0 })
+	return planReg, planInterceptor, planCh
+}
+
+func awaitPlan(t *testing.T, ch chan overlapPlanResult) overlapPlanResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(5 * time.Second):
+		t.Fatal("plan wait did not return within 5s")
+		return overlapPlanResult{}
+	}
+}
+
+func decodePlanDecision(t *testing.T, r overlapPlanResult) string {
+	t.Helper()
+	if r.err != nil {
+		t.Fatalf("plan result err = %v, want a decision", r.err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(r.res), &out); err != nil {
+		t.Fatalf("plan result %q is not JSON: %v", r.res, err)
+	}
+	decision, _ := out["decision"].(string)
+	return decision
+}
+
+// TestQuestionAndPlanOverlapTypedApproveReachesPlan (F-A22-21):
+// with a question (options red/blue) AND a plan pending together
+// — the overlap only the shared-registry/children path can
+// create — a typed "approve" must reach the plan, not be eaten
+// as the question's answer.
+func TestQuestionAndPlanOverlapTypedApproveReachesPlan(t *testing.T) {
+	h := newQuestionHarness(t)
+	_, _, planCh := startOverlapPlan(t, h)
+	resCh := h.askInBackground(context.Background(), 77, 77, "Pick a colour?", []string{"red", "blue"}, 10*time.Second)
+	waitFor(t, "question message", func() bool {
+		_, _, ok := h.questionSent(77)
+		return ok
+	})
+	h.fake.enqueue(Update{UpdateID: 10, Message: &TGMessage{
+		MessageID: 10, Chat: TGChat{ID: 77}, Text: "approve", From: &TGUser{ID: 77},
+	}})
+	if got := decodePlanDecision(t, awaitPlan(t, planCh)); got != "approved" {
+		t.Errorf("plan decision = %q, want approved (the typed \"approve\" must reach the plan, not the question)", got)
+	}
+	// The question is still pending, and no turn ran for the
+	// "approve" message (it was consumed, not turned).
+	if h.questions.PendingCount() != 1 {
+		t.Errorf("pending questions = %d, want 1 (the question must survive the plan's approval)", h.questions.PendingCount())
+	}
+	if turns := h.turnsSnapshot(); len(turns) != 0 {
+		t.Errorf("turns ran for the typed \"approve\" (%v): a consumed reply must not start a turn", turns)
+	}
+	// The question is still answerable afterwards.
+	h.fake.enqueue(Update{UpdateID: 11, Message: &TGMessage{
+		MessageID: 11, Chat: TGChat{ID: 77}, Text: "red", From: &TGUser{ID: 77},
+	}})
+	res := awaitAsk(t, resCh)
+	if res.err != nil {
+		t.Fatalf("Ask returned error: %v", res.err)
+	}
+	if res.answer != "red" || res.source != "text" || res.index != -1 {
+		t.Errorf("Ask result = %+v, want {red text -1}", res)
+	}
+}
+
+// TestQuestionAndPlanOverlapTypedOptionReachesQuestion is the
+// mirror: a typed reply naming an option answers the question,
+// and the plan behind it must never see it.
+func TestQuestionAndPlanOverlapTypedOptionReachesQuestion(t *testing.T) {
+	h := newQuestionHarness(t)
+	ctx := permissions.WithApprovalContext(context.Background(), 77, 77)
+	planReg, planInterceptor, planCh := startOverlapPlan(t, h)
+	resCh := h.askInBackground(context.Background(), 77, 77, "Pick a colour?", []string{"red", "blue"}, 10*time.Second)
+	waitFor(t, "question message", func() bool {
+		_, _, ok := h.questionSent(77)
+		return ok
+	})
+	h.fake.enqueue(Update{UpdateID: 10, Message: &TGMessage{
+		MessageID: 10, Chat: TGChat{ID: 77}, Text: "blue", From: &TGUser{ID: 77},
+	}})
+	res := awaitAsk(t, resCh)
+	if res.err != nil {
+		t.Fatalf("Ask returned error: %v", res.err)
+	}
+	if res.answer != "blue" || res.source != "text" || res.index != -1 {
+		t.Errorf("Ask result = %+v, want {blue text -1}", res)
+	}
+	// The plan is still pending: the option reply never reached it.
+	if blocked, _ := planReg.PlanModeBlocks(ctx, "shell_exec"); !blocked {
+		t.Error("PlanModeBlocks(shell_exec) after the question's answer = false, want true (plan still pending)")
+	}
+	select {
+	case r := <-planCh:
+		t.Fatalf("plan returned %+v while only the question was answered, want it still waiting", r)
+	default:
+	}
+	// Clean up: approve the plan directly through its interceptor.
+	if !planInterceptor.TryAnswer(Update{Message: &TGMessage{Chat: TGChat{ID: 77}, Text: "approve", From: &TGUser{ID: 77}}}) {
+		t.Fatal("plan TryAnswer(\"approve\"): not consumed")
+	}
+	if got := decodePlanDecision(t, awaitPlan(t, planCh)); got != "approved" {
+		t.Errorf("plan decision = %q, want approved", got)
+	}
+}

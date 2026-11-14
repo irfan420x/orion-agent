@@ -72,12 +72,17 @@ visible per command.
   (its own PID namespace — see "PID namespace" below), and —
   unless `allow_network` is set — `CLONE_NEWNET` (a network
   namespace whose only interface is a down loopback: no network at
-  all). The user namespace is **not** created by the clone: the
+  all). Under the default ordering (userns-after-clone, tried
+  first — see "PID namespace" and the F-A21-3 dual-ordering probe
+  below) the user namespace is **not** created by the clone: the
   wrapper mounts `/proc` first and only then drops into a fresh
   user namespace with `unshare --user --map-root-user` (agent
   uid/gid mapped to root inside), immediately before running user
-  code — see "PID namespace" for why the order matters. The end
-  state is the same as creating it at clone time.
+  code — see "PID namespace" for why the order matters. Under the
+  fallback ordering (userns-at-clone) the clone **does** create it
+  (`CLONE_NEWUSER` plus uid/gid mappings) and the wrapper skips
+  the late switch. Either way the end state is the same as
+  creating it at clone time.
 - Inside the namespaces a wrapper builds a chroot root under
   `<root>/.orion-root` and runs the command there as `/bin/sh -c`
   with cwd `/work`:
@@ -126,14 +131,21 @@ first, then PID namespace inside it), `subset=pid` and plain
 mounts, `/proc` and arbitrary mountpoints, even mounting proc for a
 PID namespace owned by the cell's user namespace from inside a
 nested one. The same mount succeeds from the cell's user namespace
-(no nested user namespace). So the user namespace is **not**
-created at clone time. The wrapper instead runs first as the
-agent's uid in the host user namespace, mounts `/proc` (and
-everything else), `pivot_root`s, detaches the old root, and only
-then drops into a fresh user namespace with `unshare --user
---map-root-user` immediately before running user code. The end
-state is identical to creating it at clone time — root inside its
-own user namespace, capabilities only over its own namespaces.
+(no nested user namespace). So, under the default ordering
+(userns-after-clone, tried first), the user namespace is **not**
+created at clone time *on this host*. The wrapper instead runs
+first as the agent's uid in the host user namespace, mounts
+`/proc` (and everything else), `pivot_root`s, detaches the old
+root, and only then drops into a fresh user namespace with
+`unshare --user --map-root-user` immediately before running user
+code. On a plain host the probe's fallback ordering
+(userns-at-clone, F-A21-3) does the opposite: the clone creates
+the namespace (`CLONE_NEWUSER` plus uid/gid mappings) and the
+wrapper skips the late switch — which is why the "not created at
+clone time" claim holds only for the default ordering, not
+unconditionally. The end state is identical to creating it at
+clone time — root inside its own user namespace, capabilities
+only over its own namespaces.
 
 **The mount namespace follows the user namespace.** The mount
 namespace is created by the clone, so it is owned by the host user
@@ -211,10 +223,17 @@ between runs; `/tmp` does not.
   blocked for unprivileged users on this VM (the cell itself is a
   user-namespaced container), so the sandbox only works when the
   agent runs as root, or on a host that allows unprivileged user
-  namespaces. The wrapper does all of its mounts before the
-  user-namespace switch, while running as the agent's uid in the
-  host user namespace, so as a non-root agent the very first mount
-  fails and the probe reports the sandbox unavailable.
+  namespaces. Under the default ordering the wrapper does all of
+  its mounts before the user-namespace switch, while running as
+  the agent's uid in the host user namespace, so as a non-root
+  agent the very first mount fails — but that failure no longer
+  ends the probe: it falls back to the userns-at-clone ordering,
+  which needs no privilege beyond creating a user namespace
+  (verified live on the laptop, F-A21-3). The probe reports the
+  sandbox unavailable when neither ordering works — and a
+  first-ordering failure that cannot be an ordering problem
+  (anything other than EPERM / wrapper exit 126) reports
+  unavailable without trying the second ordering (F-A22-13).
   `sandbox.Available()` probes the real mechanism (a trivial
   command through the full wrapper) and caches the result. When
   sandbox mode is on but unavailable — or setup fails — `shell_exec`

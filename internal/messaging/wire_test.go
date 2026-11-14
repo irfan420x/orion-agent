@@ -14,6 +14,7 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -453,5 +454,146 @@ func TestWireTelegramRejectsPermPrefix(t *testing.T) {
 	err := WireTelegram(reg2, gw2, gate2, cards2, 77, "test")
 	if err == nil || !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("WireTelegram with prefix \"perm:\": error %v, want it to name the reservation", err)
+	}
+}
+
+// wireTransportTool is a minimal tool implementing
+// tools.TransportAware: InstallTransport records the call and
+// returns its configured error (nil = success). The error can be
+// flipped between calls, so a test can fail the first wiring and
+// let the retry succeed — pinning the F-A22-8 contract that a
+// transport failure leaves the gateway clean.
+type wireTransportTool struct {
+	name  string
+	mu    sync.Mutex
+	calls int
+	fail  error
+}
+
+func (t *wireTransportTool) Name() string { return t.name }
+func (t *wireTransportTool) Description() string {
+	return "test transport tool"
+}
+func (t *wireTransportTool) Definition() model.ToolDefinition {
+	return model.ToolDefinition{Name: t.name, Description: t.Description(), Parameters: map[string]any{"type": "object"}}
+}
+func (t *wireTransportTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	return "ok", nil
+}
+func (t *wireTransportTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+func (t *wireTransportTool) InstallTransport(host *tools.ToolHost) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.calls++
+	return t.fail
+}
+func (t *wireTransportTool) setFail(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fail = err
+}
+func (t *wireTransportTool) transportCalls() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.calls
+}
+
+// TestWireTelegramTransportFailureLeavesCleanGateway pins the
+// F-A22-8 contract: a tool whose InstallTransport fails must fail
+// the wiring loudly AND leave the gateway clean — no "ask:"
+// handler, no tool callback, no installed callback handler, no
+// reply interceptor — so a retry on the same gateway succeeds.
+// Before the fix the transport install ran after the wiring, and
+// the same scenario left a half-wired gateway whose retry failed
+// loudly on the duplicate "ask:".
+func TestWireTelegramTransportFailureLeavesCleanGateway(t *testing.T) {
+	gw, gate, cards := wireTestGateway(t)
+	reg := tools.NewRegistry()
+	broken := &wireTransportTool{name: "calculator", fail: errors.New("boom: no transport")}
+	interceptor := &wireInterceptorTool{name: "datetime", answer: true}
+	callback := &wireCallbackTool{name: "file_read", prefix: "cb:"}
+	for _, tool := range []tools.Tool{broken, interceptor, callback} {
+		if err := reg.Register(tool); err != nil {
+			t.Fatalf("Register %s: %v", tool.Name(), err)
+		}
+	}
+	err := WireTelegram(reg, gw, gate, cards, 77, "test")
+	if err == nil {
+		t.Fatal("WireTelegram with a failing InstallTransport: accepted, want a loud error")
+	}
+	if !strings.Contains(err.Error(), "InstallTransport") || !strings.Contains(err.Error(), "calculator") {
+		t.Fatalf("WireTelegram error %v, want it to name the tool and InstallTransport", err)
+	}
+	// Clean state: nothing from the failed attempt survives.
+	if got := routerPrefixes(t, gw); len(got) != 0 {
+		t.Fatalf("router prefixes after failed WireTelegram = %v, want none", got)
+	}
+	if h := gw.callbackHandlerFor(); h != nil {
+		t.Fatal("gateway has an installed callback handler after a failed WireTelegram, want none")
+	}
+	upd := Update{Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}, Text: "hello", From: &TGUser{ID: 77}}}
+	if gw.replyChainTryAnswer(upd) {
+		t.Fatal("reply chain consumed a reply after a failed WireTelegram: the interceptor must not be installed")
+	}
+	if got := interceptor.seenTexts(); len(got) != 0 {
+		t.Fatalf("interceptor saw %v after a failed WireTelegram, want nothing (it must not be installed)", got)
+	}
+	// A retry on the same gateway — same registry, the tool now
+	// healthy — succeeds, and the wiring works end to end.
+	broken.setFail(nil)
+	if err := WireTelegram(reg, gw, gate, cards, 77, "test"); err != nil {
+		t.Fatalf("WireTelegram retry after a failed transport install: %v, want success on a clean gateway", err)
+	}
+	if got := broken.transportCalls(); got != 2 {
+		t.Fatalf("InstallTransport calls = %d, want 2 (failed attempt + retry: the retry re-runs the transport install)", got)
+	}
+	if err := wireTap(t, gw, "cb:payload"); err != nil {
+		t.Fatalf("tap cb:payload after retry: %v", err)
+	}
+	if got := callback.tapData(); len(got) != 1 || got[0] != "cb:payload" {
+		t.Fatalf("callback tool taps after retry = %v, want [cb:payload]", got)
+	}
+	if err := wireTap(t, gw, "ask:deadbeef:0"); err != nil {
+		t.Fatalf("tap ask:deadbeef:0 after retry: %v", err)
+	}
+	if !gw.replyChainTryAnswer(upd) {
+		t.Fatal("reply chain did not consume a reply after the retry: the interceptor must be installed now")
+	}
+}
+
+// TestWireTelegramTransportFailureAfterEarlierTool pins the
+// mid-loop F-A22-8 case: the first tool's InstallTransport
+// succeeds and the second's fails. The gateway is still clean
+// (the transport loop runs before any gateway mutation), and the
+// retry re-runs BOTH tools' InstallTransport — a tool must
+// tolerate the repeat call.
+func TestWireTelegramTransportFailureAfterEarlierTool(t *testing.T) {
+	gw, gate, cards := wireTestGateway(t)
+	reg := tools.NewRegistry()
+	first := &wireTransportTool{name: "calculator"}
+	second := &wireTransportTool{name: "datetime", fail: errors.New("boom: second transport fails")}
+	for _, tool := range []tools.Tool{first, second} {
+		if err := reg.Register(tool); err != nil {
+			t.Fatalf("Register %s: %v", tool.Name(), err)
+		}
+	}
+	if err := WireTelegram(reg, gw, gate, cards, 77, "test"); err == nil {
+		t.Fatal("WireTelegram with a failing second InstallTransport: accepted, want a loud error")
+	}
+	if got := routerPrefixes(t, gw); len(got) != 0 {
+		t.Fatalf("router prefixes after failed WireTelegram = %v, want none", got)
+	}
+	if h := gw.callbackHandlerFor(); h != nil {
+		t.Fatal("gateway has an installed callback handler after a failed WireTelegram, want none")
+	}
+	second.setFail(nil)
+	if err := WireTelegram(reg, gw, gate, cards, 77, "test"); err != nil {
+		t.Fatalf("WireTelegram retry: %v, want success", err)
+	}
+	if got := first.transportCalls(); got != 2 {
+		t.Fatalf("first tool InstallTransport calls = %d, want 2 (the retry re-runs it: repeat calls must be tolerated)", got)
+	}
+	if got := second.transportCalls(); got != 2 {
+		t.Fatalf("second tool InstallTransport calls = %d, want 2 (failed attempt + retry)", got)
 	}
 }

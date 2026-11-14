@@ -16,7 +16,10 @@
 //     the answer and holds that lock, so routing the reply through
 //     a turn would deadlock until the question timed out. A
 //     command ("/...") is never an answer — it flows to the normal
-//     turn path.
+//     turn path. A typed reply to a question WITH options only
+//     counts when it names one of the options (F-A22-21), so it
+//     cannot eat another wait's typed reply; a question with no
+//     options still takes any non-command reply.
 //   - Timeout and turn cancellation settle the question exactly
 //     once (the gate's single-winner settle pattern), so a late
 //     tap is told "expired" and a waiting tool never hangs
@@ -202,6 +205,32 @@ func (r *QuestionRegistry) canAnswer(p *pendingQuestion, senderID int64) bool {
 	return senderID == p.senderID || senderID == r.ownerID
 }
 
+// matchesOption reports whether typed text answers this
+// question by naming one of its options (case-insensitive,
+// trimmed, trailing "." / "!" stripped — the same normalisation
+// plan replies use). It is the question-scoped matcher
+// (F-A22-21): a typed reply only counts as the question's answer
+// when it matches what the question actually asked for.
+func (p *pendingQuestion) matchesOption(text string) bool {
+	if p == nil || len(p.options) == 0 {
+		return false
+	}
+	norm := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		return strings.Trim(s, ".!")
+	}
+	want := norm(text)
+	if want == "" {
+		return false
+	}
+	for _, opt := range p.options {
+		if norm(opt) == want {
+			return true
+		}
+	}
+	return false
+}
+
 // settle is the single state transition for a pending question
 // (the gate's settle pattern): Resolve, the timer branch and the
 // cancellation branch all settle through here, under the registry
@@ -373,7 +402,11 @@ func (a *TelegramQuestionAsker) Ask(ctx context.Context, chatID, senderID int64,
 	// after Ask was called.
 	text := "❓ " + question + "\n\n"
 	if len(options) > 0 {
-		text += "Tap an option below, or just reply with your answer."
+		// The prompt must match what the interceptor accepts
+		// (F-A22-21): a typed reply to an option question only
+		// counts when it names one of the options, so do not
+		// promise that any free-text reply answers it.
+		text += "Tap an option below, or reply with one of the options."
 	} else {
 		text += "Reply with your answer."
 	}
@@ -568,6 +601,21 @@ type questionReplyInterceptor struct {
 // never answers — they flow to the normal turn path — and only the
 // asker or the owner may answer, so another chat member's message
 // is never consumed.
+//
+// Scoped consumption (F-A22-21): when the pending question
+// carries options, a typed reply only counts as its answer when
+// it names one of the options (matchesOption). An unscoped
+// consume-anything here used to eat other waits' replies: with a
+// question and a plan pending together, a typed "approve" was
+// swallowed as the question's answer and the plan interceptor
+// never saw it. A non-matching reply now declines, so the chain
+// continues to the plan interceptor (or a normal turn). A
+// question with NO options has no scoped vocabulary to match
+// against — any reply is definitionally its answer — so it still
+// consumes any non-command reply, and question-first still wins
+// that genuinely ambiguous overlap; the overlap itself is only
+// reachable through the shared-registry (children) path, since
+// waits are sequential blocking calls in a single-agent turn.
 func (in *questionReplyInterceptor) TryAnswer(upd tools.ReplyUpdate) bool {
 	if in == nil || in.questions == nil {
 		return false
@@ -582,6 +630,9 @@ func (in *questionReplyInterceptor) TryAnswer(upd tools.ReplyUpdate) bool {
 		return false
 	}
 	if !in.questions.canAnswer(p, senderID) {
+		return false
+	}
+	if len(p.options) > 0 && !p.matchesOption(text) {
 		return false
 	}
 	if !in.questions.Resolve(p.id, questionResult{answer: text, source: "text", optionIndex: -1}) {

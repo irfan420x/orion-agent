@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -493,6 +494,210 @@ func TestGlobMatchesDirectories(t *testing.T) {
 	lines := globLines(t, out)
 	if len(lines) != 1 || !strings.HasSuffix(lines[0], "sub/") {
 		t.Errorf("pattern \"sub\" should match the directory with a trailing slash, got:\n%s", out)
+	}
+}
+
+// F-A22-24: a nonexistent walk root is a hard error naming the path,
+// not a "(no matches)" success.
+func TestGrepNonexistentPathErrors(t *testing.T) {
+	root := t.TempDir()
+	tool := &grepTool{roots: []string{root}}
+	for _, missing := range []string{
+		filepath.Join(root, "does", "not", "exist"),
+		filepath.Join(root, "missing.txt"),
+	} {
+		_, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{
+			"pattern": "NEEDLE", "path": missing,
+		}))
+		if err == nil {
+			t.Fatalf("grep on nonexistent path %q: expected an error, got (no matches) success", missing)
+		}
+		if kind := toolErrKind(t, err); kind != "invalid_args" {
+			t.Fatalf("path %q: expected invalid_args, got %q: %v", missing, kind, err)
+		}
+		if !strings.Contains(err.Error(), missing) {
+			t.Fatalf("path %q: error must name the missing path, got: %v", missing, err)
+		}
+	}
+}
+
+// F-A22-24: same for glob.
+func TestGlobNonexistentPathErrors(t *testing.T) {
+	root := t.TempDir()
+	tool := &globTool{roots: []string{root}}
+	for _, missing := range []string{
+		filepath.Join(root, "does", "not", "exist"),
+		filepath.Join(root, "missing.txt"),
+	} {
+		_, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{
+			"pattern": "**/*.go", "path": missing,
+		}))
+		if err == nil {
+			t.Fatalf("glob on nonexistent path %q: expected an error, got (no matches) success", missing)
+		}
+		if kind := toolErrKind(t, err); kind != "invalid_args" {
+			t.Fatalf("path %q: expected invalid_args, got %q: %v", missing, kind, err)
+		}
+		if !strings.Contains(err.Error(), missing) {
+			t.Fatalf("path %q: error must name the missing path, got: %v", missing, err)
+		}
+	}
+}
+
+// F-A22-25: a glob scan that hits the entry cap with zero matches must
+// still say the scan stopped early (and report skipped symlinks),
+// instead of a bare "(no matches)".
+func TestGlobScanCapZeroMatchKeepsNotes(t *testing.T) {
+	root := t.TempDir()
+	// More than maxGlobFilesScanned (20000) entries, none matching.
+	const dirs = 20
+	const perDir = 1001 // 20*1001 = 20020 files + dirs + root
+	for d := 0; d < dirs; d++ {
+		dir := filepath.Join(root, fmt.Sprintf("d%02d", d))
+		for i := 0; i < perDir; i++ {
+			writeSeedFile(t, filepath.Join(dir, fmt.Sprintf("f%04d.txt", i)), "x\n")
+		}
+	}
+	// One escaping symlink, named to sort before the d* dirs so the
+	// walk reaches it before the scan cap aborts the walk.
+	outside := t.TempDir()
+	writeSeedFile(t, filepath.Join(outside, "secret.go"), "x\n")
+	linkErr := os.Symlink(filepath.Join(outside, "secret.go"), filepath.Join(root, "0leak.go"))
+	tool := &globTool{roots: []string{root}}
+	out, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{
+		"pattern": "**/*.zzz-no-such-extension", "path": root,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, "(no matches)") {
+		t.Fatalf("expected (no matches) with notes, got:\n%s", out)
+	}
+	if !strings.Contains(out, "stopped after scanning 20000 entries") {
+		t.Errorf("scan-cap note missing from zero-match glob, got:\n%s", out)
+	}
+	if linkErr == nil && !strings.Contains(out, "skipped 1 symlinked path(s)") {
+		t.Errorf("symlink skip note missing from zero-match glob, got:\n%s", out)
+	}
+}
+
+// F-A22-26: an unreadable entry is counted and reported, not silently
+// dropped — and the rest of the search still runs. The trigger is a
+// path that exceeds PATH_MAX (4096 on Linux), not a permission: a
+// directory created via a relative path from inside a ~4090-char
+// directory has an absolute path over the limit, so the walk's
+// ReadDir on it fails with ENAMETOOLONG and the callback sees a
+// genuine walk error. That works as root (where chmod 000 proves
+// nothing — uid 0 reads through it) and non-root alike, so the test
+// never skips. Note the entry must be a DIRECTORY, not a file:
+// WalkDir takes child entries from the parent's listing without
+// Lstat-ing each one, so an over-long file is listed fine and only
+// fails later at read time (that is the read-error test below).
+// The over-long directory is removed via the same relative path
+// before t.TempDir's cleanup runs (its absolute path is unusable).
+func TestGrepWalkErrorCounted(t *testing.T) {
+	root := t.TempDir()
+	writeSeedFile(t, filepath.Join(root, "ok.txt"), "NEEDLE here\n")
+	deep := root
+	for len(deep)+201 <= 4095 {
+		deep = filepath.Join(deep, strings.Repeat("d", 200))
+		if err := os.Mkdir(deep, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// len(deep) > 3894 here, so the new directory's absolute
+	// path (deep + "/" + 200 chars) exceeds PATH_MAX.
+	t.Chdir(deep)
+	longName := strings.Repeat("d", 200)
+	if err := os.Mkdir(longName, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(longName) })
+	tool := &grepTool{roots: []string{root}}
+	out, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{
+		"pattern": "NEEDLE", "path": root,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "ok.txt") {
+		t.Errorf("readable match must still be found, got:\n%s", out)
+	}
+	if !strings.Contains(out, "skipped 1 unreadable path(s)") {
+		t.Errorf("walk error must be counted and reported, got:\n%s", out)
+	}
+}
+
+// F-A22-26: a tree of only binary files reports the binary skip on a
+// zero match, instead of a bare "(no matches)".
+func TestGrepZeroMatchBinaryNote(t *testing.T) {
+	root := t.TempDir()
+	writeSeedFile(t, filepath.Join(root, "bin.dat"), "NEEDLE\x00binary\x00junk\n")
+	tool := &grepTool{roots: []string{root}}
+	out, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{
+		"pattern": "NEEDLE", "path": root,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, "(no matches)") {
+		t.Fatalf("expected (no matches), got:\n%s", out)
+	}
+	if !strings.Contains(out, "skipped 1 binary file(s)") {
+		t.Errorf("binary skip note missing from zero-match grep, got:\n%s", out)
+	}
+}
+
+// F-A22-26: a zero-match scan over an over-1MB file reports the
+// truncation, instead of a bare "(no matches)".
+func TestGrepZeroMatchTruncatedNote(t *testing.T) {
+	root := t.TempDir()
+	writeSeedFile(t, filepath.Join(root, "big.txt"), strings.Repeat("x", (1<<20)+1))
+	tool := &grepTool{roots: []string{root}}
+	out, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{
+		"pattern": "ZZZ_NO_MATCH_ANYWHERE", "path": root,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, "(no matches)") {
+		t.Fatalf("expected (no matches), got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 file(s) over 1MB searched only in the first 1MB") {
+		t.Errorf("truncation note missing from zero-match grep, got:\n%s", out)
+	}
+}
+
+// F-A22-26 (same family, read side): a file the walk lists but the
+// read cannot open is counted and reported too — otherwise a tree
+// whose only matching file is unreadable reports a bare "(no
+// matches)". The trigger is a symlink to a directory inside the
+// root: the walk appends the resolved target to the file list (it
+// stays inside the root), but the target is a directory, so the
+// read fails — deterministically, as root and non-root alike, with
+// no permission involved, so the test never skips. (That the walk
+// lists a directory as a file candidate is a pre-existing wart —
+// the note it now produces, "could not be read", is truthful: the
+// path was not searched.)
+func TestGrepUnreadableFileCounted(t *testing.T) {
+	root := t.TempDir()
+	writeSeedFile(t, filepath.Join(root, "ok.txt"), "NEEDLE here\n")
+	writeSeedFile(t, filepath.Join(root, "sub", "real.txt"), "NEEDLE inside\n")
+	if err := os.Symlink(filepath.Join(root, "sub"), filepath.Join(root, "linkdir")); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+	tool := &grepTool{roots: []string{root}}
+	out, err := tool.Execute(context.Background(), mustJSON(t, map[string]any{
+		"pattern": "NEEDLE", "path": root,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "ok.txt") || !strings.Contains(out, "real.txt") {
+		t.Errorf("readable matches must still be found, got:\n%s", out)
+	}
+	if !strings.Contains(out, "skipped 1 file(s) that could not be read") {
+		t.Errorf("unreadable file must be counted and reported, got:\n%s", out)
 	}
 }
 

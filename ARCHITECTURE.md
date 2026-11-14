@@ -42,7 +42,7 @@ internal/memory  FileStore: JSON file, atomic writes, facts + 200-msg
 internal/messaging Telegram gateway (Bot API over HTTP, long polling)
                + CLI channel. Telegram ONLY — no WhatsApp/Baileys.
                Both channels call app.Handle -> same agent, same memory.
-               19 slash commands, per-chat session store
+               22 slash commands, per-chat session store
                (sessions.json), sender check + owner tier.
 internal/model   Provider interface {Chat, Stream} + providers:
                openai (OpenAI-compatible: OpenAI, vLLM, OpenRouter,

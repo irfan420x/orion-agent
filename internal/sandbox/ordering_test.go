@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -63,20 +64,28 @@ func TestSelectOrderingFallsBackToAtCloneOnEPERM(t *testing.T) {
 	}
 }
 
-// TestSelectOrderingFallsBackOnAnyFailure pins the deliberate
-// deviation from an EPERM-only fallback: a wrapper-stage failure
-// (e.g. the /proc mount, exit 126) is ordering-dependent too, so
-// the fallback is tried on ANY first-ordering failure. The
-// fail-closed outcome is unchanged — both failing still refuses.
-func TestSelectOrderingFallsBackOnAnyFailure(t *testing.T) {
+// TestSelectOrderingFallsBackOnExit126 pins the second
+// ordering-dependent failure (F-A22-13): a wrapper-stage failure
+// (e.g. the /proc mount, exit 126) is worth a retry on the other
+// ordering, so the fallback is tried. This used to pin the
+// deliberate ANY-failure fallback
+// (TestSelectOrderingFallsBackOnAnyFailure); the fallback is now
+// narrowed to EPERM + exit 126, and non-ordering failures must
+// NOT retry (see
+// TestSelectOrderingSkipsFallbackOnOrderingIndependentFailure).
+// The fail-closed outcome is unchanged — both failing still
+// refuses. The probe stub runs a real command exiting 126, so
+// the error is a genuine *exec.ExitError, not a string that
+// merely mentions the code.
+func TestSelectOrderingFallsBackOnExit126(t *testing.T) {
 	o, err := selectOrdering(func(ord sandboxOrdering) error {
 		if ord == orderingAfterClone {
-			return errors.New("sandbox: probe command failed (userns-after-clone): exit status 126")
+			return exec.Command("/bin/sh", "-c", "exit 126").Run()
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("selectOrdering with a non-EPERM first failure: %v", err)
+		t.Fatalf("selectOrdering with an exit-126 first failure: %v", err)
 	}
 	if o != orderingAtClone {
 		t.Errorf("selected ordering = %v, want userns-at-clone", o)
@@ -86,17 +95,78 @@ func TestSelectOrderingFallsBackOnAnyFailure(t *testing.T) {
 // TestSelectOrderingBothFailNamesBoth proves fail-closed with
 // diagnostics: when neither ordering works the error names both
 // failures, so the operator can see which ordering died where.
+// The first failure is EPERM (ordering-dependent), so the
+// fallback IS attempted — a non-ordering first failure would
+// skip it (see
+// TestSelectOrderingSkipsFallbackOnOrderingIndependentFailure)
+// and only the first failure would be named.
 func TestSelectOrderingBothFailNamesBoth(t *testing.T) {
+	probed := []sandboxOrdering{}
 	_, err := selectOrdering(func(ord sandboxOrdering) error {
-		return fmt.Errorf("ordering %s failed", ord)
+		probed = append(probed, ord)
+		return fmt.Errorf("ordering %s failed: %w", ord, syscall.EPERM)
 	})
 	if err == nil {
 		t.Fatal("selectOrdering with both orderings failing: want error, got nil")
+	}
+	if len(probed) != 2 {
+		t.Fatalf("probed orderings = %v, want both (an EPERM first failure must attempt the fallback)", probed)
 	}
 	for _, want := range []string{"userns-after-clone", "userns-at-clone"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("both-fail error %q does not name %q", err, want)
 		}
+	}
+}
+
+// TestSelectOrderingSkipsFallbackOnOrderingIndependentFailure pins
+// the F-A22-13 narrowing: a first failure that cannot differ
+// between orderings must NOT trigger a second probe — the other
+// ordering would fail the same way, and retrying would only burn
+// a second (up to 15s) probe and bury the real cause under
+// "neither namespace ordering works". The error must say no
+// fallback was attempted, so the operator sees the real cause.
+func TestSelectOrderingSkipsFallbackOnOrderingIndependentFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{
+			"probe temp dir failure",
+			fmt.Errorf("sandbox: probe temp dir: %w", syscall.ENOSPC),
+		},
+		{
+			"missing /bin/sh",
+			&os.PathError{Op: "fork/exec", Path: "/bin/sh", Err: syscall.ENOENT},
+		},
+		{
+			"probe timeout",
+			fmt.Errorf("sandbox: probe command failed (userns-after-clone): %w", context.DeadlineExceeded),
+		},
+		{
+			"generic failure",
+			errors.New("sandbox: probe setup (userns-after-clone): boom"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probed := []sandboxOrdering{}
+			_, err := selectOrdering(func(ord sandboxOrdering) error {
+				probed = append(probed, ord)
+				return tc.err
+			})
+			if err == nil {
+				t.Fatal("selectOrdering with an ordering-independent first failure: want error, got nil")
+			}
+			if len(probed) != 1 || probed[0] != orderingAfterClone {
+				t.Fatalf("probed orderings = %v, want only [userns-after-clone] (no pointless retry)", probed)
+			}
+			if !strings.Contains(err.Error(), "no fallback attempted") {
+				t.Fatalf("error %q does not say no fallback was attempted", err)
+			}
+			if strings.Contains(err.Error(), "neither namespace ordering works") {
+				t.Fatalf("error %q blames both orderings, want it to name the ordering-independent cause", err)
+			}
+		})
 	}
 }
 

@@ -39,6 +39,13 @@ func TestConfigShowPrintsSandboxProbeResult(t *testing.T) {
 		if strings.TrimSpace(strings.TrimPrefix(line, "sandbox_probe:   unavailable:")) == "" {
 			t.Errorf("unavailable probe line carries no reason, output:\n%s", out)
 		}
+		// F-A22-14: the line must say the probe is cached and a
+		// restart is needed to re-probe — otherwise the operator
+		// fixes the host, re-runs config show, and sees the same
+		// unavailable with no pointer to the restart.
+		if !strings.Contains(line, "cached for the process lifetime") || !strings.Contains(line, "restart oriond to re-probe") {
+			t.Errorf("unavailable probe line does not say the probe is cached / a restart is needed, output:\n%s", out)
+		}
 	} else {
 		t.Errorf("sandbox_probe line is neither available nor unavailable, output:\n%s", out)
 	}

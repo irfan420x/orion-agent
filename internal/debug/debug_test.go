@@ -369,3 +369,46 @@ func TestCloseStopsListening(t *testing.T) {
 		t.Errorf("nil Close: %v, want nil", err)
 	}
 }
+
+// TestPollHealthRoute verifies the optional /debug/poll-health route
+// (Telegram poll-recovery surface): with a PollHealth func configured
+// it serves the snapshot as text; without one the route is absent
+// (404), like any other unknown path.
+func TestPollHealthRoute(t *testing.T) {
+	srv, err := Start(Config{Enabled: true, Port: 0, PollHealth: func() string {
+		return `healthy=false reason="backing off after transient poll error" consecutive_timeouts=2 rebuilds=1`
+	}})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := srv.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	base := "http://" + srv.Addr
+	status, body := getUntil(t, base+"/debug/poll-health")
+	if status != http.StatusOK {
+		t.Fatalf("GET /debug/poll-health: status = %d, want 200", status)
+	}
+	if !strings.Contains(string(body), "consecutive_timeouts=2") || !strings.Contains(string(body), "rebuilds=1") {
+		t.Fatalf("GET /debug/poll-health body = %q, want the poll-health snapshot", body)
+	}
+
+	srv2, err := Start(Config{Enabled: true, Port: 0})
+	if err != nil {
+		t.Fatalf("Start (no PollHealth): %v", err)
+	}
+	defer func() {
+		if err := srv2.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	resp, _, err := getOnce(t, "http://"+srv2.Addr+"/debug/poll-health")
+	if err != nil {
+		t.Fatalf("GET /debug/poll-health (no func): %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /debug/poll-health (no func): status = %d, want 404 (route absent)", resp.StatusCode)
+	}
+}

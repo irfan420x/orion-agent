@@ -48,7 +48,11 @@
 // waiter (the in-memory channel) does not. The block is
 // expiry-bounded (the plan stops blocking at ExpiresAt), and
 // ExitPlanMode can always clear it, so a restart can never leave
-// a chat stuck in plan mode. A tap on a plan message from before
+// a chat stuck in plan mode. The same holds for a corrupt plans
+// file (F-A22-18): PlanModeBlocks fails CLOSED on it
+// (destructive tools stay blocked) and ExitPlanMode discards it
+// without parsing it, so the chat is never silently unblocked
+// and never permanently stuck. A tap on a plan message from before
 // a restart is answered with the no-longer-pending notice (the
 // F-A20-9 pattern), not silently ignored.
 //
@@ -221,7 +225,7 @@ func loadStoredPlan(s *PlanningStore, dir, key string) (plan *planState, expired
 		Plan *planState `json:"plan"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, false, fmt.Errorf("corrupt plans file %q: %w (fix or remove the file to recover)", filepath.Join(dir, planningPlansFile), err)
+		return nil, false, fmt.Errorf("corrupt plans file %q: %w (call exit_plan_mode to discard it, or remove the file to recover)", filepath.Join(dir, planningPlansFile), err)
 	}
 	if doc.Plan == nil {
 		return nil, false, nil
@@ -537,12 +541,16 @@ func (t *enterPlanModeTool) InstallTransport(host *ToolHost) error {
 // blocked, and only while a non-expired plan is stored for the
 // chat in ctx. Safe and Network tools stay allowed (research
 // while planning), and a chat with no plan never blocks. A
-// corrupt or unreadable plans file fails OPEN here (returns
-// false): failing closed would block the chat forever, because
-// the plan tools themselves also fail on a corrupt file and
-// could not clear it — the corruption then surfaces as an error
-// at the next plan-tool call, which tells the user to fix or
-// remove the file (the same rule as a corrupt todos file).
+// corrupt or unreadable plans file fails CLOSED here (returns
+// true): failing open would silently unblock destructive tools
+// at exactly the moment the plan state cannot be trusted
+// (F-A22-18). The chat is not stuck: the block only covers
+// Destructive tools — the plan tools themselves are Safe, so
+// exit_plan_mode still runs and discards the unreadable file
+// (its repair path), and enter_plan_mode reports the corruption
+// with the same repair pointer. The block reason names the
+// corruption and the repair, so the model is told how to unstick
+// the chat instead of silently proceeding.
 func (t *enterPlanModeTool) PlanModeBlocks(ctx context.Context, tool string) (bool, string) {
 	if permissions.Classify(tool) != permissions.ClassDestructive {
 		return false, ""
@@ -554,7 +562,10 @@ func (t *enterPlanModeTool) PlanModeBlocks(ctx context.Context, tool string) (bo
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
 	plan, _, err := loadStoredPlan(t.store, dir, key)
-	if err != nil || plan == nil {
+	if err != nil {
+		return true, fmt.Sprintf("the stored plan for this chat is unreadable: %v; destructive tools stay blocked until exit_plan_mode discards it", err)
+	}
+	if plan == nil {
 		return false, ""
 	}
 	return true, fmt.Sprintf("plan %q (%s) is pending approval for this chat", plan.ID, planTruncate(plan.Goal, 80))
@@ -929,6 +940,17 @@ func (t *enterPlanModeTool) Execute(ctx context.Context, args json.RawMessage) (
 // impossible; cross-process the blocked call's timeout bounds
 // the window). Idempotent: with no plan pending it reports
 // {"exited":false}.
+//
+// It is also the repair path for an unreadable plans file
+// (F-A22-18): when the stored plan cannot even be loaded, exit
+// discards the file WITHOUT parsing it, so a corrupt file never
+// leaves the chat both unblocked and unrepairable. The plan
+// tools are Safe, so PlanModeBlocks never stands between the
+// user and this repair.
+//
+// Subagent children never get this tool (F-A22-16): it is
+// excluded from the child registry, because a child calling it
+// would clear the parent chat's pending plan.
 type exitPlanModeTool struct {
 	store *PlanningStore
 }
@@ -962,7 +984,22 @@ func (t *exitPlanModeTool) Execute(ctx context.Context, args json.RawMessage) (s
 	defer t.store.mu.Unlock()
 	plan, expired, err := loadStoredPlan(t.store, dir, key)
 	if err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+		// F-A22-18 repair path: the stored plan is unreadable
+		// (corrupt JSON, unparsable expiry, refused symlink,
+		// over the size cap — anything loadStoredPlan rejects).
+		// Discard it WITHOUT parsing it: clearStoredPlan only
+		// removes the file (or clears the in-memory bucket), so
+		// the repair never depends on the corrupt content.
+		// Refusing here would leave the chat fail-closed by
+		// PlanModeBlocks with no way out except hand-editing
+		// the file — the exact stuck state the fail-closed
+		// change must not create. If the discard itself fails,
+		// report both errors honestly: the chat stays blocked
+		// and the operator must fix the file by hand.
+		if clearErr := clearStoredPlan(t.store, ctx, dir, key); clearErr != nil {
+			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf("the stored plan is unreadable (%v) and could not be discarded (%v); remove %q by hand to recover", err, clearErr, filepath.Join(dir, planningPlansFile))}
+		}
+		return `{"exited":true,"corrupt":true,"note":"the stored plans file was unreadable/corrupt and was discarded; no plan is pending now"}`, nil
 	}
 	if plan == nil && !expired {
 		return `{"exited":false,"note":"no plan is pending for this chat"}`, nil

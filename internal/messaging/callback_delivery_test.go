@@ -235,7 +235,7 @@ func TestCallbackDeliveredWhileTurnSlotsFull(t *testing.T) {
 		if q.ID != "cb-tap-1" {
 			t.Errorf("callback id = %q, want cb-tap-1", q.ID)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(scaledTimeout(5 * time.Second)):
 		t.Fatal("callback query never reached the handler while all 8 turn slots were held (poll loop stalled on the turn semaphore)")
 	}
 	waitFor(t, "callback answer", func() bool {

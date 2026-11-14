@@ -293,6 +293,32 @@ func TestRegistryCountsAndMenu(t *testing.T) {
 	for _, c := range r.BotCommands() {
 		names = append(names, c.Name)
 	}
+	// Pin the menu count itself (F-A22-3): only the 23-registry
+	// count was pinned before, so /budget, /rules and /skills
+	// reached the live menu while the README still said 19 — and
+	// no test noticed. The menu is the registry minus exactly the
+	// names the Bot API rejects, so both the absolute count and
+	// the relation to the registry are pinned, plus the dropped
+	// set itself (computed as the difference, not assumed).
+	if got := len(r.BotCommands()); got != 22 {
+		t.Errorf("BotCommands (Telegram \"/\" menu) has %d commands, want 22 (23 registered minus the Bengali alias /বাজেট, which the Bot API rejects)", got)
+	}
+	if got, want := len(r.BotCommands()), len(r.Commands())-1; got != want {
+		t.Errorf("BotCommands has %d commands, want len(Commands())-1 = %d (exactly one registered name must be dropped for the menu)", got, want)
+	}
+	inMenu := map[string]bool{}
+	for _, n := range names {
+		inMenu[n] = true
+	}
+	var dropped []string
+	for _, c := range r.Commands() {
+		if !inMenu[c.Name] {
+			dropped = append(dropped, c.Name)
+		}
+	}
+	if len(dropped) != 1 || dropped[0] != "বাজেট" {
+		t.Errorf("BotCommands drops %q, want exactly [\"বাজেট\"] (every other registered command must reach the menu)", dropped)
+	}
 	for _, want := range []string{"budget", "skills"} {
 		found := false
 		for _, n := range names {

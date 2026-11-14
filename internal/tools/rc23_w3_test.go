@@ -219,9 +219,9 @@ func TestRC23W3SearchDDGCaptcha(t *testing.T) {
 		_, _ = w.Write([]byte("<html><body><form>Please complete the challenge</form></body></html>"))
 	}))
 	defer challenge.Close()
-	oldAPI, oldLite := searchAPIBase, searchLiteBase
-	searchAPIBase, searchLiteBase = challenge.URL, challenge.URL
-	t.Cleanup(func() { searchAPIBase, searchLiteBase = oldAPI, oldLite })
+	oldAPI, oldLite, oldHTML := searchAPIBase, searchLiteBase, searchHTMLBase
+	searchAPIBase, searchLiteBase, searchHTMLBase = challenge.URL, challenge.URL, challenge.URL
+	t.Cleanup(func() { searchAPIBase, searchLiteBase, searchHTMLBase = oldAPI, oldLite, oldHTML })
 
 	s := &webSearchTool{}
 	out, err := s.Execute(context.Background(), mustJSON(t, map[string]any{"query": "golang"}))
@@ -252,9 +252,9 @@ func TestRC23W3SearchDDGCaptchaLiteBody(t *testing.T) {
 		_, _ = w.Write([]byte("<html><body><p>Please complete the following challenge to continue.</p></body></html>"))
 	}))
 	defer lite.Close()
-	oldAPI, oldLite := searchAPIBase, searchLiteBase
-	searchAPIBase, searchLiteBase = api.URL, lite.URL
-	t.Cleanup(func() { searchAPIBase, searchLiteBase = oldAPI, oldLite })
+	oldAPI, oldLite, oldHTML := searchAPIBase, searchLiteBase, searchHTMLBase
+	searchAPIBase, searchLiteBase, searchHTMLBase = api.URL, lite.URL, lite.URL
+	t.Cleanup(func() { searchAPIBase, searchLiteBase, searchHTMLBase = oldAPI, oldLite, oldHTML })
 
 	s := &webSearchTool{}
 	out, err := s.Execute(context.Background(), mustJSON(t, map[string]any{"query": "golang"}))

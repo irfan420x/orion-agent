@@ -80,15 +80,27 @@ var (
 // RegisterFactory registers a tool factory under name. It is called
 // from a tool file's init() — registration is a property of the
 // tool file itself, so a file cannot be present and unregistered.
-// A duplicate name is a programming error: it is caught loudly at
-// registry construction (the second tool with that name fails to
-// register), so a duplicate can never silently shadow a tool.
+// The name is folded through the shared normaliser (F-A22-7):
+// a factory registered as "Calculator" is the "calculator"
+// factory, and a duplicate folded name is a programming error
+// that panics loudly here, at registration time. Registry
+// construction still fails loudly on a duplicate tool as a
+// backstop, so a duplicate can never silently shadow a tool.
 func RegisterFactory(name string, f Factory) {
 	if f == nil {
 		panic(fmt.Sprintf("tools: RegisterFactory %q: nil factory", name))
 	}
+	name = permissions.NormalizeToolName(name)
+	if name == "" {
+		panic("tools: RegisterFactory: empty factory name")
+	}
 	factoryMu.Lock()
 	defer factoryMu.Unlock()
+	for _, e := range factories {
+		if e.name == name {
+			panic(fmt.Sprintf("tools: RegisterFactory %q: duplicate factory name", name))
+		}
+	}
 	factories = append(factories, factoryEntry{name: name, factory: f})
 }
 
@@ -125,7 +137,11 @@ func DefaultRegistryWithDeps(deps ToolDeps) (*Registry, error) {
 		if isNilTool(t) {
 			return nil, fmt.Errorf("tools: factory %q returned a nil tool", e.name)
 		}
-		if t.Name() != e.name {
+		// The factory name is folded at registration, so the
+		// tool's name must match it after folding too
+		// (F-A22-7): a factory registered as "Calculator" builds
+		// the "calculator" tool.
+		if permissions.NormalizeToolName(t.Name()) != e.name {
 			return nil, fmt.Errorf("tools: factory %q returned a tool named %q", e.name, t.Name())
 		}
 		if err := r.Register(t); err != nil {
@@ -310,7 +326,14 @@ type ToolHost struct {
 // tool that needs nothing implements nothing. InstallTransport is
 // called before polling starts, so it cannot race Execute; a nil
 // gateway means "no transport" (the tool must then fail cleanly
-// at Execute time, never hang).
+// at Execute time, never hang). WireTelegram calls it BEFORE any
+// gateway wiring is installed (F-A22-8): no callback handler, no
+// question registry and no approval fallback exist yet — the tool
+// gets the raw gateway through the host and must not assume wired
+// state. A failed wiring may also call it AGAIN on a retry (the
+// gateway is clean, so the retry re-runs the whole wiring), so
+// InstallTransport must tolerate a repeat call: re-installing
+// over its own previous install must be harmless.
 type TransportAware interface {
 	InstallTransport(host *ToolHost) error
 }

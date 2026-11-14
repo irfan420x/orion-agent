@@ -359,7 +359,7 @@ func run(args []string) int {
 	// error, /restart, SIGTERM).
 	var dbg *debug.Server
 	if a.Config.Debug.PprofEnabled {
-		srv, err := debug.Start(debug.Config{Enabled: true, Port: a.Config.DebugPprofPort()})
+		srv, err := debug.Start(debug.Config{Enabled: true, Port: a.Config.DebugPprofPort(), PollHealth: func() string { return gw.PollHealth().String() }})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "oriond: warning: debug pprof endpoint unavailable: %v (continuing without it)\n", err)
 		} else {
@@ -495,6 +495,7 @@ func run(args []string) int {
 	case err := <-pollErr:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
+			fmt.Fprintf(os.Stderr, "oriond: telegram poll health: %s\n", gw.PollHealth())
 			return 1
 		}
 		return 0

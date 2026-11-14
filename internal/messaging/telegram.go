@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -67,9 +68,47 @@ func SetDefaultBaseURL(baseURL string) {
 // split into multiple messages by SendMessage.
 const MaxMessageLength = 4096
 
-// defaultHTTPTimeout bounds a single Bot API request. GetUpdates long-polls
-// for 30s, so the timeout must exceed that.
+// defaultHTTPTimeout bounds a single non-poll Bot API request (sendMessage,
+// getMe, ...). Telegram answers those in ~1s, so 35s is generous; it is
+// NOT the poll deadline — getUpdates has its own client and deadline
+// below, because the two wait on different clocks.
 const defaultHTTPTimeout = 35 * time.Second
+
+// pollHTTPTimeout bounds one getUpdates long poll: the 30s server window
+// plus 15s of grace (talon: 30s window + 15s grace; OpenClaw ships the
+// same 45s getUpdates guard, arrived at independently). The old 35s
+// deadline left only 5s of slack — the cc-connect flush-timeout trap in
+// miniature: a slow-but-healthy response arriving at 31–35s was killed
+// by the client and misread as a dead connection. The deadline, not the
+// window, is the detection instrument: the window stays at 30s.
+const pollHTTPTimeout = 45 * time.Second
+
+// pollRebuildAfterTimeouts is the number of CONSECUTIVE getUpdates
+// timeouts after which the poll transport is rebuilt with a fresh dialer.
+// NOVEL COMPOSITION — no upstream project ships this N: it is reasoned,
+// not upstream-validated. The live incident (2026-11-15 01:28–01:36) ran
+// 26 failed attempts at ~35s each before self-recovering on a fresh dial;
+// N=3 cuts that black hole by an order of magnitude, and talon's
+// auto-retry uses 3 attempts. Three 45s attempts is ~135s of continuous
+// failure, far past any transient blip.
+const pollRebuildAfterTimeouts = 3
+
+// pollWatchdogInterval is the backstop: if this long passes with no
+// completed poll (success or empty result), the poll transport is rebuilt
+// even if the consecutive-timeout count did not trip — e.g. attempts
+// failing fast. 120s is OpenClaw's shipped watchdog number (default
+// 120,000ms); it is 4x the 30s window. Note the ordering with N=3: with
+// a 45s per-attempt deadline the N=3 path takes ~135s + backoff
+// (~138s), while the watchdog is only checked at the top of the poll
+// loop, so its first due opportunity is ~142s — N=3 fires FIRST in a
+// pure slow-timeout black hole (live-measured 2m18.2s, reason "3
+// consecutive getUpdates timeouts"). The watchdog is the backstop for
+// NON-consecutive-timeout stalls: polls that neither complete nor time
+// out three times in a row. The rebuild is the same either way, and
+// N=3 is what bounds fast-timeout storms (failures that return in
+// milliseconds, where 120s of wall clock could hold dozens of
+// attempts).
+const pollWatchdogInterval = 120 * time.Second
 
 // getUpdatesTimeout is the long-poll timeout requested from Telegram.
 const getUpdatesTimeout = 30
@@ -419,8 +458,55 @@ type TelegramGateway struct {
 	token   string
 	baseURL string
 	client  *http.Client
-	offset  int64
-	mu      sync.Mutex
+	// pollClient is getUpdates' OWN http.Client, separate from the
+	// send/message client (spool, PTB): the poll waits 30s by design
+	// while every other call should answer in ~1s, so sharing one
+	// pool lets a dead poll connection poison sends and vice versa.
+	// Its transport is pinned to HTTP/1.1 (see newPollTransport):
+	// over HTTP/2 every call multiplexes onto one shared connection
+	// that stays pooled after a timeout, while over HTTP/1.1 a
+	// timed-out call closes its connection and the next attempt
+	// dials fresh. Only call() routes getUpdates here; every other
+	// method uses client.
+	pollClient *http.Client
+	// pollTimeout is the per-attempt getUpdates deadline (default
+	// pollHTTPTimeout). A field, not a constant read, so tests can
+	// shrink it without waiting out a real 45s deadline.
+	pollTimeout time.Duration
+	// pollWatchdogInterval is this gateway's watchdog (default
+	// pollWatchdogInterval). A field so tests can shrink it.
+	pollWatchdogInterval time.Duration
+	// pollStateMu guards the poll-health fields below. Lock order:
+	// fetchMu (outer) -> pollStateMu (inner); never the reverse.
+	// PollHealth takes only pollStateMu.
+	pollStateMu sync.Mutex
+	// lastPollCompletedAt is when a getUpdates fetch last succeeded
+	// (empty result counts). Zero until the first success.
+	lastPollCompletedAt time.Time
+	// pollLoopStartedAt is when PollStream started (zero when it
+	// never ran). It is the watchdog baseline before the first
+	// completed poll.
+	pollLoopStartedAt time.Time
+	// lastPollRebuildAt is when the poll transport was last rebuilt.
+	// It also resets the watchdog baseline: a rebuild is the
+	// recovery action, so the watchdog must not fire again
+	// immediately after one.
+	lastPollRebuildAt time.Time
+	// pollRebuilds counts transport rebuilds over this gateway's life.
+	pollRebuilds int
+	// pollConsecutiveTimeouts counts back-to-back getUpdates
+	// TIMEOUT-class failures (see isTimeoutError). Any success — or
+	// any non-timeout transient error, which proves the connection
+	// answered — resets it. It is the N in pollRebuildAfterTimeouts.
+	pollConsecutiveTimeouts int
+	// pollInBackoff is true while PollStream sleeps between attempts
+	// after a transient failure. pollRebuilding is true while a
+	// rebuild is swapping the transport. Both feed PollHealth: a
+	// poller in either state must NOT report healthy.
+	pollInBackoff  bool
+	pollRebuilding bool
+	offset         int64
+	mu             sync.Mutex
 	// updatesFilterSent records whether a getUpdates call has
 	// already carried allowedUpdates (F-A16-2). It is set only
 	// after a fetch SUCCEEDS: a failed fetch may never have
@@ -518,8 +604,12 @@ func WithBaseURL(baseURL string) GatewayOption {
 	}
 }
 
-// WithHTTPClient overrides the HTTP client used for Bot API requests.
-// If nil, the option is ignored and the default client is kept.
+// WithHTTPClient overrides the HTTP client used for non-poll Bot API
+// requests (sendMessage, getMe, ...). If nil, the option is ignored and
+// the default client is kept. It does NOT touch the getUpdates poll
+// client: the poll has its own client with its own HTTP/1.1-only
+// transport and 45s deadline (see pollClient), and sharing one client
+// for both is exactly the pooled-connection failure this split fixes.
 func WithHTTPClient(client *http.Client) GatewayOption {
 	return func(g *TelegramGateway) {
 		if client != nil {
@@ -936,9 +1026,12 @@ func NewTelegramGateway(token string, opts ...GatewayOption) (*TelegramGateway, 
 	}
 	baseURL := DefaultBaseURLValue()
 	g := &TelegramGateway{
-		token:   token,
-		baseURL: baseURL,
-		client:  &http.Client{Timeout: defaultHTTPTimeout},
+		token:                token,
+		baseURL:              baseURL,
+		client:               &http.Client{Timeout: defaultHTTPTimeout},
+		pollClient:           newPollHTTPClient(),
+		pollTimeout:          pollHTTPTimeout,
+		pollWatchdogInterval: pollWatchdogInterval,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -947,6 +1040,15 @@ func NewTelegramGateway(token string, opts ...GatewayOption) (*TelegramGateway, 
 	}
 	if g.client == nil {
 		g.client = &http.Client{Timeout: defaultHTTPTimeout}
+	}
+	if g.pollClient == nil {
+		g.pollClient = newPollHTTPClient()
+	}
+	if g.pollTimeout <= 0 {
+		g.pollTimeout = pollHTTPTimeout
+	}
+	if g.pollWatchdogInterval <= 0 {
+		g.pollWatchdogInterval = pollWatchdogInterval
 	}
 	if g.baseURL == "" {
 		g.baseURL = "https://api.telegram.org"
@@ -960,6 +1062,243 @@ func (g *TelegramGateway) Offset() int64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.offset
+}
+
+// --- getUpdates poll recovery (live incident 2026-11-15 01:28–01:36) ---
+//
+// The incident: 26 failed getUpdates attempts ("context deadline
+// exceeded", bytes stuck in the socket send queue), then self-recovery
+// on a fresh dial — ~15 minutes of black hole on one pooled connection
+// the transport kept reusing. The pieces below make that recovery
+// deterministic instead of accidental. Provenance (open-source research,
+// fixbatch-research/OPEN-SOURCE-RESEARCH.md §2, workers/W2): split
+// clients + HTTP/1.1 pin from spool (commit cf1c03e, issue #559: 164
+// timeouts x 70s into the same dead connection); per-attempt deadline
+// window+grace from talon (commit f6f4d3a: 30s + 15s = 45s, 312 bytes
+// unacked) and OpenClaw's 45s guard; the 120s watchdog from OpenClaw.
+// The N=3 rebuild threshold is a NOVEL COMPOSITION of those parts —
+// see pollRebuildAfterTimeouts — not a shipped upstream behaviour.
+
+// newPollTransport clones the default transport and pins it to HTTP/1.1
+// only (ForceAttemptHTTP2 off). Over HTTP/2 all calls multiplex onto one
+// shared connection that stays pooled after a timeout; over HTTP/1.1 a
+// timed-out call closes its connection, so the next attempt dials fresh.
+// Everything else (dial timeout, keep-alive, idle pool, TLS) is the
+// default transport's: only the protocol set changes.
+func newPollTransport() *http.Transport {
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok && dt != nil {
+		tr := dt.Clone()
+		tr.ForceAttemptHTTP2 = false
+		return tr
+	}
+	// Unreachable with the stdlib default transport, but a fresh
+	// transport with the same shape is safer than a nil one.
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     false,
+	}
+	return tr
+}
+
+// newPollHTTPClient builds the dedicated getUpdates client: its own
+// HTTP/1.1-only transport, whole-call deadline pollHTTPTimeout.
+func newPollHTTPClient() *http.Client {
+	return &http.Client{Timeout: pollHTTPTimeout, Transport: newPollTransport()}
+}
+
+// isTimeoutError reports whether err is a timeout-class failure: a
+// context deadline, or a net.Error with Timeout() true. Detection is by
+// error inspection only — NEVER by matching error strings. No prior art
+// distinguishes "stuck" from "normal" timeout by string (research §6
+// item 10): detection is always elapsed-time based (window + grace, or
+// time since last success), and Orion sees "context deadline exceeded",
+// cc-connect saw "unexpected EOF", talon saw nothing at all until its
+// own deadline fired. A 429/5xx apiError is NOT a timeout, so it never
+// triggers a rebuild — only backoff.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// notePollLoopStarted records PollStream's start as the watchdog
+// baseline before any poll has completed.
+func (g *TelegramGateway) notePollLoopStarted() {
+	g.pollStateMu.Lock()
+	defer g.pollStateMu.Unlock()
+	if g.pollLoopStartedAt.IsZero() {
+		g.pollLoopStartedAt = time.Now()
+	}
+}
+
+// notePollCompleted records a successful getUpdates fetch: the
+// watchdog baseline moves to now and the consecutive-timeout streak
+// resets. Called from fetchUpdatesLocked, the single fetch funnel, so
+// both PollStream and one-shot GetUpdates report completions.
+func (g *TelegramGateway) notePollCompleted() {
+	g.pollStateMu.Lock()
+	defer g.pollStateMu.Unlock()
+	g.lastPollCompletedAt = time.Now()
+	g.pollConsecutiveTimeouts = 0
+}
+
+// notePollTimeout counts one more consecutive getUpdates timeout and
+// returns the new streak length.
+func (g *TelegramGateway) notePollTimeout() int {
+	g.pollStateMu.Lock()
+	defer g.pollStateMu.Unlock()
+	g.pollConsecutiveTimeouts++
+	return g.pollConsecutiveTimeouts
+}
+
+// resetPollTimeouts clears the consecutive-timeout streak. A non-timeout
+// transient error (429, 5xx, DNS, refused) proves the connection
+// answered at that moment, so the streak of *consecutive* timeouts is
+// broken even though polling as a whole has not recovered.
+func (g *TelegramGateway) resetPollTimeouts() {
+	g.pollStateMu.Lock()
+	defer g.pollStateMu.Unlock()
+	g.pollConsecutiveTimeouts = 0
+}
+
+// setPollBackoff records whether PollStream is sleeping between attempts
+// after a transient failure. It feeds PollHealth only.
+func (g *TelegramGateway) setPollBackoff(inBackoff bool) {
+	g.pollStateMu.Lock()
+	defer g.pollStateMu.Unlock()
+	g.pollInBackoff = inBackoff
+}
+
+// pollWatchdogDueLocked reports whether the watchdog has tripped, given
+// pollStateMu is already held. The baseline is the latest of loop start,
+// last completed poll, and last rebuild: a rebuild is the recovery
+// action, so the watchdog must not fire again immediately after one.
+func (g *TelegramGateway) pollWatchdogDueLocked(now time.Time) bool {
+	baseline := g.pollLoopStartedAt
+	if g.lastPollCompletedAt.After(baseline) {
+		baseline = g.lastPollCompletedAt
+	}
+	if g.lastPollRebuildAt.After(baseline) {
+		baseline = g.lastPollRebuildAt
+	}
+	if baseline.IsZero() {
+		return false
+	}
+	return now.Sub(baseline) >= g.pollWatchdogInterval
+}
+
+// pollWatchdogDue reports whether the watchdog has tripped.
+func (g *TelegramGateway) pollWatchdogDue(now time.Time) bool {
+	g.pollStateMu.Lock()
+	defer g.pollStateMu.Unlock()
+	return g.pollWatchdogDueLocked(now)
+}
+
+// rebuildPollTransport swaps the poll client's transport for a fresh one
+// built with a fresh dialer, and resets the consecutive-timeout streak.
+// It MUST run between attempts, never while a poll is in flight: it
+// takes fetchMu, which serialises it against any in-flight getUpdates
+// (PollStream holds fetchMu only for the fetch itself; GetUpdates holds
+// it across fetch-and-advance). CloseIdleConnections on the OLD transport
+// is hygiene only — it closes idle pooled connections and CANNOT touch
+// the in-flight dead one; the rebuild itself is the fix, because the new
+// transport starts with an empty pool and the next attempt dials fresh.
+// The swap is safe while other goroutines use the client: http.Client
+// is safe for concurrent use and the Transport field is only ever
+// written here, under fetchMu.
+func (g *TelegramGateway) rebuildPollTransport(reason string) {
+	g.fetchMu.Lock()
+	defer g.fetchMu.Unlock()
+	g.pollStateMu.Lock()
+	g.pollRebuilding = true
+	g.pollStateMu.Unlock()
+	defer func() {
+		g.pollStateMu.Lock()
+		g.pollRebuilding = false
+		g.pollStateMu.Unlock()
+	}()
+	if g.pollClient == nil {
+		g.pollClient = newPollHTTPClient()
+	} else {
+		old := g.pollClient.Transport
+		g.pollClient.Transport = newPollTransport()
+		if old != nil {
+			if tr, ok := old.(*http.Transport); ok {
+				tr.CloseIdleConnections()
+			}
+		}
+	}
+	g.pollStateMu.Lock()
+	g.pollRebuilds++
+	rebuilds := g.pollRebuilds
+	timeouts := g.pollConsecutiveTimeouts
+	g.pollConsecutiveTimeouts = 0
+	g.lastPollRebuildAt = time.Now()
+	g.pollStateMu.Unlock()
+	g.logf("telegram poll: rebuilt poll transport (%s; %d consecutive timeout(s); rebuild #%d)", reason, timeouts, rebuilds)
+}
+
+// PollHealth is a snapshot of the getUpdates poller's state for the
+// daemon's health/debug surface. Healthy is false whenever the poller is
+// in backoff or rebuilding, has any consecutive timeouts outstanding, has
+// never started, or has gone a full watchdog interval without a completed
+// poll — a poller in rebuild/backoff must NOT report healthy.
+type PollHealth struct {
+	Healthy             bool
+	Reason              string
+	ConsecutiveTimeouts int
+	LastCompletedAt     time.Time
+	LastRebuildAt       time.Time
+	Rebuilds            int
+	InBackoff           bool
+	Rebuilding          bool
+}
+
+// String renders the snapshot as one log/debug line. It carries counts
+// and timestamps only — no token, no message content.
+func (h PollHealth) String() string {
+	return fmt.Sprintf("healthy=%v reason=%q consecutive_timeouts=%d rebuilds=%d last_completed=%s last_rebuild=%s in_backoff=%v rebuilding=%v",
+		h.Healthy, h.Reason, h.ConsecutiveTimeouts, h.Rebuilds,
+		h.LastCompletedAt.Format(time.RFC3339), h.LastRebuildAt.Format(time.RFC3339),
+		h.InBackoff, h.Rebuilding)
+}
+
+// PollHealth returns the current poller snapshot.
+func (g *TelegramGateway) PollHealth() PollHealth {
+	g.pollStateMu.Lock()
+	defer g.pollStateMu.Unlock()
+	h := PollHealth{
+		ConsecutiveTimeouts: g.pollConsecutiveTimeouts,
+		LastCompletedAt:     g.lastPollCompletedAt,
+		LastRebuildAt:       g.lastPollRebuildAt,
+		Rebuilds:            g.pollRebuilds,
+		InBackoff:           g.pollInBackoff,
+		Rebuilding:          g.pollRebuilding,
+	}
+	switch {
+	case g.pollLoopStartedAt.IsZero():
+		h.Reason = "polling not started"
+	case h.Rebuilding:
+		h.Reason = "rebuilding poll transport"
+	case h.InBackoff:
+		h.Reason = "backing off after transient poll error"
+	case h.ConsecutiveTimeouts > 0:
+		h.Reason = fmt.Sprintf("%d consecutive poll timeout(s)", h.ConsecutiveTimeouts)
+	case g.pollWatchdogDueLocked(time.Now()):
+		h.Reason = fmt.Sprintf("no completed poll for >= %s", g.pollWatchdogInterval)
+	default:
+		h.Healthy = true
+	}
+	return h
 }
 
 // redactedError wraps an error whose message may contain the bot token
@@ -1102,7 +1441,16 @@ func (g *TelegramGateway) call(ctx context.Context, method string, query url.Val
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := g.client.Do(req)
+	// getUpdates rides the dedicated poll client (own HTTP/1.1-only
+	// transport, 45s deadline); every other method rides the shared
+	// send/message client. A nil poll client (a Gateway built without
+	// the constructor) falls back to the shared client rather than
+	// crashing — production gateways always have one.
+	client := g.client
+	if method == "getUpdates" && g.pollClient != nil {
+		client = g.pollClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		// Safe to log: g.redact returns the token-free wrapper. The
 		// raw *url.Error embeds the request URL (and the token) and
@@ -1809,8 +2157,8 @@ func (g *TelegramGateway) SendMessage(ctx context.Context, chatID int64, text st
 }
 
 // fetchUpdatesLocked long-polls for new updates (timeout=30s on the
-// server side, 35s client timeout) and returns them WITHOUT
-// advancing the offset. The caller holds fetchMu and must advance
+// server side, 45s client deadline: window + 15s grace) and returns
+// them WITHOUT advancing the offset. The caller holds fetchMu and must advance
 // the offset for every update it has decided (completed, dropped,
 // or skipped — F-A8-2: completion, not dispatch) — see
 // advanceOffsetTo and PollStream's contiguous confirmation. It
@@ -1846,8 +2194,17 @@ func (g *TelegramGateway) fetchUpdatesLocked(ctx context.Context) ([]Update, err
 	}
 	// Bound the long poll even if the caller supplied a client without a
 	// timeout. WithTimeout never extends a shorter caller deadline: the
-	// earliest deadline wins.
-	pollCtx, cancel := context.WithTimeout(ctx, defaultHTTPTimeout)
+	// earliest deadline wins. The bound is the per-attempt deadline
+	// (window + grace, 45s by default) — not the 30s window, so a
+	// slow-but-healthy response arriving just after the window is not
+	// killed and misread as a dead connection. A zero pollTimeout (a
+	// Gateway built without the constructor) falls back to the default
+	// instead of an instant deadline.
+	pollTimeout := g.pollTimeout
+	if pollTimeout <= 0 {
+		pollTimeout = pollHTTPTimeout
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 	defer cancel()
 
 	g.mu.Lock()
@@ -1893,6 +2250,9 @@ func (g *TelegramGateway) fetchUpdatesLocked(ctx context.Context) ([]Update, err
 		g.updatesFilterSent = true
 		g.logf("telegram poll: allowed_updates filter set to [message callback_query]")
 	}
+	// A completed poll — empty counts — moves the watchdog baseline
+	// and clears the consecutive-timeout streak.
+	g.notePollCompleted()
 	return updates, nil
 }
 
@@ -1926,7 +2286,7 @@ func (g *TelegramGateway) advanceOffset(updates []Update) {
 }
 
 // GetUpdates long-polls for new updates (timeout=30s on the server side,
-// 35s client timeout). After a successful call the internal offset is
+// 45s client deadline). After a successful call the internal offset is
 // advanced to max(update_id) + 1, so the next call only returns newer
 // updates. It honours ctx cancellation.
 //
@@ -1934,7 +2294,7 @@ func (g *TelegramGateway) advanceOffset(updates []Update) {
 // request, and the offset advance are one atomic step, so two
 // concurrent callers can never fetch the same offset and deliver
 // the same updates twice. A second caller waits here for the
-// in-flight long poll (up to ~35s) instead of duplicating it.
+// in-flight long poll (up to ~45s) instead of duplicating it.
 // PollStream does NOT use this method: it fetches with
 // fetchUpdatesLocked and confirms per dispatched update instead,
 // so a crash mid-batch cannot confirm updates it never dispatched.
@@ -2061,6 +2421,10 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	}
 	backoff := time.Second
 	const maxBackoff = 5 * time.Second
+
+	// Poll-recovery baseline: the watchdog counts from loop start until
+	// the first completed poll (see notePollLoopStarted).
+	g.notePollLoopStarted()
 
 	// Semaphore bounding concurrent handlers; striped locks serialise
 	// handlers for the same chat (best-effort per-chat ordering).
@@ -2572,6 +2936,17 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		default:
 		}
 
+		// Outer watchdog (backstop for the N=3 trigger below): if a
+		// full watchdog interval has passed with no completed poll,
+		// force the same transport rebuild even if the
+		// consecutive-timeout count did not trip — e.g. attempts
+		// failing fast. The rebuild resets the watchdog baseline,
+		// so it cannot fire again until another full interval
+		// passes without a completed poll.
+		if g.pollWatchdogDue(time.Now()) {
+			g.rebuildPollTransport("watchdog: no completed poll")
+		}
+
 		// Fetch WITHOUT advancing the offset (F-A7-P2-3, F-A8-2):
 		// the offset advances only as updates complete below
 		// (see markDecided), so a crash mid-batch or mid-turn
@@ -2632,11 +3007,29 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			// safe to log: call() redacts the token.
 			consecutiveFailures++
 			g.logf("telegram poll: transient getUpdates error (attempt %d, retry in %s): %v", consecutiveFailures, backoff, err)
+			// Deterministic recovery from a black-holed pooled
+			// connection (live incident 2026-11-15): on the 3rd
+			// CONSECUTIVE getUpdates TIMEOUT — timeout-class error
+			// only (see isTimeoutError), never 429/5xx — rebuild
+			// the poll transport with a fresh dialer between
+			// attempts (under fetchMu) and reset the streak. A
+			// non-timeout transient error proves the connection
+			// answered, so it breaks the streak instead.
+			if isTimeoutError(err) {
+				if timeouts := g.notePollTimeout(); timeouts >= pollRebuildAfterTimeouts {
+					g.rebuildPollTransport(fmt.Sprintf("%d consecutive getUpdates timeouts", timeouts))
+				}
+			} else {
+				g.resetPollTimeouts()
+			}
+			g.setPollBackoff(true)
 			select {
 			case <-ctx.Done():
+				g.setPollBackoff(false)
 				return nil
 			case <-time.After(backoff):
 			}
+			g.setPollBackoff(false)
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff

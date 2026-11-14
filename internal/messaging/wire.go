@@ -51,18 +51,27 @@
 // cards answerable. A nil registry, gateway, gate or cards is a
 // loud startup error, never a silent half-wiring.
 //
-// A failed WireTelegram leaves no callback handler behind for a
-// prefix failure (validate-then-install, F-A21-7): the router is
-// untouched, so a retry on the same gateway starts from a clean
-// router. A failure in a later step — a tool's InstallTransport —
-// can still leave handlers registered, because those steps have
-// no inverse (the fallback install deliberately refuses
-// replacement, F-A20-6); both binaries kill the process on a
-// WireTelegram error, so a failed wiring never serves traffic,
-// and a second call fails loudly on the duplicate "ask:" instead
-// of silently re-wiring. Rollback was considered and rejected:
-// pre-validation is possible here because every prefix rule is a
-// pure check, and it needs no new mutation path.
+// A failed WireTelegram leaves the gateway clean
+// (validate-then-install, F-A21-7, F-A22-8): the prefix check is
+// pure, and the transport install — the only other fallible step
+// — runs BEFORE any handler is registered, so a failure there
+// leaves the router untouched and a retry on the same gateway
+// starts clean and can succeed. Every step after the transport
+// install is pre-validated (the prefix check above) or infallible
+// on a fresh gateway (the fallback/router installs, the
+// question-registry set, the asker installs, the interceptor
+// appends, SetToolClasses), so no later step can fail on a retry
+// after a transport failure. A tool's InstallTransport therefore
+// runs before any gateway wiring exists — it must not assume
+// wired state — and a failed wiring may call it again on retry,
+// so it must tolerate a repeat call (see tools.TransportAware).
+// Both binaries still kill the process on a WireTelegram error,
+// so a failed wiring never serves traffic; the clean-retry
+// property is what a test pins, not a production recovery path.
+// Rollback was considered and rejected: the fallback install
+// deliberately refuses replacement (F-A20-6) and the router has
+// no unregister, so a rollback would need new mutation paths;
+// running the fallible step first needs none.
 package messaging
 
 import (
@@ -125,6 +134,23 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 			return fmt.Errorf("messaging: WireTelegram: tool %q callback prefix: %w", p.owner, err)
 		}
 	}
+	// Transport install FIRST (F-A22-8): the only other fallible
+	// step, and it runs before any gateway state is installed, so
+	// a failure leaves the router untouched and a retry on the
+	// same gateway can succeed. InstallTransport receives the raw
+	// gateway (no wiring exists yet) and may be called again on a
+	// retry, so tools must tolerate a repeat call (see
+	// tools.TransportAware). Running it here also keeps the reply
+	// interceptors out of a failed attempt: they are appended in
+	// the discovery loop below, after this step succeeds.
+	host := &tools.ToolHost{Gateway: gw, OwnerID: ownerID, LogPrefix: logPrefix}
+	for _, t := range reg.List() {
+		if ta, ok := t.(tools.TransportAware); ok {
+			if err := ta.InstallTransport(host); err != nil {
+				return fmt.Errorf("messaging: WireTelegram: tool %q InstallTransport: %w", t.Name(), err)
+			}
+		}
+	}
 	// The fallible step first (see the package doc): a duplicate
 	// "ask:" fails before any gateway state changes.
 	if err := gw.RegisterCallbackHandler(questionCallbackPrefix, handler); err != nil {
@@ -153,7 +179,6 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 	}
 	gw.SetQuestionRegistry(questions)
 	asker := NewTelegramQuestionAsker(gw, questions, ownerID, logPrefix)
-	host := &tools.ToolHost{Gateway: gw, OwnerID: ownerID, LogPrefix: logPrefix}
 	for _, t := range reg.List() {
 		if qi, ok := t.(tools.QuestionAskerInstaller); ok {
 			qi.InstallQuestionAsker(asker.Ask)
@@ -161,7 +186,12 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 		// Reply discovery (F-A20-1): every tool that implements
 		// tools.ReplyInterceptor is added to the reply chain.
 		// AddReplyInterceptor cannot fail (it appends; a nil
-		// interceptor is a no-op). Ordering (F-A21-22): the
+		// interceptor is a no-op). A typed-nil interceptor is
+		// skipped here (F-A22-9): passing it on would hand the
+		// chain an interceptor that panics on every message —
+		// add() drops it too, so the skip here is the
+		// call-site fix and the guard there is the defence
+		// that holds regardless. Ordering (F-A21-22): the
 		// question interceptor was installed first by
 		// SetQuestionRegistry above, so it runs before any later
 		// tool's interceptor; tool interceptors follow in
@@ -170,13 +200,11 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 		// There is no priority field: insertion order is the
 		// control, and every consumption is audit-logged with
 		// the interceptor's type, so a misroute is diagnosable.
-		if ri, ok := t.(tools.ReplyInterceptor); ok {
+		// (Transport install ran before any gateway mutation,
+		// F-A22-8, so a failure there left no interceptor
+		// behind either.)
+		if ri, ok := t.(tools.ReplyInterceptor); ok && !tools.IsNilValue(ri) {
 			gw.AddReplyInterceptor(ri)
-		}
-		if ta, ok := t.(tools.TransportAware); ok {
-			if err := ta.InstallTransport(host); err != nil {
-				return fmt.Errorf("messaging: WireTelegram: tool %q InstallTransport: %w", t.Name(), err)
-			}
 		}
 	}
 	gate.SetToolClasses(reg.ToolClasses())

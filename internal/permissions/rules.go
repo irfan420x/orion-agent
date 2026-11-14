@@ -142,7 +142,13 @@ func (s *RuleStore) load() error {
 			continue
 		}
 		k := decodeRuleKey(key)
-		if strings.TrimSpace(k.tool) == "" {
+		// Fold the tool name on load (F-A22-6/F-A22-7): a rule
+		// persisted under a mixed-case spelling ("SHELL_EXEC")
+		// is the same rule as the folded spelling, and every
+		// lookup folds too — otherwise a legacy rule and its
+		// lookup would silently disagree.
+		k.tool = NormalizeToolName(k.tool)
+		if k.tool == "" {
 			continue
 		}
 		s.rules[k] = action
@@ -178,7 +184,7 @@ func (s *RuleStore) LookupForChat(chatID int64, tool string) (Action, bool) {
 	if s == nil {
 		return "", false
 	}
-	tool = strings.TrimSpace(tool)
+	tool = NormalizeToolName(tool)
 	s.mu.RLock()
 	if a, ok := s.rules[ruleKey{chatID: chatID, tool: tool}]; ok {
 		s.mu.RUnlock()
@@ -229,7 +235,7 @@ func (s *RuleStore) SetForChat(chatID int64, tool string, action Action) error {
 	if s == nil {
 		return fmt.Errorf("permissions: rule store is nil")
 	}
-	tool = strings.TrimSpace(tool)
+	tool = NormalizeToolName(tool)
 	if tool == "" {
 		return fmt.Errorf("permissions: rule tool must not be empty")
 	}
@@ -257,7 +263,7 @@ func (s *RuleStore) DeleteForChat(chatID int64, tool string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.rules, ruleKey{chatID: chatID, tool: strings.TrimSpace(tool)})
+	delete(s.rules, ruleKey{chatID: chatID, tool: NormalizeToolName(tool)})
 	return s.saveLocked()
 }
 

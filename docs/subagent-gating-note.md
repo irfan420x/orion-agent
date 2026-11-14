@@ -21,7 +21,16 @@ view, and the parent's planning store.
 
 What a child **cannot** do: MCP tools and the skill tool are
 deliberately not in the child registry, and there are no subagent
-tools (no recursion). The shell denylist, result caps and the
+tools (no recursion). The plan-mode tools are likewise excluded
+(F-A22-16): `enter_plan_mode` needs a Telegram gateway a child
+never gets (it would guaranteed-fail), and `exit_plan_mode`
+touches the shared planning store, so a child calling it would
+clear the PARENT chat's pending plan — the approval boundary
+plan mode exists to enforce. Neither tool can work in a child,
+so neither is listed there. The plan-mode BLOCK is not removed
+with the tools: the registry keeps the plan-mode checker, so a
+pending parent plan still refuses the child's destructive
+tools. The shell denylist, result caps and the
 parent's PreToolUse hook bus (non-interactive, fail-closed) still
 apply — a hook can block a child's tool call exactly as it blocks
 the parent's.

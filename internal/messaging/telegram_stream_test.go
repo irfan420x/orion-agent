@@ -199,10 +199,23 @@ func (f *streamFake) keyboardsSnapshot() []string {
 	return append([]string(nil), f.keyboards...)
 }
 
-// waitFor polls cond until it is true or the deadline passes.
+// scaledTimeout lengthens a test-only wait deadline for -race builds
+// (F-A22-5, F-A22-4): raceTimeoutMultiplier is 5 under -race, 1 plain
+// (test_timeout_race_test.go / test_timeout_norace_test.go). The
+// multiplier is CockroachDB's verified 5x race scaling for
+// SucceedsSoon-style waits. It applies to deadlines only — never to
+// poll intervals or assertions.
+func scaledTimeout(d time.Duration) time.Duration {
+	return d * time.Duration(raceTimeoutMultiplier)
+}
+
+// waitFor polls cond until it is true or the deadline passes. The
+// deadline is race-scaled (F-A22-5): 5s plain, 25s under -race, because
+// -race instrumentation + full-suite contention on a small VM can keep
+// a condition from becoming true for far longer than 5s of wall clock.
 func waitFor(t *testing.T, desc string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(scaledTimeout(5 * time.Second))
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -212,18 +225,20 @@ func waitFor(t *testing.T, desc string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", desc)
 }
 
-// waitForLong is waitFor with a 30s deadline, for the tests whose
-// eventual state needs a full long-poll cycle to arrive under
-// full-suite load (F-A20-4: TestOffsetNoDoubleExecutionAfterRelease
-// failed 1/3 in the full suite on the 5s waits, never in
-// isolation). The assertions are unchanged — only the time
-// allowed to reach them grows — so a longer deadline never
+// waitForLong is waitFor with a 30s deadline (150s under -race, via
+// scaledTimeout — F-A22-5), for the tests whose eventual state needs
+// a full long-poll cycle to arrive under full-suite load (F-A20-4:
+// TestOffsetNoDoubleExecutionAfterRelease failed 1/3 in the full
+// suite on the 5s waits, never in isolation; Audit 22 reproduced it
+// again at the 30s deadline under -race + full-suite load,
+// rc13_w2_test.go:425, 31.01s). The assertions are unchanged — only
+// the time allowed to reach them grows — so a longer deadline never
 // weakens the test; it only stops load from masquerading as a
 // failure. Use it only where a single test names it, never as a
 // replacement for the shared waitFor.
 func waitForLong(t *testing.T, desc string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(scaledTimeout(30 * time.Second))
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -251,7 +266,7 @@ func stopPollStream(t *testing.T, cancel context.CancelFunc, errCh chan error) {
 		if err != nil {
 			t.Fatalf("PollStream after cancel: %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(scaledTimeout(5 * time.Second)):
 		t.Fatal("PollStream did not return after ctx cancel")
 	}
 }
