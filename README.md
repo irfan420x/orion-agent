@@ -244,6 +244,41 @@ curl http://127.0.0.1:6060/debug/pprof/heap
 go tool pprof http://127.0.0.1:6060/debug/pprof/heap
 ```
 
+## Sending files (Telegram)
+
+When the user asks for a file, or the agent created one they should
+have, the agent sends it with a `MEDIA:` line on its own line in its
+reply, with the absolute path and no spaces — for example
+`MEDIA:/home/irfan/orion-media/report.csv`. The gateway uploads the
+file to the chat (photo, video, audio, voice, or document by
+extension; unknown extensions go as a document), strips the tag from
+the visible reply, and appends a per-file delivery report (`📎 Sent
+…` / `⛔ Could not send …`) after the footer. Only explicit `MEDIA:`
+tags send: a path merely mentioned in prose is never sent, and the
+CLI (`orion run`) leaves tags as visible text.
+
+- **Allowlist (default `~/orion-media` and `/tmp`).** Files may be
+  sent only from under an allowlisted directory. Set
+  `media_allow_dirs` in `config.json` to replace the defaults
+  (an explicit list replaces, never appends). A file elsewhere is
+  refused with a visible note naming the allowlist and how to
+  allow the directory — never sent, never silent.
+- **Denylist (absolute, non-overridable).** `~/.orion`, `~/.ssh`,
+  `~/.gnupg`, `/etc`, and credential/key filenames (`*.env`,
+  `*.pem`, `*.key`, `id_*`, `*credentials*`) are never sendable —
+  not even by the owner, not even from an allowlisted dir, and not
+  through a symlink that points at them (paths are resolved
+  before the check). The refusal note names the path and says it
+  is never sendable; it never hints at what the file contains.
+- **Limits.** At most 5 files per reply (`media_max_files`,
+  clamped 1–20) and 50 MiB per file (`media_max_bytes`, clamped
+  to 50 MiB, the Bot API limit). Over-limit files are refused
+  with a visible note. One file's failure never blocks the others
+  or the text reply.
+- **Kill-switch.** `"media": { "enabled": false }` disables
+  extraction entirely: tags stay as visible text and no file is
+  sent.
+
 ## Sandbox (shell_exec)
 
 `shell_exec` runs confined by default: Linux namespaces + chroot

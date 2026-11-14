@@ -64,6 +64,37 @@ packages**.
   config-file override only. Pinned by the existing
   `TestSandboxDefaults`.
 
+### MEDIA — Telegram file delivery
+
+The agent can now send files to the Telegram chat: it replies with
+a `MEDIA:<absolute-path>` line and the gateway uploads the file,
+strips the tag, and appends a per-file delivery report to the text
+reply. Suite: **1,523 tests total (1,519 pass, 0 fail, 4 skip),
+24/24 packages**.
+
+- **Explicit tags only, no bare-path extraction.** A path merely
+  mentioned in prose is never sent (unlike Hermes's
+  `extract_local_files`); only a `MEDIA:` line on its own line
+  sends. No auto-tagging from tool results: the model decides.
+- **Unknown extensions fall back to `sendDocument`, and every
+  extracted tag is either delivered or replaced by a visible
+  refusal/failure note** — no `MEDIA:` line ever reaches the chat.
+  This is the direct fix for the Hermes bug where an unknown
+  extension left the tag visible and the file unsent.
+- **Fail-closed paths.** The denylist (`~/.orion`, `~/.ssh`,
+  `~/.gnupg`, `/etc`, credential/key filename patterns) is checked
+  on the symlink-resolved path, so a symlink inside an allowed
+  dir pointing at a secret is refused; the allowlist defaults to
+  `~/orion-media` and `/tmp` — deliberately not the daemon cwd,
+  which on the laptop is the whole home. Out-of-allowlist files
+  are refused loudly in v1; approval-gated send is a specified
+  v2. Media delivery is not a tool (no `Register`/`Classify`/gate
+  entry), so the F-A21-1 fail-closed gate is unaffected.
+- **Streaming uploads.** Files stream from disk through an
+  `io.Pipe` multipart upload on a dedicated client with a
+  10-minute per-file deadline (not the 35 s `g.client` timeout);
+  the whole file is never held in memory.
+
 ### plan_mode (tool 2 of 14) + Audit 20 Step 1 fixes
 
 plan_mode is the second of the 14 advanced tools: the agent enters
