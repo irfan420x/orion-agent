@@ -11,9 +11,17 @@ package messaging
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -177,6 +185,45 @@ func TestPollClientsAreSplitAndPollTransportIsHTTP1Only(t *testing.T) {
 	}
 	if tr.ForceAttemptHTTP2 {
 		t.Fatal("poll transport still attempts HTTP/2: it must be pinned to HTTP/1.1 so a timed-out poll closes its connection")
+	}
+	// The bool alone is NOT the pin (regression 2026-11-15: Clone()
+	// + ForceAttemptHTTP2=false still offered h2 in ALPN with no h2
+	// implementation, and every getUpdates failed with `malformed
+	// HTTP response`). The real pin is the ALPN offer plus the
+	// disabled h2 implementation — assert both, not just the bool.
+	if tr.TLSNextProto == nil {
+		t.Fatal("poll transport TLSNextProto is nil: a nil map lets the transport configure HTTP/2 on first use; it must be a non-nil (empty) map")
+	}
+	if _, hasH2 := tr.TLSNextProto["h2"]; hasH2 {
+		t.Fatal("poll transport TLSNextProto has an h2 handler: the poll transport must have no HTTP/2 implementation")
+	}
+	if cfg := tr.TLSClientConfig; cfg != nil {
+		for _, p := range cfg.NextProtos {
+			if p == "h2" {
+				t.Fatalf("poll transport TLSClientConfig.NextProtos = %v: it must not offer h2 in ALPN (ForceAttemptHTTP2=false does not remove it)", cfg.NextProtos)
+			}
+		}
+		if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
+			t.Fatalf("poll transport TLSClientConfig.NextProtos = %v, want [http/1.1]", cfg.NextProtos)
+		}
+	}
+	// The pin must not mutate the shared default transport: it still
+	// offers h2 and still has its h2 implementation.
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		if dt.TLSClientConfig != nil {
+			hasH2 := false
+			for _, p := range dt.TLSClientConfig.NextProtos {
+				if p == "h2" {
+					hasH2 = true
+				}
+			}
+			if !hasH2 {
+				t.Fatalf("default transport TLSClientConfig.NextProtos = %v after newPollTransport(): the pin must not have removed h2 from the shared default", dt.TLSClientConfig.NextProtos)
+			}
+		}
+		if _, hasH2 := dt.TLSNextProto["h2"]; !hasH2 {
+			t.Fatal("default transport TLSNextProto lost its h2 handler after newPollTransport(): the pin must not mutate the shared default")
+		}
 	}
 	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
 		if tr == dt {
@@ -533,4 +580,293 @@ func TestPollSendStillUsesSendClient(t *testing.T) {
 	} else if !isTimeoutError(err) {
 		t.Fatalf("GetMe error = %v, want a timeout-class error", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/1.1 pin behavioural test (poll regression 2026-11-15, b6aaa62).
+//
+// b6aaa62's newPollTransport() was Clone() + ForceAttemptHTTP2=false
+// only. That clone still offered h2 in ALPN with no h2 implementation,
+// so api.telegram.org selected h2 and every getUpdates failed with
+// `malformed HTTP response "\x00\x00\x12\x04…"` — three live deploys.
+// The tests below prove the pin against a server that REALLY negotiates
+// h2. They deliberately do NOT use httptest.NewTLSServer: it does not
+// negotiate h2 server-side, so even the broken transport passes
+// against it and the test would prove nothing.
+// ---------------------------------------------------------------------------
+
+// testSelfSignedCert generates a self-signed leaf for 127.0.0.1 /
+// localhost, for the h2 test server below.
+func testSelfSignedCert(t *testing.T) (tls.Certificate, *x509.Certificate) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate test key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create test certificate: %v", err)
+	}
+	cert, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}),
+	)
+	if err != nil {
+		t.Fatalf("load test certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse test certificate: %v", err)
+	}
+	return cert, leaf
+}
+
+// h2PollServer is a real TLS server with HTTP/2 enabled (http.Server +
+// ServeTLS auto-configures server-side h2). It records every request's
+// server-side negotiated protocol and r.Proto, and answers getUpdates
+// with an empty result.
+type h2PollServer struct {
+	url  string
+	leaf *x509.Certificate
+	mu   sync.Mutex
+	// negotiated[i] / protos[i] describe the i-th request received.
+	negotiated []string
+	protos     []string
+	srv        *http.Server
+}
+
+func (s *h2PollServer) snapshot() (negotiated, protos []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.negotiated...), append([]string(nil), s.protos...)
+}
+
+func startH2PollServer(t *testing.T) *h2PollServer {
+	t.Helper()
+	cert, leaf := testSelfSignedCert(t)
+	s := &h2PollServer{leaf: leaf}
+	s.srv = &http.Server{
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			proto := ""
+			if r.TLS != nil {
+				proto = r.TLS.NegotiatedProtocol
+			}
+			s.mu.Lock()
+			s.negotiated = append(s.negotiated, proto)
+			s.protos = append(s.protos, r.Proto)
+			s.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ok":true,"result":[]}`)
+		}),
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for h2 test server: %v", err)
+	}
+	s.url = "https://" + ln.Addr().String()
+	t.Cleanup(func() { s.srv.Close() })
+	go s.srv.ServeTLS(ln, "", "")
+	return s
+}
+
+// trustTestLeaf adds the test server's self-signed leaf to the
+// transport's root pool, cloning the TLS config so the pin fields
+// (NextProtos, TLSNextProto) are preserved exactly.
+func trustTestLeaf(t *testing.T, tr *http.Transport, leaf *x509.Certificate) {
+	t.Helper()
+	cfg := &tls.Config{}
+	if tr.TLSClientConfig != nil {
+		cfg = tr.TLSClientConfig.Clone()
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	cfg.RootCAs = pool
+	tr.TLSClientConfig = cfg
+}
+
+// oldBrokenPollTransport replicates the b6aaa62 newPollTransport
+// verbatim (Clone + ForceAttemptHTTP2=false only) as the negative
+// control. It must FAIL against an h2-negotiating server; if it does
+// not, the test server is not negotiating h2 and the test proves
+// nothing.
+func oldBrokenPollTransport() *http.Transport {
+	dt := http.DefaultTransport.(*http.Transport)
+	tr := dt.Clone()
+	tr.ForceAttemptHTTP2 = false
+	return tr
+}
+
+// TestPollTransportNegotiatesHTTP1AgainstH2Server is the behavioural
+// proof of the HTTP/1.1 pin: against a server that really negotiates
+// h2, the production poll client must complete a getUpdates over
+// HTTP/1.1 — and the old b6aaa62 transport must fail on the same
+// server with the live error.
+func TestPollTransportNegotiatesHTTP1AgainstH2Server(t *testing.T) {
+	srv := startH2PollServer(t)
+
+	// Snapshot the shared default transport BEFORE the factory runs:
+	// the pin must leave it alone.
+	dt := http.DefaultTransport.(*http.Transport)
+	var beforeNextProtos []string
+	if dt.TLSClientConfig != nil {
+		beforeNextProtos = append([]string(nil), dt.TLSClientConfig.NextProtos...)
+	}
+	_, beforeHasH2Handler := dt.TLSNextProto["h2"]
+
+	// Production factory, not a hand-built transport.
+	client := newPollHTTPClient()
+	client.Timeout = 10 * time.Second
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("poll transport = %T, want *http.Transport", client.Transport)
+	}
+	if tr.TLSNextProto == nil {
+		t.Fatal("poll transport TLSNextProto is nil: it must be a non-nil (empty) map so the transport never configures HTTP/2")
+	}
+	if _, hasH2 := tr.TLSNextProto["h2"]; hasH2 {
+		t.Fatal("poll transport TLSNextProto has an h2 handler")
+	}
+	cfg := tr.TLSClientConfig
+	if cfg == nil {
+		t.Fatal("poll transport TLSClientConfig is nil: the clone must carry an explicit HTTP/1.1-only NextProtos")
+	}
+	for _, p := range cfg.NextProtos {
+		if p == "h2" {
+			t.Fatalf("poll transport NextProtos = %v: must not offer h2 in ALPN", cfg.NextProtos)
+		}
+	}
+	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
+		t.Fatalf("poll transport NextProtos = %v, want [http/1.1]", cfg.NextProtos)
+	}
+
+	// The shared default transport must be untouched by the factory.
+	if dt.TLSClientConfig == nil {
+		t.Fatal("default transport TLSClientConfig is nil after newPollTransport(): expected the lazy HTTP/2 setup to have run")
+	}
+	hasH2 := false
+	for _, p := range dt.TLSClientConfig.NextProtos {
+		if p == "h2" {
+			hasH2 = true
+		}
+	}
+	if !hasH2 {
+		t.Fatalf("default transport NextProtos = %v after newPollTransport(): the pin must not remove h2 from the shared default", dt.TLSClientConfig.NextProtos)
+	}
+	if beforeNextProtos != nil {
+		if len(dt.TLSClientConfig.NextProtos) != len(beforeNextProtos) {
+			t.Fatalf("default transport NextProtos changed from %v to %v", beforeNextProtos, dt.TLSClientConfig.NextProtos)
+		}
+		for i, p := range beforeNextProtos {
+			if dt.TLSClientConfig.NextProtos[i] != p {
+				t.Fatalf("default transport NextProtos changed from %v to %v", beforeNextProtos, dt.TLSClientConfig.NextProtos)
+			}
+		}
+	}
+	if _, hasH2Handler := dt.TLSNextProto["h2"]; !hasH2Handler {
+		t.Fatalf("default transport TLSNextProto lost its h2 handler after newPollTransport() (had one before: %v)", beforeHasH2Handler)
+	}
+
+	trustTestLeaf(t, tr, srv.leaf)
+
+	// Transport-level proof: a real getUpdates-shaped request.
+	resp, err := client.Get(srv.url + "/bot" + testToken + "/getUpdates?timeout=30")
+	if err != nil {
+		t.Fatalf("GET getUpdates with the production poll client: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET getUpdates status = %d, want 200", resp.StatusCode)
+	}
+	if resp.Proto != "HTTP/1.1" {
+		t.Fatalf("GET getUpdates resp.Proto = %q, want HTTP/1.1 (the server negotiates h2 — a broken pin would speak h2 or fail)", resp.Proto)
+	}
+	negotiated, protos := srv.snapshot()
+	if len(negotiated) != 1 || negotiated[0] != "http/1.1" {
+		t.Fatalf("server-side negotiated protocol = %v, want [http/1.1]", negotiated)
+	}
+	if len(protos) != 1 || protos[0] != "HTTP/1.1" {
+		t.Fatalf("server-side request proto = %v, want [HTTP/1.1]", protos)
+	}
+
+	// Production-path proof: a real gateway GetUpdates over the same
+	// server, through call() routing and the poll client.
+	g, err := NewTelegramGateway(testToken, WithBaseURL(srv.url))
+	if err != nil {
+		t.Fatalf("NewTelegramGateway: %v", err)
+	}
+	gtr, ok := g.pollClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("gateway poll transport = %T, want *http.Transport", g.pollClient.Transport)
+	}
+	trustTestLeaf(t, gtr, srv.leaf)
+	g.pollTimeout = 10 * time.Second
+	updates, err := g.GetUpdates(context.Background())
+	if err != nil {
+		t.Fatalf("GetUpdates via the production poll client: %v", err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("GetUpdates = %d updates, want 0", len(updates))
+	}
+	negotiated, protos = srv.snapshot()
+	if len(negotiated) != 2 {
+		t.Fatalf("server saw %d requests, want 2 (direct GET + gateway GetUpdates)", len(negotiated))
+	}
+	for i, p := range negotiated {
+		if p != "http/1.1" {
+			t.Fatalf("server-side negotiated protocol for request %d = %q, want http/1.1", i+1, p)
+		}
+		if protos[i] != "HTTP/1.1" {
+			t.Fatalf("server-side request proto for request %d = %q, want HTTP/1.1", i+1, protos[i])
+		}
+	}
+
+	// Negative control: the old b6aaa62 transport must fail on this
+	// exact server with the live error. If it does not, the server is
+	// not negotiating h2 and this test proves nothing.
+	t.Run("broken b6aaa62 transport fails", func(t *testing.T) {
+		old := oldBrokenPollTransport()
+		if oldCfg := old.TLSClientConfig; oldCfg != nil {
+			offersH2 := false
+			for _, p := range oldCfg.NextProtos {
+				if p == "h2" {
+					offersH2 = true
+				}
+			}
+			if !offersH2 {
+				t.Fatalf("negative control is invalid: old transport NextProtos = %v, want it to still offer h2 (else the trap is not armed)", oldCfg.NextProtos)
+			}
+		} else {
+			t.Fatal("negative control is invalid: old transport TLSClientConfig is nil, want it to carry the inherited [h2 http/1.1] offer")
+		}
+		oldClient := &http.Client{Timeout: 10 * time.Second, Transport: old}
+		trustTestLeaf(t, old, srv.leaf)
+		_, err := oldClient.Get(srv.url + "/bot" + testToken + "/getUpdates?timeout=30")
+		if err == nil {
+			t.Fatal("negative control: the old Clone()+ForceAttemptHTTP2=false transport SUCCEEDED against the h2 server — the server is not negotiating h2, so this test proves nothing")
+		}
+		// Either failure proves the server negotiated h2: had ALPN
+		// picked HTTP/1.1 the request would have succeeded. The
+		// usual error is "malformed HTTP response" (h2 SETTINGS
+		// read as HTTP/1.1); bare "EOF" is also possible — the
+		// server rejects the client's bogus preface and closes
+		// the connection, and with unread request bytes buffered
+		// the close sends RST, discarding the in-flight SETTINGS
+		// frame before the client reads it.
+		if !strings.Contains(err.Error(), "malformed HTTP response") && !strings.Contains(err.Error(), "EOF") {
+			t.Fatalf("negative control: old transport failed with %v, want malformed HTTP response or EOF (h2 negotiated, request rejected)", err)
+		}
+		t.Logf("negative control failed as expected: %v", err)
+	})
 }

@@ -11,6 +11,7 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1080,19 +1081,62 @@ func (g *TelegramGateway) Offset() int64 {
 // see pollRebuildAfterTimeouts — not a shipped upstream behaviour.
 
 // newPollTransport clones the default transport and pins it to HTTP/1.1
-// only (ForceAttemptHTTP2 off). Over HTTP/2 all calls multiplex onto one
-// shared connection that stays pooled after a timeout; over HTTP/1.1 a
-// timed-out call closes its connection, so the next attempt dials fresh.
-// Everything else (dial timeout, keep-alive, idle pool, TLS) is the
-// default transport's: only the protocol set changes.
+// only. Over HTTP/2 all calls multiplex onto one shared connection that
+// stays pooled after a timeout; over HTTP/1.1 a timed-out call closes
+// its connection, so the next attempt dials fresh. Everything else
+// (dial timeout, keep-alive, idle pool, TLS) is the default
+// transport's: only the protocol set changes.
+//
+// The pin needs TWO mechanisms, because ForceAttemptHTTP2 = false alone
+// does NOT pin anything (regression 2026-11-15, three live deploys of
+// b6aaa62: every getUpdates failed with `malformed HTTP response
+// "\x00\x00\x12\x04…"`):
+//
+//   - TLSClientConfig.NextProtos = ["http/1.1"]: Transport.Clone()
+//     copies the source's TLSClientConfig — whose NextProtos is
+//     ["h2", "http/1.1"] once the default transport's lazy HTTP/2
+//     setup has fired — but does NOT copy its TLSNextProto["h2"]
+//     handler. A clone with only ForceAttemptHTTP2 = false therefore
+//     still OFFERS h2 in ALPN while having no HTTP/2 implementation;
+//     a server that selects h2 sends HTTP/2 SETTINGS frames that the
+//     HTTP/1.1 reader rejects as a malformed response
+//     (golang/go#39302). The config is cloned before editing so the
+//     shared http.DefaultTransport config is never mutated.
+//   - TLSNextProto = non-nil empty map: the stdlib's documented way
+//     to disable HTTP/2 on a Transport (protocols() only enables h2
+//     when TLSNextProto["h2"] is set), so the clone can never
+//     re-acquire an h2 implementation on first use either.
+//
+// Do NOT "simplify" this to Protocols.SetHTTP1(true): that was
+// measured to fail (it leaves the ALPN offer at ["h2", "http/1.1"]).
 func newPollTransport() *http.Transport {
 	if dt, ok := http.DefaultTransport.(*http.Transport); ok && dt != nil {
 		tr := dt.Clone()
 		tr.ForceAttemptHTTP2 = false
+		// HTTP/2 off at the implementation level: a non-nil (empty)
+		// TLSNextProto map stops the transport ever configuring h2.
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		// HTTP/2 off at the negotiation level: stop offering h2 in
+		// ALPN. Clone the config before editing it, so the shared
+		// default transport's config is never mutated — Clone()
+		// copies it in this Go version, but the re-clone keeps the
+		// pin correct even if a future Clone() ever shares it.
+		if tr.TLSClientConfig != nil {
+			cfg := tr.TLSClientConfig.Clone()
+			cfg.NextProtos = []string{"http/1.1"}
+			tr.TLSClientConfig = cfg
+		}
+		// (If TLSClientConfig is nil there is no ALPN offer to
+		// restrict — the transport is already HTTP/1.1-only.)
 		return tr
 	}
 	// Unreachable with the stdlib default transport, but a fresh
-	// transport with the same shape is safer than a nil one.
+	// transport pinned the same way (HTTP/1.1 only, both
+	// mechanisms) is safer than a nil one. ForceAttemptHTTP2 =
+	// false alone does NOT pin anything: with all dialers/config
+	// nil, the stdlib enables h2 by default (protocols()), so a
+	// bare literal would still offer h2 in ALPN and negotiate
+	// HTTP/2.0 against an h2 server.
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
@@ -1100,6 +1144,8 @@ func newPollTransport() *http.Transport {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     false,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+		TLSClientConfig:       &tls.Config{NextProtos: []string{"http/1.1"}},
 	}
 	return tr
 }
