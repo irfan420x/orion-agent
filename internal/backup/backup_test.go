@@ -214,3 +214,172 @@ func TestRC23W3SnapshotNamesUnique(t *testing.T) {
 		seen[snap] = true
 	}
 }
+
+// TestRC24SnapshotManifestNotesLiveSnapshot (F-A18-8, rc24): every
+// manifest Snapshot writes must say honestly that it is a live,
+// non-quiesced snapshot — quiesced=false plus a plain-language
+// note — so a restore operator knows the snapshot may mix moments.
+func TestRC24SnapshotManifestNotesLiveSnapshot(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "orion")
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	rc23W3SeedDataDir(t, dataDir)
+	snap, err := Snapshot(dataDir, backupDir)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	manData, err := os.ReadFile(filepath.Join(snap, manifestFileName))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var man manifest
+	if err := json.Unmarshal(manData, &man); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if man.Quiesced {
+		t.Errorf("manifest quiesced = true, want false (Snapshot never quiesces the daemon)")
+	}
+	if !strings.Contains(man.Consistency, "live snapshot") || !strings.Contains(man.Consistency, "mix moments") {
+		t.Errorf("manifest consistency = %q, want the live-snapshot warning", man.Consistency)
+	}
+	// The raw JSON must carry the fields too — the operator reads
+	// the file, not the Go struct.
+	if !strings.Contains(string(manData), `"quiesced": false`) {
+		t.Errorf("manifest JSON lacks \"quiesced\": false: %s", manData)
+	}
+	if !strings.Contains(string(manData), `"consistency":`) {
+		t.Errorf("manifest JSON lacks a consistency field: %s", manData)
+	}
+}
+
+// TestRC24RestoreAcceptsPreRC24Manifest (F-A18-8, rc24): a manifest
+// written before the quiesced/consistency fields existed (rc23 and
+// older) must still restore — the new fields are additive, and a
+// missing quiesced flag decodes as false, which is correct for
+// those live snapshots too.
+func TestRC24RestoreAcceptsPreRC24Manifest(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "orion")
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	want := rc23W3SeedDataDir(t, dataDir)
+	snap, err := Snapshot(dataDir, backupDir)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	// Strip the rc24 fields back to the rc23 shape: version,
+	// created_at, source, files only.
+	manData, err := os.ReadFile(filepath.Join(snap, manifestFileName))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(manData, &raw); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	delete(raw, "quiesced")
+	delete(raw, "consistency")
+	oldData, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("re-encode old manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(snap, manifestFileName), oldData, 0o600); err != nil {
+		t.Fatalf("write old manifest: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "restored")
+	if err := Restore(snap, target); err != nil {
+		t.Fatalf("Restore of a pre-rc24 manifest: %v", err)
+	}
+	for rel, content := range want {
+		got, err := os.ReadFile(filepath.Join(target, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Errorf("restored %s: %v", rel, err)
+			continue
+		}
+		if string(got) != content {
+			t.Errorf("restored %s = %q, want %q", rel, got, content)
+		}
+	}
+}
+
+// TestRC24RestoreSkipsInstanceLock (F-A18-2): the instance-lock
+// file is a runtime artifact, not data — Restore must never
+// verify or replace the live oriond.lock, so the restoring
+// process's flock stays valid through the restore and no second
+// daemon can grab a fresh lock mid-restore.
+func TestRC24RestoreSkipsInstanceLock(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "orion")
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	want := rc23W3SeedDataDir(t, dataDir)
+	// The snapshot's lock file carries marker content so a
+	// replacement would be visible.
+	if err := os.WriteFile(filepath.Join(dataDir, "oriond.lock"), []byte("snapshot-lock"), 0o600); err != nil {
+		t.Fatalf("write snapshot lock: %v", err)
+	}
+	snap, err := Snapshot(dataDir, backupDir)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	// The manifest must list the lock file — otherwise this test
+	// would pass vacuously without exercising the skip.
+	manData, err := os.ReadFile(filepath.Join(snap, manifestFileName))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if !strings.Contains(string(manData), "oriond.lock") {
+		t.Fatalf("manifest does not list oriond.lock — the skip is untested:\n%s", manData)
+	}
+
+	// The live data dir has its own lock file (held by the
+	// restoring process in production); Restore must leave it
+	// exactly as it is.
+	target := filepath.Join(t.TempDir(), "restored")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	liveLock := filepath.Join(target, "oriond.lock")
+	if err := os.WriteFile(liveLock, []byte("live-lock"), 0o600); err != nil {
+		t.Fatalf("write live lock: %v", err)
+	}
+	liveBefore, err := os.Stat(liveLock)
+	if err != nil {
+		t.Fatalf("stat live lock: %v", err)
+	}
+	if err := Restore(snap, target); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	got, err := os.ReadFile(liveLock)
+	if err != nil {
+		t.Fatalf("read live lock: %v", err)
+	}
+	if string(got) != "live-lock" {
+		t.Errorf("live oriond.lock = %q, want %q (Restore must not replace it)", got, "live-lock")
+	}
+	liveAfter, err := os.Stat(liveLock)
+	if err != nil {
+		t.Fatalf("stat live lock after: %v", err)
+	}
+	if !os.SameFile(liveBefore, liveAfter) {
+		t.Errorf("live oriond.lock was replaced (different inode) — the flock would go stale")
+	}
+	for rel, content := range want {
+		got, err := os.ReadFile(filepath.Join(target, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Errorf("restored %s: %v", rel, err)
+			continue
+		}
+		if string(got) != content {
+			t.Errorf("restored %s = %q, want %q", rel, got, content)
+		}
+	}
+
+	// A tampered snapshot lock file must not block the restore
+	// either — it is never verified.
+	if err := os.WriteFile(filepath.Join(snap, "oriond.lock"), []byte("tampered-lock"), 0o600); err != nil {
+		t.Fatalf("tamper snapshot lock: %v", err)
+	}
+	target2 := filepath.Join(t.TempDir(), "restored2")
+	if err := Restore(snap, target2); err != nil {
+		t.Fatalf("Restore with tampered snapshot lock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target2, "config.json")); err != nil {
+		t.Errorf("restored config.json missing after tampered-lock restore: %v", err)
+	}
+}

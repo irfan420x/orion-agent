@@ -13,6 +13,7 @@ import (
 func rc23W3RulesEnv(store *permissions.RuleStore, owner int64) *CommandEnv {
 	return &CommandEnv{
 		ChatID:     owner,
+		OwnerID:    owner,
 		IsOwner:    func(id int64) bool { return id == owner },
 		ListRules:  store.List,
 		DeleteRule: store.DeleteForChat,

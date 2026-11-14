@@ -34,17 +34,18 @@
 # write. Likewise ProtectHome must NOT be added: the data dir is
 # in $HOME.
 # NO CapabilityBoundingSet — DELIBERATELY OMITTED (rc23, verified
-# 2026-11-14): any restriction of the bounding set breaks the
-# sandbox. The sandbox runs every shell_exec via `unshare --user
-# --map-root-user`, whose uid_map write needs effective CAP_SETUID
-# at exec; systemd clears the effective set for non-file-caps
-# binaries, so an empty bounding set AND CapabilityBoundingSet=
-# CAP_SETUID CAP_SETGID AND CAP_SYS_ADMIN AND the same plus
-# AmbientCapabilities=CAP_SETUID CAP_SETGID ALL fail with
-# "unshare: write failed /proc/self/uid_map: Operation not
-# permitted" (matrix of 9 scratch oneshot units). Dropping the
-# bounding set would silently break every sandboxed tool call on
-# this root-run unit, so the directive is left out rather than
+# 2026-11-14; reason CORRECTED rc24, F-A18-12): any restriction of
+# the bounding set breaks the sandbox. The sandbox runs every
+# shell_exec via `unshare --user --map-root-user`, whose uid_map
+# write needs CAP_SYS_ADMIN + CAP_SETFCAP in the bounding set —
+# BOTH are required, and CAP_SETUID is NOT the gate: the rc23
+# systemd matrix showed {SETUID,SETGID,SYS_ADMIN} still fails with
+# CAP_SETUID present, while {SYS_ADMIN,SETFCAP} (no SETUID, no
+# SETGID) succeeds. The rc23 comment wrongly blamed CAP_SETUID;
+# see docs/capability-matrix/ for the prctl probe that reproduces
+# the bisection (9 variants, bare unshare) on this VM. Dropping
+# the bounding set would silently break every sandboxed tool call
+# on this root-run unit, so the directive is left out rather than
 # applied blindly. The three applied directives were each verified
 # not to break the sandbox path (matrix) and the daemon was
 # started and stopped cleanly under exactly this set (banner
@@ -83,7 +84,8 @@ RestartForceExitStatus=42
 # ProtectSystem=true, not strict: /home must stay writable (data
 # dir + working directory). Do NOT add ProtectHome, and do NOT add
 # CapabilityBoundingSet: any restriction breaks the sandbox's
-# `unshare --user --map-root-user` uid_map write (see header).
+# `unshare --user --map-root-user` uid_map write — the gate is
+# CAP_SYS_ADMIN + CAP_SETFCAP, not CAP_SETUID (see header).
 NoNewPrivileges=true
 ProtectSystem=true
 PrivateTmp=true

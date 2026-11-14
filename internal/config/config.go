@@ -181,6 +181,23 @@ type Config struct {
 	// chat cannot spend the daemon's whole allowance, and it resets
 	// at UTC midnight.
 	PerChatDailyTokenBudget int `json:"per_chat_daily_token_budget"`
+	// DailyBudgetAlertThresholdTokens is the per-chat daily usage
+	// threshold (F-A18-11, rc24) at which the owner is notified
+	// once per chat per day via Telegram: when a chat's recorded
+	// usage for the UTC day reaches this many tokens, the daemon
+	// sends the owner one alert naming the chat, its usage and
+	// the threshold, and does not alert again for that chat until
+	// the next UTC day. It is an ABSOLUTE token count, not a
+	// percentage of the budget — so it works exactly the same
+	// whether the budget is finite or unlimited (0): an
+	// unlimited budget still alerts, it just never refuses a
+	// turn. 0 disables the alert (the default: no alert is ever
+	// sent). The valid range when set is 1-10000000. The
+	// "alerted today" state is persisted with the usage in
+	// <dataDir>/budget.json, so a daemon restart does not
+	// re-alert for a day that already alerted, and the flag
+	// resets with the UTC day like the usage does.
+	DailyBudgetAlertThresholdTokens int `json:"daily_budget_alert_threshold_tokens"`
 	// Temperature, when set, is passed to the provider on every call.
 	// Nil means the provider default. 0 requests deterministic output
 	// (used by the live-model E2E test); the valid range is 0-2.
@@ -397,6 +414,16 @@ func (c *Config) Validate() error {
 	// tuning choice, and is rejected rather than silently clamped.
 	if c.PerChatDailyTokenBudget != 0 && (c.PerChatDailyTokenBudget < 1000 || c.PerChatDailyTokenBudget > 10000000) {
 		return errors.New("config: per_chat_daily_token_budget must be 0 (unlimited) or between 1000 and 10000000")
+	}
+	// F-A18-11: the daily usage alert threshold is 0 (disabled)
+	// or 1-10M tokens. It is an absolute count, independent of
+	// the budget limit above — a threshold may be set (and will
+	// fire) even with an unlimited budget, and may be above a
+	// finite limit (the alert then fires when the final,
+	// over-limit turn's spend reaches it). A negative or absurd
+	// value is a typo and is rejected, like the budget itself.
+	if c.DailyBudgetAlertThresholdTokens != 0 && (c.DailyBudgetAlertThresholdTokens < 1 || c.DailyBudgetAlertThresholdTokens > 10000000) {
+		return errors.New("config: daily_budget_alert_threshold_tokens must be 0 (disabled) or between 1 and 10000000")
 	}
 	// F-A3-2: the pprof port is 0 (the 6060 default) or a valid TCP
 	// port. A typo here must fail startup, not silently bind a

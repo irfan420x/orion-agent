@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,8 +71,9 @@ Usage:
   oriond --version        print version
   oriond --restore <snapshot>
                           restore ~/.orion from a backup snapshot and exit
-                          (F-A17-13; verify the snapshot first, then start
-                          normally to run)
+                          (F-A17-13; stop the daemon first — a running
+                          daemon would undo the restore — verify the
+                          snapshot first, then start normally to run)
 
 Environment:
   ORION_TELEGRAM_BASE_URL override the Telegram Bot API endpoint
@@ -109,14 +111,80 @@ func run(args []string) int {
 				fmt.Fprintln(os.Stderr, "oriond: --restore takes exactly one argument (a backup snapshot path)")
 				return 2
 			}
+			// F-A18-7 (restore half): a corrupt config must not
+			// block a restore — the operator restores precisely
+			// because the data dir is damaged, and the config
+			// file inside it may be damaged too. Load already
+			// falls back to the defaults when the file is
+			// missing; only a corrupt (or otherwise unloadable)
+			// file errors out, so fall back the same way here
+			// with a loud warning. The fallback honours
+			// ORION_DATA_DIR, the same env override Load
+			// applies, so a restore never silently targets
+			// ~/.orion while the daemon runs on another dir.
 			cfg, err := config.Load("")
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "oriond: cannot load config: %v\n", err)
+				cfg = config.Default()
+				if dir := os.Getenv("ORION_DATA_DIR"); dir != "" {
+					cfg.DataDir = dir
+				}
+				fmt.Fprintf(os.Stderr, "oriond: warning: cannot load config (%v); restoring with default data dir %s\n", err, cfg.DataDir)
+			}
+			// F-A18-2: take the instance lock BEFORE restoring.
+			// A running daemon re-saves sessions + memory on
+			// exit, silently undoing the restore; the lock is
+			// the only thing that can see it. If the daemon is
+			// running the lock fails and restore is refused —
+			// the operator stops the daemon first and retries.
+			lockFile, err := acquireInstanceLock(cfg.DataDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
+				if errors.Is(err, errAlreadyRunning) {
+					fmt.Fprintln(os.Stderr, "oriond: stop the daemon first (systemctl stop oriond, or SIGTERM), then retry --restore")
+					return exitAlreadyRunning
+				}
 				return 1
 			}
+			// Closure, not `defer lockFile.Close()`: the lock
+			// file may be replaced by the restore below (see
+			// refreshInstanceLock), and the deferred close must
+			// release whichever file is held at return time.
+			defer func() {
+				if lockFile != nil {
+					_ = lockFile.Close()
+				}
+			}()
 			if err := backup.Restore(args[1], cfg.DataDir); err != nil {
 				fmt.Fprintf(os.Stderr, "oriond: restore failed: %v\n", err)
 				return 1
+			}
+			// F-A18-2: a snapshot usually carries its own
+			// oriond.lock, copied via temp file + rename, so the
+			// path we locked may now be a different file — and
+			// flock follows the inode, not the path. Re-take the
+			// lock on the current file so no daemon can start
+			// alongside the rest of the restore. A failure here
+			// means another process took the new file's lock
+			// mid-restore; the restore itself already succeeded,
+			// so warn loudly instead of failing it.
+			if refreshed, rerr := refreshInstanceLock(lockFile, cfg.DataDir); rerr != nil {
+				fmt.Fprintf(os.Stderr, "oriond: warning: restore succeeded but the instance lock was taken by another process during the restore (%v); check no daemon started mid-restore before starting one\n", rerr)
+				lockFile = nil
+			} else {
+				lockFile = refreshed
+			}
+			// F-A18-2 bonus: a snapshot taken while the
+			// allow-all opt-in window was open contains a future
+			// <dataDir>/allow-all-until, and restoring it would
+			// reopen the bot to every chat on the next start —
+			// even if the operator has since closed the window.
+			// A future deadline is closed (see
+			// neutralizeRestoredAllowAll); a write failure is a
+			// warning, never a failed restore.
+			if neutralized, nerr := neutralizeRestoredAllowAll(cfg.DataDir); nerr != nil {
+				fmt.Fprintf(os.Stderr, "oriond: warning: could not close a restored allow-all window (%v); check %s before starting the daemon\n", nerr, filepath.Join(cfg.DataDir, messaging.AllowAllStateFileName))
+			} else if neutralized {
+				fmt.Fprintf(os.Stderr, "oriond: warning: restored snapshot contained a future allow-all window; it is now closed (delete %s to open a fresh one)\n", filepath.Join(cfg.DataDir, messaging.AllowAllStateFileName))
 			}
 			fmt.Fprintf(os.Stderr, "oriond: restored data dir %s from snapshot %s; start normally to run\n", cfg.DataDir, args[1])
 			return 0
@@ -342,6 +410,21 @@ func run(args []string) int {
 	}
 	messaging.InstallApprovalCallbackHandler(gw, gate, ownerID, cards, "oriond")
 
+	// Daily budget threshold alert (F-A18-11, rc24): when a
+	// chat's usage today reaches the configured threshold, the
+	// owner (the first allowlisted chat) is notified once for
+	// the day. The App decides when an alert fires and formats
+	// it; this closure only delivers it through the gateway.
+	// With no owner configured there is nobody to notify, so
+	// the delivery fails loudly (logged by the App, retried on
+	// the next record) instead of silently dropping the alert.
+	a.SetBudgetAlertNotifier(func(ctx context.Context, chatID int64, text string) error {
+		if ownerID == 0 {
+			return errors.New("oriond: no owner configured; budget alert not sent")
+		}
+		return gw.SendMessage(ctx, ownerID, text)
+	})
+
 	allowed := make(map[int64]bool, len(a.Config.TelegramAllowedChats))
 	for _, id := range a.Config.TelegramAllowedChats {
 		allowed[id] = true
@@ -465,6 +548,14 @@ func signalName(sig os.Signal) string {
 	}
 }
 
+// errAlreadyRunning marks an instance-lock failure caused by
+// another live instance (not a permissions or missing-dir failure):
+// the --restore path uses errors.Is on it to tell the operator to
+// stop the daemon first instead of reporting a generic lock error.
+// The wrapped message keeps the exact "already running" wording
+// the F-A17-3 tests assert on.
+var errAlreadyRunning = errors.New("another oriond instance is already running")
+
 // acquireInstanceLock takes an exclusive, non-blocking flock on
 // <dataDir>/oriond.lock (F-A17-3). The returned file must stay open
 // for the life of the process: closing it releases the lock. A second
@@ -484,11 +575,88 @@ func acquireInstanceLock(dataDir string) (*os.File, error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, fmt.Errorf("oriond: another oriond instance is already running (instance lock %q is held); refusing to start a second poller", path)
+			return nil, fmt.Errorf("oriond: %w (instance lock %q is held); refusing to start a second poller", errAlreadyRunning, path)
 		}
 		return nil, fmt.Errorf("oriond: lock instance lock %q: %w", path, err)
 	}
 	return f, nil
+}
+
+// refreshInstanceLock re-establishes the instance lock on the current
+// lock file after a restore (F-A18-2): a snapshot usually contains
+// its own oriond.lock, and Restore copies it via temp file + rename,
+// replacing the path the caller locked — but flock follows the inode,
+// not the path, so after the replace the caller would hold a lock on
+// a file nobody else opens, and a daemon starting then could poll
+// alongside the restore. When the path still points at the locked
+// file this returns f unchanged; when it was replaced it closes f
+// and takes the lock on the current file. An error means another
+// process took the new file's lock mid-restore: f is already closed
+// then, and the caller must not pretend the lock is still held.
+func refreshInstanceLock(f *os.File, dataDir string) (*os.File, error) {
+	if !instanceLockReplaced(f, dataDir) {
+		return f, nil
+	}
+	_ = f.Close()
+	return acquireInstanceLock(dataDir)
+}
+
+// instanceLockReplaced reports whether <dataDir>/oriond.lock is no
+// longer the file f locks (replaced, deleted, or unreadable —
+// conservative: any doubt counts as replaced, so the caller re-takes
+// the lock on the current path instead of holding a stale one).
+func instanceLockReplaced(f *os.File, dataDir string) bool {
+	oldStat, err := f.Stat()
+	if err != nil {
+		return true
+	}
+	newStat, err := os.Stat(filepath.Join(dataDir, "oriond.lock"))
+	if err != nil {
+		return true
+	}
+	oldSys, ok := oldStat.Sys().(*syscall.Stat_t)
+	if !ok {
+		return true
+	}
+	newSys, ok := newStat.Sys().(*syscall.Stat_t)
+	if !ok {
+		return true
+	}
+	return oldSys.Ino != newSys.Ino
+}
+
+// neutralizeRestoredAllowAll closes a resurrected allow-all window
+// after a restore (F-A18-2 bonus): a snapshot taken while the
+// allow-all opt-in window was open contains <dataDir>/allow-all-until
+// with a future deadline, and restoring it would reopen the bot to
+// every chat on the next start — even if the operator has since
+// closed the window or set an allowlist. A future deadline is
+// overwritten with a past one, so the next start fails closed
+// (the gateway refuses all chats until telegram_allowed_chats is
+// set; deleting the file starts a fresh window — the same semantics
+// as a corrupt state file). A missing, past, or unreadable deadline
+// is left alone: missing means no window was open, past is already
+// shut, and unreadable already fails closed at the gateway. It
+// reports whether it closed a window; a write failure is returned
+// so the caller can warn (the restore itself already succeeded).
+func neutralizeRestoredAllowAll(dataDir string) (bool, error) {
+	path := filepath.Join(dataDir, messaging.AllowAllStateFileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false, nil
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return false, nil
+	}
+	if !deadline.After(time.Now()) {
+		return false, nil
+	}
+	expired := time.Now().Add(-time.Minute).Format(time.RFC3339Nano)
+	if err := os.WriteFile(path, []byte(expired+"\n"), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // buildApprovalGate wires the permission gate for the daemon
@@ -803,10 +971,11 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 		// check lives in the handler (CommandEnv.isOwner, using
 		// OwnerID); /rules takes IsOwner as a function so the
 		// handler never guesses when the gate is unavailable.
-		OwnerID:      ownerID,
-		BudgetInfo:   a.BudgetInfoForChat,
-		SetBudget:    a.SetDailyBudget,
-		ReloadSkills: a.ReloadSkills,
+		OwnerID:              ownerID,
+		BudgetInfo:           a.BudgetInfoForChat,
+		BudgetAlertThreshold: a.BudgetAlertThreshold,
+		SetBudget:            a.SetDailyBudget,
+		ReloadSkills:         a.ReloadSkills,
 		IsOwner: func(chatID int64) bool {
 			return ownerID != 0 && chatID == ownerID
 		},

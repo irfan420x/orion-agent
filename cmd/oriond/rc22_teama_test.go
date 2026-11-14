@@ -91,6 +91,48 @@ func TestShippedUnitRestartsOnRestartRequest(t *testing.T) {
 	}
 }
 
+func TestShippedUnitHardeningDirectives(t *testing.T) {
+	// F-A18-4 (rc24): the shipped user unit must carry the same
+	// three verified-safe hardening directives as the live unit
+	// (systemd/oriond.service) — they lived only in the live unit
+	// before, so a fresh install ran unhardened. The values are
+	// pinned exactly, in both files, so the two copies cannot drift
+	// the way the restart policy did (F-A16-1).
+	//
+	// Why these three are safe for the shipped user unit:
+	// NoNewPrivileges — oriond never needs to gain privileges.
+	// ProtectSystem=true (NOT strict/full) — makes /usr, /boot and
+	// /etc read-only while leaving /home writable, and the data dir
+	// (~/.orion) and WorkingDirectory (%h) both live under /home;
+	// strict/full would make /home read-only and break the daemon.
+	// PrivateTmp — oriond shares no /tmp files with other services
+	// (the sandbox root is under ~/.orion/sandbox).
+	// The two must-NOTs are pinned too: ProtectHome would hide the
+	// data dir, and any CapabilityBoundingSet breaks the sandbox's
+	// `unshare --user --map-root-user` uid_map write (see the live
+	// unit's header for the 9-unit matrix that proved it).
+	for _, path := range []string{"../../oriond.service", "../../systemd/oriond.service"} {
+		for _, tc := range []struct {
+			key  string
+			want string
+		}{
+			{"NoNewPrivileges", "true"},
+			{"ProtectSystem", "true"},
+			{"PrivateTmp", "true"},
+		} {
+			if got := rc22UnitValue(t, path, tc.key); got != tc.want {
+				t.Errorf("%s %s = %q, want %q (F-A18-4 hardening)", path, tc.key, got, tc.want)
+			}
+		}
+		if got := rc22UnitValue(t, path, "ProtectHome"); got != "" {
+			t.Errorf("%s ProtectHome = %q, want unset — the data dir lives in $HOME (F-A18-4)", path, got)
+		}
+		if got := rc22UnitValue(t, path, "CapabilityBoundingSet"); got != "" {
+			t.Errorf("%s CapabilityBoundingSet = %q, want unset — any restriction breaks the sandbox unshare uid_map write (F-A18-4)", path, got)
+		}
+	}
+}
+
 func TestDaemonRestartCommentIsAccurate(t *testing.T) {
 	// F-A17-2: the /restart comment must name the real policy —
 	// exit 42 with Restart=on-failure + RestartForceExitStatus=42 —

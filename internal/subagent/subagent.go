@@ -628,6 +628,18 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 	close(entry.done)
 	m.mu.Unlock()
 	if lateUsage {
+		// Track the late-outcome waiter in m.wg so Shutdown
+		// waits for its persist too: the waiter writes the
+		// settled usage to the snapshot, and a Shutdown that
+		// returns before it runs leaves a writer racing the
+		// caller's cleanup of the store dir (a TempDir
+		// RemoveAll failing with "directory not empty", and a
+		// daemon killed in the gap losing the settled usage).
+		// The Add happens before runTask's deferred wg.Done,
+		// so the counter cannot hit zero in between. The
+		// ShutdownTimeout bound still applies if the executor
+		// never returns and the waiter parks forever.
+		m.wg.Add(1)
 		go m.awaitLateOutcome(entry, ch)
 	}
 }
@@ -655,6 +667,10 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 // at removal time, so no charger could have counted it yet, and
 // the fold is exact: the tokens are recorded once, in the ledger.
 func (m *Manager) awaitLateOutcome(entry *taskEntry, ch <-chan outcome) {
+	// Paired with the m.wg.Add(1) in runTask: Shutdown waits for
+	// this waiter (bounded by ShutdownTimeout) so no persist can
+	// land after Shutdown returns.
+	defer m.wg.Done()
 	o := <-ch
 	m.mu.Lock()
 	if entry.detached {

@@ -545,6 +545,12 @@ func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit 
 		}, stats.SubagentTokens); recErr != nil && a.Logger != nil {
 			a.Logger.Printf("app: chat %d: turn recorded %d tokens, over daily budget: %v", chatID, stats.Tokens, recErr)
 		}
+		// Daily usage alert (F-A18-11): the turn's spend may
+		// have crossed the threshold — check after recording,
+		// so the alert sees the spend that just happened.
+		// Never fatal: a failed delivery is logged inside
+		// maybeAlertBudget and retried on the next record.
+		a.maybeAlertBudget(ctx, chatID)
 	}
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
@@ -746,6 +752,12 @@ func (a *App) sweepAndRecordSubagents(chatID int64) int {
 	if err := a.Budget.RecordUsageForModel(chatID, providerName, modelName, model.Usage{TotalTokens: swept}, swept); err != nil && a.Logger != nil {
 		a.Logger.Printf("app: chat %d: session-close subagent sweep recorded %d tokens, over daily budget: %v", chatID, swept, err)
 	}
+	// Daily usage alert (F-A18-11): the swept spend may have
+	// crossed the threshold. No turn context exists at session
+	// close, so the notifier runs on context.Background();
+	// delivery is best-effort and logged on failure, never a
+	// reason to fail the shutdown.
+	a.maybeAlertBudget(context.Background(), chatID)
 	return swept
 }
 
@@ -935,7 +947,7 @@ func (a *App) compressForChatWith(ctx context.Context, chatID int64, keepRecent 
 	// (the compress pushed the chat over its limit) is logged,
 	// never fatal: the summary already happened, and the NEXT
 	// turn is the one that gets refused.
-	before, after, summaryLen, summary, err := compressWithOn(ctx, cs.store, provider, keepRecent, sessionMemory, a.compressUsageSink(chatID))
+	before, after, summaryLen, summary, err := compressWithOn(ctx, cs.store, provider, keepRecent, sessionMemory, a.compressUsageSink(ctx, chatID))
 	if err == nil && summaryLen > 0 {
 		// A successful manual /compress clears this chat's
 		// auto-compaction circuit breaker, and the summary is
@@ -963,7 +975,10 @@ func (a *App) compressForChatWith(ctx context.Context, chatID int64, keepRecent 
 // safe to pass when the app has no Budget (it no-ops) and safe to
 // call from compressWithOn even when the summary is later refused
 // by the what-not-to-save gate — the tokens were spent either way.
-func (a *App) compressUsageSink(chatID int64) func(model.Usage) {
+// The summarisation spend may cross the daily usage alert
+// threshold (F-A18-11), so the sink checks for an alert after
+// recording, on the turn's context.
+func (a *App) compressUsageSink(ctx context.Context, chatID int64) func(model.Usage) {
 	return func(u model.Usage) {
 		if a == nil || a.Budget == nil {
 			return
@@ -972,6 +987,7 @@ func (a *App) compressUsageSink(chatID int64) func(model.Usage) {
 		if err := a.Budget.RecordUsageForModel(chatID, providerName, modelName, u, 0); err != nil && a.Logger != nil {
 			a.Logger.Printf("app: chat %d: /compress recorded %d tokens, over daily budget: %v", chatID, u.TotalTokens, err)
 		}
+		a.maybeAlertBudget(ctx, chatID)
 	}
 }
 

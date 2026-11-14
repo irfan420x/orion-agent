@@ -19,6 +19,16 @@
 // snapshot (or recreate the link on restore). Non-regular files
 // (sockets, devices, fifos) are skipped the same way.
 //
+// LIVE, NOT QUIESCED (F-A18-8): a snapshot is a live copy — the
+// daemon is never paused while files are copied, so the snapshot
+// may mix moments (see Snapshot). Each file's hash covers the bytes
+// copied, so every file is self-consistent, but there is no
+// cross-file instant. The manifest records this honestly
+// (quiesced=false plus a plain-language note) so a restore operator
+// knows what they are getting; a real quiesce needs a shared lock
+// on every daemon persistence write, surveyed in Snapshot's doc
+// comment and deliberately not built for rc24.
+//
 // WIRING (coordinator): the daemon never calls this on its own
 // — snapshots are an operator action. Suggested entry points:
 //
@@ -65,6 +75,22 @@ const manifestVersion = 1
 // manifestFileName is the manifest's file name inside a snapshot.
 const manifestFileName = "manifest.json"
 
+// instanceLockFileName is the daemon's instance-lock file
+// (oriond.lock, held via flock by cmd/oriond and cmd/orion).
+// Restore never verifies or copies it: it is a runtime artifact,
+// not data — the restoring process holds the live lock (F-A18-2),
+// and flock follows the inode, so replacing the file would
+// silently drop the lock and let a second daemon start against a
+// half-restored data dir.
+const instanceLockFileName = "oriond.lock"
+
+// liveSnapshotNote is recorded in every manifest Snapshot writes
+// (F-A18-8): the snapshot is live, not quiesced, and the operator
+// restoring it must know that. The note is deliberately plain
+// language — it is read by an operator at 3am deciding whether to
+// trust a restore, not by code.
+const liveSnapshotNote = "live snapshot: files were copied one by one while the daemon may have been writing; each file's hash covers the bytes copied, but files may come from different moments, so a restore may mix moments (e.g. memory.json from after a turn whose sessions.json predates it). No daemon writes were paused."
+
 // DefaultDir returns the default backup root for a data dir: a
 // sibling of the data dir, so a snapshot never lives inside the
 // tree it backs up (a wipe of the data dir then leaves the
@@ -83,10 +109,24 @@ type manifestFile struct {
 
 // manifest is the snapshot's manifest.json.
 type manifest struct {
-	Version   int            `json:"version"`
-	CreatedAt time.Time      `json:"created_at"`
-	Source    string         `json:"source"`
-	Files     []manifestFile `json:"files"`
+	Version   int       `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+	Source    string    `json:"source"`
+	// Quiesced reports whether the daemon's persistence writes were
+	// paused while the files were copied. It is always false today
+	// (F-A18-8): Snapshot takes a live copy — see Snapshot. The
+	// field exists so a future quiesced snapshot can say so
+	// truthfully, and so an operator (or a future Restore) can tell
+	// a live snapshot from a quiesced one without guessing. A
+	// manifest written before this field existed (rc23 and older)
+	// decodes as false, which is correct: those were live too.
+	Quiesced bool `json:"quiesced"`
+	// Consistency describes what cross-file consistency the
+	// snapshot provides. For a live snapshot it is
+	// liveSnapshotNote; a future quiesced format would say what
+	// was held and when.
+	Consistency string         `json:"consistency"`
+	Files       []manifestFile `json:"files"`
 }
 
 // SnapshotInfo is one snapshot as List reports it.
@@ -104,6 +144,67 @@ type SnapshotInfo struct {
 // collide. Rotation is NOT done here — call Prune after Snapshot
 // (the CLI does) so a caller that snapshots in a loop cannot
 // delete the snapshot it just made by mistake.
+//
+// LIVE SNAPSHOT (F-A18-8): Snapshot does NOT quiesce the daemon.
+// It copies the data dir file by file while oriond may be writing,
+// so the snapshot may mix moments: memory.json can postdate
+// sessions.json, subagent-state.json can predate budget.json, and
+// a transcript can end mid-turn. Every file's hash covers exactly
+// the bytes copied, so each file is self-consistent, but there is
+// no cross-file instant — a restore resurrects a mix of moments,
+// not one instant. The manifest records this honestly
+// (quiesced=false plus a plain-language note) so the operator
+// restoring it knows what they are getting; `orion backup --help`
+// says the same. Every daemon persistence write is individually
+// atomic (temp file + fsync + rename), so a live snapshot never
+// contains a torn file — only files from different moments.
+//
+// A real quiesce was surveyed for rc24 and deliberately NOT built:
+// it would need a shared lock around every daemon persistence write
+// (the candidate design is a reader-writer flock on a dedicated
+// backup.lock in the data dir, backup holding it exclusively for
+// the copy), and the write paths that would ALL have to take it are
+// spread across eight packages:
+//
+//   - memory.FileStore.saveLocked → memory.json (shared and per-chat
+//     chats/<id>/memory.json), internal/memory/file_store.go
+//   - memory.TypedStore.writeFileLocked → memories/*.json,
+//     internal/memory/typed.go
+//   - memory.SessionLog.writeLocked / Clear →
+//     chats/<id>/session-memory.md, internal/memory/session.go
+//   - messaging.SessionStore.saveLocked → sessions.json,
+//     internal/messaging/session.go
+//   - subagent.writePersistedState → subagent-state.json,
+//     internal/subagent/persistence.go
+//   - budget.saveLocked → budget.json, internal/budget/budget.go
+//   - messaging.persistAllowAllDeadline → allow-all deadline file,
+//     internal/messaging/telegram.go
+//   - session.Transcript.appendLocked / WriteCurrent →
+//     sessions/<id>.jsonl and sessions/current.json,
+//     internal/session/transcript.go
+//   - permissions.RuleStore.saveLocked → permissions.json,
+//     internal/permissions/rules.go
+//   - security.AuditLog.Append → audit.jsonl (+ signed head),
+//     internal/security/audit.go — a hot path (every audited action)
+//   - config.Save → config.json, internal/config/config.go
+//   - app.writeChatProviderOverride → chats/<id>/ provider override,
+//     internal/app/chats.go
+//   - app conversation export → exports/conversation-*.md,
+//     internal/app/commands.go
+//   - the orion CLI's own writes (config.Save, rules changes) would
+//     need the shared lock too, or a CLI write could still race a
+//     backup.
+//
+// That is a cross-package change on hot paths (audit appends,
+// transcript appends) plus new stall semantics — a backup holding
+// the exclusive lock for a whole copy would stall every daemon
+// persist for that long, and a missed write path would leave the
+// snapshot mixed-moment while the manifest claims it is quiesced,
+// which is worse than an honest live snapshot. Until all of those
+// paths are wired and proven, the honest live snapshot plus this
+// survey is the safe state. The flock idiom itself already exists
+// in-tree (security/audit.go, session/transcript.go,
+// tools/planning.go) if a future RC takes the quiesce on.
 func Snapshot(dataDir, backupDir string) (string, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return "", fmt.Errorf("backup: data dir must not be empty")
@@ -137,7 +238,7 @@ func Snapshot(dataDir, backupDir string) (string, error) {
 	}
 	// A snapshot that fails part-way is removed, never left
 	// half-populated for Restore to trip over.
-	man := manifest{Version: manifestVersion, CreatedAt: time.Now(), Source: srcAbs}
+	man := manifest{Version: manifestVersion, CreatedAt: time.Now(), Source: srcAbs, Quiesced: false, Consistency: liveSnapshotNote}
 	walkErr := filepath.WalkDir(srcAbs, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -251,6 +352,10 @@ func copyFileHashed(src, dst string, mode fs.FileMode) (string, error) {
 // are not in the snapshot are left alone (a merge restore, not a
 // wipe-and-replace — deleting the operator's newer files because
 // a snapshot predates them would be data loss, not recovery).
+// The instance-lock file (oriond.lock) is never verified or
+// restored: it is a runtime artifact, not data, and the restoring
+// process holds the live lock (F-A18-2) — replacing the file
+// would silently drop that lock.
 func Restore(snapshotPath, dataDir string) error {
 	if strings.TrimSpace(snapshotPath) == "" {
 		return fmt.Errorf("backup: snapshot path must not be empty")
@@ -279,6 +384,11 @@ func Restore(snapshotPath, dataDir string) error {
 		if f.Path == "" || strings.Contains(f.Path, "..") || filepath.IsAbs(f.Path) {
 			return fmt.Errorf("backup: manifest in %q has unsafe path %q", snapAbs, f.Path)
 		}
+		if f.Path == instanceLockFileName {
+			// F-A18-2: the instance-lock file is a runtime
+			// artifact, never restored (see Restore doc).
+			continue
+		}
 		p := filepath.Join(snapAbs, filepath.FromSlash(f.Path))
 		sum, err := hashFile(p)
 		if err != nil {
@@ -299,6 +409,11 @@ func Restore(snapshotPath, dataDir string) error {
 		return fmt.Errorf("backup: create data dir: %w", err)
 	}
 	for _, f := range man.Files {
+		if f.Path == instanceLockFileName {
+			// F-A18-2: never replace the live lock file (see
+			// Restore doc) — the restoring process holds it.
+			continue
+		}
 		src := filepath.Join(snapAbs, filepath.FromSlash(f.Path))
 		dst := filepath.Join(dataDir, filepath.FromSlash(f.Path))
 		if _, err := copyFileHashed(src, dst, f.Mode); err != nil {

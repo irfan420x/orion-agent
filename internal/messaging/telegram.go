@@ -106,6 +106,47 @@ type TGPhotoSize struct {
 	FileSize int    `json:"file_size,omitempty"`
 }
 
+// TGSticker is a sticker attached to a message (F-A18-9). Only
+// FileID matters to Orion — the sticker bytes are never fetched:
+// Orion has no vision support, so a sticker is answered with an
+// honest cannot-process reply, never downloaded.
+type TGSticker struct {
+	FileID string `json:"file_id"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+// TGVoice is a voice note attached to a message (F-A18-9). Orion
+// has no speech-to-text support; the bytes are never fetched.
+type TGVoice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+}
+
+// TGVideo is a video attached to a message (F-A18-9). Orion has
+// no video support; the bytes are never fetched.
+type TGVideo struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	Duration int    `json:"duration"`
+}
+
+// TGDocument is a file attached to a message (F-A18-9). Orion
+// cannot read files sent here; the bytes are never fetched.
+type TGDocument struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+}
+
+// TGLocation is a location attached to a message (F-A18-9). Orion
+// has no maps support.
+type TGLocation struct {
+	Longitude float64 `json:"longitude"`
+	Latitude  float64 `json:"latitude"`
+}
+
 // TGMessage is a Telegram message.
 type TGMessage struct {
 	MessageID int64   `json:"message_id"`
@@ -118,11 +159,75 @@ type TGMessage struct {
 	// — HasPhoto is the only reliable photo test. The photo bytes
 	// are never fetched: Orion has no vision support.
 	Photo []TGPhotoSize `json:"photo,omitempty"`
+	// Sticker, Voice, Video, Document and Location hold a
+	// non-photo attachment, if any (F-A18-9). Like a photo, the
+	// bytes are never fetched — see MediaKind and
+	// cannotProcessMediaMessage. A message carries at most one
+	// of these in practice; MediaKind reports the first in a
+	// fixed order when several are somehow present.
+	Sticker  *TGSticker  `json:"sticker,omitempty"`
+	Voice    *TGVoice    `json:"voice,omitempty"`
+	Video    *TGVideo    `json:"video,omitempty"`
+	Document *TGDocument `json:"document,omitempty"`
+	Location *TGLocation `json:"location,omitempty"`
 }
 
 // HasPhoto reports whether the message carries a photo attachment.
 func (m *TGMessage) HasPhoto() bool {
 	return m != nil && len(m.Photo) > 0
+}
+
+// MediaKind returns the kind of non-photo media attached to the
+// message ("sticker", "voice", "video", "document" or "location"),
+// or "" when the message carries no non-photo media (F-A18-9). A
+// photo is not media here — HasPhoto covers it.
+func (m *TGMessage) MediaKind() string {
+	if m == nil {
+		return ""
+	}
+	switch {
+	case m.Sticker != nil:
+		return "sticker"
+	case m.Voice != nil:
+		return "voice"
+	case m.Video != nil:
+		return "video"
+	case m.Document != nil:
+		return "document"
+	case m.Location != nil:
+		return "location"
+	default:
+		return ""
+	}
+}
+
+// HasMedia reports whether the message carries non-photo media.
+func (m *TGMessage) HasMedia() bool {
+	return m.MediaKind() != ""
+}
+
+// cannotProcessMediaMessage is the honest reply sent when a
+// non-photo media message arrives (F-A18-9): Orion cannot see,
+// hear, watch, read or map the attachment, so it must say so —
+// and ask for words — instead of silently dropping the message
+// or running a turn on an attachment the model never received.
+// kind is one of MediaKind's values; anything else gets the
+// generic form.
+func cannotProcessMediaMessage(kind string) string {
+	switch kind {
+	case "sticker":
+		return "😀 I can't process stickers yet — Orion can't interpret sticker images, so please describe what you meant in words and I'll help from that."
+	case "voice":
+		return "🎙️ I can't process voice notes yet — Orion has no speech-to-text support, so please type your message in words and I'll help from that."
+	case "video":
+		return "🎬 I can't process videos yet — Orion has no video support, so I can't watch video clips sent here. Please describe what you need in words and I'll help from that."
+	case "document":
+		return "📄 I can't process documents yet — Orion can't read files sent here. Please paste the text you need help with and I'll help from that."
+	case "location":
+		return "📍 I can't process locations yet — Orion has no maps support, so please type the place name or address in words and I'll help from that."
+	default:
+		return "I can't process that kind of message yet — please send it in words and I'll help from that."
+	}
 }
 
 // CannotSeeImagesMessage is the honest reply sent when a photo
@@ -1876,6 +1981,24 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		_ = g.SendMessage(ctx, upd.Message.Chat.ID, CannotSeeImagesMessage)
 	}
 
+	// handleMedia answers a non-photo media message (F-A18-9):
+	// the honest cannot-process reply for its kind, never a turn
+	// (the model never received the attachment) and never
+	// silence. It mirrors handlePhoto's confirmation discipline
+	// (markDecided on completion, never at spawn) and takes the
+	// per-chat lock, so a media reply cannot overtake a turn for
+	// the same chat. The send is best-effort, like every other
+	// reply: a failed send must not kill polling.
+	handleMedia := func(upd Update, kind string) {
+		defer markDecided(upd.UpdateID)
+		defer func() { <-sem }()
+		lock := chatLock(upd.Message.Chat.ID)
+		lock.Lock()
+		defer lock.Unlock()
+		g.logf("telegram poll: %s from chat %d answered with cannot-process reply (no %s support)", kind, upd.Message.Chat.ID, kind)
+		_ = g.SendMessage(ctx, upd.Message.Chat.ID, cannotProcessMediaMessage(kind))
+	}
+
 	handle := func(upd Update) {
 		// Registered first, so it runs LAST (LIFO): after the
 		// reply/apology is sent, after the panic recovery, and
@@ -2329,11 +2452,17 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			// "text", so Text is empty for a captioned photo —
 			// and a photo WITH text still shows an image the
 			// model cannot see, so answering the text while
-			// ignoring the photo would mislead. The photo
-			// branch below runs after the allowlist/sender
-			// checks, so a stranger's photo gets no reply.
+			// ignoring the photo would mislead. Non-photo media
+			// (F-A18-9) is the same: a voice note, video,
+			// document, sticker or location the model never
+			// received must be answered honestly, never run as
+			// a turn on its (empty) text and never dropped
+			// silently. Both branches below run after the
+			// allowlist/sender checks, so a stranger's media
+			// gets no reply.
 			hasPhoto := upd.Message.HasPhoto()
-			if strings.TrimSpace(upd.Message.Text) == "" && !hasPhoto {
+			mediaKind := upd.Message.MediaKind()
+			if strings.TrimSpace(upd.Message.Text) == "" && !hasPhoto && mediaKind == "" {
 				markDecided(upd.UpdateID)
 				progress++
 				return true
@@ -2383,6 +2512,29 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 					return false
 				}
 				go handlePhoto(upd)
+				progress++
+				return true
+			}
+			// Non-photo media (F-A18-9): answer honestly instead
+			// of running a turn. The sender is already
+			// authorised (above); the reply goes through the same
+			// in-flight/sem discipline as a turn, so a crash
+			// mid-reply re-delivers the media instead of
+			// confirming and losing it. A media message WITH
+			// text still takes this branch — answering the text
+			// while ignoring the attachment would mislead, as
+			// with a photo.
+			if mediaKind != "" {
+				if !markInFlight(upd.UpdateID) {
+					return true
+				}
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					unmarkInFlight(upd.UpdateID)
+					return false
+				}
+				go handleMedia(upd, mediaKind)
 				progress++
 				return true
 			}
@@ -2454,7 +2606,9 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 // Poll loops on GetUpdates until ctx is cancelled, delivering each
 // incoming message with non-empty text to handler and sending the
 // handler's reply back to the same chat. A photo message is answered
-// with the cannot-see reply inside PollStream and never reaches the
+// with the cannot-see reply, and a non-photo media message
+// (sticker, voice, video, document, location) with its
+// cannot-process reply, inside PollStream; neither reaches the
 // handler. It is a thin wrapper over
 // PollStream: the handler receives no progress events and no footer
 // is appended (stats nil). All PollStream semantics apply — backoff

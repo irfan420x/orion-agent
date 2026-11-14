@@ -349,11 +349,22 @@ if [ "$WITH_SYSTEMD" -eq 1 ]; then
 		# bot is running when it is not. (A failed start is still
 		# reported: the whole enable --now must succeed for the
 		# success message.)
-		if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now oriond.service 2>/dev/null; then
+		#
+		# rc24: a failed reload/enable MUST fail the install
+		# loudly (non-zero exit + clear error), not warn and exit
+		# 0 — the old warning was easy to miss, so the operator
+		# walked away believing the bot was running when the unit
+		# had never started. The unit file itself is already
+		# installed at this point, so the fix is to run the
+		# command by hand (or re-run install.sh) once systemd
+		# works; systemctl's own error is left visible (no
+		# 2>/dev/null) so the reason is not hidden. The
+		# "systemctl not found" branch below stays a warning:
+		# a non-systemd host genuinely has nothing to enable.
+		if systemctl --user daemon-reload && systemctl --user enable --now oriond.service; then
 			echo "oriond.service enabled and started"
 		else
-			echo "warning: could not reload/enable/start the user systemd instance (no user session?)" >&2
-			echo "warning: run manually once logged in: systemctl --user daemon-reload && systemctl --user enable --now oriond" >&2
+			die "could not reload/enable/start the user systemd instance (systemctl --user daemon-reload && systemctl --user enable --now oriond.service failed) — oriond.service was installed to $UNIT_DIR/oriond.service but is NOT enabled or running; fix systemd and run the command above once logged in, or re-run install.sh --systemd"
 		fi
 	else
 		echo "warning: systemctl not found — unit installed but not enabled; enable it on a systemd host" >&2

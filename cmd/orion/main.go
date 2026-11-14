@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -121,7 +122,10 @@ func main() {
 
 // exitCodeFor maps a command error to a process exit code. A nil error
 // is 0; an interruption (context.Canceled, e.g. Ctrl-C during chat, a
-// run, or a subagent wait) is also 0 and silent; any other error is 1.
+// run, or a subagent wait) is also 0 and silent; a refused second
+// poller (errAlreadyRunning) is 2, like oriond's exitAlreadyRunning,
+// so a supervisor — and the journal — can tell it apart from a
+// crash; any other error is 1.
 func exitCodeFor(err error) int {
 	if err == nil {
 		return 0
@@ -129,7 +133,47 @@ func exitCodeFor(err error) int {
 	if errors.Is(err, context.Canceled) {
 		return 0
 	}
+	if errors.Is(err, errAlreadyRunning) {
+		return 2
+	}
 	return 1
+}
+
+// errAlreadyRunning marks an instance-lock failure caused by another
+// live poller (oriond, `orion daemon`, or `orion telegram poll`
+// already holding <dataDir>/oriond.lock) — not a permissions or
+// missing-dir failure. exitCodeFor maps it to exit 2.
+var errAlreadyRunning = errors.New("another orion instance is already running")
+
+// acquireInstanceLock takes an exclusive, non-blocking flock on
+// <dataDir>/oriond.lock (F-A17-3 / F-A18-5) — the SAME lock file
+// oriond holds, so `orion daemon`, `orion telegram poll` and oriond
+// mutually exclude: a second poller would draw a Telegram 409 and
+// flap the good daemon too. This is a copy of the helper in
+// cmd/oriond/main.go (package main cannot be imported); keep the two
+// in sync — same file, same flock, same "already running" wording —
+// or a future change to one side silently reopens the 409 flap. The
+// returned file must stay open for the life of the polling loop:
+// closing it releases the lock. A lock failure that is not "already
+// locked" (permissions, missing dir) is a different error, so it is
+// never misreported as a second instance.
+func acquireInstanceLock(dataDir string) (*os.File, error) {
+	if dataDir == "" {
+		return nil, errors.New("orion: cannot take the instance lock: data dir is empty")
+	}
+	path := filepath.Join(dataDir, "oriond.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("orion: open instance lock %q: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w (instance lock %q is held); stop the other daemon or poller first", errAlreadyRunning, path)
+		}
+		return nil, fmt.Errorf("orion: lock instance lock %q: %w", path, err)
+	}
+	return f, nil
 }
 
 // signalName spells a shutdown signal the way an operator reads
@@ -803,6 +847,19 @@ func cmdTelegram(ctx context.Context, args []string) error {
 		return err
 	}
 	defer a.Close()
+	// F-A18-5: single-instance guard — the same flock on
+	// <dataDir>/oriond.lock oriond holds (see acquireInstanceLock):
+	// a second `orion telegram poll` would draw a Telegram 409 and
+	// flap the good poller. Taken here, before the token check and
+	// gateway setup, so the refusal is fast and never talks to
+	// Telegram at all. `telegram test` returned above and never
+	// polls, so it takes no lock. Held (defer Close) until this
+	// command returns.
+	lockFile, err := acquireInstanceLock(a.Config.DataDir)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
 	if a.Config.TelegramToken == "" {
 		return fmt.Errorf("telegram: no token configured (set ORION_TELEGRAM_TOKEN or config telegram_token)")
 	}
@@ -833,13 +890,16 @@ func cmdTelegram(ctx context.Context, args []string) error {
 		// F-A7-P2-8: this entrypoint is TURN-ONLY — it has no
 		// slash-command framework. /restart, /new, /model and
 		// the rest go to the agent as plain text here; only
-		// oriond dispatches slash commands (its registry and
-		// CommandEnv live in cmd/oriond, and wiring them here
+		// oriond dispatches slash commands in full (its registry
+		// and CommandEnv live in cmd/oriond, and wiring them here
 		// would duplicate ~300 lines of per-turn env, pause,
 		// footer, retry and restart plumbing with no shared
-		// home for it). /restart owner-only therefore holds
-		// vacuously on this path: there is no /restart command
-		// to refuse, only a text turn about restarting.
+		// home for it). The ONE exception is /rules (F-A18-10),
+		// dispatched by daemonTurnHandler because the rule store
+		// it operates on is already built by wireGate here.
+		// /restart owner-only therefore holds vacuously on this
+		// path: there is no /restart command to refuse, only a
+		// text turn about restarting.
 		if _, _, err := wireGate(a, gw); err != nil {
 			return err
 		}
@@ -875,6 +935,17 @@ Run Telegram polling until interrupted. Takes no arguments.
 		return err
 	}
 	defer a.Close()
+	// F-A18-5: single-instance guard — the same flock on
+	// <dataDir>/oriond.lock oriond holds (see acquireInstanceLock):
+	// a second `orion daemon` would draw a Telegram 409 and flap
+	// the good daemon. Taken here, before getMe and the startup
+	// banner, so the refusal is fast and never talks to Telegram
+	// at all. Held (defer Close) until this command returns.
+	lockFile, err := acquireInstanceLock(a.Config.DataDir)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
 	if a.Config.TelegramToken == "" {
 		return fmt.Errorf("daemon: no telegram token configured; run `orion chat` for CLI mode instead")
 	}
@@ -944,6 +1015,47 @@ func startDebugEndpoint(a *app.App) *debug.Server {
 	return srv
 }
 
+// newRulesCommandEnv builds the CommandEnv for the /rules command
+// this binary serves (F-A18-10): the permission gate's rule store
+// is already built by wireGate on both Telegram entrypoints, so
+// /rules needs no per-turn env, pause, footer, retry or restart
+// plumbing — only the gate's rule store and the owner id. The
+// closures read the gate lazily (a.PermissionGate) exactly like
+// cmd/oriond's buildCommandEnv, so the env stays valid even before
+// wireGate installs the gate; a dispatch before the gate exists
+// replies that rules are unavailable instead of guessing. The
+// owner is the first allowlisted chat, as in wireGate.
+func newRulesCommandEnv(a *app.App) *messaging.CommandEnv {
+	ownerID := messaging.OwnerIDFromAllowlist(a.Config.TelegramAllowedChats)
+	return &messaging.CommandEnv{
+		OwnerID: ownerID,
+		IsOwner: func(chatID int64) bool {
+			return ownerID != 0 && chatID == ownerID
+		},
+		ListRules: func() []permissions.Rule {
+			g := a.PermissionGate()
+			if g == nil || g.Rules() == nil {
+				return nil
+			}
+			return g.Rules().List()
+		},
+		DeleteRule: func(chatID int64, tool string) error {
+			g := a.PermissionGate()
+			if g == nil || g.Rules() == nil {
+				return errors.New("rules store unavailable")
+			}
+			return g.Rules().DeleteForChat(chatID, tool)
+		},
+		SetRule: func(chatID int64, tool string, action permissions.Action) error {
+			g := a.PermissionGate()
+			if g == nil || g.Rules() == nil {
+				return errors.New("rules store unavailable")
+			}
+			return g.Rules().SetForChat(chatID, tool, action)
+		},
+	}
+}
+
 // daemonTurnHandler is the turn function for `orion daemon` AND
 // `orion telegram poll` (F-A6-3): each chat runs on its own
 // per-chat agent through App.HandleForChat, so a chat's history,
@@ -956,16 +1068,19 @@ func startDebugEndpoint(a *app.App) *debug.Server {
 // check at all: any allowlisted chat could spend without limit on
 // this path while oriond enforced the budget.
 //
-// TURN-ONLY (F-A7-P2-8): this handler dispatches NO slash
-// commands. /restart, /new, /model, /help and every other slash
-// command go to the agent as plain text on these entrypoints; only
-// oriond runs the slash-command framework (messaging.Registry +
-// cmd/oriond's CommandEnv wiring). Use oriond for a bot that
-// answers /commands; use `orion daemon` / `orion telegram poll`
-// for a plain turn loop. Do not "fix" this by dispatching a
-// subset here: a partial registry would silently differ from
-// oriond's, and the full wiring (per-turn env, pause, footer,
-// retry, restart drain) has no shared home outside cmd/oriond.
+// TURN-ONLY (F-A7-P2-8) with one exception, /rules (F-A18-10):
+// every slash command except /rules goes to the agent as plain
+// text on these entrypoints; only oriond runs the full
+// slash-command framework (messaging.Registry + cmd/oriond's
+// CommandEnv wiring). /rules is dispatched here because the
+// permission-gate rule store it operates on is already built by
+// wireGate in this binary, the handler is the shared one from
+// messaging.DefaultRegistry (so it cannot drift from oriond's),
+// and it needs none of the per-turn env, pause, footer, retry or
+// restart plumbing a full registry would. Do not extend this to
+// a second command: a partial registry would silently differ
+// from oriond's, and the full wiring has no shared home outside
+// cmd/oriond.
 //
 // The turn context carries the approval context (P1-O2/P1-O4):
 // the chat the prompt goes to and the sender who may answer it.
@@ -984,6 +1099,14 @@ func startDebugEndpoint(a *app.App) *debug.Server {
 // returns, so the command does not exit while a turn is still
 // writing its transcript/memory into the data dir.
 func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string, error) {
+	// /rules (F-A18-10): the one slash command this binary
+	// dispatches — see newRulesCommandEnv. The registry is the
+	// shared DefaultRegistry, so the handler is oriond's handler;
+	// only /rules is ever dispatched here, and only when the text
+	// actually parses as /rules (Parse also strips an @botname
+	// suffix, so /rules@bot in a group works).
+	rulesEnv := newRulesCommandEnv(a)
+	rulesRegistry := messaging.DefaultRegistry(rulesEnv)
 	return func(c context.Context, chatID int64, text string) (string, error) {
 		runCtx, cancel := context.WithCancel(c)
 		registered := a.RegisterRun(chatID, runCtx, cancel)
@@ -992,6 +1115,19 @@ func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string,
 		}
 		defer cancel()
 		senderID, _ := messaging.SenderIDFromContext(c)
+		if name, _, ok := messaging.Parse(text); ok && name == "rules" {
+			// Per-turn copy of the env with this chat's ID:
+			// the shared env must never carry mutable
+			// per-chat state (PollStream handles chats
+			// concurrently). The sender stays in ctx, so
+			// the handler's isOwner check recognises the
+			// owner sending from a group chat (F-A18-10).
+			turnEnv := *rulesEnv
+			turnEnv.ChatID = chatID
+			if reply, handled, err := rulesRegistry.Dispatch(runCtx, &turnEnv, text); handled {
+				return reply, err
+			}
+		}
 		c = permissions.WithApprovalContext(runCtx, chatID, senderID)
 		reply, err := a.HandleForChat(c, chatID, text)
 		if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
@@ -1098,5 +1234,19 @@ func wireGate(a *app.App, gw *messaging.TelegramGateway) (*permissions.Gate, *me
 	if ownerID != 0 {
 		fmt.Fprintf(os.Stderr, "orion: owner chat %d (first telegram_allowed_chats entry)\n", ownerID)
 	}
+	// Daily budget threshold alert (F-A18-11, rc24): same
+	// delivery as oriond — when a chat's usage today reaches
+	// the configured threshold, the owner is notified once for
+	// the day. The App decides when an alert fires and formats
+	// it; this closure only delivers it through the gateway.
+	// With no owner configured the delivery fails loudly
+	// (logged by the App, retried on the next record) instead
+	// of silently dropping the alert.
+	a.SetBudgetAlertNotifier(func(ctx context.Context, chatID int64, text string) error {
+		if ownerID == 0 {
+			return errors.New("orion: no owner configured; budget alert not sent")
+		}
+		return gw.SendMessage(ctx, ownerID, text)
+	})
 	return gate, cards, nil
 }

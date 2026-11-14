@@ -37,6 +37,15 @@
 // the whole day at the chat's current model. The split is
 // accounting only; the budget meter is always the total, and Record
 // (total only) stays the simple path for callers without a split.
+//
+// The usage alert threshold (F-A18-11) reads the same meter with a
+// different consequence: CheckAlert reports when a chat's usage
+// today reaches a configured absolute token count, once per chat
+// per day, and MarkAlerted records the delivery — persisted with
+// the usage, so a restart never re-alerts for the same day. The
+// alert fires whether the budget limit is finite or unlimited; it
+// never refuses a turn, it only notifies the owner (the App layer
+// owns the Telegram send — the Budget type has no sender).
 package budget
 
 import (
@@ -118,6 +127,13 @@ type chatDay struct {
 	completion int
 	subagent   int
 	byModel    map[modelKey]*modelDay
+	// alerted records that the owner has already been alerted
+	// about this chat's usage today (F-A18-11): the alert fires
+	// once per chat per day, never once per turn after the
+	// threshold is crossed. It resets with the day (see
+	// entryLocked) and is persisted with the usage, so a daemon
+	// restart does not re-alert for a day that already alerted.
+	alerted bool
 }
 
 // DayUsage is one chat's token usage for today, with the split the
@@ -137,8 +153,16 @@ type DayUsage struct {
 type Budget struct {
 	mu    sync.Mutex
 	limit int
-	now   func() time.Time
-	usage map[int64]*chatDay
+	// alertThreshold is the per-chat daily usage threshold
+	// (F-A18-11) in tokens: when a chat's recorded usage for
+	// today reaches it, CheckAlert reports a crossing (once per
+	// chat per day — see chatDay.alerted). 0 or negative means
+	// disabled. It is an absolute count, independent of limit:
+	// it fires with an unlimited budget (limit <= 0) exactly as
+	// with a finite one, and may be above a finite limit.
+	alertThreshold int
+	now            func() time.Time
+	usage          map[int64]*chatDay
 	// file is the persistence path set with SetFile ("" means
 	// in-memory only); loadedChats counts the chats restored by
 	// the last SetFile load, so the caller can log the reload.
@@ -180,6 +204,73 @@ func (b *Budget) SetLimit(limit int) {
 	b.limit = limit
 }
 
+// SetAlertThreshold changes the per-chat daily usage alert
+// threshold (F-A18-11) in tokens. A threshold <= 0 disables the
+// alert. The threshold is an absolute token count, independent of
+// the budget limit: it fires with an unlimited budget exactly as
+// with a finite one. Changing the threshold never clears an
+// "alerted today" flag — a chat already alerted today is not
+// re-alerted even if the threshold is lowered below its usage.
+func (b *Budget) SetAlertThreshold(threshold int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.alertThreshold = threshold
+}
+
+// AlertThreshold returns the configured per-chat daily usage alert
+// threshold in tokens (<= 0 means the alert is disabled).
+func (b *Budget) AlertThreshold() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.alertThreshold
+}
+
+// CheckAlert reports whether chatID's usage today has reached the
+// alert threshold and the owner has not been alerted about this
+// chat today yet. It returns the chat's usage today, the threshold
+// it was evaluated against, and whether the alert should fire. It
+// is a pure check: it never marks the chat alerted — the caller
+// marks it with MarkAlerted only after the alert was actually
+// delivered, so a failed delivery is retried on the next record
+// instead of silently lost for the day. With the alert disabled
+// (threshold <= 0) it never fires, whatever the usage is; a chat
+// already alerted today never fires again until the UTC day rolls
+// over; usage below the threshold never fires. The threshold is
+// an absolute count, so the budget limit (finite or unlimited)
+// plays no part in the decision.
+func (b *Budget) CheckAlert(chatID int64) (used, threshold int, crossed bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	threshold = b.alertThreshold
+	e := b.entryLocked(chatID)
+	if threshold <= 0 {
+		return e.used, threshold, false
+	}
+	if e.alerted {
+		return e.used, threshold, false
+	}
+	if e.used < threshold {
+		return e.used, threshold, false
+	}
+	return e.used, threshold, true
+}
+
+// MarkAlerted records that the owner has been alerted about
+// chatID's usage today, so CheckAlert stays silent for this chat
+// until the UTC day rolls over. The flag is persisted with the
+// usage (when a file is set), so a daemon restart does not
+// re-alert for a day that already alerted. A save failure is
+// returned — the in-memory flag is already set, so the alert
+// still fires at most once for this process's lifetime; the
+// caller logs the error.
+func (b *Budget) MarkAlerted(chatID int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e := b.entryLocked(chatID)
+	e.alerted = true
+	return b.saveLocked()
+}
+
 // today returns the current UTC calendar date as "2006-01-02".
 func (b *Budget) today() string {
 	return b.now().UTC().Format("2006-01-02")
@@ -202,6 +293,9 @@ func (b *Budget) entryLocked(chatID int64) *chatDay {
 		e.completion = 0
 		e.subagent = 0
 		e.byModel = map[modelKey]*modelDay{}
+		// The alert flag resets with the day: a chat alerted
+		// yesterday may alert again today (F-A18-11).
+		e.alerted = false
 	}
 	if e.byModel == nil {
 		e.byModel = map[modelKey]*modelDay{}
@@ -389,6 +483,10 @@ type budgetFileChat struct {
 	Completion int               `json:"completion"`
 	Subagent   int               `json:"subagent"`
 	Models     []budgetFileModel `json:"models,omitempty"`
+	// AlertedToday records that the owner was already alerted
+	// about this chat's usage today (F-A18-11): a reload must
+	// not re-alert for a day that already alerted.
+	AlertedToday bool `json:"alerted_today,omitempty"`
 }
 
 type budgetFileModel struct {
@@ -454,6 +552,7 @@ func (b *Budget) SetFile(path string) (int, error) {
 			completion: fc.Completion,
 			subagent:   fc.Subagent,
 			byModel:    map[modelKey]*modelDay{},
+			alerted:    fc.AlertedToday,
 		}
 		for _, fm := range fc.Models {
 			if fm.Used < 0 || fm.Prompt < 0 || fm.Completion < 0 || fm.Subagent < 0 {
@@ -515,7 +614,7 @@ func (b *Budget) saveLocked() error {
 		if e.day != f.Day {
 			continue
 		}
-		fc := budgetFileChat{Used: e.used, Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent}
+		fc := budgetFileChat{Used: e.used, Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent, AlertedToday: e.alerted}
 		for k, md := range e.byModel {
 			fc.Models = append(fc.Models, budgetFileModel{
 				Provider: k.Provider, Model: k.Model,

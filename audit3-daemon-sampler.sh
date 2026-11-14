@@ -4,8 +4,9 @@
 # Usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>
 #   pid:    a fixed daemon PID to sample (original behaviour).
 #   follow: resolve the daemon PID dynamically each iteration via
-#           `systemctl show oriond -p MainPID --value`, so sampling
-#           survives daemon restarts (systemd service mode).
+#           resolve_pid() (system manager first, user manager as
+#           fallback; see below), so sampling survives daemon
+#           restarts (systemd service mode).
 #   label:  the release label written to the CSV/MD (e.g. rc21).
 #   auto:   derive the label each iteration from `bin/orion version`
 #           (e.g. "0.2.0-rc21" -> "rc21"); falls back to "unknown".
@@ -16,6 +17,11 @@
 # Output paths are overridable for tests / alternate checkouts
 # (F-A17-7): SAMPLER_OUT, SAMPLER_CSV, ORION_BIN — each defaults
 # to the $HOME/workspace/orion-go paths below when unset.
+# ORION_SYSTEMD_SCOPE (F-A18-3): system|user — pin which systemd
+# manager resolve_pid() asks; unset means system-first with a
+# user-manager fallback. SAMPLER_SLEEP / SAMPLER_RETRY_SLEEP
+# (seconds) override the inter-sample / retry sleeps for tests
+# and manual checks; defaults are the production 300s / 60s.
 set -u
 PID_ARG="${1:?usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>}"
 LABEL_ARG="${2:?usage: audit3-daemon-sampler.sh <pid|follow> <label|auto> <max_samples>}"
@@ -31,6 +37,8 @@ fi
 OUT="${SAMPLER_OUT:-$HOME/workspace/orion-go/AUDIT3_DAEMON_MEASUREMENTS.md}"
 CSV="${SAMPLER_CSV:-$HOME/workspace/orion-go/AUDIT3_DAEMON_SAMPLES.csv}"
 ORION_BIN="${ORION_BIN:-$HOME/workspace/orion-go/bin/orion}"
+SAMPLER_SLEEP="${SAMPLER_SLEEP:-300}"
+SAMPLER_RETRY_SLEEP="${SAMPLER_RETRY_SLEEP:-60}"
 
 # Derive the release label (e.g. rc21) from the built CLI version string.
 # Prints the fixed label unchanged when LABEL_ARG is not "auto".
@@ -48,13 +56,42 @@ resolve_label() {
 }
 
 # Resolve the live daemon PID from systemd (follow mode only).
-# F-A17-7: the shipped deployment is a USER unit
-# (~/.config/systemd/user/oriond.service, installed by
-# install.sh), so this MUST ask the user manager (--user): the
-# bare `systemctl show oriond` queries the system manager, which
-# never sees a user unit, and the sampler then spins in its 60s
-# sleep-loop forever with an empty PID.
+# F-A18-3 (supersedes the F-A17-7 comment this replaces): the
+# SHIPPED deployment is a user unit (~/.config/systemd/user/
+# oriond.service, installed by install.sh), but the LIVE
+# deployment on this VM is a SYSTEM unit (systemd/oriond.service,
+# User=root) — and root's user manager has no system units, so
+# the old --user-only resolve returned empty and the sampler spun
+# in its 60s sleep-loop forever writing nothing (CSV had no rows
+# since 03:04:38Z, rc22 PID 25867, while the live daemon was
+# PID 2105 rc23). So: try the system manager first, fall back to
+# the user manager, and honour ORION_SYSTEMD_SCOPE=system|user
+# for explicit control. An invalid ORION_SYSTEMD_SCOPE is
+# ignored with a stderr warning (fail open to the default
+# system-first order, never fail the sample). A "0" MainPID
+# (unit known but not running) is treated as empty so the
+# fallback still gets a chance.
 resolve_pid() {
+  case "${ORION_SYSTEMD_SCOPE:-}" in
+    system)
+      systemctl show oriond -p MainPID --value 2>/dev/null | tr -d ' '
+      return
+      ;;
+    user)
+      systemctl --user show oriond -p MainPID --value 2>/dev/null | tr -d ' '
+      return
+      ;;
+    "")
+      ;;
+    *)
+      echo "sampler: ignoring invalid ORION_SYSTEMD_SCOPE='${ORION_SYSTEMD_SCOPE}' (want system|user)" >&2
+      ;;
+  esac
+  pid=$(systemctl show oriond -p MainPID --value 2>/dev/null | tr -d ' ')
+  if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+    printf '%s' "$pid"
+    return
+  fi
   systemctl --user show oriond -p MainPID --value 2>/dev/null | tr -d ' '
 }
 
@@ -66,7 +103,7 @@ while :; do
   if [ "$FOLLOW" -eq 1 ]; then
     PID=$(resolve_pid)
     if [ -z "$PID" ] || [ "$PID" = "0" ]; then
-      sleep 60
+      sleep "$SAMPLER_RETRY_SLEEP"
       continue
     fi
   else
@@ -75,7 +112,7 @@ while :; do
   LABEL=$(resolve_label)
   if [ ! -d "/proc/$PID" ]; then
     if [ "$FOLLOW" -eq 1 ]; then
-      sleep 60
+      sleep "$SAMPLER_RETRY_SLEEP"
       continue
     fi
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$LABEL] pid $PID gone after $n samples" >> "$OUT"
@@ -96,6 +133,6 @@ while :; do
   echo "$line" >> "$OUT"
   echo "$ts,$LABEL,$PID,$el,$rss,$hwm,$vms,$th,$fds,$io_r,$io_w" >> "$CSV"
   n=$((n+1))
-  sleep 300
+  sleep "$SAMPLER_SLEEP"
 done
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$LABEL] sampler finished $n samples" >> "$OUT"

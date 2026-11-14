@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/irfan/orion/internal/backup"
@@ -14,6 +15,17 @@ import (
 // but the newest DefaultKeep snapshots. It loads the config file
 // directly (no provider construction), so it works even when the
 // configured provider has no API key.
+//
+// F-A18-7: a corrupt config.json must not block a backup — the data
+// dir is what is being saved, and the operator needs a backup most
+// exactly when the config is damaged. On a Load error cmdBackup
+// warns on stderr and falls back to config.Default() (data dir
+// ~/.orion). A missing config already falls back to defaults inside
+// Load; only a present-but-unreadable config reaches the fallback.
+//
+// F-A18-8: the snapshot is LIVE, not quiesced — see
+// backup.Snapshot. Files are copied one by one while the daemon may
+// be writing, so a snapshot may mix moments; the manifest says so.
 func cmdBackup(args []string) error {
 	if len(args) > 0 && isHelpArg(args[0]) {
 		fmt.Print(`Usage: orion backup
@@ -21,6 +33,12 @@ func cmdBackup(args []string) error {
 Snapshot the Orion data dir (~/.orion) into <parent>/.orion-backups
 (newest 7 kept). Takes no arguments. Restore with:
   oriond --restore <snapshot>
+
+The snapshot is live, not quiesced: files are copied one by one
+while the daemon may be writing, so a snapshot can mix moments
+(memory.json from after a turn whose sessions.json predates it).
+Each file's hash covers the bytes copied, but there is no
+cross-file instant. The manifest records this (quiesced=false).
 `)
 		return nil
 	}
@@ -33,7 +51,13 @@ Snapshot the Orion data dir (~/.orion) into <parent>/.orion-backups
 	}
 	cfg, err := config.Load(defaultPath)
 	if err != nil {
-		return err
+		// F-A18-7 (rc24): a corrupt config must not block a
+		// backup. Fall back to the defaults (data dir
+		// ~/.orion) and say so on stderr, so the fallback is
+		// visible, never silent. The fallback only needs the
+		// data dir — no provider is constructed here.
+		cfg = config.Default()
+		fmt.Fprintf(os.Stderr, "backup: cannot load config %s (%v); using default data dir %s\n", defaultPath, err, cfg.DataDir)
 	}
 	dir := backup.DefaultDir(cfg.DataDir)
 	path, err := backup.Snapshot(cfg.DataDir, dir)

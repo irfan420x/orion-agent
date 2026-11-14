@@ -9,6 +9,26 @@
 # iteration and records RSS/threads/FDs.
 #
 # Log path (sampler-systemd.log) is stable — no date in the name.
+#
+# Paths (F-A18-3): these are LITERAL /home/hatch paths ON
+# PURPOSE, not an oversight. rc24 first tried parameterising
+# them with one Environment=ORION_WORKSPACE variable referenced
+# as ${ORION_WORKSPACE} in WorkingDirectory / ExecStart /
+# StandardOutput — but systemd 255 REJECTS that at load time in
+# all three directives ("path is not absolute" /
+# "Neither a valid executable name nor an absolute path"), in
+# BOTH systemd-analyze verify AND the live manager (proven with
+# a scratch transient unit, 2026-11-14). The executable path in
+# ExecStart must be literally absolute at parse time, before any
+# variable expansion. So: to run on another machine, edit the
+# paths in this file (or generate it from a template — future
+# work, same pattern install.sh already uses for the shipped
+# user unit). Do NOT re-introduce ${...} path references here.
+# ORION_SYSTEMD_SCOPE=system (F-A18-3) pins the sampler's PID
+# resolution to the system manager: this is a system unit
+# sampling the system oriond unit; on a user-unit install change
+# it to "user" (or drop it and let the sampler fall back from
+# system to user on its own).
 
 [Unit]
 Description=Orion daemon resource sampler (telemetry)
@@ -23,6 +43,7 @@ User=root
 WorkingDirectory=/home/hatch/workspace/orion-go
 ExecStart=/home/hatch/workspace/orion-go/audit3-daemon-sampler.sh follow auto 0
 Environment=HOME=/home/hatch
+Environment=ORION_SYSTEMD_SCOPE=system
 Restart=always
 RestartSec=5
 StandardOutput=append:/home/hatch/workspace/orion-go/sampler-systemd.log

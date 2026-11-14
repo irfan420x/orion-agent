@@ -98,6 +98,13 @@ type App struct {
 	// CLI never installs one). gateMu guards it.
 	gate   *permissions.Gate
 	gateMu sync.RWMutex
+	// budgetAlertNotifier sends the daily budget threshold alert
+	// to the owner (F-A18-11): installed by the Telegram
+	// entrypoints via SetBudgetAlertNotifier; nil means no alerts
+	// (hand-built Apps, the CLI). It is set at startup before
+	// polling starts and only read afterwards, like the gate's
+	// prompter, so it needs no lock.
+	budgetAlertNotifier BudgetAlertNotifier
 	// globalTranscript/globalSessionID are the CLI/global live
 	// session transcript and id (see sessions.go); nil/"" until
 	// wireGlobalTranscript runs in Build, or when the transcript
@@ -259,6 +266,14 @@ func Build(path string) (*App, error) {
 	// daemon restart resets every chat's daily spend to zero. The
 	// file holds today's per-chat totals (atomic write-temp+rename
 	// in budget.SetFile); a stale day loads as empty.
+	// Daily usage alert threshold (F-A18-11, rc24): an absolute
+	// token count per chat per day; 0 disables the alert. It is
+	// independent of the budget limit — it fires with an
+	// unlimited budget exactly as with a finite one.
+	app.Budget.SetAlertThreshold(cfg.DailyBudgetAlertThresholdTokens)
+	if cfg.DailyBudgetAlertThresholdTokens > 0 {
+		logger.Printf("budget: daily usage alert threshold %d tokens per chat (owner notified once per chat per day)", cfg.DailyBudgetAlertThresholdTokens)
+	}
 	if n, err := app.Budget.SetFile(filepath.Join(cfg.DataDir, "budget.json")); err != nil {
 		logger.Printf("budget: persist disabled (%v); usage is in-memory only", err)
 	} else if n > 0 {

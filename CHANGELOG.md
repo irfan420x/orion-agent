@@ -4,6 +4,121 @@ All notable changes to Orion are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc24] — 2026-11-14
+
+### Audit 18 fixes (v0.2.0-rc24) — see `AUDIT18_2026-11-14.md`
+
+Fixes all six P2s and all six P3s from the fresh-eyes audit of rc23
+(0 P0, 0 P1, 6 P2, 6 P3), plus the F-A17-17 drain-test residual, the
+install.sh silent failure, and D4 (AUDIT13 is now committed, so the
+definition is verifiable). Audit 17's fixes all still hold; rc8
+security holds.
+**Verdict: NOT production-ready** — the 24–72 h daemon soak (F-A3-4)
+is still open. Verified by the release coordinator on the final
+commit: **1,374 tests pass, 0 fail, 4 skip (total 1,378), 24/24
+packages, race clean 24/24, no data race** (clean-clone recount;
+the coordinator corrects these numbers here if the recount differs).
+
+- **F-A18-1 (P2)** — the install test's `Restart=always` assertion
+  was hollow (it matched the comment text in oriond.service, not a
+  directive). It now uses a directive parser (comments excluded)
+  asserting `Restart=on-failure` + `RestartForceExitStatus=42`.
+- **F-A18-2 (P2)** — `oriond --restore` now takes the instance lock
+  before restoring and refuses clearly ("stop the daemon first",
+  exit 2) when the daemon is running; usage says so. A restored
+  snapshot's future allow-all deadline is neutralised (fail-closed)
+  so the window cannot resurrect, and Restore no longer replaces
+  the live `oriond.lock` (flock follows the inode — replacing it
+  would silently drop the lock mid-restore).
+- **F-A18-3 (P2)** — the sampler's `resolve_pid` now tries the
+  system manager first and falls back to the user manager
+  (`ORION_SYSTEMD_SCOPE` pins one); the committed sampler service
+  pins `ORION_SYSTEMD_SCOPE=system`. Live-verified: the fixed
+  script writes a fresh CSV row for the live daemon (PID 2105,
+  rc23). The `${ORION_WORKSPACE}` parameterization was attempted
+  and reverted — systemd 255 rejects `${VAR}` in WorkingDirectory /
+  ExecStart / StandardOutput (verified with a scratch unit); paths
+  stay literal by design, and generating the unit from a template
+  is the future path.
+- **F-A18-4 (P2)** — the three verified-safe hardening directives
+  (NoNewPrivileges, ProtectSystem=true, PrivateTmp) are now in the
+  SHIPPED oriond.service as well as the live unit, and the
+  drift-guard test pins the match in both (plus the absence of
+  ProtectHome / CapabilityBoundingSet).
+- **F-A18-5 (P2)** — `orion daemon` / `orion telegram poll` now
+  take the same flock on `<dataDir>/oriond.lock`, so a second CLI
+  poller exits 2 instead of causing a Telegram 409 flap.
+- **F-A18-11 (P2)** — the daily budget guardrail is restored as a
+  configurable threshold alert (NOT a reverted limit — the user's
+  unlimited setting stays): new
+  `daily_budget_alert_threshold_tokens` (0 = disabled); when a
+  chat's daily usage crosses it, the owner is notified on Telegram
+  once per chat per day (state persists in budget.json, survives
+  restarts, retries a failed send). `/budget` shows the threshold.
+- **F-A18-6 (P3)** — `/skills reload` is now owner-only.
+- **F-A18-7 (P3)** — `oriond --restore` and `orion backup` fall
+  back to the default data dir on a corrupt config (with a warning)
+  instead of failing; the restore fallback also honours
+  ORION_DATA_DIR.
+- **F-A18-8 (P3)** — live snapshots are documented as
+  non-quiesced: the manifest records `quiesced: false` + a
+  consistency note, and the limit is in the Snapshot docs and
+  `orion backup --help`. A reader-writer `backup.lock` quiesce was
+  surveyed (~14 write sites across 8 packages) and deliberately
+  NOT implemented — too invasive for a stability RC, and a partial
+  lock would be worse than an honest live snapshot; it belongs in
+  a later RC.
+- **F-A18-9 (P3)** — non-photo media (sticker / voice / video /
+  document / location) now gets an honest per-kind reply instead of
+  being silently dropped (TGMessage carries the fields; bytes are
+  never downloaded).
+- **F-A18-10 (P3)** — `/rules` now uses `isOwner(ctx)` (chat OR
+  sender), so the owner in a group chat is recognised; `/rules` is
+  wired in the `orion` binary too (single-command exception in the
+  daemon turn handler, documented with a do-not-extend guard).
+- **F-A18-12 (P3)** — the CapabilityBoundingSet reason is corrected
+  (the real gate is CAP_SYS_ADMIN + CAP_SETFCAP, not CAP_SETUID),
+  in the live unit's comment and the rc23 CHANGELOG paragraph; the
+  9-unit matrix artifact (probe script + real run log + README) is
+  now in the repo at `docs/capability-matrix/`. The omission itself
+  is unchanged and correct.
+- **F-A17-17 residual** — a test now pins drain 30s equality across
+  both entrypoints (sensitivity-verified).
+- **install.sh** — a present-but-failing systemctl (daemon-reload /
+  enable --now) now fails loudly (exit 1) instead of warning and
+  exiting 0; "systemctl not found" stays a warning.
+- **Makefile** — the GO lookup now verifies each candidate by
+  running `go version` and fails with a clear error listing all
+  checked locations when none works.
+- **D4** — `AUDIT13_2026-11-14.md` is now committed, so the D4
+  definition (lines 144–145) is verifiable instead of
+  builder-asserted.
+- **Verification-blocking race fix (found during the rc24 clean-clone
+  verification, rc23 code, not an audit finding)** — `Shutdown`
+  returned while the late-outcome waiter (`awaitLateOutcome`) was
+  still parked: it was not tracked by `m.wg`, so its persist of the
+  settled usage could land after the caller started cleaning up the
+  store dir. That was the `TestRC23W3PersistenceRunningTaskLost`
+  flake (TempDir RemoveAll "directory not empty", ~1 in 3 full-suite
+  runs). The waiter is now tracked in `m.wg` (Add before spawn,
+  Done on return; the 10s ShutdownTimeout still bounds a never-
+  returning executor), so Shutdown is the durability signal for
+  late usage too. Regression test
+  `TestRC24ShutdownWaitsForLateOutcomePersist` (deterministic:
+  fails 3/3 without the fix, passes 5/5 with it).
+
+Known flaky test (pre-existing, rc23 code, not an rc24 regression):
+`TestRC23W3PersistenceRunningTaskLost` (internal/subagent) failed
+once in the first -v recount with a TempDir-cleanup race
+("directory not empty") and passed standalone 4/5 times and in
+the second full recount; the plain suite passed both times. The
+test's own assertions pass — the failure is the cleanup racing a
+persist write. **FIXED in rc24 by the race fix above** (the waiter
+is now tracked in `m.wg`); the flaky test passes 10/10 standalone
+and 5/5 in full-package runs after the fix, and the regression test
+pins it. Recorded here so the next audit does not mistake the
+earlier failure for a regression.
+
 ## [0.2.0-rc23] — 2026-11-14
 
 ### Audit 17 fixes (v0.2.0-rc23) — see `AUDIT17_2026-11-14.md`
@@ -127,9 +242,14 @@ the coordinator corrects these numbers here if the recount differs).
   `ProtectSystem=true`, not strict: the data dir and working
   directory live under /home. `CapabilityBoundingSet` is
   DELIBERATELY omitted: any restriction of the bounding set breaks
-  the sandbox's `unshare --user --map-root-user` uid_map write
-  (verified with a 9-unit matrix — empty set, CAP_SETUID/CAP_SETGID,
-  CAP_SYS_ADMIN, and +AmbientCapabilities all fail) and would
+  the sandbox's `unshare --user --map-root-user` uid_map write.
+  The gate is CAP_SYS_ADMIN + CAP_SETFCAP (both required) —
+  CAP_SETUID is NOT the gate: the 9-unit matrix showed
+  {SETUID,SETGID,SYS_ADMIN} still fails with CAP_SETUID present,
+  while {SYS_ADMIN,SETFCAP} succeeds without it. (rc24, F-A18-12:
+  the rc23 text wrongly blamed CAP_SETUID; the omission itself is
+  unchanged and correct — the probe in `docs/capability-matrix/`
+  reproduces the bisection.) Restricting the set would
   silently break every sandboxed tool call on this root-run unit.
   Verified: `systemd-analyze verify` clean; the daemon starts,
   polls, writes its data dir, and stops cleanly (SIGTERM, exit 0)

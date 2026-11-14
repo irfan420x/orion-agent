@@ -1,0 +1,25 @@
+capability-matrix probe (F-A18-12, rc24)
+run at (UTC): 2026-11-14T04:26:37.183793+00:00
+kernel: 7.0.0-44-generic
+uid=0 euid=0
+unshare: /usr/bin/unshare
+starting CapBnd: 0x000001ffffb7cfff
+command per variant: unshare --user --map-root-user true
+
+[as expected] FULL (no drops, control)                   expected=PASS got=PASS
+[as expected] {} (empty bounding set)                    expected=FAIL got=FAIL (unshare: write failed /proc/self/uid_map: Operation not permitted)
+[as expected] {SETUID, SETGID}                           expected=FAIL got=FAIL (unshare: write failed /proc/self/uid_map: Operation not permitted)
+[as expected] {SYS_ADMIN}                                expected=FAIL got=FAIL (unshare: write failed /proc/self/uid_map: Operation not permitted)
+[as expected] {SETUID, SETGID, SYS_ADMIN}                expected=FAIL got=FAIL (unshare: write failed /proc/self/uid_map: Operation not permitted)
+[as expected] {SYS_ADMIN, SETFCAP}                       expected=PASS got=PASS
+[as expected] {SETFCAP}                                  expected=FAIL got=FAIL (unshare: write failed /proc/self/uid_map: Operation not permitted)
+[as expected] {SETUID, SETGID, SYS_ADMIN, SETFCAP}       expected=PASS got=PASS
+[as expected] {SETUID, SYS_ADMIN, SETFCAP}               expected=PASS got=PASS
+
+summary: 9/9 variants matched expectation
+verdict: the bisection holds on this host —
+  * {SETUID, SETGID, SYS_ADMIN} FAILS with CAP_SETUID present,
+  * {SYS_ADMIN, SETFCAP} PASSES with CAP_SETUID absent,
+  * {SYS_ADMIN} alone and {SETFCAP} alone both FAIL,
+  so the gate is CAP_SYS_ADMIN + CAP_SETFCAP (both required);
+  CAP_SETUID is NOT the gate. CapabilityBoundingSet stays omitted.

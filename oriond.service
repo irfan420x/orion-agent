@@ -51,6 +51,24 @@
 #   such as a revoked token; systemd stops trying until the unit
 #   is reset (`systemctl --user reset-failed oriond`) or started
 #   by hand. 12 matches the live unit (systemd/oriond.service).
+# - Hardening (F-A18-4, rc24): NoNewPrivileges=true,
+#   ProtectSystem=true, PrivateTmp=true — the same three directives
+#   as the live unit (systemd/oriond.service), pinned by the
+#   drift-guard test in cmd/oriond/rc22_teama_test.go.
+#   ProtectSystem=true — NOT strict/full: the daemon's data dir
+#   (~/.orion) and working directory both live under /home, and
+#   ProtectSystem=strict would make /home read-only and break the
+#   daemon; ProtectSystem=true leaves /home writable while making
+#   /usr, /boot and /etc read-only, which oriond never needs to
+#   write. Likewise ProtectHome must NOT be added (the data dir is
+#   in $HOME), and CapabilityBoundingSet must NOT be added either:
+#   any restriction of the bounding set breaks the sandbox — the
+#   sandbox runs every shell_exec via `unshare --user
+#   --map-root-user`, whose uid_map write needs effective
+#   CAP_SETUID at exec (see the live unit's header for the
+#   9-unit matrix that proved this). The three applied directives
+#   were each verified not to break the daemon (systemd-analyze
+#   verify clean; the live unit runs under exactly this set).
 # - Linger (F-A16-6): install.sh --systemd runs
 #   `loginctl enable-linger $USER`, so the unit starts at boot
 #   and survives logout. Without linger a user unit stops on
@@ -80,6 +98,14 @@ WorkingDirectory=%h
 Restart=on-failure
 RestartSec=5s
 RestartForceExitStatus=42
+# F-A18-4: harden the daemon (network-facing, executes tools).
+# ProtectSystem=true, not strict: /home must stay writable (data
+# dir + working directory). Do NOT add ProtectHome, and do NOT add
+# CapabilityBoundingSet: any restriction breaks the sandbox's
+# `unshare --user --map-root-user` uid_map write (see header).
+NoNewPrivileges=true
+ProtectSystem=true
+PrivateTmp=true
 
 [Install]
 WantedBy=default.target

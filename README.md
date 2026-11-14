@@ -3,11 +3,11 @@
 Orion is a model-agnostic OS agent that can do everything, with many
 subagents — built in Go, local-first, Linux/macOS first.
 
-> **Status: v0.2.0-rc23.** The Go core, agent loop, tools, memory, security,
+> **Status: v0.2.0-rc24.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,327 tests total — 1,323 pass, 0 fail, 4 skip;
+> built and tested (1,378 tests total — 1,374 pass, 0 fail, 4 skip;
 > 24/24 packages; clean-clone recount by the release coordinator,
-> 2026-11-14 — see CHANGELOG for the rc23 audit fixes).
+> 2026-11-14 — see CHANGELOG for the rc24 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -118,9 +118,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,327 tests total (1,323 passing, 0 failing, 4 skipped)
-(recount by the rc23 W1 worker on the working tree, 2026-11-14 — the
-coordinator sets the final rc23 counts from the clean-clone recount).
+24/24 packages, 1,378 tests total (1,374 passing, 0 failing, 4 skipped)
+(recount by the rc24 coordinator from a clean clone of the rc24
+commit, 2026-11-14).
 Run the suite with
 `go test ./...` or `make test`.
 
@@ -316,8 +316,15 @@ recorded even when the turn fails (so an over-budget turn is logged,
 and the *next* turn is the one refused). Spend is persisted to
 `<data_dir>/budget.json`, so a daemon restart does not reset any
 chat's daily total; yesterday's spend never counts against today.
-Side-channel provider calls (selector, extraction, auto-compact)
-and finished-but-unfetched subagent tasks are charged to the owning
+A usage alert threshold (`daily_budget_alert_threshold_tokens` in
+`config.json`, 0 = disabled, 1–10,000,000) notifies the owner once
+per chat per day via Telegram when that chat's usage reaches it —
+an absolute token count, so it works with an unlimited budget too,
+where it watches usage that nothing refuses. The "alerted today"
+flag is persisted in `budget.json` alongside the usage, so a
+restart never re-alerts for the same day. Side-channel provider
+calls (selector, extraction, auto-compact) and finished-but-unfetched
+subagent tasks are charged to the owning
 chat at turn end, so they count against the same budget. Metering of
 `/compress` itself landed in rc11 (Audit 6, F-A6-1 — no production
 caller passed the metering sink on the `/compress` path in rc10);

@@ -141,6 +141,15 @@ type CommandEnv struct {
 	// hand-built envs, where /budget reports that budget info is
 	// unavailable instead of inventing numbers.
 	BudgetInfo func(chatID int64) (limit int, usedToday int)
+	// BudgetAlertThreshold returns the per-chat daily usage
+	// alert threshold in tokens (F-A18-11, rc24): 0 means the
+	// alert is disabled. /budget shows it next to the limit so
+	// the owner can see when they will be notified. Nil in
+	// hand-built envs, where the threshold line is omitted
+	// instead of invented. The threshold itself is set in the
+	// config file (daily_budget_alert_threshold_tokens), not
+	// through /budget.
+	BudgetAlertThreshold func() int
 	// SetBudget persists a new per-chat daily token limit (0 =
 	// unlimited, otherwise 1000–10000000, matching config
 	// validation) AND applies it to the live budget, so the new
@@ -228,11 +237,12 @@ type CommandEnv struct {
 	// then falls back to plain Compress.
 	CompressWithSessionMemory func(ctx context.Context, chatID int64, keepRecent int, sessionMemory string) (before, after, summaryLen int, err error)
 	// IsOwner reports whether chatID is the daemon owner (the
-	// first allowlisted chat). /rules is owner-only and checks
-	// this itself — unlike /restart, whose check lives in
-	// cmd/oriond/buildTurnHandler because the shared env's
-	// Restart cannot refuse. The coordinator wires it in
-	// cmd/oriond/buildCommandEnv as:
+	// first allowlisted chat). /rules consults it only as its
+	// "wired" signal (nil means the rules wiring is absent and
+	// /rules reports unavailability); the ownership decision
+	// itself is CommandEnv.isOwner (OwnerID plus the sender
+	// from ctx, so the owner in a group chat counts — F-A18-10).
+	// The coordinator wires it in cmd/oriond/buildCommandEnv as:
 	//   IsOwner: func(chatID int64) bool { return ownerID != 0 && chatID == ownerID },
 	// Nil until wired; /rules then replies that it is
 	// unavailable instead of guessing.
@@ -610,15 +620,27 @@ func budgetHandler(ctx context.Context, env *CommandEnv, args string) (string, e
 		arg = fields[0]
 	}
 	if arg == "" {
+		// The alert threshold (F-A18-11) rides along with the
+		// limit display: the owner sees both the cap and the
+		// point at which they get notified once per day. An
+		// unwired threshold (nil func) omits the line.
+		thresholdLine := ""
+		if env.BudgetAlertThreshold != nil {
+			if threshold := env.BudgetAlertThreshold(); threshold > 0 {
+				thresholdLine = fmt.Sprintf("\nAlert threshold: %s tokens (owner notified once per day when crossed; set daily_budget_alert_threshold_tokens in config)", formatThousands(threshold))
+			} else {
+				thresholdLine = "\nAlert threshold: off"
+			}
+		}
 		if limit <= 0 {
-			return fmt.Sprintf("💰 Daily token budget (this chat): unlimited\nTokens used today: %s (resets at UTC midnight)", formatThousands(used)), nil
+			return fmt.Sprintf("💰 Daily token budget (this chat): unlimited\nTokens used today: %s (resets at UTC midnight)%s", formatThousands(used), thresholdLine), nil
 		}
 		remaining := limit - used
 		if remaining < 0 {
 			remaining = 0
 		}
-		return fmt.Sprintf("💰 Daily token budget (this chat): %s tokens per day\nTokens used today: %s\nRemaining today: %s (resets at UTC midnight)",
-			formatThousands(limit), formatThousands(used), formatThousands(remaining)), nil
+		return fmt.Sprintf("💰 Daily token budget (this chat): %s tokens per day\nTokens used today: %s\nRemaining today: %s (resets at UTC midnight)%s",
+			formatThousands(limit), formatThousands(used), formatThousands(remaining), thresholdLine), nil
 	}
 	newLimit, ok := parseBudgetArg(arg)
 	if !ok {
@@ -647,6 +669,13 @@ func budgetHandler(ctx context.Context, env *CommandEnv, args string) (string, e
 // skillsReloadHandler implements /skills reload (F-A17-15): re-read
 // the skills directory without restarting the daemon.
 func skillsReloadHandler(ctx context.Context, env *CommandEnv, args string) (string, error) {
+	// Owner-only (F-A18-6): reloading skills changes what the
+	// agent can do for every chat, so it is owner-only like
+	// /budget — a non-owner allowlisted chat is refused before
+	// ReloadSkills is ever called.
+	if !env.isOwner(ctx) {
+		return "⛔ /skills reload is owner-only. Your chat can use every other command, but only the owner can reload skills.", nil
+	}
 	if env.ReloadSkills == nil {
 		return "Skills reload is unavailable (not wired).", nil
 	}
@@ -1025,8 +1054,10 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 	// deletes a legacy global rule, /rules delete <chat>:<tool>
 	// deletes one chat's rule, and /rules scope <tool> <chat>
 	// moves a global rule onto a single chat. Owner-only like
-	// /restart: the check lives in the handler (IsOwner), so it
-	// is testable through Dispatch with a stub env.
+	// /restart: the check lives in the handler (isOwner — chat or
+	// sender, F-A18-10), so it is testable through Dispatch with
+	// a stub env; a nil IsOwner still means the rules wiring is
+	// absent and the command reports unavailability.
 	r.Register(Command{
 		Name:        "rules",
 		Description: "Owner-only: list permission rules; '/rules delete <tool>' deletes a legacy global rule, '/rules delete <chat>:<tool>' deletes a per-chat rule, '/rules scope <tool> <chat>' moves a global rule to one chat",
@@ -1035,7 +1066,11 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			if env.IsOwner == nil {
 				return "Rules are unavailable (not wired).", nil
 			}
-			if !env.IsOwner(env.ChatID) {
+			// Owner-only (F-A18-10): isOwner checks the chat OR
+			// the sender from ctx, so the owner sending from a
+			// group chat is recognised — the old IsOwner(ChatID)
+			// check refused them even though they are the owner.
+			if !env.isOwner(ctx) {
 				return "⛔ /rules is owner-only. Only the owner can list, delete, or scope permission rules.", nil
 			}
 			fields := strings.Fields(args)
