@@ -6,6 +6,58 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Provider-auto context window
+
+The history budget is now derived from the active provider's
+declared context window instead of a hardcoded 32768 tokens
+(user order 2026-11-15 02:08 SGT). Suite: **1,536 tests total
+(1,532 pass, 0 fail, 4 skip), 24/24 packages**.
+
+- **Provider windows (one source of truth).** New
+  `internal/model/context_window.go`: an optional
+  `ContextWindowProvider` interface + `ContextWindow(p)` helper +
+  per-provider tables, values verified against the official
+  provider docs on 2026-11-15 only. DeepSeek 1M
+  (deepseek-chat/reasoner/flash/v4-pro — currently routing to
+  deepseek-v4-flash; the old 64K figure was stale), OpenAI
+  gpt-4o(-mini) 128,000 and gpt-4.1(-mini) 1,047,576, Anthropic
+  4.5 models 200,000, Ollama llama3.1/3.2 131,072 and
+  qwen2.5-0.5b/7b/14b 32,768. Unknown model falls back to the
+  provider's smallest verified window (DeepSeek 1M, OpenAI
+  128K, Anthropic 200K, Ollama 32K). Ollama `mistral` is
+  unverified (no official statement found) and deliberately has
+  no table value — it falls to the fallback. Lookup is
+  case-insensitive, trimmed; Ollama strips a `:tag` suffix. The
+  DeepSeek provider is an `openAIProvider` with name `deepseek`,
+  so its window branches on the provider name (DeepSeek table,
+  never OpenAI's).
+- **Derivation (half the window).** `maxHistoryTokens()`:
+  explicit `max_history_tokens` > 0 wins; otherwise half the
+  provider window, clamped to [1024, 1000000]; otherwise the
+  32768 legacy fallback for a provider that declares no window.
+  `NewAgent` no longer fills 32768 for `<= 0`; new exported
+  `HistoryBudget()`. Config defaults `MaxHistoryTokens` to 0
+  (auto); `Validate` accepts 0; non-zero still 1024–1M. The 80%
+  auto-compact / 70% warning thresholds are fractions of the
+  budget, so they are provider-relative with no numeric change;
+  `maxCompactionInputTokens` (16K) is unchanged.
+- **DeepSeek budget is now 500,000 tokens** (half of the verified
+  1M window), not 32768 — the faithful result of the user's
+  order; no extra ceiling was added. Flagged for the cost
+  consequence: a DeepSeek turn may now carry far more history.
+- **Ollama `num_ctx` always sent.** `buildRequest` sets
+  `Options["num_ctx"]` to the declared window on every request
+  (Chat and Stream), so Ollama's server default (4096 per the
+  current official FAQ; the 2048 figure is a stale 2025
+  snapshot) can never silently truncate a derived budget.
+- **F-A22-15 fixed here.** `TestAudit3HistoryBudget32768` is
+  reworked as `TestAudit3HistoryBudgetOverride32768` (it now
+  pins the override path) with the step timeout raised 5s → 10s
+  and the outer deadline 10s → 30s (the isolated run took 6.8s).
+  Remote main was still a907d3e when this landed, and Muse #1's
+  fix batch skips F-A22-15, so this change reworks the test
+  first; his batch must re-check against it.
+
 ### F1 — Audit 21 fixes (P1 + P2/P3 leftovers)
 
 Fixes Audit 21's P1 and the P2/P3 leftovers, on top of plan_mode.

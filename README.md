@@ -5,9 +5,9 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,593 tests total — 1,589 pass, 0 fail, 4 skip;
+> built and tested (1,606 tests total — 1,602 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
-> MEDIA delivery and the Audit 22 fix batch (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
+> Audit 22 fix batch and the provider-auto context-window change (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -118,9 +118,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,593 tests total (1,589 passing, 0 failing, 4 skipped)
-(recount in the working tree after the MEDIA delivery and the
-Audit 22 fix batch, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
+24/24 packages, 1,606 tests total (1,602 passing, 0 failing, 4 skipped)
+(recount in the working tree after the Audit 22 fix batch and the
+provider-auto context-window change, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
 `go test ./...` or `make test`.
 
@@ -143,7 +143,7 @@ Run the suite with
   "max_steps": 20,
   "timeout_seconds": 120,
   "max_tool_result_bytes": 262144,
-  "max_history_tokens": 32768,
+  "max_history_tokens": 0,
   "sandbox": { "enabled": true, "root": "~/.orion/sandbox", "allow_network": false, "allow_without_seccomp": false }
 }
 ```
@@ -175,26 +175,57 @@ with a marker — instead of failing the turn.
   1 MiB is returned truncated with its true size, not refused.
   Lower this if your provider has a small context window; raise it
   (up to 10 MiB) if you routinely need large file reads.
-- `max_history_tokens` (default `32768`, allowed 1K–1M): the token
-  budget for the history fed to the provider on each step — system
-  prompt, recent history, fact-aware recall injection, and in-turn
-  messages, estimated with `model.CountTokens` (~4 runes/token,
-  the same estimate the model layer uses for usage). The default
-  fits DeepSeek's 64K window with room for tool definitions and
-  the completion; set it lower for local Ollama models with
-  smaller windows. When the window is over budget the agent loop
-  trims the oldest turns first and never drops the system prompt,
-  never drops the latest user turn or the most recent turn, and
-  never breaks a tool-call/tool-result pair (whole turns are
-  dropped, and content is only ever cut — never the tool-call
-  fields). If a single tool result alone exceeds the budget it is
-  truncated head-first with a `[truncated for context budget …]`
-  marker and the turn continues. The full transcript is still
-  kept in memory and in the `MaxStepsError` transcript; only the
-  request window is trimmed. Recall counts against the same
-  budget, so recall + history together stay within it: when the
-  window is tight, the oldest turns pay for the recalled facts,
-  never the system prompt.
+- `max_history_tokens` (default `0` = auto, allowed `0` or 1K–1M):
+  the token budget for the history fed to the provider on each
+  step — system prompt, recent history, fact-aware recall
+  injection, and in-turn messages, estimated with
+  `model.CountTokens` (~4 runes/token, the same estimate the
+  model layer uses for usage). With the default `0` the budget is
+  derived from the active provider's declared context window:
+  **half the window** (the old 32768-token budget was this same
+  rule for the old, incorrect 64K DeepSeek window). Half a window
+  leaves headroom for the tool definitions and the completion.
+  An explicit value overrides the derivation. When the window is
+  over budget the agent loop trims the oldest turns first and
+  never drops the system prompt, never drops the latest user turn
+  or the most recent turn, and never breaks a tool-call/tool-result
+  pair (whole turns are dropped, and content is only ever cut —
+  never the tool-call fields). If a single tool result alone
+  exceeds the budget it is truncated head-first with a
+  `[truncated for context budget …]` marker and the turn
+  continues. The full transcript is still kept in memory and in
+  the `MaxStepsError` transcript; only the request window is
+  trimmed. Recall counts against the same budget, so recall +
+  history together stay within it: when the window is tight, the
+  oldest turns pay for the recalled facts, never the system
+  prompt. The 80% auto-compact / 70% warning thresholds are
+  fractions of this budget, so they scale with the provider
+  automatically.
+
+  Provider context windows (verified against the official provider
+  docs on 2026-11-15; unknown models fall back to the provider's
+  smallest verified window, and a provider that declares no window
+  at all falls back to the legacy 32768-token budget):
+
+  | Provider | Model | Window | Derived history budget |
+  |---|---|---|---|
+  | DeepSeek | deepseek-chat, deepseek-reasoner, deepseek-flash, deepseek-v4-pro | 1,000,000 | 500,000 |
+  | OpenAI | gpt-4o, gpt-4o-mini | 128,000 | 64,000 |
+  | OpenAI | gpt-4.1, gpt-4.1-mini | 1,047,576 | 523,788 |
+  | Anthropic | claude-sonnet-4-5, claude-opus-4-5, claude-haiku-4-5 | 200,000 | 100,000 |
+  | Ollama | llama3.1, llama3.2 | 131,072 | 65,536 |
+  | Ollama | qwen2.5-0.5b, qwen2.5-7b, qwen2.5-14b | 32,768 | 16,384 |
+
+  DeepSeek's aliases currently route to deepseek-v4-flash at a 1M
+  context (the old 64K figure was stale) and retire 2026-07-24;
+  the derived DeepSeek budget is therefore 500,000 tokens, not
+  32768 — the faithful result of deriving half the verified
+  window, with no extra ceiling. Ollama's `mistral` has no
+  verified window (no official statement found) and falls to the
+  32,768 unknown-model fallback. For Ollama, every chat request
+  also sends `options.num_ctx` set to the declared window, so the
+  server default (4096 per the current official FAQ) can never
+  silently truncate a derived budget.
 
 Switch providers without rebuilding:
 
