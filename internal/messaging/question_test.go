@@ -405,7 +405,7 @@ func TestAskQuestionFreeTextReply(t *testing.T) {
 func TestAskQuestionTurnAsksAndReplyResolves(t *testing.T) {
 	// The deadlock test: a turn (which holds chat 77's lock)
 	// calls Ask and blocks; a typed reply in the same chat must
-	// still resolve it, because tryAnswerQuestion runs BEFORE
+	// still resolve it, because replyChain.tryAnswer runs BEFORE
 	// the per-chat lock in PollStream's handle. On the old code
 	// (reply routed through a turn) the reply would wait on the
 	// lock until the 30s Ask timeout, and this test would fail

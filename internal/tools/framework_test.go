@@ -249,8 +249,12 @@ func TestRegisterRejectsNovelNames(t *testing.T) {
 }
 
 // TestToolClasses pins Registry.ToolClasses: it returns exactly
-// the declared class of every RiskClasser tool, and nothing for
-// tools that declare nothing.
+// the declared class of every registered tool — one entry per
+// tool, equal to its RiskClasser declaration. Every tool in a
+// registry declares: Register rejects tools that do not implement
+// RiskClasser, so there is no "tool that declares nothing" case
+// left to pin here, and ToolClasses can never hold an entry for a
+// non-declaring tool.
 func TestToolClasses(t *testing.T) {
 	r, err := DefaultRegistry()
 	if err != nil {
@@ -266,7 +270,12 @@ func TestToolClasses(t *testing.T) {
 			t.Errorf("ToolClasses has no entry for %q", tool.Name())
 			continue
 		}
-		if want := tool.(RiskClasser).RiskClass(); got != want {
+		rc, ok := tool.(RiskClasser)
+		if !ok {
+			t.Errorf("tool %q does not implement RiskClasser, but Register accepted it", tool.Name())
+			continue
+		}
+		if want := rc.RiskClass(); got != want {
 			t.Errorf("ToolClasses[%q] = %v, want %v", tool.Name(), got, want)
 		}
 	}
