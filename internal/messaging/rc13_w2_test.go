@@ -417,20 +417,25 @@ func TestOffsetNoDoubleExecutionAfterRelease(t *testing.T) {
 	}})
 	select {
 	case <-cbDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("callback in the batch never reached the handler")
 	}
 
 	releaseAll()
-	waitFor(t, "blocked message dispatched after release", func() bool {
+	waitForLong(t, "blocked message dispatched after release", func() bool {
 		return entered.Load() == 9
 	})
-	waitFor(t, "offset past the whole batch", func() bool {
+	waitForLong(t, "offset past the whole batch", func() bool {
 		return g.Offset() == 11
 	})
 	// Let several poll cycles run: a stale batch returning
-	// already-decided updates must not re-run any turn.
-	time.Sleep(1500 * time.Millisecond)
+	// already-decided updates must not re-run any turn. The
+	// quiesce window is deliberately long (5s, not 1.5s): under
+	// full-suite load a stale batch can take seconds to
+	// re-dispatch, so a short sleep would MISS a real
+	// re-dispatch instead of catching it — a longer sleep is a
+	// stronger check, not a weaker one.
+	time.Sleep(5 * time.Second)
 	if got := entered.Load(); got != 9 {
 		t.Fatalf("turn handler entered %d times in total, want exactly 9 (a stale getUpdates batch re-dispatched already-finished turns)", got)
 	}

@@ -212,6 +212,27 @@ func waitFor(t *testing.T, desc string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", desc)
 }
 
+// waitForLong is waitFor with a 30s deadline, for the tests whose
+// eventual state needs a full long-poll cycle to arrive under
+// full-suite load (F-A20-4: TestOffsetNoDoubleExecutionAfterRelease
+// failed 1/3 in the full suite on the 5s waits, never in
+// isolation). The assertions are unchanged — only the time
+// allowed to reach them grows — so a longer deadline never
+// weakens the test; it only stops load from masquerading as a
+// failure. Use it only where a single test names it, never as a
+// replacement for the shared waitFor.
+func waitForLong(t *testing.T, desc string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", desc)
+}
+
 // runPollStream starts PollStream in a goroutine and returns a cancel
 // func plus an error channel for its result.
 func runPollStream(t *testing.T, g *TelegramGateway, handler TurnFunc) (context.CancelFunc, chan error) {
