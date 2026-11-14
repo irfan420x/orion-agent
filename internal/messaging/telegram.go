@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
@@ -486,6 +487,15 @@ type TelegramGateway struct {
 	// can never appear in a log line. Fatal poll errors are NOT
 	// logged here; PollStream returns them to the caller.
 	logger func(format string, args ...any)
+	// mediaCfg holds the resolved media-delivery config (see
+	// WithMediaDelivery in media.go). When Enabled is false —
+	// including when no option was ever passed — deliverMedia is a
+	// no-op and MEDIA: tags stay as visible text.
+	mediaCfg config.MediaDeliveryConfig
+	// mediaAllow holds the resolved allowlist directories (see
+	// resolveMediaAllowDirs): a file may be sent only from under
+	// one of these, and only after passing the denylist.
+	mediaAllow []string
 }
 
 // Gateway is an alias for TelegramGateway.
