@@ -46,6 +46,13 @@ import (
 // pending question.
 const questionCallbackPrefix = "ask:"
 
+// questionNoLongerPendingNotice is the toast for a tap on a
+// question card whose question is no longer pending (F-A20-9).
+// Same reasoning as approvalNoLongerPendingNotice in telegram.go:
+// already answered, expired, or lost to a restart — the handler
+// cannot tell which, so one deterministic toast covers all three.
+const questionNoLongerPendingNotice = "This question is no longer pending — it may have been answered, expired, or lost when the bot restarted."
+
 // questionResult is one answered question: the answer text, how it
 // arrived ("button" for an option tap, "text" for a typed reply),
 // and the tapped option index (0-based; -1 for a typed reply).
@@ -479,8 +486,12 @@ func HandleQuestionCallback(ctx context.Context, gw tools.CallbackGateway, quest
 	fmt.Fprintf(stderr, "%s: question tap: %s option %d from %d\n", logPrefix, id, index, senderID)
 	p, found := questions.lookup(id)
 	if !found {
-		fmt.Fprintf(stderr, "%s: question tap: question %s expired (no longer pending)\n", logPrefix, id)
-		return gw.AnswerCallback(ctx, q.CallbackID(), "This question has expired.")
+		// Same restart-orphan honesty as the approval handler
+		// (F-A20-9): already answered, expired, or lost to a
+		// restart — the handler cannot tell which, so the
+		// toast says so (see questionNoLongerPendingNotice).
+		fmt.Fprintf(stderr, "%s: question tap: question %s no longer pending (answered, expired, or lost to a restart)\n", logPrefix, id)
+		return gw.AnswerCallback(ctx, q.CallbackID(), questionNoLongerPendingNotice)
 	}
 	if !questions.canAnswer(p, senderID) {
 		fmt.Fprintf(stderr, "%s: question tap: question %s refused for sender %d (asker %d, owner %d)\n", logPrefix, id, senderID, p.senderID, questions.ownerID)
@@ -492,8 +503,11 @@ func HandleQuestionCallback(ctx context.Context, gw tools.CallbackGateway, quest
 	}
 	answer := p.options[index]
 	if !questions.Resolve(id, questionResult{answer: answer, source: "button", optionIndex: index}) {
-		fmt.Fprintf(stderr, "%s: question tap: question %s expired during resolve\n", logPrefix, id)
-		return gw.AnswerCallback(ctx, q.CallbackID(), "This question has expired.")
+		// Same toast as the not-pending branch: the resolve
+		// lost the race to another tap or the timeout — one
+		// deterministic toast for both (F-A20-9).
+		fmt.Fprintf(stderr, "%s: question tap: question %s no longer pending during resolve (answered by another tap, or expired)\n", logPrefix, id)
+		return gw.AnswerCallback(ctx, q.CallbackID(), questionNoLongerPendingNotice)
 	}
 	fmt.Fprintf(stderr, "%s: question tap: question %s answered with option %d\n", logPrefix, id, index)
 	// Edit the question in place to show the answer. The answer

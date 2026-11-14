@@ -433,6 +433,11 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
 		return 1
 	}
+	// F-A20-9: pending approvals/questions live only in memory,
+	// so a restart voids every card sent before it — note it at
+	// startup, so a later "no longer pending" toast on a dead
+	// card is diagnosable instead of mysterious.
+	fmt.Fprintf(os.Stderr, "oriond: note: approval/question cards from before this restart are void (pending approvals and questions do not survive a restart); tapping one answers that the request is no longer pending\n")
 
 	// Daily budget threshold alert (F-A18-11, rc24): when a
 	// chat's usage today reaches the configured threshold, the

@@ -22,6 +22,7 @@ import (
 
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/permissions"
+	"github.com/irfan/orion/internal/tools"
 )
 
 // turnCall is one call the recording turn handler saw.
@@ -686,4 +687,57 @@ func countSent(f *queueFake, chatID int64, substr string) int {
 		}
 	}
 	return n
+}
+
+// recordingCallbackGateway is a tools.CallbackGateway that records
+// callback answers (toast texts) by query id, for pinning the
+// exact toast a tap receives. Only AnswerCallback records
+// anything; the send/edit methods are stubs.
+type recordingCallbackGateway struct {
+	answers map[string]string
+}
+
+func (g *recordingCallbackGateway) SendText(ctx context.Context, chatID int64, text string) (int64, error) {
+	return 0, nil
+}
+
+func (g *recordingCallbackGateway) SendKeyboard(ctx context.Context, chatID int64, text string, keyboard tools.InlineKeyboard) (int64, error) {
+	return 0, nil
+}
+
+func (g *recordingCallbackGateway) EditTextRemoveKeyboard(ctx context.Context, chatID, messageID int64, htmlText string) error {
+	return nil
+}
+
+func (g *recordingCallbackGateway) AnswerCallback(ctx context.Context, callbackID, text string) error {
+	if g.answers == nil {
+		g.answers = map[string]string{}
+	}
+	g.answers[callbackID] = text
+	return nil
+}
+
+func TestHandleQuestionCallbackUnknownIDGetsRestartNotice(t *testing.T) {
+	// F-A20-9: a tap on a question card whose question is no
+	// longer pending (the restart orphan — pending questions
+	// live only in memory, so a daemon restart voids every
+	// live card) is answered with the honest notice — it may
+	// have been answered, expired, or lost when the bot
+	// restarted — not a bare "expired".
+	gw := &recordingCallbackGateway{}
+	questions := NewQuestionRegistry(77)
+	q := TGCallbackQuery{
+		ID: "cb-stale-q", From: &TGUser{ID: 77},
+		Message: &TGMessage{MessageID: 1, Chat: TGChat{ID: 77}},
+		Data:    "ask:0123456789abcdef:0",
+	}
+	if err := HandleQuestionCallback(context.Background(), gw, questions, q, "test"); err != nil {
+		t.Fatalf("HandleQuestionCallback: %v", err)
+	}
+	if got := gw.answers["cb-stale-q"]; got != questionNoLongerPendingNotice {
+		t.Errorf("stale question tap toast = %q, want %q", got, questionNoLongerPendingNotice)
+	}
+	if questions.PendingCount() != 0 {
+		t.Error("stale tap left a pending question behind")
+	}
 }

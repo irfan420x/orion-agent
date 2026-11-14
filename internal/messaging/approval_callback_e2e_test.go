@@ -519,7 +519,9 @@ func TestW6ApprovalExpired(t *testing.T) {
 
 // TestW6ApprovalDuplicateTap: two taps on Approve (a double-click)
 // resolve the request exactly once; the second tap is told the
-// request has expired.
+// request is no longer pending (F-A20-9 — one deterministic toast
+// for already-answered / expired / lost-to-restart, so the
+// outcome never depends on the tap/resolve interleave).
 func TestW6ApprovalDuplicateTap(t *testing.T) {
 	h := newW6Harness(t, 0)
 	h.fake.taps = []w6Tap{
@@ -533,8 +535,8 @@ func TestW6ApprovalDuplicateTap(t *testing.T) {
 	assertCardKeyboard(t, card)
 	close(h.fake.release)
 	w6WaitFor(t, "command to execute after the first tap", h.execute.Load)
-	w6WaitFor(t, "second tap to be answered as expired", func() bool {
-		_, ok := h.answerWithText("This approval request has expired.")
+	w6WaitFor(t, "second tap to be answered as no-longer-pending", func() bool {
+		_, ok := h.answerWithText(approvalNoLongerPendingNotice)
 		return ok
 	})
 	// Wait for the FIRST tap's outcome answer before counting it.
@@ -542,11 +544,11 @@ func TestW6ApprovalDuplicateTap(t *testing.T) {
 	// dispatches each tap as `go handleCallback`, cbSem cap 8), and
 	// the first tap's outcome answer is the LAST step of its
 	// handler: Resolve -> outcome edit (editMessageText) -> answer.
-	// The second tap's "expired" answer needs only one Bot API
+	// The second tap's "no longer pending" answer needs only one Bot API
 	// call, so it routinely lands BEFORE the first tap's outcome
 	// answer — and the turn is released by Resolve, before the
 	// first tap's edit even starts. Asserting the count right
-	// after the "expired" wait therefore raced the first
+	// after the "no longer pending" wait therefore raced the first
 	// handler's still-in-flight edit+answer and saw 0 (the
 	// "outcome edit failed: context canceled" in the failing log
 	// is the test tearing down mid-edit, a symptom of the same
@@ -566,7 +568,7 @@ func TestW6ApprovalDuplicateTap(t *testing.T) {
 		if txt, _ := a["text"].(string); txt == "✅ Approved — running it now." {
 			count++
 		}
-		if txt, _ := a["text"].(string); txt == "This approval request has expired." {
+		if txt, _ := a["text"].(string); txt == approvalNoLongerPendingNotice {
 			expired++
 		}
 	}
@@ -575,12 +577,14 @@ func TestW6ApprovalDuplicateTap(t *testing.T) {
 		t.Fatalf("approval outcome answered %d times, want exactly 1 (duplicate tap resolved twice)", count)
 	}
 	if expired != 1 {
-		t.Fatalf("expired answer sent %d times, want exactly 1 (duplicate tap answered once)", expired)
+		t.Fatalf("no-longer-pending answer sent %d times, want exactly 1 (duplicate tap answered once)", expired)
 	}
 }
 
 // TestW6ApprovalStaleCallback: a tap carrying an unknown request ID
-// is answered "expired" and resolves nothing.
+// is answered with the honest no-longer-pending notice (F-A20-9 —
+// "may have been answered, expired, or lost when the bot
+// restarted") and resolves nothing.
 func TestW6ApprovalStaleCallback(t *testing.T) {
 	h := newW6Harness(t, 0)
 	h.fake.taps = []w6Tap{{UpdateID: w6CbUpd, QueryID: "tap-query-stale", Data: "perm:approve:0000000000000000"}}
@@ -590,8 +594,8 @@ func TestW6ApprovalStaleCallback(t *testing.T) {
 	card := h.capturedCard(t)
 	assertCardKeyboard(t, card)
 	close(h.fake.release)
-	w6WaitFor(t, "stale tap to be answered as expired", func() bool {
-		_, ok := h.answerWithText("This approval request has expired.")
+	w6WaitFor(t, "stale tap to be answered as no-longer-pending", func() bool {
+		_, ok := h.answerWithText(approvalNoLongerPendingNotice)
 		return ok
 	})
 	// The real request is still pending (short wait), so nothing ran

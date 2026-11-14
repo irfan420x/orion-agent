@@ -1303,6 +1303,21 @@ func (g *TelegramGateway) AnswerCallbackQuery(ctx context.Context, callbackID, t
 // is the gate's opaque pending-request ID (16 hex chars).
 const permissionCallbackPrefix = "perm:"
 
+// approvalNoLongerPendingNotice is the toast for a tap on an
+// approval card whose request is no longer pending (F-A20-9).
+// The pending approvals live only in memory, so a daemon
+// restart voids every live card; a settled card has its keyboard
+// removed, so nobody can tap it; and a double-tap's second tap
+// races the first tap's resolve. The handler therefore cannot
+// tell WHICH of the three happened — already answered, expired,
+// or lost to a restart — and says so honestly instead of
+// picking one (a bare "expired" blamed the user for being slow
+// when the bot had restarted, and "ask again" would be wrong
+// for a double-tap whose request was already approved). One
+// deterministic toast covers all three, so the outcome never
+// depends on the tap/resolve interleave.
+const approvalNoLongerPendingNotice = "This approval request is no longer pending — it may have been answered, expired, or lost when the bot restarted."
+
 // ApprovalKeyboard builds the inline keyboard for an approval
 // prompt: Approve once / Deny on the first row, Always allow /
 // Never allow on the second. "Always"/"Never" persist a standing
@@ -1521,8 +1536,12 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 	fmt.Fprintf(stderr, "%s: approval tap: %s request %s from %d\n", logPrefix, decision, id, senderID)
 	req, found := gate.Pending(id)
 	if !found {
-		fmt.Fprintf(stderr, "%s: approval tap: request %s expired (no longer pending)\n", logPrefix, id)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+		// The request is not pending: already answered, expired,
+		// or lost to a restart (F-A20-9) — the handler cannot
+		// tell which, so the toast says so (see
+		// approvalNoLongerPendingNotice).
+		fmt.Fprintf(stderr, "%s: approval tap: request %s no longer pending (answered, expired, or lost to a restart)\n", logPrefix, id)
+		return gw.AnswerCallbackQuery(ctx, q.ID, approvalNoLongerPendingNotice)
 	}
 	if senderID != req.SenderID && senderID != ownerID {
 		fmt.Fprintf(stderr, "%s: approval tap: request %s refused for sender %d (requester %d, owner %d)\n", logPrefix, id, senderID, req.SenderID, ownerID)
@@ -1544,8 +1563,14 @@ func HandleApprovalCallback(ctx context.Context, gw *TelegramGateway, gate *perm
 		persist, approved, outcome = &deny, false, "⛔ Denied — I won't ask again for this tool in this chat."
 	}
 	if !gate.Resolve(id, approved, persist) {
-		fmt.Fprintf(stderr, "%s: approval tap: request %s expired during resolve\n", logPrefix, id)
-		return gw.AnswerCallbackQuery(ctx, q.ID, "This approval request has expired.")
+		// Same toast as the not-pending branch: the resolve
+		// lost the race to another tap or the timeout, and the
+		// handler cannot tell which — one deterministic toast
+		// for both, so the outcome never depends on the
+		// tap/resolve interleave (F-A20-9; the precise
+		// "already approved" toast is the open P3 F-A20-23).
+		fmt.Fprintf(stderr, "%s: approval tap: request %s no longer pending during resolve (answered by another tap, or expired)\n", logPrefix, id)
+		return gw.AnswerCallbackQuery(ctx, q.ID, approvalNoLongerPendingNotice)
 	}
 	fmt.Fprintf(stderr, "%s: approval tap: request %s resolved approved=%v\n", logPrefix, id, approved)
 	cards.Forget(id)

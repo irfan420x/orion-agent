@@ -1237,6 +1237,9 @@ func wireGate(a *app.App, gw *messaging.TelegramGateway) (*permissions.Gate, *me
 	if err := messaging.WireTelegram(a.Tools, gw, gate, cards, ownerID, "orion"); err != nil {
 		return nil, nil, err
 	}
+	// F-A20-9: as in oriond — pending approvals/questions live
+	// only in memory, so a restart voids every card sent before it.
+	fmt.Fprintf(os.Stderr, "orion: note: approval/question cards from before this restart are void (pending approvals and questions do not survive a restart); tapping one answers that the request is no longer pending\n")
 	if ownerID != 0 {
 		fmt.Fprintf(os.Stderr, "orion: owner chat %d (first telegram_allowed_chats entry)\n", ownerID)
 	}
