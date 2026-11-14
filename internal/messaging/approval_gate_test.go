@@ -95,6 +95,16 @@ func TestSharedApprovalWiringPromptsAndResolvesViaInstalledHandler(t *testing.T)
 	if cardMsgID == 0 {
 		t.Fatal("approval card arrived with no message id")
 	}
+	// The prompter Notes the request BEFORE sending (F-A20-11),
+	// so the tracker knows the request from the moment its send
+	// starts — but the message id lands only when the send
+	// returns. Wait for the TRACKED id, not just the send: the
+	// old wait observed the fake outbox, which records the card
+	// before Note runs, and the Take below raced it (~9% flake).
+	waitFor(t, "approval card tracked with its message id", func() bool {
+		msgID, ok := cards.Peek(reqID)
+		return ok && msgID == cardMsgID
+	})
 	// The card is tracked: the tracker holds this request's card.
 	if msgID, ok := cards.Take(reqID); !ok || msgID != cardMsgID {
 		t.Fatalf("cards.Take(%s) = (%d, %v), want (%d, true)", reqID, msgID, ok, cardMsgID)

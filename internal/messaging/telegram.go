@@ -1386,10 +1386,42 @@ func ParsePermissionCallback(data string) (decision, requestID string, ok bool) 
 type ApprovalCards struct {
 	mu sync.Mutex
 	m  map[string]int64
+	// pending holds request ids whose card send has started but
+	// whose message id is not yet known (F-A20-11): the prompter
+	// Notes the id BEFORE sending, so a card is never observable
+	// (in the Telegram outbox) before it is tracked. Take only
+	// ever returns a real card (msgID != 0); Peek reports the
+	// tracked message id without removing it.
+	pending map[string]bool
 }
 
 // NewApprovalCards returns an empty card tracker.
-func NewApprovalCards() *ApprovalCards { return &ApprovalCards{m: map[string]int64{}} }
+func NewApprovalCards() *ApprovalCards {
+	return &ApprovalCards{m: map[string]int64{}, pending: map[string]bool{}}
+}
+
+// NotePending records id as "card send in flight" BEFORE the
+// prompter sends it (F-A20-11). A test (or the expiry hook) that
+// observes the card in the outbox can then know the tracker
+// already knows the request — the old race was that the card was
+// observable before Note ran, so a Take in between returned
+// (0, false) for a card that really existed.
+func (c *ApprovalCards) NotePending(id string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]int64{}
+	}
+	if c.pending == nil {
+		c.pending = map[string]bool{}
+	}
+	if _, ok := c.m[id]; !ok {
+		c.pending[id] = true
+	}
+}
 
 // Note records msgID as the live card for pending request id.
 func (c *ApprovalCards) Note(id string, msgID int64) {
@@ -1402,10 +1434,29 @@ func (c *ApprovalCards) Note(id string, msgID int64) {
 		c.m = map[string]int64{}
 	}
 	c.m[id] = msgID
+	delete(c.pending, id)
+}
+
+// Peek returns the tracked message id for id without removing it:
+// (msgID, true) once the card has been sent and Noted, (0, false)
+// while the send is still in flight or the id is unknown.
+func (c *ApprovalCards) Peek(id string) (int64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msgID, ok := c.m[id]
+	if !ok || msgID == 0 {
+		return 0, false
+	}
+	return msgID, true
 }
 
 // Take removes and returns the card for id, reporting whether one
-// was tracked.
+// was tracked. A send still in flight (NotePending, no Note yet)
+// is NOT a card: Take returns (0, false) and leaves the pending
+// mark in place, so the Note that follows still lands.
 func (c *ApprovalCards) Take(id string) (int64, bool) {
 	if c == nil {
 		return 0, false
@@ -1413,9 +1464,10 @@ func (c *ApprovalCards) Take(id string) (int64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	msgID, ok := c.m[id]
-	if ok {
-		delete(c.m, id)
+	if !ok || msgID == 0 {
+		return 0, false
 	}
+	delete(c.m, id)
 	return msgID, ok
 }
 
@@ -1427,6 +1479,7 @@ func (c *ApprovalCards) Forget(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.m, id)
+	delete(c.pending, id)
 }
 
 // ApprovalPromptText renders the approval-card text for req: what
@@ -1452,10 +1505,22 @@ func ApprovalPrompter(gw *TelegramGateway, cards *ApprovalCards, logPrefix strin
 	// production; only the read moves to setup time.
 	stderr := os.Stderr
 	return func(ctx context.Context, req permissions.ApprovalRequest) error {
+		// Note BEFORE sending (F-A20-11): the request is tracked
+		// from the moment its send starts, so a card is never
+		// observable in the outbox before the tracker knows it.
+		// The old order (send, then Note) let a fast observer
+		// Take the card before Note ran and see (0, false) for
+		// a card that really existed.
+		cards.NotePending(req.ID)
 		msgID, err := gw.SendMessageWithKeyboard(ctx, req.ChatID, ApprovalPromptText(req), ApprovalKeyboard(req.ID))
 		if err == nil {
 			cards.Note(req.ID, msgID)
 			fmt.Fprintf(stderr, "%s: approval prompt: tool %q request %s chat %d card %d\n", logPrefix, req.Tool, req.ID, req.ChatID, msgID)
+		} else {
+			// The send failed: drop the pending mark, so a
+			// later request with this id is never confused
+			// with a card that was never delivered.
+			cards.Forget(req.ID)
 		}
 		return err
 	}
