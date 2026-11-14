@@ -30,6 +30,12 @@ import (
 // duplicate/cap/reservation rules. It answers nothing itself —
 // dispatch (the tap reaching the tool) is what is under test;
 // the answer path is covered by the question/approval tests.
+//
+// NOTE (F-A21-1): Registry.Register rejects unclassified names,
+// so these test doubles borrow classified Safe names
+// ("calculator", "datetime") and declare RiskClass() Safe to
+// match. The name is irrelevant to the wiring under test; the
+// prefix is what each test varies.
 type wireCallbackTool struct {
 	name   string
 	prefix string
@@ -136,9 +142,9 @@ func wireTap(t *testing.T, gw *TelegramGateway, data string) error {
 func TestWireTelegramDiscoversCallbackHandler(t *testing.T) {
 	gw, gate, cards := wireTestGateway(t)
 	reg := tools.NewRegistry()
-	tool := &wireCallbackTool{name: "fake_tool", prefix: "fake:"}
+	tool := &wireCallbackTool{name: "calculator", prefix: "fake:"}
 	if err := reg.Register(tool); err != nil {
-		t.Fatalf("Register fake_tool: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	if err := WireTelegram(reg, gw, gate, cards, 77, "test"); err != nil {
 		t.Fatalf("WireTelegram: %v", err)
@@ -177,9 +183,9 @@ func TestWireTelegramDiscoversCallbackHandler(t *testing.T) {
 func TestWireTelegramDiscoversReplyInterceptor(t *testing.T) {
 	gw, gate, cards := wireTestGateway(t)
 	reg := tools.NewRegistry()
-	tool := &wireInterceptorTool{name: "fake_tool", answer: true}
+	tool := &wireInterceptorTool{name: "calculator", answer: true}
 	if err := reg.Register(tool); err != nil {
-		t.Fatalf("Register fake_tool: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	if err := WireTelegram(reg, gw, gate, cards, 77, "test"); err != nil {
 		t.Fatalf("WireTelegram: %v", err)
@@ -194,7 +200,7 @@ func TestWireTelegramDiscoversReplyInterceptor(t *testing.T) {
 	// A declining interceptor leaves the update unconsumed.
 	gw2, gate2, cards2 := wireTestGateway(t)
 	reg2 := tools.NewRegistry()
-	decliner := &wireInterceptorTool{name: "fake_tool", answer: false}
+	decliner := &wireInterceptorTool{name: "calculator", answer: false}
 	if err := reg2.Register(decliner); err != nil {
 		t.Fatalf("Register decliner: %v", err)
 	}
@@ -225,7 +231,7 @@ func TestWireTelegramRejectsDuplicateCallbackPrefix(t *testing.T) {
 			gw, gate, cards := wireTestGateway(t)
 			reg := tools.NewRegistry()
 			for i, p := range tc.prefixes {
-				tool := &wireCallbackTool{name: "fake_tool_" + string(rune('a'+i)), prefix: p}
+				tool := &wireCallbackTool{name: []string{"calculator", "datetime"}[i], prefix: p}
 				if err := reg.Register(tool); err != nil {
 					t.Fatalf("Register %s: %v", tool.name, err)
 				}
@@ -242,7 +248,7 @@ func TestWireTelegramRejectsDuplicateCallbackPrefix(t *testing.T) {
 // boundary) is accepted.
 func TestWireTelegramRejectsLongCallbackPrefix(t *testing.T) {
 	// 17 bytes: 16 digits + ":".
-	tooLong := &wireCallbackTool{name: "fake_tool", prefix: "1234567890123456:"}
+	tooLong := &wireCallbackTool{name: "calculator", prefix: "1234567890123456:"}
 	gw, gate, cards := wireTestGateway(t)
 	reg := tools.NewRegistry()
 	if err := reg.Register(tooLong); err != nil {
@@ -252,7 +258,7 @@ func TestWireTelegramRejectsLongCallbackPrefix(t *testing.T) {
 		t.Fatal("WireTelegram with a 17-byte prefix: accepted, want a loud error")
 	}
 	// 16 bytes: 15 digits + ":" — the boundary, accepted.
-	atCap := &wireCallbackTool{name: "fake_tool", prefix: "123456789012345:"}
+	atCap := &wireCallbackTool{name: "calculator", prefix: "123456789012345:"}
 	gw2, gate2, cards2 := wireTestGateway(t)
 	reg2 := tools.NewRegistry()
 	if err := reg2.Register(atCap); err != nil {
@@ -304,30 +310,55 @@ func TestWireTelegramDirect(t *testing.T) {
 		t.Fatalf("second WireTelegram error %v, want it to name the duplicate \"ask:\" prefix", err)
 	}
 	// The first wiring still works after the failed second call:
-	// an ask: tap is still answered (unknown question → expired).
+	// an ask: tap is still answered (unknown question → expired),
+	// and the router still holds exactly the first wiring's
+	// handler — the failed call added nothing and removed nothing.
+	if got := routerPrefixes(t, gw); len(got) != 1 || got[0] != "ask:" {
+		t.Fatalf("router prefixes after failed second WireTelegram = %v, want [ask:] (first wiring intact)", got)
+	}
 	if err := wireTap(t, gw, "ask:deadbeef:0"); err != nil {
 		t.Fatalf("tap after failed second WireTelegram: %v", err)
 	}
 }
 
-// TestWireTelegramPartialFailure pins the partial-failure
-// window: a failure in the tool callback discovery leaves the
-// gateway partially wired (the "ask:" handler and any tool
-// handlers registered before the failure stay registered) — and
-// the failure is loud, so no binary ever serves traffic on it:
-// the router was never installed as the gateway's handler.
+// routerPrefixes returns the prefixes currently registered on
+// the gateway's router, for asserting a failed wiring left
+// nothing behind (F-A21-7).
+func routerPrefixes(t *testing.T, gw *TelegramGateway) []string {
+	t.Helper()
+	r := gw.callbackRouterFor()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.handlers))
+	for p := range r.handlers {
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestWireTelegramPartialFailure pins the F-A21-7 contract: a
+// failure in the tool callback discovery leaves the gateway
+// CLEAN — no handler from the failed attempt survives. This test
+// used to pin the opposite (partial) state: before
+// validate-then-install, the "ask:" handler and any tool handlers
+// registered before the failure stayed registered. The fix
+// changed that pinned behaviour, so the test now asserts the
+// clean router instead. The failure is still loud, so no binary
+// ever serves traffic on it: the router was never installed as
+// the gateway's handler.
 func TestWireTelegramPartialFailure(t *testing.T) {
 	gw, gate, cards := wireTestGateway(t)
 	reg := tools.NewRegistry()
 	// The first tool registers fine; the second duplicates its
-	// prefix, so the discovery loop fails on it.
-	good := &wireCallbackTool{name: "good_tool", prefix: "good:"}
-	bad := &wireCallbackTool{name: "bad_tool", prefix: "good:"}
+	// prefix, so the wiring fails on it — but only after every
+	// prefix was pre-validated, so nothing was registered at all.
+	good := &wireCallbackTool{name: "calculator", prefix: "good:"}
+	bad := &wireCallbackTool{name: "datetime", prefix: "good:"}
 	if err := reg.Register(good); err != nil {
-		t.Fatalf("Register good_tool: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	if err := reg.Register(bad); err != nil {
-		t.Fatalf("Register bad_tool: %v", err)
+		t.Fatalf("Register datetime: %v", err)
 	}
 	err := WireTelegram(reg, gw, gate, cards, 77, "test")
 	if err == nil {
@@ -336,14 +367,65 @@ func TestWireTelegramPartialFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "good:") {
 		t.Fatalf("WireTelegram error %v, want it to name the duplicate prefix", err)
 	}
-	// Partial state: "ask:" and "good:" are registered on the
-	// router, but the router was never installed as the
-	// gateway's handler (the failure came before
+	// Clean state: NOTHING is registered on the router — neither
+	// "ask:" nor "good:" — and the router was never installed as
+	// the gateway's handler (the failure came before
 	// InstallCallbackRouter), so no tap can be dispatched.
 	// Both binaries kill the process on a WireTelegram error
 	// instead of serving traffic on a partially wired gateway.
+	if got := routerPrefixes(t, gw); len(got) != 0 {
+		t.Fatalf("router prefixes after failed WireTelegram = %v, want none (a failed wiring must leave a clean router)", got)
+	}
 	if h := gw.callbackHandlerFor(); h != nil {
 		t.Fatal("gateway has an installed callback handler after a failed WireTelegram, want none (partial wiring must not serve traffic)")
+	}
+}
+
+// TestWireTelegramFailedWiringLeavesCleanRouter pins the F-A21-7
+// contract for the other bad declarations: a tool claiming
+// "ask:", a reserved "perm:" prefix, and an over-long prefix
+// must all fail with the router untouched — no handler from the
+// failed attempt survives, and a retry on the same gateway
+// starts from a clean router.
+func TestWireTelegramFailedWiringLeavesCleanRouter(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{"tool claims ask:", "ask:"},
+		{"tool claims perm:", "perm:"},
+		{"17-byte prefix", "1234567890123456:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw, gate, cards := wireTestGateway(t)
+			reg := tools.NewRegistry()
+			tool := &wireCallbackTool{name: "calculator", prefix: tc.prefix}
+			if err := reg.Register(tool); err != nil {
+				t.Fatalf("Register calculator: %v", err)
+			}
+			if err := WireTelegram(reg, gw, gate, cards, 77, "test"); err == nil {
+				t.Fatalf("WireTelegram with prefix %q: accepted, want a loud error", tc.prefix)
+			}
+			if got := routerPrefixes(t, gw); len(got) != 0 {
+				t.Fatalf("router prefixes after failed WireTelegram = %v, want none", got)
+			}
+			if h := gw.callbackHandlerFor(); h != nil {
+				t.Fatal("gateway has an installed callback handler after a failed WireTelegram, want none")
+			}
+			// And a retry on the same gateway starts clean: a
+			// good wiring now succeeds on it.
+			reg2 := tools.NewRegistry()
+			good := &wireCallbackTool{name: "calculator", prefix: "good:"}
+			if err := reg2.Register(good); err != nil {
+				t.Fatalf("Register calculator: %v", err)
+			}
+			if err := WireTelegram(reg2, gw, gate, cards, 77, "test"); err != nil {
+				t.Fatalf("WireTelegram retry after a failed wiring: %v, want success on a clean router", err)
+			}
+			if err := wireTap(t, gw, "good:payload"); err != nil {
+				t.Fatalf("tap good:payload after retry: %v", err)
+			}
+		})
 	}
 }
 
@@ -353,9 +435,9 @@ func TestWireTelegramPartialFailure(t *testing.T) {
 func TestWireTelegramRejectsPermPrefix(t *testing.T) {
 	gw, gate, cards := wireTestGateway(t)
 	reg := tools.NewRegistry()
-	tool := &wireCallbackTool{name: "fake_tool", prefix: "perm:"}
+	tool := &wireCallbackTool{name: "calculator", prefix: "perm:"}
 	if err := reg.Register(tool); err != nil {
-		t.Fatalf("Register fake_tool: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	if err := WireTelegram(reg, gw, gate, cards, 77, "test"); err == nil {
 		t.Fatal("WireTelegram with prefix \"perm:\": accepted, want a loud error (reserved for approvals)")
@@ -364,9 +446,9 @@ func TestWireTelegramRejectsPermPrefix(t *testing.T) {
 	// developer reading the startup failure knows why.
 	gw2, gate2, cards2 := wireTestGateway(t)
 	reg2 := tools.NewRegistry()
-	tool2 := &wireCallbackTool{name: "fake_tool", prefix: "perm:"}
+	tool2 := &wireCallbackTool{name: "calculator", prefix: "perm:"}
 	if err := reg2.Register(tool2); err != nil {
-		t.Fatalf("Register fake_tool: %v", err)
+		t.Fatalf("Register calculator: %v", err)
 	}
 	err := WireTelegram(reg2, gw2, gate2, cards2, 77, "test")
 	if err == nil || !strings.Contains(err.Error(), "reserved") {

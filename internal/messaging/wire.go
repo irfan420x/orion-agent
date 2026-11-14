@@ -34,26 +34,35 @@
 //     installed on the gate (SetToolClasses); the hardcoded maps
 //     remain the authority (see permissions.classify).
 //
-// The "ask:" registration is the fallible step, so it runs first:
-// a duplicate (WireTelegram called twice on one gateway) fails
-// before any gateway state changes, instead of leaving the asker
-// and the handler pointed at different registries. The tool
-// callback discovery is fallible too (duplicate prefix, 16-byte
-// cap, "perm:" reservation), so it runs next, before the
-// fallback/router/question-registry installs — a bad declaration
-// fails the whole wiring loudly at startup, never silently.
+// The "ask:" registration is the fallible step, so its prefix is
+// validated first: every callback prefix this call would register
+// ("ask:" plus each tool's declared prefix) is pre-validated
+// against the router before any is registered, so a duplicate,
+// over-long or reserved prefix fails with the router untouched
+// instead of leaving the handlers registered before the failure
+// behind. The tool callback discovery is fallible too (duplicate
+// prefix, 16-byte cap, "perm:" reservation), so it runs next,
+// before the fallback/router/question-registry installs — a bad
+// declaration fails the whole wiring loudly at startup, never
+// silently.
 //
 // Cards is required: the approval handler Forgets resolved
 // requests from the cards, and a nil cards would leave resolved
 // cards answerable. A nil registry, gateway, gate or cards is a
 // loud startup error, never a silent half-wiring.
 //
-// A failed WireTelegram leaves the gateway partially wired (the
-// "ask:" handler and any tool handlers registered before the
-// failure stay registered). That is acceptable because both
-// binaries kill the process on a WireTelegram error — a failed
-// wiring never serves traffic — and a second call fails loudly
-// on the duplicate "ask:" instead of silently re-wiring.
+// A failed WireTelegram leaves no callback handler behind for a
+// prefix failure (validate-then-install, F-A21-7): the router is
+// untouched, so a retry on the same gateway starts from a clean
+// router. A failure in a later step — a tool's InstallTransport —
+// can still leave handlers registered, because those steps have
+// no inverse (the fallback install deliberately refuses
+// replacement, F-A20-6); both binaries kill the process on a
+// WireTelegram error, so a failed wiring never serves traffic,
+// and a second call fails loudly on the duplicate "ask:" instead
+// of silently re-wiring. Rollback was considered and rejected:
+// pre-validation is possible here because every prefix rule is a
+// pure check, and it needs no new mutation path.
 package messaging
 
 import (
@@ -82,6 +91,40 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 	}
 	questions := NewQuestionRegistry(ownerID)
 	handler := questionCallbackHandler{questions: questions, logPrefix: logPrefix}
+	// Validate-then-install (F-A21-7): collect every callback
+	// prefix this call would register — "ask:" for the question
+	// transport plus each tool's declared prefix — and validate
+	// ALL of them before registering any. The within-set check
+	// names both tools claiming a prefix; the router check
+	// (validatePrefix) applies the same rules register enforces
+	// (suffix ":", 16-byte cap, "perm:" reservation, not already
+	// installed) without mutating anything. A bad declaration
+	// therefore fails here with the router untouched: no handler
+	// from the failed attempt survives, and a retry on the same
+	// gateway starts clean. WireTelegram runs once at startup
+	// before polling, so nothing can register between this
+	// validation and the installs below.
+	type plannedPrefix struct {
+		prefix string
+		owner  string // tool name, or "question transport" for ask:
+	}
+	planned := []plannedPrefix{{prefix: questionCallbackPrefix, owner: "question transport"}}
+	for _, t := range reg.List() {
+		if ch, ok := t.(tools.CallbackHandler); ok {
+			planned = append(planned, plannedPrefix{prefix: ch.CallbackPrefix(), owner: t.Name()})
+		}
+	}
+	seen := make(map[string]string, len(planned))
+	router := gw.callbackRouterFor()
+	for _, p := range planned {
+		if first, dup := seen[p.prefix]; dup {
+			return fmt.Errorf("messaging: WireTelegram: tool %q callback prefix %q duplicates tool %q's prefix", p.owner, p.prefix, first)
+		}
+		seen[p.prefix] = p.owner
+		if err := router.validatePrefix(p.prefix); err != nil {
+			return fmt.Errorf("messaging: WireTelegram: tool %q callback prefix: %w", p.owner, err)
+		}
+	}
 	// The fallible step first (see the package doc): a duplicate
 	// "ask:" fails before any gateway state changes.
 	if err := gw.RegisterCallbackHandler(questionCallbackPrefix, handler); err != nil {
@@ -89,10 +132,12 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 	}
 	// Callback discovery (F-A20-1): every tool that implements
 	// tools.CallbackHandler gets its declared prefix registered
-	// on the router. This is fallible too (duplicate prefix,
-	// 16-byte cap, "perm:" reservation), so it runs here, before
-	// the fallback/router/question-registry installs — a bad
-	// declaration fails the whole wiring loudly at startup.
+	// on the router. Every prefix was pre-validated above
+	// (F-A21-7), so these registrations cannot fail on a bad
+	// declaration — they run here, before the
+	// fallback/router/question-registry installs, and a failure
+	// here (only a concurrent registration could cause one) is
+	// still loud at startup, never silent.
 	for _, t := range reg.List() {
 		if ch, ok := t.(tools.CallbackHandler); ok {
 			if err := gw.RegisterCallbackHandler(ch.CallbackPrefix(), ch); err != nil {
@@ -116,9 +161,15 @@ func WireTelegram(reg *tools.Registry, gw *TelegramGateway, gate *permissions.Ga
 		// Reply discovery (F-A20-1): every tool that implements
 		// tools.ReplyInterceptor is added to the reply chain.
 		// AddReplyInterceptor cannot fail (it appends; a nil
-		// interceptor is a no-op). The question interceptor was
-		// installed first by SetQuestionRegistry above, so it
-		// runs before any later tool's interceptor.
+		// interceptor is a no-op). Ordering (F-A21-22): the
+		// question interceptor was installed first by
+		// SetQuestionRegistry above, so it runs before any later
+		// tool's interceptor; tool interceptors follow in
+		// reg.List() order — alphabetical by tool name,
+		// deterministic — and the first returning true wins.
+		// There is no priority field: insertion order is the
+		// control, and every consumption is audit-logged with
+		// the interceptor's type, so a misroute is diagnosable.
 		if ri, ok := t.(tools.ReplyInterceptor); ok {
 			gw.AddReplyInterceptor(ri)
 		}

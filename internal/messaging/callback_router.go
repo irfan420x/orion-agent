@@ -50,6 +50,45 @@ func callbackPrefix(data string) string {
 	return ""
 }
 
+// validatePrefixRules checks the shape rules for a callback
+// prefix (suffix ":", at most 16 bytes, "perm:" reserved) without
+// touching the router. register and validatePrefix share it,
+// so the pre-check WireTelegram runs can never drift from the
+// rules register enforces (F-A21-7).
+func validatePrefixRules(prefix string) error {
+	if prefix == "" || !strings.HasSuffix(prefix, ":") {
+		return fmt.Errorf("messaging: callback router: prefix %q must end with \":\"", prefix)
+	}
+	if len(prefix) > 16 {
+		return fmt.Errorf("messaging: callback router: prefix %q is %d bytes, max 16", prefix, len(prefix))
+	}
+	if prefix == permissionCallbackPrefix {
+		return fmt.Errorf("messaging: callback router: prefix %q is reserved for approvals", prefix)
+	}
+	return nil
+}
+
+// validatePrefix checks one prefix against the registration
+// rules and the handlers already installed, without mutating
+// the router. WireTelegram pre-validates every planned prefix
+// with it before registering any (validate-then-install,
+// F-A21-7), so a bad declaration fails with the router
+// untouched. register enforces the same rules at install time.
+func (r *callbackRouter) validatePrefix(prefix string) error {
+	if r == nil {
+		return fmt.Errorf("messaging: callback router: nil router")
+	}
+	if err := validatePrefixRules(prefix); err != nil {
+		return err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, ok := r.handlers[prefix]; ok {
+		return fmt.Errorf("messaging: callback router: duplicate callback prefix %q", prefix)
+	}
+	return nil
+}
+
 // register adds a tool callback handler under prefix. The prefix
 // must end with ":", be at most 16 bytes (Telegram caps
 // callback_data at 64 bytes and the tool's own payload needs the
@@ -62,14 +101,8 @@ func (r *callbackRouter) register(prefix string, h tools.CallbackHandler) error 
 	if h == nil {
 		return fmt.Errorf("messaging: callback router: nil handler for prefix %q", prefix)
 	}
-	if prefix == "" || !strings.HasSuffix(prefix, ":") {
-		return fmt.Errorf("messaging: callback router: prefix %q must end with \":\"", prefix)
-	}
-	if len(prefix) > 16 {
-		return fmt.Errorf("messaging: callback router: prefix %q is %d bytes, max 16", prefix, len(prefix))
-	}
-	if prefix == permissionCallbackPrefix {
-		return fmt.Errorf("messaging: callback router: prefix %q is reserved for approvals", prefix)
+	if err := validatePrefixRules(prefix); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
