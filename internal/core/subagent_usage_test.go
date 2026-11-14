@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/tools"
 )
 
@@ -20,6 +21,10 @@ type chargeTool struct {
 
 func (t *chargeTool) Name() string        { return "charge" }
 func (t *chargeTool) Description() string { return "Reports subagent tokens to the agent." }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "charge" is not in the gate's maps).
+func (t *chargeTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (t *chargeTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{Name: "charge", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
 }
@@ -155,6 +160,10 @@ type raceChargeTool struct {
 
 func (t *raceChargeTool) Name() string        { return "racecharge" }
 func (t *raceChargeTool) Description() string { return "Reports subagent tokens concurrently." }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "racecharge" is not in the gate's maps).
+func (t *raceChargeTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (t *raceChargeTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{Name: "racecharge", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
 }

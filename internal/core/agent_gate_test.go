@@ -26,6 +26,14 @@ type gateStubTool struct {
 
 func (t *gateStubTool) Name() string        { return t.name }
 func (t *gateStubTool) Description() string { return "test tool " + t.name }
+
+// RiskClass returns the gate's class for the tool's name:
+// Register requires the declaration to match
+// permissions.Classify, and this stub's name decides its gate
+// class (shell_exec/file_write are gated, echo is not).
+func (t *gateStubTool) RiskClass() permissions.Class {
+	return permissions.Classify(t.name)
+}
 func (t *gateStubTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{Name: t.name, Description: t.Description()}
 }

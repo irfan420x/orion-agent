@@ -14,6 +14,7 @@ import (
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
 
 // usageScriptProvider is a scripted model.Provider for cost tests:
@@ -62,6 +63,10 @@ type chargeTokensTool struct {
 
 func (t *chargeTokensTool) Name() string        { return "charge" }
 func (t *chargeTokensTool) Description() string { return "Reports subagent tokens to the agent." }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "charge" is not in the gate's maps).
+func (t *chargeTokensTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (t *chargeTokensTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{Name: "charge", Description: t.Description(), Parameters: map[string]any{"type": "object"}}
 }

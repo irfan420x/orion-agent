@@ -12,6 +12,7 @@ import (
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/tools"
 )
 
@@ -126,6 +127,10 @@ type deadlineTool struct {
 
 func (deadlineTool) Name() string        { return "deadline" }
 func (deadlineTool) Description() string { return "Reports its remaining context deadline." }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "deadline" is not in the gate's maps).
+func (deadlineTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (deadlineTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{Name: "deadline", Description: "Reports deadline.", Parameters: map[string]any{"type": "object"}}
 }

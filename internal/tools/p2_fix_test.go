@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
 
 // --- P2-23: file_read truncation marker ---
@@ -280,6 +281,13 @@ func TestFileListCapsEntriesAndReportsTotal(t *testing.T) {
 type namedStubTool struct{ name string }
 
 func (s *namedStubTool) Name() string { return s.name }
+
+// RiskClass returns the gate's class for the tool's name:
+// Register requires the declaration to match
+// permissions.Classify.
+func (s *namedStubTool) RiskClass() permissions.Class {
+	return permissions.Classify(s.name)
+}
 func (s *namedStubTool) Description() string {
 	return "stub tool for registry guard tests"
 }
@@ -346,6 +354,10 @@ func TestCalcParserPeekNextBounds(t *testing.T) {
 type panicTool struct{}
 
 func (panicTool) Name() string { return "panicker" }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "panicker" is not in the gate's maps).
+func (panicTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (panicTool) Description() string {
 	return "tool that panics, for the recover test"
 }

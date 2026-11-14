@@ -14,6 +14,7 @@ import (
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/tools"
 )
 
@@ -233,6 +234,11 @@ type echoTool struct {
 
 func (t *echoTool) Name() string        { return "echo" }
 func (t *echoTool) Description() string { return "Echoes the text argument back." }
+
+// RiskClass declares the tool Safe: Register requires every tool
+// to declare a class matching permissions.Classify (here Safe,
+// since "echo" is not in the gate's maps).
+func (t *echoTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (t *echoTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{
 		Name:        "echo",
@@ -265,6 +271,10 @@ type failingTool struct{}
 
 func (failingTool) Name() string        { return "boom" }
 func (failingTool) Description() string { return "Always fails." }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "boom" is not in the gate's maps).
+func (failingTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (failingTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{Name: "boom", Description: "Always fails.", Parameters: map[string]any{"type": "object"}}
 }

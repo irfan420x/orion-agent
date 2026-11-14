@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/skills"
 	"github.com/irfan/orion/internal/tools"
 )
@@ -23,6 +24,14 @@ type recordingTool struct {
 
 func (t *recordingTool) Name() string        { return t.name }
 func (t *recordingTool) Description() string { return "Recording stub tool." }
+
+// RiskClass returns the gate's class for the tool's name:
+// Register requires the declaration to match
+// permissions.Classify, and this stub's name decides its gate
+// class (shell_exec/file_write are gated, echo is not).
+func (t *recordingTool) RiskClass() permissions.Class {
+	return permissions.Classify(t.name)
+}
 func (t *recordingTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{
 		Name:        t.name,

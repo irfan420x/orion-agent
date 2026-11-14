@@ -357,10 +357,12 @@ type Gate struct {
 	loggerMu sync.RWMutex
 	// toolClasses, when set via SetToolClasses, is the
 	// per-tool risk class the tools framework collected from the
-	// tools' own RiskClass() declarations. It is consulted
-	// before the hardcoded maps (see classify): the tool is the
-	// authority on what it does, and the maps are the fallback
-	// for tools that declare nothing (MCP tools, unknown tools).
+	// tools' own RiskClass() declarations. It can only RAISE a
+	// tool's class, never lower it below the hardcoded maps
+	// (see classify): the maps are the authority, and a
+	// declaration that disagrees with them is rejected at
+	// registration (Registry.Register), so the installed map
+	// never downgrades a gated tool to Safe.
 	// toolClassesMu guards it (a dedicated mutex, not mu, so
 	// classify can never deadlock against a caller holding mu).
 	toolClasses   map[string]Class
@@ -438,8 +440,11 @@ func (g *Gate) SetTimeout(d time.Duration) {
 // declarations. The map is copied, so later mutation of the
 // caller's map cannot change the gate. A nil/empty map clears the
 // installed classes (the hardcoded maps then decide alone).
-// Installed classes take precedence over the hardcoded maps (see
-// classify); tools absent from the map fall back to Classify, so
+// Installed classes can only RAISE a tool's class, never lower
+// it: classify() returns the hardcoded maps' answer whenever
+// Classify calls the tool destructive or network, and consults
+// the installed map only for tools Classify calls safe (see
+// classify). Tools absent from the map fall back to Classify, so
 // MCP tools (mcp__ prefix) and unknown tools are unaffected.
 // Safe for concurrent use with Check.
 func (g *Gate) SetToolClasses(classes map[string]Class) {
@@ -461,22 +466,31 @@ func (g *Gate) SetToolClasses(classes map[string]Class) {
 	g.toolClasses = m
 }
 
-// classify returns the risk class of a tool: the installed
-// per-tool declaration first, the hardcoded maps (Classify)
-// second. The two must agree for every built-in tool — a test pins
-// that — so the installed map never changes what the maps already
-// decide; it only makes the declaration explicit and loud.
+// classify returns the risk class of a tool. The hardcoded maps
+// (Classify) are the authority: a tool Classify calls destructive
+// or network is gated even if an installed declaration says safe
+// — the installed map can only raise a tool Classify calls safe,
+// never lower one Classify gates. The two must agree for every
+// built-in tool — Register enforces that at registration time —
+// so in production the installed map never changes what Classify
+// decides; this is the fail-closed backstop for a hand-built map
+// (a test, or a future caller that bypasses Register).
 func (g *Gate) classify(tool string) Class {
 	tool = strings.TrimSpace(tool)
-	if g != nil {
-		g.toolClassesMu.RLock()
-		class, ok := g.toolClasses[tool]
-		g.toolClassesMu.RUnlock()
-		if ok {
-			return class
-		}
+	base := Classify(tool)
+	if g == nil {
+		return base
 	}
-	return Classify(tool)
+	if base != ClassSafe {
+		return base
+	}
+	g.toolClassesMu.RLock()
+	declared, ok := g.toolClasses[tool]
+	g.toolClassesMu.RUnlock()
+	if !ok {
+		return base
+	}
+	return declared
 }
 
 // SetOnExpire installs the hook called when a pending request dies

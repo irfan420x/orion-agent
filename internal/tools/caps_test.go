@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
 
 // --- TruncateToolResult ---
@@ -71,6 +72,10 @@ type hugeTool struct {
 
 func (h hugeTool) Name() string        { return "huge" }
 func (h hugeTool) Description() string { return "Returns a huge payload for cap tests." }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "huge" is not in the gate's maps).
+func (h hugeTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (h hugeTool) Definition() model.ToolDefinition {
 	return model.ToolDefinition{Name: "huge", Description: h.Description(), Parameters: map[string]any{"type": "object"}}
 }

@@ -9,8 +9,10 @@
 //     (and to forget). Adding a tool = one new file + a rebuild
 //     (Go is compiled; the rebuild is seconds, the wiring is zero).
 //   - RiskClasser: the tool declares its permission-gate risk class.
-//     A tool that forgets to declare is caught by the test that
-//     every built-in tool implements RiskClasser.
+//     A tool that forgets to declare is rejected at registration
+//     (Registry.Register), and a declaration that disagrees with
+//     the gate's hardcoded maps is rejected too — the maps are
+//     the authority, so a destructive tool cannot slip in as Safe.
 //   - QuestionAskerInstaller: the tool needs the Telegram question
 //     transport (an Ask func) installed after the gateway exists.
 //     The transport itself lives in internal/messaging (this
@@ -132,10 +134,11 @@ func DefaultRegistryWithDeps(deps ToolDeps) (*Registry, error) {
 }
 
 // ToolClasses returns the permission-gate risk class each registered
-// tool declares, for tools that implement RiskClasser. Tools that
-// declare nothing are absent (the gate falls back to its hardcoded
-// maps for them). The framework installs this map on the gate at
-// startup; a test pins that every built-in tool declares.
+// tool declares, for tools that implement RiskClasser. Register
+// requires every tool to implement RiskClasser and to agree with
+// the gate's hardcoded maps, so in practice every registered tool
+// has an entry here. The framework installs this map on the gate
+// at startup; a test pins that every built-in tool declares.
 func (r *Registry) ToolClasses() map[string]permissions.Class {
 	classes := map[string]permissions.Class{}
 	if r == nil {
@@ -151,9 +154,11 @@ func (r *Registry) ToolClasses() map[string]permissions.Class {
 
 // RiskClasser — the tool declares its permission-gate risk class.
 // A tool that mutates the machine or the network MUST implement
-// this; a tool that forgets is caught by the test that every
-// built-in tool declares its class explicitly (a destructive tool
-// must not silently slip in as Safe by forgetting to declare).
+// this; a tool that forgets is rejected at registration
+// (Registry.Register) instead of silently defaulting to Safe —
+// a destructive tool must not slip in as Safe by forgetting to
+// declare. The declaration must also agree with the gate's
+// hardcoded maps (permissions.Classify), which are the authority.
 type RiskClasser interface {
 	RiskClass() permissions.Class
 }

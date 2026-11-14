@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/tools"
 )
 
@@ -131,5 +132,17 @@ func delimitMCPResult(server, text string) string {
 	return fmt.Sprintf(mcpResultBegin+"\n%s\n"+mcpResultEnd, server, text)
 }
 
+// RiskClass declares the tool ClassNetwork: an MCP server is an
+// external process with unknown capabilities, so every MCP tool
+// needs approval when a gate is installed. This matches the
+// gate's hardcoded mcp__ prefix rule (permissions.Classify), so
+// the declaration and the maps agree — Register rejects a tool
+// whose declaration disagrees with the maps.
+func (t *Tool) RiskClass() permissions.Class { return permissions.ClassNetwork }
+
 // Compile-time check: Tool implements tools.Tool.
 var _ tools.Tool = (*Tool)(nil)
+
+// Compile-time check: Tool implements tools.RiskClasser (Register
+// requires every tool to declare its risk class explicitly).
+var _ tools.RiskClasser = (*Tool)(nil)

@@ -20,6 +20,7 @@ import (
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/sandbox"
 	"github.com/irfan/orion/internal/tools"
 )
@@ -674,6 +675,41 @@ func TestToolDefinitionDefaults(t *testing.T) {
 	out, err := nodesc.Execute(context.Background(), json.RawMessage(`{}`))
 	if err != nil || !strings.Contains(out, "nodesc-ok") {
 		t.Errorf("nodesc Execute = %q, %v; want it to contain nodesc-ok", out, err)
+	}
+}
+
+// TestToolDeclaresNetworkRiskClass pins that every MCP tool
+// declares ClassNetwork: an MCP server is an external process
+// with unknown capabilities, so every MCP tool needs approval.
+// This must agree with the gate's hardcoded mcp__ prefix rule
+// (permissions.Classify) — Register rejects a tool whose
+// declaration disagrees with the maps, so an MCP tool that
+// forgot to declare would fail registration loudly instead of
+// silently running ungated.
+func TestToolDeclaresNetworkRiskClass(t *testing.T) {
+	dir := t.TempDir()
+	mgr := startFakeManager(t, dir, "", nil)
+	mcpTools := mgr.Tools()
+	if len(mcpTools) == 0 {
+		t.Fatal("manager has no tools")
+	}
+	reg := tools.NewRegistry()
+	for _, tl := range mcpTools {
+		rc, ok := tl.(interface{ RiskClass() permissions.Class })
+		if !ok {
+			t.Errorf("MCP tool %q does not implement RiskClasser", tl.Name())
+			continue
+		}
+		if got := rc.RiskClass(); got != permissions.ClassNetwork {
+			t.Errorf("MCP tool %q declares %v, want %v (ClassNetwork)", tl.Name(), got, permissions.ClassNetwork)
+		}
+		if got := permissions.Classify(tl.Name()); got != permissions.ClassNetwork {
+			t.Errorf("MCP tool %q: Classify = %v, want %v (mcp__ prefix rule)", tl.Name(), got, permissions.ClassNetwork)
+		}
+		// Register accepts it: the declaration matches Classify.
+		if err := reg.Register(tl); err != nil {
+			t.Errorf("Register MCP tool %q: %v, want accepted", tl.Name(), err)
+		}
 	}
 }
 

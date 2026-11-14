@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
 
 // validatingStubTool is a tool with a rich schema, for exercising
@@ -20,6 +21,10 @@ type validatingStubTool struct {
 }
 
 func (t *validatingStubTool) Name() string { return "stub" }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "stub" is not in the gate's maps).
+func (t *validatingStubTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *validatingStubTool) Description() string { return "Schema-validation stub." }
 
@@ -255,6 +260,13 @@ type schemaStubTool struct {
 }
 
 func (t *schemaStubTool) Name() string { return t.name }
+
+// RiskClass returns the gate's class for the tool's name:
+// Register requires the declaration to match
+// permissions.Classify.
+func (t *schemaStubTool) RiskClass() permissions.Class {
+	return permissions.Classify(t.name)
+}
 
 func (t *schemaStubTool) Description() string { return "Schema stub." }
 

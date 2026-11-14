@@ -25,10 +25,19 @@ func TestGateSetToolClasses(t *testing.T) {
 	}
 	// Install a map that (wrongly, for the test) declares
 	// calculator Destructive: Check must now gate it — the
-	// installed declaration wins over the hardcoded maps.
+	// installed map can only RAISE a tool Classify calls Safe,
+	// never lower one Classify gates (see classify).
 	g.SetToolClasses(map[string]Class{"calculator": ClassDestructive})
 	if ok, _ := g.Check(ctx, "calculator", `{}`); ok {
 		t.Fatal("calculator declared Destructive: Check allowed, want gated")
+	}
+	// The other direction is fail-closed: an installed map that
+	// (wrongly) declares shell_exec Safe must NOT downgrade it
+	// — Classify calls shell_exec Destructive, and the hardcoded
+	// maps are the authority, so Check still gates it.
+	g.SetToolClasses(map[string]Class{"shell_exec": ClassSafe})
+	if ok, _ := g.Check(ctx, "shell_exec", `{"command":"echo hi"}`); ok {
+		t.Fatal("shell_exec declared Safe: Check allowed, want gated (Classify is the authority)")
 	}
 	// A tool absent from the map still falls back to Classify:
 	// file_read stays Safe, web_fetch stays Network.

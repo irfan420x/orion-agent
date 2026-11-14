@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 )
 
 // --- Hardening tests (audit P0-3, P1-4, P1-5, P1-11; security wiring) ---
@@ -18,6 +19,10 @@ import (
 type stubTool struct{ output string }
 
 func (s *stubTool) Name() string { return "stub" }
+
+// RiskClass declares the tool Safe (Register requires a class
+// matching permissions.Classify; "stub" is not in the gate's maps).
+func (s *stubTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 func (s *stubTool) Description() string {
 	return "stub tool for tests"
 }

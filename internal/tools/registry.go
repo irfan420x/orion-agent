@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
 )
 
@@ -79,12 +80,30 @@ func (r *Registry) MaxResultBytes() int {
 // tool with an empty (or whitespace-only) name is rejected instead of
 // panicking later on a nil dereference or registering an uncallable
 // entry.
+//
+// A tool must implement RiskClasser (declare its permission-gate
+// risk class explicitly): a tool that forgets to declare would
+// otherwise default to Safe and could run a destructive action
+// without approval. The declaration must also agree with the
+// gate's hardcoded maps (permissions.Classify): a mismatch is a
+// programming error — the maps are the authority, and a tool whose
+// declaration disagrees is rejected instead of silently running at
+// the wrong class. Add the tool to the maps in
+// internal/permissions/gate.go (or fix its declaration) and
+// re-register.
 func (r *Registry) Register(t Tool) error {
 	if t == nil {
 		return fmt.Errorf("tools: cannot register nil tool")
 	}
 	if strings.TrimSpace(t.Name()) == "" {
 		return fmt.Errorf("tools: cannot register tool with empty name")
+	}
+	rc, ok := t.(RiskClasser)
+	if !ok {
+		return fmt.Errorf("tools: tool %q does not implement RiskClasser: declare its risk class explicitly", t.Name())
+	}
+	if got, want := rc.RiskClass(), permissions.Classify(t.Name()); got != want {
+		return fmt.Errorf("tools: tool %q declares risk class %v but the permission gate classifies it %v: the gate's maps are the authority", t.Name(), got, want)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

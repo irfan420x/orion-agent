@@ -3,9 +3,12 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
 	"sort"
 	"testing"
 
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/skills"
 	"github.com/irfan/orion/internal/subagent"
@@ -81,6 +84,109 @@ func TestFactoriesRegisterAllDefaultTools(t *testing.T) {
 	for i := range factoryNames {
 		if factoryNames[i] != toolNames[i] {
 			t.Fatalf("factories %v != tools %v", factoryNames, toolNames)
+		}
+	}
+}
+
+// --- Register fail-closed enforcement (F-A20-2) ---
+
+// noRiskTool is a minimal Tool that does NOT implement
+// RiskClasser, for pinning that Register rejects it loudly.
+type noRiskTool struct{ name string }
+
+func (t noRiskTool) Name() string { return t.name }
+func (t noRiskTool) Description() string {
+	return "test tool without a risk class"
+}
+func (t noRiskTool) Definition() model.ToolDefinition {
+	return model.ToolDefinition{Name: t.name, Description: t.Description(), Parameters: map[string]any{"type": "object"}}
+}
+func (t noRiskTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	return "ok", nil
+}
+
+// riskTool is a minimal Tool with a configurable declared risk
+// class, for pinning that Register rejects a declaration that
+// disagrees with the gate's hardcoded maps.
+type riskTool struct {
+	name  string
+	class permissions.Class
+}
+
+func (t riskTool) Name() string { return t.name }
+func (t riskTool) Description() string {
+	return "test tool with a declared risk class"
+}
+func (t riskTool) Definition() model.ToolDefinition {
+	return model.ToolDefinition{Name: t.name, Description: t.Description(), Parameters: map[string]any{"type": "object"}}
+}
+func (t riskTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	return "ok", nil
+}
+func (t riskTool) RiskClass() permissions.Class { return t.class }
+
+// TestRegisterRequiresRiskClass pins the fail-closed rule: a
+// tool that does not implement RiskClasser is rejected at
+// registration, loudly — it must never silently default to Safe
+// and run a destructive action without approval.
+func TestRegisterRequiresRiskClass(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(noRiskTool{name: "echo"}); err == nil {
+		t.Fatal("Register accepted a tool without RiskClasser, want a loud error")
+	}
+	if _, ok := r.Get("echo"); ok {
+		t.Fatal("rejected tool is registered anyway")
+	}
+}
+
+// TestRegisterRejectsMismatchedRiskClass pins that a tool whose
+// declared class disagrees with the gate's hardcoded maps
+// (permissions.Classify) is rejected at registration: the maps
+// are the authority, and a wrong declaration must fail loudly,
+// not silently downgrade the tool to Safe.
+func TestRegisterRejectsMismatchedRiskClass(t *testing.T) {
+	cases := []struct {
+		name  string
+		class permissions.Class
+	}{
+		{"shell_exec", permissions.ClassSafe},        // destructive name, Safe declaration
+		{"file_write", permissions.ClassSafe},        // destructive name, Safe declaration
+		{"calculator", permissions.ClassDestructive}, // safe name, Destructive declaration
+		{"web_fetch", permissions.ClassSafe},         // network name, Safe declaration
+		{"mcp__srv__tool", permissions.ClassSafe},    // MCP name, Safe declaration
+	}
+	for _, tc := range cases {
+		r := NewRegistry()
+		if err := r.Register(riskTool{name: tc.name, class: tc.class}); err == nil {
+			t.Errorf("Register(%q declaring %v): accepted, want a loud error", tc.name, tc.class)
+		}
+		if _, ok := r.Get(tc.name); ok {
+			t.Errorf("Register(%q declaring %v): rejected tool is registered anyway", tc.name, tc.class)
+		}
+	}
+}
+
+// TestRegisterAcceptsMatchingRiskClass pins the other side: a
+// tool whose declaration agrees with the gate's maps registers
+// fine, including an MCP-named tool declaring Network and an
+// unknown name declaring Safe (Classify's default for unknown
+// names).
+func TestRegisterAcceptsMatchingRiskClass(t *testing.T) {
+	cases := []struct {
+		name  string
+		class permissions.Class
+	}{
+		{"shell_exec", permissions.ClassDestructive},
+		{"file_write", permissions.ClassDestructive},
+		{"calculator", permissions.ClassSafe},
+		{"web_fetch", permissions.ClassNetwork},
+		{"mcp__srv__tool", permissions.ClassNetwork},
+		{"echo", permissions.ClassSafe},
+	}
+	for _, tc := range cases {
+		r := NewRegistry()
+		if err := r.Register(riskTool{name: tc.name, class: tc.class}); err != nil {
+			t.Errorf("Register(%q declaring %v): %v, want accepted", tc.name, tc.class, err)
 		}
 	}
 }
