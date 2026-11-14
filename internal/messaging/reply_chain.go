@@ -8,6 +8,24 @@
 // returning true consumes the update (no turn is started).
 // An interceptor MUST return false unless the update is definitely
 // its own (same chat, authorised sender, not a command).
+//
+// Commands never reach an interceptor (F-A21-2): tryAnswer skips
+// the whole chain for a command update and logs the bypass, so a
+// greedy interceptor cannot eat /start — the contract's "not a
+// command" is enforced structurally, not just documented. The
+// question interceptor (ask_user_question) and plan_mode's
+// enter_plan_mode interceptor already decline commands
+// themselves; the chain-level check is the backstop for the next
+// tool that forgets.
+//
+// Ordering is the priority control (F-A21-22): the question
+// interceptor runs first, then tool interceptors in registry
+// List() order (alphabetical by tool name, deterministic); first
+// true wins, and there is no priority field. A collision between
+// two tools' interceptors is therefore decided by tool name,
+// visibly: every consumption is audit-logged (interceptor
+// type/index, chat, text), so a misroute is diagnosable from the
+// daemon log instead of silent.
 package messaging
 
 import (
@@ -22,10 +40,15 @@ type replyChain struct {
 	mu           sync.RWMutex
 	interceptors []tools.ReplyInterceptor
 	// logf receives the consumption audit log (which interceptor
-	// consumed which update) and panic reports. It is set by the
-	// gateway to its own logf when the chain is created, so the
-	// lines land in the daemon log in production; nil means
-	// silent (tests set it to a recorder).
+	// consumed which update, and which command bypassed the
+	// chain) and panic reports. It is set by the gateway to its
+	// own logf when the chain is created, so the lines land in
+	// the daemon log in production; nil means silent (tests set
+	// it to a recorder). Both production gateway constructors
+	// (cmd/orion newTelegramGateway, cmd/oriond) pass WithLogger,
+	// so logf is live in production — the only gateway built
+	// without one is orion's `telegram test` token check, which
+	// never wires a chain. No wiring change is needed (F-A21-2).
 	logf func(format string, args ...any)
 }
 
@@ -40,9 +63,16 @@ func (c *replyChain) log(format string, args ...any) {
 
 func newReplyChain() *replyChain { return &replyChain{} }
 
-// add appends an interceptor (nil is a no-op). Interceptors run in
-// the order added; the question interceptor is added first by
-// SetQuestionRegistry, so it runs before any later tool's.
+// add appends an interceptor (nil is a no-op). Interceptors run
+// in the order added, first true wins — that order IS the
+// priority control (F-A21-22): there is no priority field, and
+// the question interceptor is installed first by SetQuestionRegistry
+// (setQuestion puts it at the front), so it runs before any
+// tool's. Tool interceptors follow in registry List() order,
+// which is alphabetical by tool name and deterministic: a
+// collision between two tools is decided by name, and every
+// consumption is audit-logged with the interceptor's type, so a
+// misroute is diagnosable from the daemon log.
 func (c *replyChain) add(in tools.ReplyInterceptor) {
 	if c == nil || in == nil {
 		return
@@ -57,7 +87,12 @@ func (c *replyChain) add(in tools.ReplyInterceptor) {
 // questions from typed replies. Replacing instead of appending
 // makes SetQuestionRegistry idempotent: calling it twice never
 // leaves two question interceptors in the chain. A nil interceptor
-// removes it (no questions).
+// removes it (no questions). A fresh install goes FIRST in the
+// chain, ahead of any tool interceptor already added, so the
+// question-first ordering rule (F-A21-22) holds no matter when
+// SetQuestionRegistry runs relative to AddReplyInterceptor —
+// WireTelegram calls it before the discovery loop, but the
+// guarantee does not depend on that call order.
 func (c *replyChain) setQuestion(in *questionReplyInterceptor) {
 	if c == nil {
 		return
@@ -75,7 +110,7 @@ func (c *replyChain) setQuestion(in *questionReplyInterceptor) {
 		}
 	}
 	if in != nil {
-		c.interceptors = append(c.interceptors, in)
+		c.interceptors = append([]tools.ReplyInterceptor{in}, c.interceptors...)
 	}
 }
 
@@ -86,8 +121,19 @@ func (c *replyChain) setQuestion(in *questionReplyInterceptor) {
 // and treated as "did not consume", so one broken tool cannot
 // kill the poll loop or swallow the update — the chain continues
 // with the next interceptor. Every consumption is audit-logged
-// (which interceptor, which chat), so a swallowed update is
-// diagnosable instead of silent.
+// (which interceptor, which chat, what text), so a swallowed
+// update is diagnosable instead of silent.
+//
+// Commands are never answers (F-A21-2): a command update skips
+// every interceptor — however greedy — and returns false, so
+// normal command handling runs. The bypass is audit-logged when
+// the chain is non-empty (one line per command, only while
+// interceptors exist — commands are rare next to messages, so
+// this is not log spam, and the line is the proof the
+// enforcement ran). Declines are NOT logged: every ordinary
+// message declines every interceptor, so per-decline lines would
+// be N lines per message — and an unconsumed update is not lost,
+// it proceeds to a normal turn, so there is nothing to diagnose.
 func (c *replyChain) tryAnswer(upd Update) bool {
 	if c == nil {
 		return false
@@ -95,6 +141,12 @@ func (c *replyChain) tryAnswer(upd Update) bool {
 	c.mu.RLock()
 	interceptors := append([]tools.ReplyInterceptor(nil), c.interceptors...)
 	c.mu.RUnlock()
+	if upd.IsCommand() {
+		if len(interceptors) > 0 {
+			c.log("reply chain: command %q for chat %d skipped %d interceptor(s); commands are never answers", truncateRunes(strings.TrimSpace(upd.Text()), 100), upd.ChatID(), len(interceptors))
+		}
+		return false
+	}
 	for i, in := range interceptors {
 		if c.tryOne(i, in, upd) {
 			return true
@@ -106,7 +158,13 @@ func (c *replyChain) tryAnswer(upd Update) bool {
 // tryOne runs one interceptor with panic isolation: a panic is
 // logged (with the interceptor's type, so the broken tool is
 // identifiable) and the update is left unconsumed, so the chain
-// continues. A consumption is audit-logged the same way.
+// continues. A consumption is audit-logged the same way —
+// interceptor index and type, chat, and the consumed text
+// (truncated to 100 runes so a long reply cannot bloat the log;
+// the text is what the interceptor claimed, so it belongs in the
+// audit line — this is a deliberate, bounded exception to the
+// no-message-text-in-logs rule PollStream follows, and the
+// daemon log lives on the operator's own host).
 func (c *replyChain) tryOne(i int, in tools.ReplyInterceptor, upd Update) (consumed bool) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -115,7 +173,7 @@ func (c *replyChain) tryOne(i int, in tools.ReplyInterceptor, upd Update) (consu
 		}
 	}()
 	if in.TryAnswer(upd) {
-		c.log("reply chain: interceptor %d (%T) consumed update for chat %d", i, in, upd.ChatID())
+		c.log("reply chain: interceptor %d (%T) consumed update for chat %d: %q", i, in, upd.ChatID(), truncateRunes(upd.Text(), 100))
 		return true
 	}
 	return false
