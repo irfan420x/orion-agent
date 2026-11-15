@@ -838,12 +838,18 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 //   - It does NOT record the prompt as the chat's last input:
 //     /retry is for the user's last message, and a scheduled
 //     prompt must never hijack it.
-//   - The approval context carries the JOB's requester (the user
-//     who scheduled it), so a destructive action inside the
-//     scheduled turn prompts that user in that chat — exactly as
-//     an interactive turn would. Nobody auto-approves here: an
-//     unanswered approval denies the call after the gate timeout
-//     and the turn completes with the denial recorded.
+//   - The turn is UNATTENDED (F-C3): the approval context carries
+//     the JOB's requester (the user who scheduled it), but the
+//     turn is marked unattended, so the gate IGNORES persisted
+//     "always allow" rules and denies every gated tool promptly
+//     instead of prompting — nobody is present to approve, and
+//     an unanswered approval must not burn the 90s gate window
+//     per call. A scheduled turn in which EVERY tool call was
+//     gate-denied returns an error (after delivering the reply,
+//     so the chat still sees what was denied) so the scheduler
+//     counts it toward the job's consecutive failures and backs
+//     off / disables the job (F-C8) instead of recording "ok"
+//     for a turn that accomplished nothing.
 //
 // The turn's token usage is recorded in the session like a user
 // turn's. A failed turn notifies the chat (best effort) and
@@ -857,6 +863,10 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	runCtx = permissions.WithApprovalContext(runCtx, job.ChatID, job.Requester)
+	// Unattended (F-C3): the gate ignores persisted allow rules
+	// in this turn and denies gated tools promptly — see the doc
+	// comment above. Interactive turns never carry this marker.
+	runCtx = permissions.WithUnattendedContext(runCtx)
 	registered := a.RegisterRun(job.ChatID, runCtx, cancel)
 	if registered {
 		defer a.UnregisterRun(job.ChatID, runCtx)
@@ -879,7 +889,28 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 	if err := gw.SendMessage(ctx, job.ChatID, security.RedactSecrets(text)); err != nil {
 		fmt.Fprintf(os.Stderr, "oriond: cron: job %s ran but its reply could not be sent to chat %d: %v\n", job.ID, job.ChatID, err)
 	}
+	if scheduledTurnAllDenied(stats) {
+		// F-C8: the turn ran and its reply was delivered, but
+		// every tool call it attempted was denied by the gate
+		// — it accomplished nothing. Return an error (without
+		// a second "failed" notice: the reply above already
+		// explains the denials) so the scheduler counts this
+		// run toward the job's consecutive failures instead
+		// of recording "ok" and firing the same doomed turn
+		// again next cycle.
+		return reply, fmt.Errorf("scheduled turn: all %d tool call(s) were denied by the permission gate (unattended turn: persisted allow rules do not apply and nobody is present to approve)", stats.ToolCalls)
+	}
 	return reply, nil
+}
+
+// scheduledTurnAllDenied reports whether a finished scheduled turn
+// attempted tool calls and had every one of them denied by the
+// permission gate. A turn with no tool calls (a plain-text answer)
+// is not all-denied, and a turn where any call ran is not either —
+// only a turn that accomplished nothing through tools counts, so
+// the scheduler can back off / disable the job (F-C8).
+func scheduledTurnAllDenied(stats *core.TurnStats) bool {
+	return stats != nil && stats.ToolCalls > 0 && stats.GateDeniedCalls == stats.ToolCalls
 }
 
 // buildTurnHandler builds the PollStream TurnFunc: slash commands are

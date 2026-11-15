@@ -31,14 +31,22 @@
 //     turn on the chat's agent, through the same gate machinery
 //     as an interactive turn (the daemon's runner sets the
 //     approval context to the job's chat and requester, and the
-//     turn runs on the chat's agent with the installed gate). A
-//     destructive action inside a scheduled turn prompts exactly
-//     as it would interactively; nobody auto-approves inside a
-//     scheduled turn. An unanswered approval (3am, nobody awake)
-//     denies that tool call after the gate timeout and the turn
-//     continues/completes with the denial recorded — the job does
-//     not silently run the action, and the denial is visible in
-//     the reply the scheduler sends to the chat.
+//     turn runs on the chat's agent with the installed gate) —
+//     but the turn is UNATTENDED (F-C3), so it is NOT approved
+//     like an interactive turn: persisted "always allow" rules
+//     are IGNORED in a scheduled turn, and a destructive or
+//     network action inside it is DENIED PROMPTLY, without a
+//     prompt card and without waiting the gate's approval
+//     window — nobody is present to approve, so waiting would
+//     only burn the tick. The denial is fed back to the model
+//     as a tool result and is visible in the reply the scheduler
+//     sends to the chat, and a turn in which EVERY tool call was
+//     gate-denied counts toward the job's consecutive failures
+//     (F-C8) instead of recording "ok" — a job that needs a
+//     gated tool backs off and is disabled after 5 such runs,
+//     instead of firing the same doomed turn forever. Safe tools
+//     still run freely in a scheduled turn, exactly as they do
+//     interactively.
 //   - Safety: a job that fails repeatedly backs off exponentially
 //     (1, 2, 4, 8, 16 minutes) and is DISABLED after 5 consecutive
 //     failures, so the backoff never grows past 16 minutes — never
@@ -533,12 +541,73 @@ func encodeCronJob(tool string, v any) (string, error) {
 
 // ---------------------------------------------------------------- cron_schedule
 
-type cronScheduleTool struct{ store *PlanningStore }
+type cronScheduleTool struct {
+	store *PlanningStore
+	// rules, when set (see SetCronScheduleRuleStore), is the
+	// permission rule store the tool consults READ-ONLY at
+	// schedule time to warn about persisted "always allow"
+	// rules for gated tools (F-C3). A nil store means no
+	// warning — the job is still created. The daemon wires the
+	// live store in when it builds the permission gate; a
+	// hand-built registry without a gate simply has none.
+	rules *permissions.RuleStore
+}
+
+// setRuleStore installs the rule store consulted for the
+// schedule-time warning. It is unexported: callers use
+// SetCronScheduleRuleStore, which finds the tool on a registry.
+func (t *cronScheduleTool) setRuleStore(r *permissions.RuleStore) {
+	t.rules = r
+}
+
+// SetCronScheduleRuleStore installs store as the permission rule
+// store the registry's cron_schedule tool consults (read-only)
+// to warn at schedule time about persisted "always allow" rules
+// for gated tools (F-C3). It is a no-op when the registry has no
+// cron_schedule tool (e.g. a hand-built registry) or the store is
+// nil. The daemon calls it from App.NewPermissionGate, so every
+// entrypoint that builds a gate wires the same live store; the
+// cron tools never write rules, they only read them for the
+// warning.
+func SetCronScheduleRuleStore(reg *Registry, store *permissions.RuleStore) {
+	if reg == nil || store == nil {
+		return
+	}
+	t, ok := reg.Get("cron_schedule")
+	if !ok {
+		return
+	}
+	if s, ok := t.(interface{ setRuleStore(*permissions.RuleStore) }); ok {
+		s.setRuleStore(store)
+	}
+}
+
+// unattendedAllowWarning lists the gated (destructive/network)
+// tools for which chatID holds a persisted "always allow" rule:
+// rules that would previously have auto-allowed an unattended
+// execution, and that a scheduled turn now ignores (F-C3). It
+// returns nil when the store is nil or no such rule exists. The
+// caller warns only — it never refuses to schedule.
+func (t *cronScheduleTool) unattendedAllowWarning(chatID int64) []string {
+	if t.rules == nil {
+		return nil
+	}
+	var warned []string
+	for _, tool := range permissions.KnownTools() {
+		if permissions.Classify(tool) == permissions.ClassSafe {
+			continue
+		}
+		if action, ok := t.rules.LookupForChat(chatID, tool); ok && action == permissions.ActionAllow {
+			warned = append(warned, tool)
+		}
+	}
+	return warned
+}
 
 func (t *cronScheduleTool) Name() string { return "cron_schedule" }
 
 func (t *cronScheduleTool) Description() string {
-	return "Schedule a recurring agent turn: run a prompt on a cron expression (5 fields: minute hour day-of-month month day-of-week, UTC). The job runs in this chat until cancelled; the scheduled turn goes through the same permission gate as an interactive turn, so a destructive action inside it still needs approval. Returns the job id and the next run (UTC). Times are UTC — Orion has no per-chat timezone. Telegram only: needs a chat in the run context."
+	return "Schedule a recurring agent turn: run a prompt on a cron expression (5 fields: minute hour day-of-month month day-of-week, UTC). The job runs in this chat until cancelled; the scheduled turn is unattended, so persisted \"always allow\" rules never apply to it and a destructive or network action inside it is denied promptly instead of running. Returns the job id and the next run (UTC). Times are UTC — Orion has no per-chat timezone. Telegram only: needs a chat in the run context."
 }
 
 func (t *cronScheduleTool) Definition() model.ToolDefinition {
@@ -652,10 +721,21 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err := saveCronJobs(t.store, dir, key, jobs); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
+	note := "Times are UTC (Orion has no per-chat timezone). The scheduled turn is unattended: persisted \"always allow\" rules never apply to it, and a destructive or network action inside it is denied promptly instead of running."
+	if warned := t.unattendedAllowWarning(chatID); len(warned) > 0 {
+		// Warn only, never refuse: the user scheduled the job
+		// with these rules standing, and the rules used to
+		// auto-allow unattended execution — they must know the
+		// job will now be denied instead, before the 3am run
+		// surprises them. The rules themselves are untouched:
+		// they still apply to interactive turns, and the owner
+		// can delete them with the /rules command.
+		note += fmt.Sprintf(" Warning: this chat has persisted \"always allow\" rules for %s — those rules are ignored in scheduled turns, so if this job needs one of those tools it will be denied every run and the job will back off and be disabled after 5 consecutive failures.", strings.Join(warned, ", "))
+	}
 	return encodeCronJob(t.Name(), map[string]any{
 		"job":      summarizeCronJob(job),
 		"timezone": "UTC",
-		"note":     "Times are UTC (Orion has no per-chat timezone). The scheduled turn runs through the same permission gate as an interactive turn: a destructive action inside it needs your approval when it fires.",
+		"note":     note,
 	})
 }
 
@@ -805,15 +885,19 @@ func init() {
 
 // CronRunner runs one scheduled turn for job (a copy of the
 // stored job): it must run a normal agent turn for job.ChatID
-// with job.Prompt, through the same permission gate as an
-// interactive turn (approval context: job.ChatID, job.Requester),
-// and deliver the reply to that chat itself. It returns the
-// reply and a nil error when the turn ran (even when a gated
-// tool call inside it was denied — a denial is a turn outcome,
-// not a runner failure); a non-nil error means the turn itself
-// failed, and counts toward the job's consecutive failures.
-// The runner runs OUTSIDE the store lock, so it may take as
-// long as a turn takes.
+// with job.Prompt, marked UNATTENDED (F-C3) — the gate ignores
+// persisted "always allow" rules in that turn and denies gated
+// tools promptly instead of prompting — and deliver the reply
+// to that chat itself. It returns the reply and a nil error when
+// the turn ran (even when a gated tool call inside it was denied
+// — a denial is a turn outcome, not a runner failure), EXCEPT
+// when EVERY tool call in the turn was gate-denied: that turn
+// accomplished nothing, so the runner returns an error (after
+// delivering the reply) and the scheduler counts it toward the
+// job's consecutive failures (F-C8). A non-nil error otherwise
+// means the turn itself failed, and counts toward the job's
+// consecutive failures. The runner runs OUTSIDE the store lock,
+// so it may take as long as a turn takes.
 type CronRunner func(ctx context.Context, job CronJob) (string, error)
 
 // CronScheduler fires due cron jobs. It scans the store's chat

@@ -26,8 +26,12 @@
 //     in one chat applies to that chat only, never to other chats.
 //     Rules written before rc22 carry no chat and load as legacy
 //     global rules (see RuleStore); a deny rule is never prompted;
-//     an allow rule never prompts either. Rules are the user's
-//     standing decisions.
+//     an allow rule never prompts either — EXCEPT in an unattended
+//     (scheduled) turn (F-C3), where allow rules are ignored and
+//     every gated tool is denied promptly without prompting:
+//     nobody is present to approve, and a standing "always allow"
+//     must never auto-run a destructive tool at 3am. Rules are
+//     the user's standing decisions — for interactive turns.
 //   - Anything else gated prompts the user through a Prompter — in
 //     the daemon, a Telegram inline-keyboard message with Approve /
 //     Deny / Always allow / Never allow buttons. The gate blocks the
@@ -296,6 +300,33 @@ func ApprovalContextFrom(ctx context.Context) (chatID, senderID int64, ok bool) 
 		return 0, 0, false
 	}
 	return v.chatID, v.senderID, true
+}
+
+// unattendedContextKey is the context key for the unattended-turn
+// marker (F-C3): a scheduled (cron) turn runs with nobody present,
+// so it must never auto-allow through a persisted rule and must
+// never wait on an approval prompt nobody will answer.
+type unattendedContextKey struct{}
+
+// WithUnattendedContext returns ctx marked as an unattended
+// (scheduled) turn. Only the scheduled-turn runner sets it —
+// cmd/oriond runScheduledTurn — so an interactive turn never
+// carries it, and interactive behaviour is unchanged.
+func WithUnattendedContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, unattendedContextKey{}, true)
+}
+
+// UnattendedFrom reports whether ctx marks an unattended
+// (scheduled) turn.
+func UnattendedFrom(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(unattendedContextKey{}).(bool)
+	return v
 }
 
 // ApprovalRequest is one gated tool call waiting on the user.
@@ -663,10 +694,19 @@ func (g *Gate) Timeout() time.Duration {
 //     never applies here (F-A16-3 — per-chat isolation at the
 //     permission layer, matching the history/model/budget layers);
 //     a legacy global rule, written before rules were per-chat,
-//     still applies to every chat;
+//     still applies to every chat. In an UNATTENDED (scheduled)
+//     turn (F-C3) an allow rule is IGNORED — nobody is present,
+//     so a standing "always allow" must never auto-run a
+//     destructive or network tool at 3am; a deny rule still
+//     denies, promptly, as before;
 //  4. safe tools (allowed outright);
-//  5. the prompter + the user's answer (or the timeout / turn
-//     cancellation, which deny).
+//  5. in an unattended turn, every remaining gated tool is denied
+//     PROMPTLY, without prompting and without waiting the
+//     approval window: nobody is there to answer, so waiting
+//     90s per call would burn the scheduled tick on an answer
+//     that never comes;
+//  6. the prompter + the user's answer (or the timeout / turn
+//     cancellation, which deny) — interactive turns only.
 //
 // A nil gate allows everything: "no gate installed" is the CLI
 // configuration, not a denial.
@@ -705,17 +745,43 @@ func (g *Gate) Check(ctx context.Context, tool, args string) (bool, string) {
 	// a call here (F-A16-3). A turn with no chat in its context
 	// (a local run, which never installs a gate anyway) falls
 	// back to the global rules only.
+	//
+	// Unattended turns (F-C3): a scheduled turn runs with nobody
+	// present, so a persisted "always allow" rule must never
+	// auto-allow a gated tool in it — the rule is ignored below
+	// and the call is denied promptly instead (step 5). A
+	// persisted DENY rule still denies, promptly, as before:
+	// ignoring it too would only ever prompt, and an unattended
+	// turn never prompts.
+	unattended := UnattendedFrom(ctx)
 	chatID, senderID, _ := ApprovalContextFrom(ctx)
 	if g.rules != nil {
 		if action, ok := g.rules.LookupForChat(chatID, tool); ok {
 			if action == ActionAllow {
-				return true, ""
+				if !unattended {
+					return true, ""
+				}
+				// Unattended: fall through — the
+				// allow rule is ignored and the
+				// call is denied promptly below.
+			} else {
+				return false, fmt.Sprintf("denied by permission rule for tool %q", tool)
 			}
-			return false, fmt.Sprintf("denied by permission rule for tool %q", tool)
 		}
 	}
 	if g.classify(tool) == ClassSafe {
 		return true, ""
+	}
+	if unattended {
+		// Prompt-or-deny only, never auto-allow, never wait:
+		// nobody is present to answer, so do not send a
+		// prompt card and do not burn the 90s approval
+		// window on a call nobody will approve. The denial
+		// is recorded as a denial (not success) by the
+		// caller, and a scheduled turn whose every tool call
+		// is denied this way counts toward the job's
+		// failure/backoff accounting (F-C8).
+		return false, fmt.Sprintf("denied: unattended scheduled turn — tool %q needs approval, but no one is present to approve it and persisted \"always allow\" rules never apply to scheduled turns", tool)
 	}
 	if g.prompter == nil {
 		return false, fmt.Sprintf("denied: tool %q needs approval but no approver is configured", tool)

@@ -57,6 +57,16 @@ type ProgressEvent struct {
 	// TurnStats so the footer can break it out instead of silently
 	// folding delegated work into the parent's total.
 	SubagentTokens int
+	// ToolCalls is the number of tool calls the agent executed
+	// (or attempted) this turn; GateDeniedCalls is how many of
+	// them the permission gate denied before they ran. Both are
+	// set on TurnFinished only. Callers copy them into
+	// TurnStats: a scheduled turn in which EVERY tool call was
+	// gate-denied accomplished nothing, so the scheduler counts
+	// it toward the job's failure/backoff accounting (F-C8)
+	// instead of recording "ok".
+	ToolCalls       int
+	GateDeniedCalls int
 }
 
 // EventHandler receives ProgressEvents from an Agent run.
@@ -85,6 +95,16 @@ type TurnStats struct {
 	// MemoriesUsed by the caller that builds the TurnStats
 	// (internal/app HandleStream); zero when none were used.
 	MemoriesUsed int
+	// ToolCalls counts the tool calls the agent attempted this
+	// turn; GateDeniedCalls counts how many of them the
+	// permission gate denied before they ran. Populated from the
+	// TurnFinished event by the caller that builds the TurnStats
+	// (internal/app HandleStream). A scheduled turn with
+	// ToolCalls > 0 and GateDeniedCalls == ToolCalls had every
+	// tool call denied, so the scheduler counts it as a job
+	// failure (F-C8) instead of recording "ok".
+	ToolCalls       int
+	GateDeniedCalls int
 }
 
 // EventHandler returns the agent's current progress-event handler, or

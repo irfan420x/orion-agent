@@ -613,6 +613,14 @@ func (a *App) NewPermissionGate(prompter permissions.Prompter) (*permissions.Gat
 	}
 	gate := permissions.NewGate(ruleStore, prompter)
 	a.SetPermissionGate(gate)
+	// F-C3: the cron_schedule tool warns at schedule time when
+	// this chat holds persisted "always allow" rules for gated
+	// tools — rules a scheduled turn now ignores. Wired here,
+	// in the one shared constructor, so every entrypoint that
+	// builds a gate (oriond, `orion daemon`, `orion telegram
+	// poll`) warns from the same live store. A nil registry (a
+	// hand-built App) is a no-op inside the setter.
+	tools.SetCronScheduleRuleStore(a.Tools, ruleStore)
 	return gate, nil
 }
 

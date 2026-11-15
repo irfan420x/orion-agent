@@ -764,6 +764,12 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 	turnStart := time.Now()
 	var usage model.Usage
 	var memoriesUsed int
+	// toolCalls counts the tool calls attempted this turn and
+	// gateDeniedCalls how many the permission gate denied before
+	// they ran; both are carried on TurnFinished for TurnStats,
+	// so a scheduled turn whose every tool call was denied can
+	// count toward the job's failure accounting (F-C8).
+	var turnToolCalls, turnGateDeniedCalls int
 	lastStep := 0
 	turnFinished := false
 	finishTurn := func(err error) {
@@ -797,13 +803,15 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		usage.CompletionTokens += side.CompletionTokens
 		usage.TotalTokens += side.TotalTokens
 		a.emit(ProgressEvent{
-			Kind:           EventTurnFinished,
-			Step:           lastStep,
-			Duration:       time.Since(turnStart),
-			Err:            err,
-			Usage:          usage,
-			MemoriesUsed:   memoriesUsed,
-			SubagentTokens: subagentTokens,
+			Kind:            EventTurnFinished,
+			Step:            lastStep,
+			Duration:        time.Since(turnStart),
+			Err:             err,
+			Usage:           usage,
+			MemoriesUsed:    memoriesUsed,
+			SubagentTokens:  subagentTokens,
+			ToolCalls:       turnToolCalls,
+			GateDeniedCalls: turnGateDeniedCalls,
 		})
 		// Stop hooks (rc9, audit P0 #6): fire once per turn, after
 		// the outcome is known. They observe only — a Stop hook
@@ -1127,6 +1135,10 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 			toolStart := time.Now()
 			a.emit(ProgressEvent{Kind: EventToolCallStarted, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Usage: usage})
 			result := a.executeTool(toolCtx, tc)
+			turnToolCalls++
+			if isGateDenialResult(result) {
+				turnGateDeniedCalls++
+			}
 			toolCancel()
 			// Record the execution for recall v2 (recently-used
 			// tools) and the session-extraction tool-call counter.
@@ -1450,6 +1462,17 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 		}
 	}
 	return kept, stats
+}
+
+// isGateDenialResult reports whether an executeTool result string is
+// a permission-gate denial. The gate branch of executeTool is the
+// only producer of the "Error: permission denied for tool" prefix
+// (hook blocks say "blocked by hook", skill blocks say "not allowed
+// while a skill is active", tool failures carry the tool's own
+// text), so the prefix identifies a denial exactly. The run loop
+// counts these per turn for TurnStats (F-C8).
+func isGateDenialResult(result string) bool {
+	return strings.HasPrefix(result, "Error: permission denied for tool ")
 }
 
 // executeTool runs one tool call. Arguments must be a JSON object string;

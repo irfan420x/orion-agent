@@ -556,6 +556,8 @@ func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input str
 				Steps:            ev.Step,
 				Duration:         ev.Duration,
 				MemoriesUsed:     ev.MemoriesUsed,
+				ToolCalls:        ev.ToolCalls,
+				GateDeniedCalls:  ev.GateDeniedCalls,
 			}
 		}
 		if emit != nil {
