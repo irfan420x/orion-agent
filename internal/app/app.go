@@ -109,6 +109,19 @@ type App struct {
 	// PollStream's chat lock, then this lock, then chatsMu —
 	// never the reverse — so the two locks cannot deadlock.
 	// A nil map (hand-built Apps) is created lazily by turnLock.
+	// The map is never evicted (F-C22, assessed, kept): one
+	// entry is a single mutex per chat that ever ran a turn, and
+	// in production that set is the allowlisted Telegram chats
+	// (plus, with the allow-all opt-in, any chat that messages
+	// the bot) — a handful of ~100-byte entries. The per-chat
+	// session map holds far more per chat and is never evicted
+	// either, so evicting locks alone would not bound memory;
+	// a refcounted eviction was rejected as disproportionate —
+	// new race surface on the serialisation lock to save
+	// ~100 bytes per chat.
+	// The CLI channel is not a chat turn (F-C23): `orion chat`
+	// and `orion run` use the global agent via App.Handle and
+	// never take this lock.
 	turnMu    sync.Mutex
 	turnLocks map[int64]*sync.Mutex
 	// gate is the permission/confirmation gate (P1-O2), installed

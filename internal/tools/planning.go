@@ -405,9 +405,15 @@ func ensurePlanningDir(dir, dataDir string) error {
 // save would silently drop the first's task. The lock is on a
 // separate lockfile, never the state file, so the rename does not
 // break it, and flock is released automatically if a process dies,
-// so a crash can never leave a stale lock behind. Callers must
-// hold s.mu (the in-process half) and call this before loading;
-// the lock is held until the save completes. The in-memory path
+// so a crash can never leave a stale lock behind. The planning
+// tools hold s.mu (the in-process half) and call this before
+// loading; the lock is held until the save completes. The cron
+// tools take this lock BEFORE s.mu instead (F-C27): holding mu
+// across the up-to-10s flock wait blocked every other chat's
+// planning operation. The two orders cannot deadlock: each
+// state file has its own lockfile, and no path ever holds one
+// file's lock while taking another's — the cron order and the
+// planning order never share a lock pair. The in-memory path
 // (dir == "") needs no lock and returns a no-op release.
 //
 // The flock is taken non-blocking with retries so a stuck holder

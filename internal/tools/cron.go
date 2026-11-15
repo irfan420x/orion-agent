@@ -523,8 +523,11 @@ func (j *CronJob) nextRunTime() (time.Time, error) {
 }
 
 // loadCronJobs returns the chat's jobs in creation order. Call
-// with s.mu held (the planning-store convention). A corrupt file
-// is an error, never a silent reset: silently dropping a chat's
+// with s.mu held AND the cron file lock (lockState) already
+// taken — flock first, then mu (F-C27: holding mu across the
+// flock wait blocked every other chat's planning operation).
+// For the in-memory path the flock is a no-op, so mu alone
+// serialises. A corrupt file is an error, never a silent reset: silently dropping a chat's
 // scheduled jobs would hide data loss — and a dropped job that
 // keeps firing from a stale in-memory copy would be worse.
 //
@@ -787,10 +790,11 @@ func validateCronJobs(raw []*CronJob, chatID int64) *cronJobsDoc {
 
 // saveCronJobs persists the doc's entries in file order — valid
 // and quarantined alike, so a save never silently drops a
-// quarantined job. Call with s.mu held; the caller takes the
-// flock (lockState) around the load-modify-save, as task_create
-// does. For a fully-valid file the written bytes are identical
-// to before (same jobs, same order).
+// quarantined job. Call with s.mu held and the cron file lock
+// (lockState) already taken — flock first, then mu (F-C27), as
+// the schedule/cancel/claim/outcome sites do. For a fully-valid
+// file the written bytes are identical to before (same jobs,
+// same order).
 func saveCronJobs(s *PlanningStore, dir, key string, doc *cronJobsDoc) error {
 	jobs := make([]*CronJob, len(doc.entries))
 	for i, e := range doc.entries {
@@ -1306,52 +1310,76 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
 	}
 	dir, key := t.store.resolveBucket(ctx)
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
+	// F-C27: the file lock is taken BEFORE the store mutex.
+	// lockState retries the flock for up to 10s while contended;
+	// holding s.mu across that wait blocked every other chat's
+	// planning operation for the whole wait. The flock is what
+	// serialises writers — across processes, and in-process too
+	// (flock is per open-file description, so two lockState
+	// calls on the same file conflict even in one process) — so
+	// the load-modify-save below, done under mu while the flock
+	// is held, is still atomic. The in-memory path (dir == "")
+	// has no file lock — lockState is a no-op there — so mu
+	// stays the only serialisation and is held for the whole
+	// op. The order here (file lock, then mu) cannot deadlock
+	// against the planning tools (mu, then file lock): they lock
+	// different lock files, and no path ever holds one file's
+	// lock while taking another's.
 	release, err := t.store.lockState(ctx, dir, cronJobsFile)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	defer release()
-	doc, err := loadCronJobs(t.store, dir, key)
-	if err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
-	}
-	// F-C10: the global cap bounds the tick scan across chats;
-	// the per-chat cap below still applies on top of it.
-	if total := t.store.totalCronJobsLocked(); total >= cronMaxJobsTotal {
-		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("global job limit reached (%d jobs across all chats); cancel an old job with cron_cancel first", cronMaxJobsTotal)}
-	}
-	valid := doc.validJobs()
-	if len(valid) >= cronMaxJobsPerChat {
-		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("job limit reached (%d jobs for this chat); cancel an old job with cron_cancel first", cronMaxJobsPerChat)}
-	}
-	var id string
-	for attempts := 0; attempts < 10; attempts++ {
-		cand, err := newCronJobID()
+	// The mutation runs under mu and returns what the reply
+	// needs; the warning computation below runs after both
+	// locks are released.
+	doc, job, toolErr := func() (*cronJobsDoc, *CronJob, *ToolError) {
+		t.store.mu.Lock()
+		defer t.store.mu.Unlock()
+		doc, err := loadCronJobs(t.store, dir, key)
 		if err != nil {
-			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+			return nil, nil, &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 		}
-		// The id must not collide with a quarantined entry
-		// either: a new job sharing a quarantined id would
-		// load as a duplicate and be quarantined itself.
-		if !doc.hasID(cand) {
-			id = cand
-			break
+		// F-C10: the global cap bounds the tick scan across chats;
+		// the per-chat cap below still applies on top of it.
+		if total := t.store.totalCronJobsLocked(); total >= cronMaxJobsTotal {
+			return nil, nil, &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("global job limit reached (%d jobs across all chats); cancel an old job with cron_cancel first", cronMaxJobsTotal)}
 		}
-	}
-	if id == "" {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("could not mint a unique cron job id")}
-	}
-	job := &CronJob{
-		ID: id, ChatID: chatID, Requester: senderID,
-		Expression: expr, Prompt: prompt,
-		CreatedAt: now.Format(time.RFC3339),
-		NextRun:   next.Format(time.RFC3339),
-	}
-	doc.append(job)
-	if err := saveCronJobs(t.store, dir, key, doc); err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+		valid := doc.validJobs()
+		if len(valid) >= cronMaxJobsPerChat {
+			return nil, nil, &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("job limit reached (%d jobs for this chat); cancel an old job with cron_cancel first", cronMaxJobsPerChat)}
+		}
+		var id string
+		for attempts := 0; attempts < 10; attempts++ {
+			cand, err := newCronJobID()
+			if err != nil {
+				return nil, nil, &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+			}
+			// The id must not collide with a quarantined entry
+			// either: a new job sharing a quarantined id would
+			// load as a duplicate and be quarantined itself.
+			if !doc.hasID(cand) {
+				id = cand
+				break
+			}
+		}
+		if id == "" {
+			return nil, nil, &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("could not mint a unique cron job id")}
+		}
+		job := &CronJob{
+			ID: id, ChatID: chatID, Requester: senderID,
+			Expression: expr, Prompt: prompt,
+			CreatedAt: now.Format(time.RFC3339),
+			NextRun:   next.Format(time.RFC3339),
+		}
+		doc.append(job)
+		if err := saveCronJobs(t.store, dir, key, doc); err != nil {
+			return nil, nil, &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+		}
+		return doc, job, nil
+	}()
+	if toolErr != nil {
+		return "", toolErr
 	}
 	note := "Times are UTC (Orion has no per-chat timezone). The scheduled turn is unattended: persisted \"always allow\" rules never apply to it, and a destructive or network action inside it is denied promptly instead of running."
 	if quarantined := doc.quarantined(); len(quarantined) > 0 {
@@ -1451,14 +1479,15 @@ func (t *cronListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 // cronCancelTool removes one job from the chat's cron.json. stopJob,
 // when set (SetCronCancelStopJob — the daemon wires the scheduler's
 // StopJob), also stops the job's live turn: it is called AFTER the
-// job is removed, so a turn that ends after the cancel finds its job
-// gone and its outcome is dropped instead of resurrecting it. The
-// stop runs while the store lock is still held; that is safe because
-// StopJob only takes the scheduler's running lock and cancels a
-// context — it never takes the store lock, and the cancelled turn's
-// outcome apply waits for this lock. A nil stopJob means cancel is
-// future-runs-only (a hand-built registry with no scheduler, or a
-// process that runs no scheduled turns).
+// job is removed and after both store locks are released, so a turn
+// that ends after the cancel finds its job gone and its outcome is
+// dropped instead of resurrecting it. The stop runs outside the
+// store lock (F-C27); that is safe because StopJob only takes the
+// scheduler's running lock and cancels a context — it never takes
+// the store lock, and the cancelled turn's outcome apply waits for
+// this lock. A nil stopJob means cancel is future-runs-only (a
+// hand-built registry with no scheduler, or a process that runs no
+// scheduled turns).
 type cronCancelTool struct {
 	store   *PlanningStore
 	stopJob func(jobID string) bool
@@ -1561,34 +1590,50 @@ func (t *cronCancelTool) Execute(ctx context.Context, args json.RawMessage) (str
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	dir, key := t.store.resolveBucket(ctx)
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
+	// F-C27: file lock before the store mutex, as in
+	// cron_schedule — holding s.mu across the lockState retry
+	// loop blocked every other chat's planning operation while
+	// contended. The flock serialises writers, so the
+	// load-modify-save below (under mu, flock held) is still
+	// atomic; the in-memory path holds mu for the whole op
+	// (lockState is a no-op there).
 	release, err := t.store.lockState(ctx, dir, cronJobsFile)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	defer release()
-	doc, err := loadCronJobs(t.store, dir, key)
-	if err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
-	}
-	// First entry in file order with this id, valid or
-	// quarantined: a quarantined job is cancellable by id
-	// exactly like a valid one (F-C6).
-	wasQuarantined, found := doc.removeFirstByID(id)
-	if !found {
-		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("unknown job %q: use cron_list to see this chat's jobs", id)}
-	}
-	if err := saveCronJobs(t.store, dir, key, doc); err != nil {
-		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+	wasQuarantined, toolErr := func() (bool, *ToolError) {
+		t.store.mu.Lock()
+		defer t.store.mu.Unlock()
+		doc, err := loadCronJobs(t.store, dir, key)
+		if err != nil {
+			return false, &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+		}
+		// First entry in file order with this id, valid or
+		// quarantined: a quarantined job is cancellable by id
+		// exactly like a valid one (F-C6).
+		wasQuarantined, found := doc.removeFirstByID(id)
+		if !found {
+			return false, &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("unknown job %q: use cron_list to see this chat's jobs", id)}
+		}
+		if err := saveCronJobs(t.store, dir, key, doc); err != nil {
+			return false, &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+		}
+		return wasQuarantined, nil
+	}()
+	if toolErr != nil {
+		return "", toolErr
 	}
 	// The job is gone from the store first; only then stop its live
-	// turn, if it has one. A stop here can only ever cancel this
-	// job's turn: StopJob looks the job id up in the scheduler's
-	// running map, so a user turn in the same chat (or any other
-	// job's turn) is never cancelled by mistake — and a cancel
-	// issued from inside the very turn it would stop is safe, the
-	// turn simply ends as stopped.
+	// turn, if it has one — and only after both locks are released
+	// (F-C27): StopJob only takes the scheduler's running lock and
+	// cancels a context, so it never needed the store lock, and the
+	// cancelled turn's outcome apply waits for it. A stop here can
+	// only ever cancel this job's turn: StopJob looks the job id up
+	// in the scheduler's running map, so a user turn in the same
+	// chat (or any other job's turn) is never cancelled by mistake
+	// — and a cancel issued from inside the very turn it would stop
+	// is safe, the turn simply ends as stopped.
 	stopped := false
 	if t.stopJob != nil {
 		stopped = t.stopJob(id)
@@ -1686,13 +1731,17 @@ func (t *cronEnableTool) Execute(ctx context.Context, args json.RawMessage) (str
 	}
 	now := time.Now().UTC()
 	dir, key := t.store.resolveBucket(ctx)
-	t.store.mu.Lock()
-	defer t.store.mu.Unlock()
+	// F-C27: the file lock is taken BEFORE the store mutex (see
+	// cron_schedule): lockState retries the flock for up to 10s
+	// while contended, and holding s.mu across that wait blocked
+	// every other chat's planning operation.
 	release, err := t.store.lockState(ctx, dir, cronJobsFile)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	defer release()
+	t.store.mu.Lock()
+	defer t.store.mu.Unlock()
 	doc, err := loadCronJobs(t.store, dir, key)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
@@ -1836,7 +1885,16 @@ type CronScheduler struct {
 	mu     sync.Mutex // guards runner, tick, log, turnTimeout, maxWorkers, sem
 	runner CronRunner
 	tick   time.Duration
-	log    *log.Logger
+	// tickNotify wakes a running Run when SetTickInterval
+	// changes the interval, so the pending tick is rescheduled
+	// at the new interval at once (F-C21). Buffered (1) and
+	// sent non-blocking: rapid changes coalesce, and a change
+	// made before Run starts (or after it stops) is simply
+	// dropped — the next Run reads the current interval
+	// anyway. A scheduler built without NewCronScheduler has a
+	// nil channel; Run then treats it as never notified.
+	tickNotify chan struct{}
+	log        *log.Logger
 	// turnTimeout is the per-turn deadline; 0 = cronTurnTimeout.
 	turnTimeout time.Duration
 	// maxWorkers is the worker-pool bound; 0 = cronMaxWorkers.
@@ -1891,9 +1949,10 @@ func NewCronScheduler(store *PlanningStore) *CronScheduler {
 		store.markCronSchedulerPresent()
 	}
 	return &CronScheduler{
-		store: store,
-		tick:  cronDefaultTick,
-		log:   log.New(os.Stderr, "orion/cron: ", log.LstdFlags),
+		store:      store,
+		tick:       cronDefaultTick,
+		tickNotify: make(chan struct{}, 1),
+		log:        log.New(os.Stderr, "orion/cron: ", log.LstdFlags),
 	}
 }
 
@@ -1907,14 +1966,28 @@ func (s *CronScheduler) SetRunner(r CronRunner) {
 }
 
 // SetTickInterval overrides the scan interval. A non-positive
-// value restores the default.
+// value restores the default. The change applies to a running
+// scheduler too (F-C21): Run reschedules its pending tick at
+// the new interval instead of waiting out the old one — the
+// previous fixed ticker silently ignored a change made after
+// Run started, so the setter was a no-op in production (it had
+// zero callers). The notify is sent after releasing mu and
+// never blocks: a change made while Run is not running is
+// simply dropped, and the next Run reads the current interval.
 func (s *CronScheduler) SetTickInterval(d time.Duration) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if d <= 0 {
 		d = cronDefaultTick
 	}
 	s.tick = d
+	notify := s.tickNotify
+	s.mu.Unlock()
+	if notify != nil {
+		select {
+		case notify <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // SetTurnTimeout overrides the per-turn deadline — how long one
@@ -2083,21 +2156,29 @@ func (s *CronScheduler) StopJob(jobID string) bool {
 // promptly instead of waiting a full tick) and then on every
 // tick until ctx is done. A tick error is logged, never fatal:
 // one bad chat must not stop the scheduler for every other chat.
+// The pending tick is a timer rebuilt from the current interval
+// after every tick (F-C21), so SetTickInterval reschedules it
+// at once — a change made while Run is running is honoured
+// from the next tick, not silently ignored until a restart.
 func (s *CronScheduler) Run(ctx context.Context) {
 	if err := s.ProcessDue(ctx, time.Now().UTC()); err != nil {
 		s.logf("initial scan: %v", err)
 	}
-	ticker := time.NewTicker(s.tickInterval())
-	defer ticker.Stop()
 	for {
+		timer := time.NewTimer(s.tickInterval())
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case t := <-ticker.C:
+		case t := <-timer.C:
 			if err := s.ProcessDue(ctx, t.UTC()); err != nil {
 				s.logf("tick: %v", err)
 			}
+		case <-s.tickNotify:
+			// The interval changed: drop the pending tick
+			// and rebuild the timer at the new interval.
 		}
+		timer.Stop()
 	}
 }
 
@@ -2466,13 +2547,19 @@ var errCronJobGone = errors.New("cron: job no longer exists")
 // success, backed off on failure) — the claim never changes what
 // a normal run records, it only makes the slot crash-safe.
 func (s *CronScheduler) claimJob(ctx context.Context, b cronBucket, j *CronJob, nextAfter time.Time) error {
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
+	// F-C27: file lock before the store mutex, as in
+	// cron_schedule — a contended claim held s.mu across the
+	// lockState retry loop and blocked every other chat's
+	// planning operation. The flock serialises writers, so the
+	// load-modify-save below (under mu, flock held) is still
+	// atomic.
 	release, err := s.store.lockState(ctx, b.dir, cronJobsFile)
 	if err != nil {
 		return fmt.Errorf("claim job %q: lock jobs: %w", j.ID, err)
 	}
 	defer release()
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
 	doc, err := loadCronJobs(s.store, b.dir, b.key)
 	if err != nil {
 		return fmt.Errorf("claim job %q: reload jobs: %w", j.ID, err)
@@ -2846,13 +2933,19 @@ func (s *CronScheduler) applyOutcomes(ctx context.Context, b cronBucket, outcome
 	for _, oc := range outcomes {
 		byID[oc.jobID] = oc
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
+	// F-C27: file lock before the store mutex, as in
+	// cron_schedule — a contended outcome apply held s.mu across
+	// the lockState retry loop and blocked every other chat's
+	// planning operation. The flock serialises writers, so the
+	// load-modify-save below (under mu, flock held) is still
+	// atomic.
 	release, err := s.store.lockState(ctx, b.dir, cronJobsFile)
 	if err != nil {
 		return fmt.Errorf("lock jobs: %w", err)
 	}
 	defer release()
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
 	doc, err := loadCronJobs(s.store, b.dir, b.key)
 	if err != nil {
 		return fmt.Errorf("reload jobs: %w", err)

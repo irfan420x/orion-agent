@@ -130,6 +130,94 @@ func TestCronDifferentChatTurnsRunInParallel(t *testing.T) {
 	}
 }
 
+// cronBlockingProvider blocks the FIRST provider call (Chat or
+// Stream) until released, and passes every later call straight
+// through to the stub. It lets a test park one turn inside the
+// provider while another channel's turn runs.
+type cronBlockingProvider struct {
+	stubProvider
+	mu      sync.Mutex
+	n       int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *cronBlockingProvider) gate() {
+	p.mu.Lock()
+	p.n++
+	first := p.n == 1
+	p.mu.Unlock()
+	if first {
+		close(p.started)
+		<-p.release
+	}
+}
+
+func (p *cronBlockingProvider) Chat(ctx context.Context, req model.ChatRequest) (*model.ChatResponse, error) {
+	p.gate()
+	return p.stubProvider.Chat(ctx, req)
+}
+
+func (p *cronBlockingProvider) Stream(ctx context.Context, req model.ChatRequest, fn func(chunk string) error) (*model.ChatResponse, error) {
+	p.gate()
+	return p.stubProvider.Stream(ctx, req, fn)
+}
+
+// TestCronCLIChannelNotSerialisedByTurnLock proves F-C23 is
+// intended, not a regression: the per-chat turn lock covers
+// per-chat (Telegram/scheduled) turns only. A CLI-channel turn
+// (App.Handle — `orion chat` / `orion run`, on the global
+// agent) completes while a per-chat turn for a chat is parked
+// inside the provider holding that chat's turn lock, so the CLI
+// channel never waits behind it. (The CLI channel has no chat
+// id and never enters runChatTurn; cmd/orion/main.go:1149 is
+// the CLI binary's Telegram path, not the interactive CLI.)
+func TestCronCLIChannelNotSerialisedByTurnLock(t *testing.T) {
+	a := testApp(t)
+	defer a.Close()
+	p := &cronBlockingProvider{started: make(chan struct{}), release: make(chan struct{})}
+	a.Provider = p
+
+	// Park a per-chat turn inside the provider: it holds chat
+	// 111's turn lock for as long as it is parked.
+	turnDone := make(chan error, 1)
+	go func() {
+		_, _, err := a.HandleStreamForChat(context.Background(), 111, "hello", nil)
+		turnDone <- err
+	}()
+	select {
+	case <-p.started:
+	case <-time.After(5 * time.Second):
+		close(p.release)
+		t.Fatal("timed out waiting for the chat turn to reach the provider")
+	}
+
+	// The CLI channel must complete while the chat turn is still
+	// parked — if App.Handle waited on the turn lock, this would
+	// block until the release below.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reply, err := a.Handle(ctx, "hello")
+	if err != nil {
+		close(p.release)
+		t.Fatalf("CLI Handle while a chat turn is parked: %v", err)
+	}
+	if reply == "" {
+		close(p.release)
+		t.Fatal("CLI Handle returned an empty reply")
+	}
+
+	close(p.release)
+	select {
+	case err := <-turnDone:
+		if err != nil {
+			t.Fatalf("parked chat turn: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked chat turn did not finish after release")
+	}
+}
+
 // TestCronExcludedFromChildRegistry proves subagent children do
 // not get the cron tools: scheduling is a parent-chat commitment
 // (recurring turns, token spend), so a child running a brief must

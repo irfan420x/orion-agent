@@ -442,6 +442,10 @@ func (a *App) HandleForChat(ctx context.Context, chatID int64, input string) (st
 // turnLock returns the serialising mutex for one chat's turns,
 // creating it (and the map) lazily. Hand-built Apps start with a
 // nil map; Build-created Apps get one on first use either way.
+// Entries are never evicted (F-C22): one mutex per chat that ever
+// ran a turn — bounded in practice by the allowlisted chats, and
+// far smaller than the per-chat session the chats map holds for
+// the same chat (see the turnMu comment in app.go).
 func (a *App) turnLock(chatID int64) *sync.Mutex {
 	a.turnMu.Lock()
 	defer a.turnMu.Unlock()
@@ -508,6 +512,15 @@ func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input str
 	// in the same chat and interleaving that chat's history.
 	// Different chats take different locks and still run in
 	// parallel.
+	// This lock covers per-chat turns only (F-C23): the
+	// interactive CLI channel (`orion chat` / `orion run`) runs
+	// on the global agent via App.Handle and never takes this
+	// lock, so there is no CLI turn in a chat for it to block —
+	// the lock serialises Telegram user turns against scheduled
+	// turns, never the CLI channel. User-vs-user serialisation
+	// is unchanged by this lock: PollStream already serialises
+	// user turns per chat, so the lock only adds the
+	// scheduled-vs-user case it was introduced for.
 	lock := a.turnLock(chatID)
 	lock.Lock()
 	defer lock.Unlock()
