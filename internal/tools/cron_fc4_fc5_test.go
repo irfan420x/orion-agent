@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -23,12 +24,15 @@ import (
 // ErrCronTurnStopped — exactly what the daemon's runner returns
 // for a stopped turn.
 type cronCtxRunner struct {
+	mu      sync.Mutex
 	release chan struct{}
 	calls   []CronJob
 }
 
 func (r *cronCtxRunner) run(ctx context.Context, job CronJob) (string, error) {
+	r.mu.Lock()
 	r.calls = append(r.calls, job)
+	r.mu.Unlock()
 	select {
 	case <-ctx.Done():
 		return "", ErrCronTurnStopped
@@ -37,7 +41,11 @@ func (r *cronCtxRunner) run(ctx context.Context, job CronJob) (string, error) {
 	}
 }
 
-func (r *cronCtxRunner) count() int { return len(r.calls) }
+func (r *cronCtxRunner) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
 
 func waitForCronRunnerCalls(t *testing.T, count func() int, n int) {
 	t.Helper()
