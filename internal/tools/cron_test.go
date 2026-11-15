@@ -87,13 +87,16 @@ func mustCronList(t *testing.T, tool *cronListTool, ctx context.Context) cronLis
 func rewriteCronJob(t *testing.T, store *PlanningStore, ctx context.Context, id string, fn func(*CronJob)) {
 	t.Helper()
 	dir, key := store.resolveBucket(ctx)
-	store.mu.Lock()
-	defer store.mu.Unlock()
+	// F-C27: flock before mu, like every cron site — this helper
+	// used to take mu first, inverting the order on the same
+	// (s.mu, cron-flock) pair.
 	release, err := store.lockState(ctx, dir, cronJobsFile)
 	if err != nil {
 		t.Fatalf("rewriteCronJob lock: %v", err)
 	}
 	defer release()
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	jobs, err := loadCronJobs(store, dir, key)
 	if err != nil {
 		t.Fatalf("rewriteCronJob load: %v", err)

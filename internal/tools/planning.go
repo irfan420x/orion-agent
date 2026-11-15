@@ -452,10 +452,16 @@ func ensurePlanningDir(dir, dataDir string) error {
 // loading; the lock is held until the save completes. The cron
 // tools take this lock BEFORE s.mu instead (F-C27): holding mu
 // across the up-to-10s flock wait blocked every other chat's
-// planning operation. The two orders cannot deadlock: each
-// state file has its own lockfile, and no path ever holds one
-// file's lock while taking another's — the cron order and the
-// planning order never share a lock pair. The in-memory path
+// planning operation. The two orders cannot deadlock: every
+// cron site (schedule, cancel, enable, processChat's tick load,
+// claimJob, applyOutcomes) takes the cron file lock before s.mu,
+// so no thread ever holds mu while waiting for the cron flock;
+// and a planning-flock holder always already holds mu (the
+// planning tools take mu first, on their own per-file locks),
+// so no thread can hold a planning flock while waiting for mu.
+// No path ever holds one file's lock while taking another's, so
+// no circular wait exists on any (s.mu, flock) pair. The
+// in-memory path
 // (dir == "") needs no lock and returns a no-op release.
 //
 // The flock is taken non-blocking with retries so a stuck holder

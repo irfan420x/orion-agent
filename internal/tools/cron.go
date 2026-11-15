@@ -1358,10 +1358,16 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 	// is held, is still atomic. The in-memory path (dir == "")
 	// has no file lock — lockState is a no-op there — so mu
 	// stays the only serialisation and is held for the whole
-	// op. The order here (file lock, then mu) cannot deadlock
-	// against the planning tools (mu, then file lock): they lock
-	// different lock files, and no path ever holds one file's
-	// lock while taking another's.
+	// op. The order here (file lock, then mu) is uniform across
+	// every cron site — schedule, cancel, enable, processChat's
+	// tick load, claimJob, applyOutcomes — so no circular wait
+	// exists on the (s.mu, cron-flock) pair: no cron site ever
+	// holds mu while waiting for the cron flock. It cannot
+	// deadlock against the planning tools (mu, then file lock)
+	// either: they lock different lock files, and a
+	// planning-flock holder always already holds mu, so no
+	// thread can hold a planning flock while waiting for mu;
+	// no path ever holds one file's lock while taking another's.
 	release, err := t.store.lockState(ctx, dir, cronJobsFile)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
@@ -2353,12 +2359,17 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 	// not tearing — and it is held only for the load, never
 	// across the turns: the claim and the outcome apply take
 	// it again, as before.
-	s.store.mu.Lock()
+	// F-C27: the file lock is taken BEFORE the store mutex, as
+	// in cron_schedule — holding s.mu across the lockState
+	// retry loop blocked every other chat's planning operation
+	// while contended, and inverted the order against the
+	// schedule/cancel/claim/outcome sites on the same
+	// (s.mu, cron-flock) pair.
 	release, lerr := s.store.lockState(ctx, b.dir, cronJobsFile)
 	if lerr != nil {
-		s.store.mu.Unlock()
 		return fmt.Errorf("load jobs: %w", lerr)
 	}
+	s.store.mu.Lock()
 	doc, err := loadCronJobs(s.store, b.dir, b.key)
 	release()
 	s.store.mu.Unlock()

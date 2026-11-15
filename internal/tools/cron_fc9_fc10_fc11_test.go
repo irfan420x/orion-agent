@@ -168,13 +168,16 @@ func seedCronJobs(t *testing.T, store *PlanningStore, chatID int64, n int) {
 	t.Helper()
 	ctx := cronChatCtx(chatID, chatID)
 	dir, key := store.resolveBucket(ctx)
-	store.mu.Lock()
-	defer store.mu.Unlock()
+	// F-C27: flock before mu, like every cron site — this helper
+	// used to take mu first, inverting the order on the same
+	// (s.mu, cron-flock) pair.
 	release, err := store.lockState(ctx, dir, cronJobsFile)
 	if err != nil {
 		t.Fatalf("seedCronJobs lock: %v", err)
 	}
 	defer release()
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	doc, err := loadCronJobs(store, dir, key)
 	if err != nil {
 		t.Fatalf("seedCronJobs load: %v", err)
