@@ -203,8 +203,9 @@ enter/exit_plan_mode pattern). Suite: **1,626 tests total
   approval denies that call and the turn completes with the
   denial recorded.
 - **Safety + missed runs.** Exponential backoff on failure (1,
-  2, 4, 8, 16, 32, 60 minutes, capped at 60) and the job is
-  DISABLED after 5 consecutive failures — never a hot loop. A
+  2, 4, 8, 16 minutes) and the job is DISABLED after 5
+  consecutive failures, so the backoff never grows past 16
+  minutes — never a hot loop. A
   run missed by more than 10 minutes (daemon was down) is
   SKIPPED, not run late, and does not count as a failure.
   Times are stored and shown in UTC — the codebase has no
