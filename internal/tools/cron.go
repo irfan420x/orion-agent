@@ -1016,11 +1016,11 @@ func SetCronScheduleRuleStore(reg *Registry, store *permissions.RuleStore) {
 }
 
 // unattendedAllowWarning lists the gated (destructive/network)
-// tools for which chatID holds a persisted "always allow" rule:
-// rules that would previously have auto-allowed an unattended
-// execution, and that a scheduled turn now ignores (F-C3). It
-// returns nil when the store is nil or no such rule exists. The
-// caller warns only — it never refuses to schedule.
+// tools for which chatID holds an EFFECTIVE persisted "always
+// allow" rule: rules that would previously have auto-allowed an
+// unattended execution, and that a scheduled turn now ignores
+// (F-C3). It returns nil when the store is nil or no such rule
+// exists. The caller warns only — it never refuses to schedule.
 //
 // The warning iterates the rule store's own entries for the chat,
 // not KnownTools(): KnownTools lists only the explicitly classified
@@ -1032,27 +1032,50 @@ func SetCronScheduleRuleStore(reg *Registry, store *permissions.RuleStore) {
 // never warn. Names are deduplicated (a tool can hold both a
 // global and a per-chat allow rule) and sorted, so the warning is
 // stable.
+//
+// Effective-rule filter: a tool warns only when its EFFECTIVE
+// rule for this chat — the rule the gate itself would consult —
+// is an allow. The store resolves per-chat first, global second
+// (LookupForChat): a per-chat DENY shadowing a legacy global
+// ALLOW means the job is denied via the deny rule, not via the
+// ignored allow, so that tool must NOT warn. Conversely a
+// per-chat ALLOW shadowing a global DENY is effective, so it
+// warns. The filter resolves over the List() snapshot rather than
+// calling LookupForChat per tool: LookupForChat logs (once per
+// tool) when a legacy global rule falls back, and this warning
+// path is read-only — it must not consume that first-use log or
+// mutate the store's warned state. The resolution is identical:
+// List() entries carry already-normalised tool names, and the
+// per-chat-wins / global-fallback order is LookupForChat's.
 func (t *cronScheduleTool) unattendedAllowWarning(chatID int64) []string {
 	if t.rules == nil {
 		return nil
 	}
-	seen := map[string]bool{}
-	var warned []string
+	// Effective rule per tool for this chat: the chat's own rule
+	// wins; a legacy global rule (chat 0) applies only when the
+	// chat holds no rule of its own. Order-independent: a
+	// per-chat entry always overwrites, a global entry only
+	// fills a gap.
+	effective := map[string]permissions.Action{}
 	for _, rule := range t.rules.List() {
-		if rule.Action != permissions.ActionAllow {
-			continue
-		}
 		if rule.ChatID != chatID && rule.ChatID != 0 {
 			continue
 		}
-		if permissions.Classify(rule.Tool) == permissions.ClassSafe {
+		if rule.ChatID == chatID {
+			effective[rule.Tool] = rule.Action
+		} else if _, ok := effective[rule.Tool]; !ok {
+			effective[rule.Tool] = rule.Action
+		}
+	}
+	var warned []string
+	for tool, action := range effective {
+		if action != permissions.ActionAllow {
 			continue
 		}
-		if seen[rule.Tool] {
+		if permissions.Classify(tool) == permissions.ClassSafe {
 			continue
 		}
-		seen[rule.Tool] = true
-		warned = append(warned, rule.Tool)
+		warned = append(warned, tool)
 	}
 	sort.Strings(warned)
 	return warned

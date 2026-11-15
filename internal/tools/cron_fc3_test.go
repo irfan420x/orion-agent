@@ -134,6 +134,90 @@ func TestCronScheduleWarnsOnlyForRequestingChat(t *testing.T) {
 	}
 }
 
+func TestCronScheduleNoWarningWhenPerChatDenyShadowsGlobalAllow(t *testing.T) {
+	// The re-verifier's warning-only flaw: a per-chat DENY for a
+	// tool shadows a legacy global (chat 0) ALLOW for the same
+	// tool — LookupForChat returns the deny, so the job is denied
+	// via the deny rule, not via the ignored allow. The warning
+	// must therefore NOT name that tool: its mechanism claim
+	// ("those [allow] rules are ignored") would be wrong for it.
+	// A global allow with NO per-chat deny must still warn.
+	store := NewPlanningStore("")
+	rules := permissions.NewRuleStore("")
+	if err := rules.SetForChat(0, "shell_exec", permissions.ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	if err := rules.SetForChat(111, "shell_exec", permissions.ActionDeny); err != nil {
+		t.Fatal(err)
+	}
+	// Control: a global allow no per-chat rule shadows.
+	if err := rules.SetForChat(0, "web_fetch", permissions.ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	tool := &cronScheduleTool{store: store, rules: rules}
+	note := cronScheduleNote(t, tool, cronChatCtx(111, 111), "0 9 * * 1-5", "morning brief")
+	if !strings.Contains(note, "Warning: this chat has persisted") || !strings.Contains(note, "web_fetch") {
+		t.Errorf("schedule note = %q, want an always-allow Warning naming web_fetch (unshadowed global allow)", note)
+	}
+	if strings.Contains(note, "shell_exec") {
+		t.Errorf("schedule note = %q, want no mention of shell_exec (per-chat deny shadows the global allow)", note)
+	}
+	// Warn only: the job was still created, the rules untouched.
+	if got := mustCronList(t, &cronListTool{store: store}, cronChatCtx(111, 111)); got.Count != 1 {
+		t.Fatalf("list after warned schedule = %d jobs, want 1 (warn, do not refuse)", got.Count)
+	}
+	if action, ok := rules.LookupForChat(111, "shell_exec"); !ok || action != permissions.ActionDeny {
+		t.Errorf("LookupForChat(shell_exec) = %q/%v, want deny/true (warning must not change the effective rule)", action, ok)
+	}
+	if action, ok := rules.LookupForChat(111, "web_fetch"); !ok || action != permissions.ActionAllow {
+		t.Errorf("LookupForChat(web_fetch) = %q/%v, want allow/true (warning must not revoke the rule)", action, ok)
+	}
+
+	// Pure case: with ONLY the shadowed pair standing, there is
+	// no always-allow warning — no effective allow rule exists.
+	// (The dormant-scheduler warning still appears: no scheduler
+	// runs in this test process, and it is unrelated to the
+	// allow-rule warning this test is about.)
+	shadowOnly := NewPlanningStore("")
+	shadowRules := permissions.NewRuleStore("")
+	if err := shadowRules.SetForChat(0, "shell_exec", permissions.ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadowRules.SetForChat(111, "shell_exec", permissions.ActionDeny); err != nil {
+		t.Fatal(err)
+	}
+	shadowTool := &cronScheduleTool{store: shadowOnly, rules: shadowRules}
+	if note := cronScheduleNote(t, shadowTool, cronChatCtx(111, 111), "0 9 * * 1-5", "morning brief"); strings.Contains(note, "Warning: this chat has persisted") {
+		t.Errorf("schedule note = %q, want no always-allow Warning when the only allow is shadowed by a per-chat deny", note)
+	}
+}
+
+func TestCronScheduleWarnsWhenPerChatAllowShadowsGlobalDeny(t *testing.T) {
+	// The reverse precedence: a per-chat ALLOW shadowing a
+	// global DENY is the effective rule, so the scheduled turn
+	// ignores it and the tool must warn — the deny underneath
+	// must not suppress the warning.
+	store := NewPlanningStore("")
+	rules := permissions.NewRuleStore("")
+	if err := rules.SetForChat(0, "shell_exec", permissions.ActionDeny); err != nil {
+		t.Fatal(err)
+	}
+	if err := rules.SetForChat(111, "shell_exec", permissions.ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	tool := &cronScheduleTool{store: store, rules: rules}
+	note := cronScheduleNote(t, tool, cronChatCtx(111, 111), "0 9 * * 1-5", "morning brief")
+	if !strings.Contains(note, "Warning") || !strings.Contains(note, "shell_exec") {
+		t.Errorf("schedule note = %q, want a Warning naming shell_exec (per-chat allow is effective over the global deny)", note)
+	}
+	if got := mustCronList(t, &cronListTool{store: store}, cronChatCtx(111, 111)); got.Count != 1 {
+		t.Fatalf("list after warned schedule = %d jobs, want 1 (warn, do not refuse)", got.Count)
+	}
+	if action, ok := rules.LookupForChat(111, "shell_exec"); !ok || action != permissions.ActionAllow {
+		t.Errorf("LookupForChat(shell_exec) = %q/%v, want allow/true (warning must not change the effective rule)", action, ok)
+	}
+}
+
 func TestCronScheduleWarnsAboutMcpAndUnclassifiedAllowRules(t *testing.T) {
 	// The warning must cover allow rules for ALL gated tools held
 	// for the chat, not only the built-ins KnownTools() lists:
