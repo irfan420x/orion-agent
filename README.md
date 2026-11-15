@@ -5,9 +5,9 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,632 tests total — 1,628 pass, 0 fail, 4 skip;
+> built and tested (1,654 tests total — 1,650 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
-> Audit 22 fix batch, the provider-auto context-window change, the cron tool and the behavior fix (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
+> Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix and the busy-input acknowledgement (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -98,13 +98,26 @@ a block with its command, file writes as ✍️ lines, repeats collapse
 to (×N). Displayed commands are redacted, so secrets never leak
 into the chat. The final reply is a structured message in your
 language, with a runtime footer (model, tokens, steps, duration)
-you can toggle with `/footer`. On `oriond`, the `/` menu offers 22 commands
+you can toggle with `/footer`. On `oriond`, the `/` menu offers 23 commands
 (`/help`, `/new`, `/sessions`, `/resume`, `/stop`, `/status`, `/model`,
-`/usage`, `/budget`, `/undo`, `/retry`, `/pause`, `/agents`, `/title`, `/compress`,
+`/usage`, `/budget`, `/busy`, `/undo`, `/retry`, `/pause`, `/agents`, `/title`, `/compress`,
 `/save`, `/restart`, `/rules`, `/whoami`, `/footer`, `/memory`, `/skills`); per-chat
-command state (title, footer preference, pause flag, usage totals)
+command state (title, footer preference, pause flag, usage totals, busy-input mode)
 persists in `~/.orion/sessions.json`, while conversation transcripts
 persist separately as per-session JSONL files (see [Sessions](#sessions)).
+
+While a turn runs, a new message from the same chat is acknowledged
+at once instead of waiting silently: the bot sends a short status
+message and handles the new message according to the chat's busy-input
+mode — **interrupt** (default) cancels the running turn and redirects
+it to the new message, **queue** runs the new message after the current
+task finishes, **steer** joins the new message into the running turn at
+the next step boundary. Change the mode with `/busy queue`, `/busy
+steer`, or `/busy interrupt` (`/busy` alone shows the current mode).
+Queued messages run in arrival order. Commands (`/stop`, `/busy`, …)
+never trigger busy handling. If the running turn is waiting on a plan
+decision, interrupt degrades to queue so the plan card is not orphaned;
+if it is waiting on a question, the question card is visibly cancelled.
 
 # Run oriond as a service (systemd user unit, oriond.service):
 ./install.sh --systemd                  # installs + enables + starts the unit
@@ -118,9 +131,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,632 tests total (1,628 passing, 0 failing, 4 skipped)
+24/24 packages, 1,654 tests total (1,650 passing, 0 failing, 4 skipped)
 (recount in the working tree after the Audit 22 fix batch, the
-provider-auto context-window change, the cron tool and the behavior fix, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
+provider-auto context-window change, the cron tool, the behavior fix and the busy-input acknowledgement, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
 `go test ./...` or `make test`.
 

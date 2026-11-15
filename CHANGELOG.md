@@ -6,6 +6,45 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Busy-input acknowledgement — interrupt/queue/steer
+
+A new message arriving while a turn runs no longer waits silently
+on the chat lock: the bot sends an immediate status ack and applies
+the chat's busy-input mode. Suite: **1,654 tests total
+(1,650 pass, 0 fail, 4 skip), 24/24 packages**.
+
+- **Interrupt (default).** The running turn's context is cancelled
+  (the old turn sends no reply) and the new message runs as the
+  next turn. If the running turn is waiting on a plan decision,
+  interrupt degrades to queue so the plan card is not orphaned; if
+  it is waiting on a question, the question card is visibly edited
+  to "cancelled — the run was interrupted" with the keyboard removed.
+- **Queue.** The message waits behind the per-chat lock and runs as
+  a normal turn after the current task finishes; queued messages
+  run in arrival order (per-chat FIFO ticket queue — the lock alone
+  cannot order two handles spawned in the same batch).
+- **Steer.** The message joins the running turn at the next step
+  boundary (appended to the in-flight transcript and recorded in
+  history); a steer landing during the final provider call is never
+  lost — it stays pending and runs as a leftover turn after the
+  current one. If the steer is not accepted (no run active), the
+  message queues instead and gets the queue ack, never the steer ack.
+- **Ack.** One ack per running turn (later arrivals while the same
+  run is busy send no second ack, but their mode action still
+  applies); the ack names the run's elapsed time, step and current
+  tool when known. Commands (`/stop`, `/busy`, …) never trigger busy
+  handling. The mode is per-chat, persists in `sessions.json`, and
+  is changed with `/busy` (`/busy` alone shows the current mode).
+- Pinned by `TestBusyInterruptCancelsRunningTurn`,
+  `TestBusyAckCoalescingAndQueueOrdering`,
+  `TestBusyInterruptWithPendingPlanDegradesToQueue`,
+  `TestBusyInterruptWithPendingQuestion`,
+  `TestBusySteerAcceptedRunsNoTurn`, `TestBusySteerNotAcceptedRunsNormalTurn`,
+  `TestBusyCommandsExempt`, `TestBusySteerLeftoversRunAsTurns`,
+  `TestSteerDrainsAtNextStepBoundary`,
+  `TestSteerDuringFinalCallIsNotLost`,
+  `TestSessionStoreBusyModeRoundTrip`, `TestBusyCommand`.
+
 ### Behavior fix — try-first + humanized answers
 
 Orion's system prompt taught the model to explain instead of trying
