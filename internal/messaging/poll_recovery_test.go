@@ -864,9 +864,14 @@ func TestPollTransportNegotiatesHTTP1AgainstH2Server(t *testing.T) {
 		// server rejects the client's bogus preface and closes
 		// the connection, and with unread request bytes buffered
 		// the close sends RST, discarding the in-flight SETTINGS
-		// frame before the client reads it.
-		if !strings.Contains(err.Error(), "malformed HTTP response") && !strings.Contains(err.Error(), "EOF") {
-			t.Fatalf("negative control: old transport failed with %v, want malformed HTTP response or EOF (h2 negotiated, request rejected)", err)
+		// frame before the client reads it. A third failure,
+		// "readLoopPeekFailLocked", is the same rejection surfacing
+		// one layer deeper: the transport's read loop peeking at the
+		// server's bogus-preface reply fails while the connection
+		// is torn down, so the buffered h2 SETTINGS frame is never
+		// delivered as a well-formed response.
+		if !strings.Contains(err.Error(), "malformed HTTP response") && !strings.Contains(err.Error(), "EOF") && !strings.Contains(err.Error(), "readLoopPeekFailLocked") {
+			t.Fatalf("negative control: old transport failed with %v, want malformed HTTP response, EOF, or readLoopPeekFailLocked (h2 negotiated, request rejected)", err)
 		}
 		t.Logf("negative control failed as expected: %v", err)
 	})
