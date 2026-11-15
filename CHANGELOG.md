@@ -6,6 +6,52 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Behavior fix — try-first + humanized answers
+
+Orion's system prompt taught the model to explain instead of trying
+(user order 2026-11-15 08:28 SGT). Suite: **1,632 tests total
+(1,628 pass, 0 fail, 4 skip), 24/24 packages**.
+
+- **Try-first.** When a tool call is denied or fails, the prompt now
+  says to try a different way first — a different tool, a different
+  command, installing the missing tool, or a different query — and
+  only explain what was blocked after genuinely trying and failing.
+  It also says never to predict a tool will fail without trying it.
+  The old lines ("do not retry the same call — explain what was
+  blocked and offer a safe alternative", "ask for clarification
+  before acting") are gone. Evidence: the 2026-11-15 08:16 song
+  turn, where Orion found the YouTube links but never attempted
+  the download, predicting yt-dlp would be blocked — yt-dlp is
+  not in the shell denylist.
+- **Act on the best reading.** An ambiguous request is now acted on
+  under its most reasonable reading; clarification is asked for
+  only when the action is irreversible or the ambiguity changes
+  the outcome. A direct order is never ambiguous.
+- **Presenting results.** A new prompt paragraph forbids pasting raw
+  tool output (search results, JSON, link lists) into the reply:
+  synthesize a human answer in the user's language — news most
+  important first, one headline per item with one line saying why
+  it matters; no result dumps, no restated request, no step
+  narration, no summary after the summary.
+- Pinned by `TestSystemPromptTryFirstAndHumanized`
+  (`internal/core/agent_test.go`): the new guidance is present
+  and the old wording is absent.
+- **Personality file (user order 2026-11-15 08:44 SGT).** Orion's
+  voice now lives outside the code: the agent reads
+  `<data_dir>/personality.md` (for example
+  `~/.orion/personality.md`) once at startup and appends it after
+  the core instructions. The user edits the file to change how
+  Orion sounds — no rebuild needed, a restart picks it up. A
+  missing, unreadable, or empty file falls back to a short
+  built-in default (Bengali-first, concise, human); an oversize
+  file is truncated to 8 KiB, never rejected. The file is style
+  and voice ONLY: the assembled prompt states that the core
+  instructions take precedence, so it can never change safety,
+  denylist, gate, or approval behavior. Pinned by four tests in
+  `internal/core/personality_test.go` (missing → default, user
+  file appended after core, oversize truncated with valid UTF-8,
+  hostile file cannot override a core rule).
+
 ### Provider-auto context window
 
 The history budget is now derived from the active provider's
