@@ -459,7 +459,7 @@ type cronEnableOut struct {
 // scan used to stop after 64 runs, which misses a sub-5-minute
 // gap that only appears later in the 7-day window. This schedule
 // fires every 5 minutes through most of the day, but 22:57 →
-// 23:00 is a 3-minute gap — the 65th gap after a midnight start,
+// 23:00 is a 3-minute gap — the 144th gap after a midnight start,
 // past the old cap — so it must be rejected, not accepted.
 //
 // Counterexample, verified by counting: minutes
