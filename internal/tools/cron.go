@@ -124,7 +124,17 @@
 //     re-firing. A turn the owner stops deliberately (/stop, or
 //     cron_cancel on the running job — F-C5) records "stopped",
 //     consumes the slot, and does NOT count toward the 5-strike
-//     disable: a stop is not a failure.
+//     disable: a stop is not a failure. A turn interrupted by
+//     daemon shutdown (F-C19) records "shutdown" instead: same
+//     accounting (slot consumed, no failure strike), honest
+//     wording — a shutdown is not the job's fault either, and
+//     its outcome is applied best-effort, not dropped.
+//     A successful turn that runs longer than the gap to its
+//     next slot (F-C18) does not leave a next run in the past:
+//     the next run is the next cron occurrence after the turn
+//     finished, so the next tick cannot re-fire it at once —
+//     only slots the turn already outlasted are skipped, and
+//     a turn that finishes before its next slot keeps it.
 package tools
 
 import (
@@ -386,6 +396,14 @@ func (s *cronSchedule) matches(t time.Time) bool {
 	if s.month&(1<<uint(t.Month())) == 0 {
 		return false
 	}
+	return s.dayMatches(t)
+}
+
+// dayMatches is the day-of-month / day-of-week half of matches:
+// a day matches when both fields are unrestricted, when the one
+// restricted field matches, or — when both are restricted —
+// when either matches (Vixie cron OR semantics).
+func (s *cronSchedule) dayMatches(t time.Time) bool {
 	domMatch := s.dom&(1<<uint(t.Day())) != 0
 	dowMatch := s.dow&(1<<uint(t.Weekday())) != 0
 	switch {
@@ -400,20 +418,51 @@ func (s *cronSchedule) matches(t time.Time) bool {
 	}
 }
 
+// nextMinute returns the first set minute in the minute mask at
+// or after min, or -1 when no minute later in the hour matches.
+func (s *cronSchedule) nextMinute(min int) int {
+	for m := min; m <= 59; m++ {
+		if s.minute&(1<<uint(m)) != 0 {
+			return m
+		}
+	}
+	return -1
+}
+
 // nextAfter returns the next time strictly after `after` that
-// matches the schedule, searching minute by minute (the schedule
-// is minute-granular, so no finer search is needed). The search
-// is bounded: a schedule that cannot fire within
-// cronSearchYears is an error, not an unbounded loop. Feb 29 is
-// the worst case at ~2.1M iterations, each a few bitmask tests.
+// matches the schedule. The search is field-wise, not minute by
+// minute (F-C28): a month that cannot match jumps to the 1st of
+// the next month, a day that cannot match jumps to midnight
+// tomorrow, an hour that cannot match jumps to the next hour,
+// and within an hour the next set minute is taken directly.
+// Each step skips only times that cannot match — the month/day/
+// hour/minute checks are exactly the matches() checks — so the
+// returned time is identical to the old minute scan, but the
+// worst case drops from ~2.6M iterations (Feb 29, 5-year cap)
+// to a few thousand: at most 60 month jumps, ~1,826 day jumps,
+// and the hours/minutes of the matching day. The search is
+// still bounded: a schedule that cannot fire within
+// cronSearchYears is an error, not an unbounded loop.
 func (s *cronSchedule) nextAfter(after time.Time) (time.Time, error) {
 	t := after.UTC().Truncate(time.Minute).Add(time.Minute)
 	limit := t.AddDate(cronSearchYears, 0, 0)
 	for !t.After(limit) {
-		if s.matches(t) {
-			return t, nil
+		if s.month&(1<<uint(t.Month())) == 0 {
+			t = time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+			continue
 		}
-		t = t.Add(time.Minute)
+		if !s.dayMatches(t) {
+			t = time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, time.UTC)
+			continue
+		}
+		if s.hour&(1<<uint(t.Hour())) == 0 {
+			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour()+1, 0, 0, 0, time.UTC)
+			continue
+		}
+		if m := s.nextMinute(t.Minute()); m >= 0 {
+			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), m, 0, 0, time.UTC), nil
+		}
+		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour()+1, 0, 0, 0, time.UTC)
 	}
 	return time.Time{}, fmt.Errorf("cron expression has no run in the next %d years", cronSearchYears)
 }
@@ -1914,8 +1963,23 @@ func (s *CronScheduler) releaseClaim(chatID int64) {
 // (or, via app.runChatTurn's per-chat lock, a user turn) in that
 // same chat.
 func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.Time, wallStart time.Time, sem chan struct{}, runner CronRunner) error {
+	// The load takes the flock like every writer (F-C26):
+	// lockState's contract is "call this before loading", and
+	// the tick's decision must be serialised against a
+	// concurrent load-modify-save, not taken from a state a
+	// writer is mid-rewrite of. The atomic rename already
+	// rules out a torn read, so the flock is about ordering,
+	// not tearing — and it is held only for the load, never
+	// across the turns: the claim and the outcome apply take
+	// it again, as before.
 	s.store.mu.Lock()
+	release, lerr := s.store.lockState(ctx, b.dir, cronJobsFile)
+	if lerr != nil {
+		s.store.mu.Unlock()
+		return fmt.Errorf("load jobs: %w", lerr)
+	}
 	doc, err := loadCronJobs(s.store, b.dir, b.key)
+	release()
 	s.store.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("load jobs: %w", err)
@@ -2040,8 +2104,17 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 	}
 	var applyErr error
 	if len(outcomes) > 0 {
-		if err := s.applyOutcomes(ctx, b, outcomes); err != nil {
-			applyErr = s.retryOutcomesAsFailures(ctx, b, outcomes, err)
+		// WithoutCancel, like the mid-loop shutdown branch
+		// above (R2): the tick may be ending (shutdown) by
+		// the time the turns finish, and the outcome apply
+		// must not be lost to a cancelled context when the
+		// flock is contended — lockState consults ctx only
+		// while contended, so a plain ctx works until
+		// exactly the shutdown it must survive. The flock
+		// still bounds this to one 10s-timed-out save.
+		applyCtx := context.WithoutCancel(ctx)
+		if err := s.applyOutcomes(applyCtx, b, outcomes); err != nil {
+			applyErr = s.retryOutcomesAsFailures(applyCtx, b, outcomes, err)
 		}
 	}
 	return errors.Join(append(claimErrs, applyErr)...)
@@ -2252,7 +2325,13 @@ func (s *CronScheduler) retryOutcomesAsFailures(ctx context.Context, b cronBucke
 // turn context into it). Any of the three stop signals — the
 // sentinel, a context.Canceled error, or the stopped mark
 // StopJob left — records the run as "stopped": the slot is
-// consumed and the failure count is untouched. A timeout still
+// consumed and the failure count is untouched. A shutdown
+// (F-C19) records "shutdown" instead: the daemon's runner maps
+// a shutdown to the same sentinel, so runJob tells the two
+// apart from the parent context — a cancelled parent with no
+// StopJob mark is a shutdown, not a stop — with the same
+// accounting and the next run advanced past the turn's outcome
+// time (see outcomeNextRun above). A timeout still
 // counts as a failure: the deadline reports DeadlineExceeded,
 // never Canceled, and the stopped check runs before the timeout
 // override, so a stop racing the deadline is a stop, not a
@@ -2317,6 +2396,28 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 	// time. The failure backoff is anchored here, not at `at`
 	// (see the doc comment above).
 	doneAt := at.Add(time.Since(turnStart))
+	// outcomeNextRun is the next run for a turn that finished
+	// at doneAt (F-C18): the slot computed from the turn's
+	// start (nextAfter) when the turn finished before it,
+	// otherwise the next cron occurrence after doneAt. A turn
+	// that runs longer than the gap to its next slot — a
+	// 7-minute turn on a 5-minute job, which the 10-minute
+	// turn timeout allows — would otherwise leave a next run
+	// already in the past, and the next tick would re-fire
+	// it immediately (inside the missed window). The slot is
+	// only advanced past slots the turn already outlasted;
+	// a turn that finishes before its next slot keeps that
+	// slot exactly (see
+	// TestCronSchedulerLongSuccessfulTurnKeepsSchedule).
+	// The failure backoff already anchors at doneAt, so this
+	// is the same rule for the success and stopped outcomes,
+	// which otherwise keep the start-anchored slot (the
+	// budget outcome anchors its reset at doneAt the same way,
+	// via nextBudgetRun below).
+	outcomeNextRun := nextAfter
+	if sched, serr := parseCronExpression(j.Expression); serr == nil {
+		outcomeNextRun = sched.nextRunAfterOutcome(nextAfter, doneAt)
+	}
 	// A deliberate stop (F-C5) is not a failure: the slot is
 	// consumed and the failure count is untouched. The check
 	// runs before the timeout override below, so a stop racing
@@ -2325,11 +2426,25 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 	// runner echoing the deadline returns a context error too,
 	// and that is a timeout, not a stop.
 	if runErr != nil && (errors.Is(runErr, ErrCronTurnStopped) || s.wasStopped(j.ID) || (errors.Is(runErr, context.Canceled) && turnCtx.Err() != context.DeadlineExceeded)) {
+		// F-C19: a shutdown is not an owner stop. When the
+		// daemon's own (parent) context was cancelled and
+		// nobody stopped this turn, the turn was interrupted
+		// by the daemon shutting down — record it as a
+		// shutdown, not "stopped by the owner": same
+		// accounting (slot consumed, no failure strike),
+		// honest wording. The daemon's runner maps both a
+		// stop and a shutdown to ErrCronTurnStopped, so the
+		// distinction can only be made here, from the parent
+		// context — see the comment in runScheduledTurn.
+		lastRes := "stopped: scheduled turn stopped by the owner"
+		if !s.wasStopped(j.ID) && ctx.Err() == context.Canceled {
+			lastRes = "shutdown: scheduled turn interrupted by daemon shutdown"
+		}
 		return &cronOutcome{
 			jobID:    j.ID,
-			nextRun:  nextAfter,
+			nextRun:  outcomeNextRun,
 			lastRun:  at,
-			lastRes:  "stopped: scheduled turn stopped by the owner",
+			lastRes:  lastRes,
 			failures: j.ConsecutiveFailures,
 			disabled: false,
 		}
@@ -2359,8 +2474,11 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 			// the job is never disabled on this outcome, and
 			// the next run waits for the reset instead of the
 			// next cron slot (a minutely job would otherwise
-			// re-fire every minute until midnight).
-			nextRun := nextBudgetRun(nextAfter, at)
+			// re-fire every minute until midnight). The reset
+			// is anchored at doneAt, not at the turn's start:
+			// a turn that runs past midnight must wait for
+			// the NEXT reset, not the one it already crossed.
+			nextRun := nextBudgetRun(nextAfter, doneAt)
 			return &cronOutcome{
 				jobID:    j.ID,
 				nextRun:  nextRun,
@@ -2387,7 +2505,7 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 	}
 	return &cronOutcome{
 		jobID:    j.ID,
-		nextRun:  nextAfter,
+		nextRun:  outcomeNextRun,
 		lastRun:  at,
 		lastRes:  "ok",
 		failures: 0,
@@ -2414,6 +2532,27 @@ func nextBudgetRun(nextCron, now time.Time) time.Time {
 func nextUTCMidnight(at time.Time) time.Time {
 	t := at.UTC()
 	return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
+// nextRunAfterOutcome returns the next run for a turn that
+// finished at doneAt (F-C18): nextAfter — the slot computed
+// from the turn's start — when the turn finished before it,
+// otherwise the next cron occurrence after doneAt. A turn that
+// outlasts its next slot must not leave a next run in the
+// past: the next tick would re-fire it immediately. Only slots
+// the turn already outlasted are skipped, so a turn that
+// finishes before its next slot keeps that slot exactly. A
+// schedule that cannot fire again within the search window
+// keeps nextAfter rather than failing the outcome.
+func (s *cronSchedule) nextRunAfterOutcome(nextAfter, doneAt time.Time) time.Time {
+	if nextAfter.After(doneAt) {
+		return nextAfter
+	}
+	next, err := s.nextAfter(doneAt)
+	if err != nil {
+		return nextAfter
+	}
+	return next
 }
 
 // backoffNextRun applies the exponential failure backoff to the

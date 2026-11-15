@@ -931,11 +931,17 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 		// sentinel records the run as stopped (slot consumed,
 		// failure count untouched) instead of counting it
 		// toward the 5-strike disable. Any error wrapping
-		// context.Canceled is a stop: the agent only reports
-		// Canceled when a turn context was cancelled, and the
-		// contexts are cancelled by a stop or by daemon
-		// shutdown (whose outcome is dropped anyway) — a
-		// timeout reports DeadlineExceeded, never Canceled.
+		// context.Canceled becomes the stopped sentinel: the
+		// agent only reports Canceled when a turn context was
+		// cancelled, and the contexts are cancelled by a stop
+		// or by daemon shutdown — a timeout reports
+		// DeadlineExceeded, never Canceled. The two are NOT
+		// the same outcome: the scheduler tells them apart
+		// from the daemon context (F-C19) and records a
+		// shutdown as "shutdown", not "stopped by the owner"
+		// — same accounting (no failure strike), honest
+		// wording, and the outcome is applied best-effort
+		// on shutdown, not dropped.
 		if errors.Is(err, context.Canceled) {
 			return "", tools.ErrCronTurnStopped
 		}
