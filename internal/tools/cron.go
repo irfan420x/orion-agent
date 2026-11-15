@@ -71,8 +71,19 @@
 //     and turns for one chat are serialised against user turns
 //     by the per-chat turn lock in app.runChatTurn, so a
 //     scheduled turn can never overlap a user turn in the same
-//     chat. A tick that finds a previous tick still running is
-//     skipped, never overlapped.
+//     chat. Chats run in PARALLEL, bounded by a worker pool
+//     (cronMaxWorkers, F-C2): one chat's slow turn never delays
+//     another chat's scan or run, and a tick never double-fires
+//     a job — each chat is claimed per tick (inFlight), so an
+//     overlapping tick skips only the chats still running, never
+//     the whole tick. Within one chat, jobs still run strictly
+//     one after another. Every scheduled turn gets a deadline
+//     (cronTurnTimeout, F-C2): a hung provider or stuck tool
+//     ends the turn as a failure (backoff/disable accounting),
+//     never holds a worker forever. A job is judged against the
+//     missed window at the time it is actually processed, not
+//     the tick start — a job that crossed the window while
+//     queued behind a slow chat is skipped, not run late.
 package tools
 
 import (
@@ -123,6 +134,28 @@ const (
 	// fire at minute granularity, so 30s keeps the worst firing
 	// delay under a minute without busy-scanning.
 	cronDefaultTick = 30 * time.Second
+	// cronMaxWorkers bounds how many chats' scheduled turns run
+	// at once in one tick (F-C2). A tick with more due chats
+	// than this queues the rest behind the pool — bounded, so a
+	// burst of due jobs cannot spawn an unbounded pile of agent
+	// turns, and one chat's long turn delays other chats only
+	// up to the pool bound. 8 is far above the chats a daemon
+	// normally serves at once, and far below any resource
+	// concern.
+	cronMaxWorkers = 8
+	// cronTurnTimeout bounds one scheduled turn (F-C2). A turn
+	// that has not finished within this long ends as a failure
+	// (backoff/disable accounting), so a hung provider or a
+	// stuck tool cannot hold a worker — or a chat — forever.
+	// 10 minutes is five times the agent's per-step timeout
+	// (120s, internal/core/agent.go) and the same length as the
+	// missed window: a healthy multi-step turn finishes in a
+	// few minutes, while a turn that has run longer than the
+	// missed window is already too late by the scheduler's own
+	// definition. The gate's 90s approval window never applies
+	// here — unattended turns deny gated tools promptly (F-C3)
+	// instead of waiting for approval.
+	cronTurnTimeout = 10 * time.Minute
 	// cronSearchYears bounds the next-run search: a schedule
 	// that cannot fire within 5 years (e.g. Feb 29 on a
 	// non-leap cycle the search somehow misses) is an error,
@@ -928,12 +961,23 @@ type CronRunner func(ctx context.Context, job CronJob) (string, error)
 type CronScheduler struct {
 	store *PlanningStore
 
-	mu     sync.Mutex // guards runner, tick, log
+	mu     sync.Mutex // guards runner, tick, log, turnTimeout, maxWorkers
 	runner CronRunner
 	tick   time.Duration
 	log    *log.Logger
+	// turnTimeout is the per-turn deadline; 0 = cronTurnTimeout.
+	turnTimeout time.Duration
+	// maxWorkers is the worker-pool bound for one tick; 0 =
+	// cronMaxWorkers.
+	maxWorkers int
 
-	runMu sync.Mutex // TryLock guard: a tick never overlaps a running tick
+	claimMu sync.Mutex // guards inFlight
+	// inFlight is the per-chat claim (F-C2): chats whose tick
+	// work is still in progress. An overlapping tick skips a
+	// claimed chat instead of double-firing its jobs — but only
+	// that chat, never the whole tick. The claim is held from
+	// the scan until that chat's runs and outcome apply finish.
+	inFlight map[int64]struct{}
 }
 
 // NewCronScheduler builds a scheduler over store. A nil store
@@ -964,6 +1008,49 @@ func (s *CronScheduler) SetTickInterval(d time.Duration) {
 		d = cronDefaultTick
 	}
 	s.tick = d
+}
+
+// SetTurnTimeout overrides the per-turn deadline — how long one
+// scheduled turn may run before the scheduler ends it as a
+// failure (F-C2). A non-positive value restores the default
+// (cronTurnTimeout).
+func (s *CronScheduler) SetTurnTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d <= 0 {
+		d = cronTurnTimeout
+	}
+	s.turnTimeout = d
+}
+
+// SetMaxWorkers overrides how many chats' turns run at once in
+// one tick (F-C2). A non-positive value restores the default
+// (cronMaxWorkers).
+func (s *CronScheduler) SetMaxWorkers(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n <= 0 {
+		n = cronMaxWorkers
+	}
+	s.maxWorkers = n
+}
+
+func (s *CronScheduler) turnTimeoutDuration() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnTimeout <= 0 {
+		return cronTurnTimeout
+	}
+	return s.turnTimeout
+}
+
+func (s *CronScheduler) maxWorkerCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxWorkers <= 0 {
+		return cronMaxWorkers
+	}
+	return s.maxWorkers
 }
 
 // SetLogger replaces the scheduler's diagnostic logger. A nil
@@ -1038,18 +1125,17 @@ type cronOutcome struct {
 
 // ProcessDue fires every job due at `now` (UTC) across all
 // chats, and skips missed runs per the header policy. It is safe
-// for concurrent use: a call that finds another call still
-// running returns nil immediately (the tick is skipped, not
-// overlapped). Per-chat failures are logged and do not stop
-// other chats; a nil store or a missing runner is a returned
-// error (a wiring fault the daemon must hear about) and leaves
-// every job untouched.
+// for concurrent use. Chats run in parallel, bounded by the
+// worker pool (F-C2): one chat's slow turn never delays another
+// chat's scan or run, and ProcessDue returns only once every
+// dispatched chat's work is done. A chat whose previous tick's
+// work is still in flight is skipped by its per-chat claim,
+// never double-fired — but only that chat is skipped, never the
+// whole tick. Per-chat failures are logged and do not stop other
+// chats; a nil store or a missing runner is a returned error (a
+// wiring fault the daemon must hear about) and leaves every job
+// untouched.
 func (s *CronScheduler) ProcessDue(ctx context.Context, now time.Time) error {
-	if !s.runMu.TryLock() {
-		s.logf("tick skipped: previous tick still running")
-		return nil
-	}
-	defer s.runMu.Unlock()
 	if s.store == nil {
 		return errors.New("cron: no planning store configured")
 	}
@@ -1058,34 +1144,145 @@ func (s *CronScheduler) ProcessDue(ctx context.Context, now time.Time) error {
 		return errors.New("cron: no turn runner configured; scheduled jobs will not run")
 	}
 	now = now.UTC()
-	for _, b := range s.store.cronBuckets() {
+	buckets := s.store.cronBuckets()
+	if len(buckets) == 0 {
+		return nil
+	}
+	// wallStart anchors the missed-run check: a job is judged
+	// against the time it is actually processed (tick time plus
+	// the real delay it waited), not the tick start — see
+	// processChat.
+	wallStart := time.Now()
+	// The pool is per tick: one goroutine per chat bucket, but
+	// only maxWorkerCount of them may run turns at once. (In
+	// production Run serialises ticks, so the live bound is
+	// one pool; overlapping ticks — concurrent ProcessDue calls
+	// — each bring their own, still bounded, pool.)
+	sem := make(chan struct{}, s.maxWorkerCount())
+	var wg sync.WaitGroup
+	for _, b := range buckets {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := s.processChat(ctx, b, now, runner); err != nil {
-			s.logf("chat %d: %v", b.chatID, err)
+		if !s.tryClaim(b.chatID) {
+			s.logf("chat %d: tick skipped: previous tick still running", b.chatID)
+			continue
 		}
+		wg.Add(1)
+		go func(b cronBucket) {
+			defer wg.Done()
+			defer s.releaseClaim(b.chatID)
+			if err := s.processChat(ctx, b, now, wallStart, sem, runner); err != nil {
+				s.logf("chat %d: %v", b.chatID, err)
+			}
+		}(b)
 	}
+	wg.Wait()
 	return nil
 }
 
+// tryClaim marks chatID as having a tick's work in progress. It
+// returns false when another tick already holds the chat — the
+// caller skips the chat instead of double-firing its jobs. The
+// claim is per chat, never global: a slow chat blocks only its
+// own next tick, never any other chat's.
+func (s *CronScheduler) tryClaim(chatID int64) bool {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	if s.inFlight == nil {
+		s.inFlight = map[int64]struct{}{}
+	}
+	if _, ok := s.inFlight[chatID]; ok {
+		return false
+	}
+	s.inFlight[chatID] = struct{}{}
+	return true
+}
+
+// releaseClaim drops the per-chat claim taken by tryClaim. It is
+// called after the chat's runs and outcome apply finish, so a
+// later tick always sees the applied outcome, never a stale
+// next run.
+func (s *CronScheduler) releaseClaim(chatID int64) {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	delete(s.inFlight, chatID)
+}
+
 // processChat loads one chat's jobs, decides each due job, runs
-// the due ones (outside the store lock), and applies the
-// outcomes ID-scoped against a fresh load.
-func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.Time, runner CronRunner) error {
+// the due ones (outside the store lock, under the tick's worker
+// semaphore), and applies the outcomes ID-scoped against a fresh
+// load. Jobs in one chat run strictly one after another, so a
+// scheduled turn in a chat never overlaps another scheduled turn
+// (or, via app.runChatTurn's per-chat lock, a user turn) in that
+// same chat.
+func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.Time, wallStart time.Time, sem chan struct{}, runner CronRunner) error {
 	s.store.mu.Lock()
 	jobs, err := loadCronJobs(s.store, b.dir, b.key)
 	s.store.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("load jobs: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Fast filter at tick time: does this chat have anything
+	// due? Chats with nothing due never take a worker slot.
+	// The authoritative decision is re-made per job below, at
+	// the time it is actually processed — this filter only
+	// decides whether the chat needs a slot at all.
+	needsWorker := false
+	for _, j := range jobs {
+		if cronDueAt(j, now) {
+			needsWorker = true
+			break
+		}
+	}
+	if !needsWorker {
+		// Nothing can run this tick, but a job already past
+		// the missed window still needs its skip outcome
+		// recorded (this chat never waited for a worker, so
+		// tick time IS its processing time here).
+		var outcomes []cronOutcome
+		for _, j := range jobs {
+			if kind, _, oc := s.classifyCronJob(j, now, b.chatID); kind == cronJobMissed {
+				outcomes = append(outcomes, *oc)
+			}
+		}
+		if len(outcomes) == 0 {
+			return nil
+		}
+		return s.applyOutcomes(ctx, b, outcomes)
+	}
+	// A chat with work to run takes a worker slot: at most
+	// maxWorkerCount chats run turns at once, so one chat's
+	// long turn delays other chats only up to the pool bound,
+	// never indefinitely. A cancelled tick stops waiting for a
+	// slot instead of starting work during shutdown.
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// Authoritative decision, per job, at the time it is
+	// actually processed: a job that waited behind the pool —
+	// or behind an earlier turn in this same chat — is judged
+	// against the time it runs, not the tick start. A job that
+	// crossed the missed window while queued is skipped, not
+	// run late; a job that became due while queued is run.
 	var outcomes []cronOutcome
 	for _, j := range jobs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if oc := s.decideJob(ctx, j, now, runner, b.chatID); oc != nil {
+		at := now.Add(time.Since(wallStart))
+		kind, nextAfter, oc := s.classifyCronJob(j, at, b.chatID)
+		switch kind {
+		case cronJobMissed:
 			outcomes = append(outcomes, *oc)
+		case cronJobDue:
+			outcomes = append(outcomes, *s.runJob(ctx, j, at, nextAfter, runner, b.chatID))
 		}
 	}
 	if len(outcomes) == 0 {
@@ -1094,53 +1291,140 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 	return s.applyOutcomes(ctx, b, outcomes)
 }
 
-// decideJob decides one job at `now`. It returns nil when the job
-// is not due or is disabled. A missed run (due more than
-// cronMissedWindow ago) is skipped with an outcome that advances
-// NextRun without counting a failure. A due run invokes the runner
-// OUTSIDE the store lock (the caller holds no store lock here by
-// construction).
-func (s *CronScheduler) decideJob(ctx context.Context, j *CronJob, now time.Time, runner CronRunner, chatID int64) *cronOutcome {
+// cronDueAt is the cheap, quiet "is this job due at `at`"
+// check: not disabled, next run parses, next run is not in the
+// future, and it is not already past the missed window. It never
+// logs: the authoritative classifyCronJob below is the one that
+// reports a corrupt job, so a bad job is logged once per tick,
+// not once per check.
+func cronDueAt(j *CronJob, at time.Time) bool {
 	if j.Disabled {
-		return nil
+		return false
+	}
+	next, err := j.nextRunTime()
+	if err != nil {
+		return false
+	}
+	if next.After(at) {
+		return false
+	}
+	return at.Sub(next) <= cronMissedWindow
+}
+
+// cronJobKind is what classifyCronJob decided for one job at one
+// moment. A missed job carries its skip outcome; a due job
+// carries no outcome yet — its turn still has to run.
+type cronJobKind int
+
+const (
+	cronJobNotDue cronJobKind = iota
+	cronJobMissed
+	cronJobDue
+)
+
+// classifyCronJob decides one job at `at` without running it.
+// It returns the decision, the next cron occurrence after `at`
+// (for missed and due jobs), and — for a missed job — the skip
+// outcome. The decision is pure: the caller supplies the
+// decision time, so a job queued behind a slow chat is judged
+// at its real processing time (see processChat), and a missed
+// run is skipped without counting a failure, exactly as before.
+func (s *CronScheduler) classifyCronJob(j *CronJob, at time.Time, chatID int64) (cronJobKind, time.Time, *cronOutcome) {
+	if j.Disabled {
+		return cronJobNotDue, time.Time{}, nil
 	}
 	next, err := j.nextRunTime()
 	if err != nil {
 		s.logf("chat %d: skipping job %q: %v", chatID, j.ID, err)
-		return nil
+		return cronJobNotDue, time.Time{}, nil
 	}
-	if next.After(now) {
-		return nil
+	if next.After(at) {
+		return cronJobNotDue, time.Time{}, nil
 	}
 	sched, err := parseCronExpression(j.Expression)
 	if err != nil {
 		// Unreachable for a loaded job (loadCronJobs
 		// validates), but a job must never crash the tick.
 		s.logf("chat %d: skipping job %q: invalid expression: %v", chatID, j.ID, err)
-		return nil
+		return cronJobNotDue, time.Time{}, nil
 	}
-	nextAfterNow, err := sched.nextAfter(now)
+	nextAfter, err := sched.nextAfter(at)
 	if err != nil {
 		s.logf("chat %d: skipping job %q: %v", chatID, j.ID, err)
-		return nil
+		return cronJobNotDue, time.Time{}, nil
 	}
-	if now.Sub(next) > cronMissedWindow {
+	if at.Sub(next) > cronMissedWindow {
 		// Missed run: skip, do not run late, do not count a
 		// failure (downtime is not the job failing).
-		return &cronOutcome{
+		return cronJobMissed, nextAfter, &cronOutcome{
 			jobID:    j.ID,
-			nextRun:  nextAfterNow,
-			lastRes:  fmt.Sprintf("skipped: scheduled run at %s was missed by %s (daemon was down or busy); next run %s (UTC)", next.Format(time.RFC3339), now.Sub(next).Round(time.Second), nextAfterNow.Format(time.RFC3339)),
+			nextRun:  nextAfter,
+			lastRes:  fmt.Sprintf("skipped: scheduled run at %s was missed by %s (daemon was down or busy); next run %s (UTC)", next.Format(time.RFC3339), at.Sub(next).Round(time.Second), nextAfter.Format(time.RFC3339)),
 			failures: j.ConsecutiveFailures,
 			disabled: false,
 		}
 	}
+	return cronJobDue, nextAfter, nil
+}
+
+// runJob runs one due job's turn under the per-turn deadline and
+// builds its outcome. nextAfter is the next cron occurrence
+// after `at`, from classifyCronJob; `at` is the time the job was
+// actually processed, and is the base for lastRun and backoff.
+//
+// The turn runs in its own goroutine and the scheduler stops
+// waiting at the deadline: a runner that ignores its context
+// cannot hold the worker (or the tick) forever — the late result
+// is discarded and the job is recorded as a timeout failure
+// with backoff, never silently dropped and never re-fired
+// immediately. A runner that honours its context (the daemon's
+// runScheduledTurn does, through the agent) ends promptly on
+// cancellation, so no goroutine is left behind in the normal
+// case.
+//
+// F-C4 hook: a claim-before-run step belongs here, before the
+// runner is invoked — atomically mark the job running in the
+// store (or advance NextRun) so a daemon crash mid-turn cannot
+// re-fire it on restart. The per-chat in-flight claim in
+// ProcessDue only guards overlapping ticks in this process; it
+// does not survive a restart.
+func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, nextAfter time.Time, runner CronRunner, chatID int64) *cronOutcome {
 	// Due: run the turn. The copy carries the bucket's chat id
 	// (see cronBucket): the stored ChatID is never trusted to
 	// redirect a run.
 	runJob := *j
 	runJob.ChatID = chatID
-	_, runErr := runner(ctx, runJob)
+	timeout := s.turnTimeoutDuration()
+	turnCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	type runResult struct {
+		err error
+	}
+	resCh := make(chan runResult, 1)
+	go func() {
+		_, err := runner(turnCtx, runJob)
+		resCh <- runResult{err: err}
+	}()
+	var runErr error
+	select {
+	case res := <-resCh:
+		runErr = res.err
+	case <-turnCtx.Done():
+		// The wait ended at the deadline (or the parent ctx
+		// was cancelled). The runner goroutine is left to
+		// finish on its own; its late result is discarded
+		// (the buffered channel lets it exit without a reader).
+		runErr = ctx.Err()
+		if runErr == nil {
+			runErr = turnCtx.Err()
+		}
+	}
+	// A turn that hit its deadline — whether the runner
+	// reported it or the scheduler stopped waiting — is a
+	// timeout failure, with a message that says so.
+	if turnCtx.Err() == context.DeadlineExceeded {
+		runErr = fmt.Errorf("scheduled turn timed out after %s", timeout)
+	}
 	if runErr != nil {
 		failures := j.ConsecutiveFailures + 1
 		disabled := failures >= cronMaxFailures
@@ -1150,8 +1434,8 @@ func (s *CronScheduler) decideJob(ctx context.Context, j *CronJob, now time.Time
 		}
 		return &cronOutcome{
 			jobID:    j.ID,
-			nextRun:  backoffNextRun(nextAfterNow, now, failures),
-			lastRun:  now,
+			nextRun:  backoffNextRun(nextAfter, at, failures),
+			lastRun:  at,
 			lastRes:  lastRes,
 			failures: failures,
 			disabled: disabled,
@@ -1159,8 +1443,8 @@ func (s *CronScheduler) decideJob(ctx context.Context, j *CronJob, now time.Time
 	}
 	return &cronOutcome{
 		jobID:    j.ID,
-		nextRun:  nextAfterNow,
-		lastRun:  now,
+		nextRun:  nextAfter,
+		lastRun:  at,
 		lastRes:  "ok",
 		failures: 0,
 		disabled: false,
