@@ -147,12 +147,12 @@ func TestCronSchedulerClaimSaveFailureSkipsRun(t *testing.T) {
 	// The first persist is the claim: fail it. The turn must not
 	// run without a persisted claim, whatever the disk does.
 	calls := 0
-	s.saveJobs = func(st *PlanningStore, dir, key string, jobs []*CronJob) error {
+	s.saveJobs = func(st *PlanningStore, dir, key string, doc *cronJobsDoc) error {
 		calls++
 		if calls == 1 {
 			return errors.New("disk full (simulated)")
 		}
-		return saveCronJobs(st, dir, key, jobs)
+		return saveCronJobs(st, dir, key, doc)
 	}
 	if err := s.ProcessDue(ctx, now); err != nil {
 		t.Fatalf("ProcessDue: %v (a claim failure is logged, not returned)", err)
@@ -196,12 +196,12 @@ func TestCronSchedulerOutcomeSaveFailureCountsAsFailure(t *testing.T) {
 	// outcome apply (fails); call 3 is the retry-as-failure
 	// (succeeds).
 	calls := 0
-	s.saveJobs = func(st *PlanningStore, dir, key string, jobs []*CronJob) error {
+	s.saveJobs = func(st *PlanningStore, dir, key string, doc *cronJobsDoc) error {
 		calls++
 		if calls == 2 {
 			return errors.New("disk full (simulated)")
 		}
-		return saveCronJobs(st, dir, key, jobs)
+		return saveCronJobs(st, dir, key, doc)
 	}
 	if err := s.ProcessDue(ctx, now); err != nil {
 		t.Fatalf("ProcessDue: %v (the retry saves the failure, so the tick succeeds)", err)
@@ -254,10 +254,10 @@ func TestCronSchedulerOutcomeSaveFailureSurfacedWhenRetryFails(t *testing.T) {
 	// that stays full). The failure cannot be counted on disk —
 	// but it must be loud, and the slot must still not re-fire.
 	calls := 0
-	s.saveJobs = func(st *PlanningStore, dir, key string, jobs []*CronJob) error {
+	s.saveJobs = func(st *PlanningStore, dir, key string, doc *cronJobsDoc) error {
 		calls++
 		if calls == 1 {
-			return saveCronJobs(st, dir, key, jobs)
+			return saveCronJobs(st, dir, key, doc)
 		}
 		return errors.New("disk full (simulated)")
 	}

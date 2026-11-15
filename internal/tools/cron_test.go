@@ -96,7 +96,7 @@ func rewriteCronJob(t *testing.T, store *PlanningStore, ctx context.Context, id 
 		t.Fatalf("rewriteCronJob load: %v", err)
 	}
 	found := false
-	for _, j := range jobs {
+	for _, j := range jobs.validJobs() {
 		if j.ID == id {
 			fn(j)
 			found = true

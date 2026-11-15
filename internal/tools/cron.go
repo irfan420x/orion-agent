@@ -50,7 +50,13 @@
 //   - Safety: a job that fails repeatedly backs off exponentially
 //     (1, 2, 4, 8, 16 minutes) and is DISABLED after 5 consecutive
 //     failures, so the backoff never grows past 16 minutes — never
-//     a hot loop.
+//     a hot loop. A corrupt job never poisons the chat (F-C6):
+//     each entry is validated on its own at load, and a bad one
+//     is quarantined — skipped, listed in cron_list with its
+//     reason, removable with cron_cancel — while the valid jobs
+//     keep running. Only a file that is not valid JSON at all
+//     still fails the whole file, since per-job quarantine needs
+//     a parseable file.
 //     A chat may hold at most 20 jobs. A disabled job never
 //     fires; it stays listed until cancelled, so the owner can
 //     see what stopped and re-create it.
@@ -407,20 +413,39 @@ func (j *CronJob) nextRunTime() (time.Time, error) {
 // is an error, never a silent reset: silently dropping a chat's
 // scheduled jobs would hide data loss — and a dropped job that
 // keeps firing from a stale in-memory copy would be worse.
-func loadCronJobs(s *PlanningStore, dir, key string) ([]*CronJob, error) {
+//
+// Corruption is per job, not per file (F-C6): each entry is
+// validated on its own, and an entry that fails validation is
+// QUARANTINED — skipped, never run, but kept in the file in its
+// original position with its reason, so the valid jobs keep
+// running and the owner can see the bad one in cron_list and
+// remove it with cron_cancel instead of hand-editing cron.json
+// on disk. The validation rules are unchanged (missing or
+// duplicate id, invalid expression, empty prompt, unparsable
+// next run, negative failure count); only the handling changed,
+// from whole-file failure to per-job quarantine. The one case
+// that still fails the whole file is a file that cannot be
+// parsed at all (not valid JSON): per-job quarantine is
+// impossible without a parseable file, so that stays a loud
+// error, exactly as before.
+func loadCronJobs(s *PlanningStore, dir, key string) (*cronJobsDoc, error) {
+	var raw []*CronJob
 	if dir == "" {
 		b := s.bucket(key)
-		out := make([]*CronJob, len(b.cronJobs))
+		raw = make([]*CronJob, len(b.cronJobs))
 		for i, j := range b.cronJobs {
+			if j == nil {
+				continue
+			}
 			cp := *j
-			out[i] = &cp
+			raw[i] = &cp
 		}
-		return out, nil
+		return validateCronJobs(raw), nil
 	}
 	data, err := readStateFile(filepath.Join(dir, cronJobsFile))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return &cronJobsDoc{}, nil
 		}
 		return nil, err
 	}
@@ -431,38 +456,167 @@ func loadCronJobs(s *PlanningStore, dir, key string) ([]*CronJob, error) {
 		return nil, fmt.Errorf("corrupt cron jobs file %q: %w (fix or remove the file to recover)", filepath.Join(dir, cronJobsFile), err)
 	}
 	if doc.Jobs == nil {
-		return nil, nil
+		return &cronJobsDoc{}, nil
 	}
-	seen := make(map[string]bool, len(doc.Jobs))
-	for _, j := range doc.Jobs {
-		if j == nil || j.ID == "" || seen[j.ID] {
-			return nil, fmt.Errorf("corrupt cron jobs file %q: duplicate or missing job id", filepath.Join(dir, cronJobsFile))
-		}
-		seen[j.ID] = true
-		if _, err := parseCronExpression(j.Expression); err != nil {
-			return nil, fmt.Errorf("corrupt cron jobs file %q: job %q has an invalid expression: %v", filepath.Join(dir, cronJobsFile), j.ID, err)
-		}
-		if strings.TrimSpace(j.Prompt) == "" {
-			return nil, fmt.Errorf("corrupt cron jobs file %q: job %q has an empty prompt", filepath.Join(dir, cronJobsFile), j.ID)
-		}
-		if _, err := j.nextRunTime(); err != nil {
-			return nil, fmt.Errorf("corrupt cron jobs file %q: %v", filepath.Join(dir, cronJobsFile), err)
-		}
-		if j.ConsecutiveFailures < 0 {
-			return nil, fmt.Errorf("corrupt cron jobs file %q: job %q has a negative failure count", filepath.Join(dir, cronJobsFile), j.ID)
-		}
-	}
-	return doc.Jobs, nil
+	return validateCronJobs(doc.Jobs), nil
 }
 
-// saveCronJobs persists jobs in creation order. Call with s.mu
-// held; the caller takes the flock (lockState) around the
-// load-modify-save, as task_create does.
-func saveCronJobs(s *PlanningStore, dir, key string, jobs []*CronJob) error {
+// cronJobEntry is one entry of a chat's cron file, in file
+// order. reason is "" for a valid job; a non-empty reason means
+// the job is quarantined (F-C6) — it never runs, but the entry
+// stays in the file so a later save does not silently delete
+// it, and so the owner can inspect and cancel it.
+type cronJobEntry struct {
+	job    *CronJob // as stored; nil for a null entry
+	reason string   // "" = valid; otherwise why the job is quarantined
+}
+
+// cronJobsDoc is one chat's loaded cron file: every entry in
+// file order, each either valid or quarantined with its reason.
+// Callers work with validJobs() and save the whole doc, so a
+// quarantined entry survives any load-modify-save round trip
+// (schedule, cancel, outcome apply) until the owner cancels it.
+type cronJobsDoc struct {
+	entries []cronJobEntry
+}
+
+// validJobs returns the valid jobs in file order. The returned
+// jobs share pointers with the doc's entries, so mutating one
+// (an outcome apply) is visible when the doc is saved.
+func (d *cronJobsDoc) validJobs() []*CronJob {
+	out := make([]*CronJob, 0, len(d.entries))
+	for _, e := range d.entries {
+		if e.reason == "" {
+			out = append(out, e.job)
+		}
+	}
+	return out
+}
+
+// quarantined returns the quarantined entries in file order.
+func (d *cronJobsDoc) quarantined() []cronQuarantinedJob {
+	var out []cronQuarantinedJob
+	for _, e := range d.entries {
+		if e.reason != "" {
+			out = append(out, cronQuarantinedJob{job: e.job, reason: e.reason})
+		}
+	}
+	return out
+}
+
+// hasID reports whether any entry (valid or quarantined)
+// carries id — a newly minted id must not collide with a
+// quarantined one either, or the new job would load as a
+// duplicate and be quarantined on the next read.
+func (d *cronJobsDoc) hasID(id string) bool {
+	for _, e := range d.entries {
+		if e.job != nil && e.job.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// append adds a valid job at the end of the file.
+func (d *cronJobsDoc) append(job *CronJob) {
+	d.entries = append(d.entries, cronJobEntry{job: job})
+}
+
+// removeFirstByID removes the first entry (in file order) whose
+// id matches, valid or quarantined, and reports whether it
+// found one and whether the removed entry was quarantined. A
+// quarantined entry is therefore cancellable by id exactly like
+// a valid one; when a valid job and a quarantined entry share an
+// id, the first in file order goes first. Note a quarantined
+// duplicate can promote: removing the earlier twin frees the id,
+// so the later entry loads as valid on the next read (it now
+// holds the id alone) — a second cancel then removes it as a
+// valid job. An entry with no id cannot be addressed this way —
+// it stays listed with its reason until the file is fixed by hand.
+func (d *cronJobsDoc) removeFirstByID(id string) (wasQuarantined bool, found bool) {
+	for i, e := range d.entries {
+		if e.job == nil || e.job.ID != id {
+			continue
+		}
+		wasQuarantined = e.reason != ""
+		d.entries = append(d.entries[:i], d.entries[i+1:]...)
+		return wasQuarantined, true
+	}
+	return false, false
+}
+
+// cronQuarantinedJob is one quarantined entry: the job as stored
+// (nil for a null entry) and why it failed validation. It is
+// never run and never trusted — only listed and cancellable.
+type cronQuarantinedJob struct {
+	job    *CronJob
+	reason string
+}
+
+// id returns the entry's id, or "(no id)" when the entry has
+// none (a missing-id entry cannot be cancelled by id).
+func (q cronQuarantinedJob) id() string {
+	if q.job == nil || q.job.ID == "" {
+		return "(no id)"
+	}
+	return q.job.ID
+}
+
+// validateCronJobs applies the load validation rules to each
+// entry independently (F-C6): missing or duplicate id, invalid
+// expression, empty prompt, unparsable next run, negative
+// failure count. A failing entry is quarantined with its reason
+// instead of failing the whole file. The first entry carrying an
+// id wins it — a later entry with the same id is a duplicate
+// even when the first entry was itself quarantined, so ids stay
+// unambiguous for cancel.
+func validateCronJobs(raw []*CronJob) *cronJobsDoc {
+	doc := &cronJobsDoc{entries: make([]cronJobEntry, 0, len(raw))}
+	seen := make(map[string]bool, len(raw))
+	for _, j := range raw {
+		var reason string
+		switch {
+		case j == nil || j.ID == "":
+			reason = "missing job id"
+		case seen[j.ID]:
+			reason = fmt.Sprintf("duplicate job id %q", j.ID)
+		default:
+			if _, err := parseCronExpression(j.Expression); err != nil {
+				reason = fmt.Sprintf("invalid expression: %v", err)
+			} else if strings.TrimSpace(j.Prompt) == "" {
+				reason = "empty prompt"
+			} else if _, err := j.nextRunTime(); err != nil {
+				reason = err.Error()
+			} else if j.ConsecutiveFailures < 0 {
+				reason = "negative failure count"
+			}
+		}
+		if j != nil && j.ID != "" {
+			seen[j.ID] = true
+		}
+		doc.entries = append(doc.entries, cronJobEntry{job: j, reason: reason})
+	}
+	return doc
+}
+
+// saveCronJobs persists the doc's entries in file order — valid
+// and quarantined alike, so a save never silently drops a
+// quarantined job. Call with s.mu held; the caller takes the
+// flock (lockState) around the load-modify-save, as task_create
+// does. For a fully-valid file the written bytes are identical
+// to before (same jobs, same order).
+func saveCronJobs(s *PlanningStore, dir, key string, doc *cronJobsDoc) error {
+	jobs := make([]*CronJob, len(doc.entries))
+	for i, e := range doc.entries {
+		jobs[i] = e.job
+	}
 	if dir == "" {
 		b := s.bucket(key)
 		cp := make([]*CronJob, len(jobs))
 		for i, j := range jobs {
+			if j == nil {
+				continue
+			}
 			c := *j
 			cp[i] = &c
 		}
@@ -573,6 +727,29 @@ func summarizeCronJob(j *CronJob) cronJobSummary {
 		NextRun: j.NextRun, LastRun: j.LastRun, LastResult: j.LastResult,
 		ConsecutiveFailures: j.ConsecutiveFailures, Disabled: j.Disabled,
 	}
+}
+
+// cronQuarantinedSummary is the wire shape of one quarantined
+// (corrupt) job in a cron_list reply: the job as stored, why it
+// failed validation, and the explicit corrupt flag, so the owner
+// can tell at a glance which jobs are not running and why, and
+// remove one with cron_cancel.
+type cronQuarantinedSummary struct {
+	ID         string `json:"id"`
+	Expression string `json:"expression,omitempty"`
+	Prompt     string `json:"prompt,omitempty"`
+	Reason     string `json:"reason"`
+	Corrupt    bool   `json:"corrupt"`
+}
+
+func summarizeCronQuarantinedJob(q cronQuarantinedJob) cronQuarantinedSummary {
+	s := cronQuarantinedSummary{Reason: q.reason, Corrupt: true}
+	if q.job != nil {
+		s.ID = q.job.ID
+		s.Expression = q.job.Expression
+		s.Prompt = q.job.Prompt
+	}
+	return s
 }
 
 func encodeCronJob(tool string, v any) (string, error) {
@@ -748,11 +925,12 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	defer release()
-	jobs, err := loadCronJobs(t.store, dir, key)
+	doc, err := loadCronJobs(t.store, dir, key)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
-	if len(jobs) >= cronMaxJobsPerChat {
+	valid := doc.validJobs()
+	if len(valid) >= cronMaxJobsPerChat {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("job limit reached (%d jobs for this chat); cancel an old job with cron_cancel first", cronMaxJobsPerChat)}
 	}
 	var id string
@@ -761,14 +939,10 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 		if err != nil {
 			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 		}
-		collides := false
-		for _, existing := range jobs {
-			if existing.ID == cand {
-				collides = true
-				break
-			}
-		}
-		if !collides {
+		// The id must not collide with a quarantined entry
+		// either: a new job sharing a quarantined id would
+		// load as a duplicate and be quarantined itself.
+		if !doc.hasID(cand) {
 			id = cand
 			break
 		}
@@ -782,11 +956,17 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 		CreatedAt: now.Format(time.RFC3339),
 		NextRun:   next.Format(time.RFC3339),
 	}
-	jobs = append(jobs, job)
-	if err := saveCronJobs(t.store, dir, key, jobs); err != nil {
+	doc.append(job)
+	if err := saveCronJobs(t.store, dir, key, doc); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	note := "Times are UTC (Orion has no per-chat timezone). The scheduled turn is unattended: persisted \"always allow\" rules never apply to it, and a destructive or network action inside it is denied promptly instead of running."
+	if quarantined := doc.quarantined(); len(quarantined) > 0 {
+		// Surface the corruption the schedule just worked
+		// around: the new job is fine, but the chat still
+		// holds quarantined jobs that never run.
+		note += fmt.Sprintf(" Warning: this chat has %d quarantined (corrupt) job(s) that never run — see cron_list for the reason and remove one with cron_cancel.", len(quarantined))
+	}
 	if warned := t.unattendedAllowWarning(chatID); len(warned) > 0 {
 		// Warn only, never refuse: the user scheduled the job
 		// with these rules standing, and the rules used to
@@ -811,7 +991,7 @@ type cronListTool struct{ store *PlanningStore }
 func (t *cronListTool) Name() string { return "cron_list" }
 
 func (t *cronListTool) Description() string {
-	return "List this chat's scheduled cron jobs (id, expression, prompt, next run, last outcome, failure count, disabled flag). Only this chat's jobs are ever listed. Times are UTC."
+	return "List this chat's scheduled cron jobs (id, expression, prompt, next run, last outcome, failure count, disabled flag). Only this chat's jobs are ever listed. Jobs that failed validation are listed separately under \"quarantined\" as corrupt, with the reason they never run; remove one with cron_cancel. Times are UTC."
 }
 
 func (t *cronListTool) Definition() model.ToolDefinition {
@@ -834,16 +1014,21 @@ func (t *cronListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	dir, key := t.store.resolveBucket(ctx)
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
-	jobs, err := loadCronJobs(t.store, dir, key)
+	doc, err := loadCronJobs(t.store, dir, key)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
+	jobs := doc.validJobs()
 	summaries := make([]cronJobSummary, 0, len(jobs))
 	for _, j := range jobs {
 		summaries = append(summaries, summarizeCronJob(j))
 	}
+	quarantined := make([]cronQuarantinedSummary, 0, len(doc.entries))
+	for _, q := range doc.quarantined() {
+		quarantined = append(quarantined, summarizeCronQuarantinedJob(q))
+	}
 	return encodeCronJob(t.Name(), map[string]any{
-		"jobs": summaries, "count": len(summaries), "timezone": "UTC",
+		"jobs": summaries, "count": len(summaries), "quarantined": quarantined, "timezone": "UTC",
 	})
 }
 
@@ -895,7 +1080,7 @@ func SetCronCancelStopJob(reg *Registry, fn func(jobID string) bool) {
 func (t *cronCancelTool) Name() string { return "cron_cancel" }
 
 func (t *cronCancelTool) Description() string {
-	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; if its turn is running now, the turn is stopped too. Its past runs are not undone. Only this chat's jobs can be cancelled."
+	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; if its turn is running now, the turn is stopped too. Its past runs are not undone. Only this chat's jobs can be cancelled. A quarantined (corrupt) job listed by cron_list can be cancelled by id the same way, so a bad job can be cleaned up without editing cron.json on disk."
 }
 
 func (t *cronCancelTool) Definition() model.ToolDefinition {
@@ -941,23 +1126,18 @@ func (t *cronCancelTool) Execute(ctx context.Context, args json.RawMessage) (str
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	defer release()
-	jobs, err := loadCronJobs(t.store, dir, key)
+	doc, err := loadCronJobs(t.store, dir, key)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
-	kept := jobs[:0]
-	found := false
-	for _, j := range jobs {
-		if j.ID == id {
-			found = true
-			continue
-		}
-		kept = append(kept, j)
-	}
+	// First entry in file order with this id, valid or
+	// quarantined: a quarantined job is cancellable by id
+	// exactly like a valid one (F-C6).
+	wasQuarantined, found := doc.removeFirstByID(id)
 	if !found {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("unknown job %q: use cron_list to see this chat's jobs", id)}
 	}
-	if err := saveCronJobs(t.store, dir, key, kept); err != nil {
+	if err := saveCronJobs(t.store, dir, key, doc); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	// The job is gone from the store first; only then stop its live
@@ -971,7 +1151,7 @@ func (t *cronCancelTool) Execute(ctx context.Context, args json.RawMessage) (str
 	if t.stopJob != nil {
 		stopped = t.stopJob(id)
 	}
-	return encodeCronJob(t.Name(), map[string]any{"cancelled": true, "job_id": id, "stopped_running": stopped})
+	return encodeCronJob(t.Name(), map[string]any{"cancelled": true, "job_id": id, "stopped_running": stopped, "quarantined": wasQuarantined})
 }
 
 func init() {
@@ -1069,7 +1249,7 @@ type CronScheduler struct {
 	// to simulate a persist failure (a failing store) — the
 	// tools keep calling saveCronJobs directly, so production
 	// behaviour is unchanged.
-	saveJobs func(s *PlanningStore, dir, key string, jobs []*CronJob) error
+	saveJobs func(s *PlanningStore, dir, key string, doc *cronJobsDoc) error
 
 	runningMu sync.Mutex // guards running, stopped
 	// running is the per-job live-turn table (F-C5): job ids
@@ -1207,13 +1387,15 @@ func (s *CronScheduler) currentRunner() CronRunner {
 }
 
 // persistJobs is the scheduler's job save: saveCronJobs unless a
-// test replaced saveJobs to simulate a persist failure.
-func (s *CronScheduler) persistJobs(dir, key string, jobs []*CronJob) error {
+// test replaced saveJobs to simulate a persist failure. The whole
+// doc is saved, so quarantined entries survive the round trip
+// instead of being silently dropped (F-C6).
+func (s *CronScheduler) persistJobs(dir, key string, doc *cronJobsDoc) error {
 	save := s.saveJobs
 	if save == nil {
 		save = saveCronJobs
 	}
-	return save(s.store, dir, key, jobs)
+	return save(s.store, dir, key, doc)
 }
 
 // registerRun records jobID's turn as live, with the cancel for
@@ -1412,10 +1594,19 @@ func (s *CronScheduler) releaseClaim(chatID int64) {
 // same chat.
 func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.Time, wallStart time.Time, sem chan struct{}, runner CronRunner) error {
 	s.store.mu.Lock()
-	jobs, err := loadCronJobs(s.store, b.dir, b.key)
+	doc, err := loadCronJobs(s.store, b.dir, b.key)
 	s.store.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("load jobs: %w", err)
+	}
+	jobs := doc.validJobs()
+	// Quarantined entries are skipped, never run — but logged,
+	// so a bad job is visible in the daemon log as well as in
+	// cron_list, and the tick still runs the valid jobs. (The
+	// line repeats once per tick, like the skip logs in
+	// classifyCronJob below; the tick itself no longer fails.)
+	for _, q := range doc.quarantined() {
+		s.logf("chat %d: quarantined corrupt job %q: %s (valid jobs still run; remove it with cron_cancel)", b.chatID, q.id(), q.reason)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1587,8 +1778,9 @@ func (s *CronScheduler) classifyCronJob(j *CronJob, at time.Time, chatID int64) 
 	}
 	sched, err := parseCronExpression(j.Expression)
 	if err != nil {
-		// Unreachable for a loaded job (loadCronJobs
-		// validates), but a job must never crash the tick.
+		// Unreachable for a loaded job (load validation
+		// quarantines invalid jobs), but a job must never
+		// crash the tick.
 		s.logf("chat %d: skipping job %q: invalid expression: %v", chatID, j.ID, err)
 		return cronJobNotDue, time.Time{}, nil
 	}
@@ -1636,12 +1828,12 @@ func (s *CronScheduler) claimJob(ctx context.Context, b cronBucket, j *CronJob, 
 		return fmt.Errorf("claim job %q: lock jobs: %w", j.ID, err)
 	}
 	defer release()
-	jobs, err := loadCronJobs(s.store, b.dir, b.key)
+	doc, err := loadCronJobs(s.store, b.dir, b.key)
 	if err != nil {
 		return fmt.Errorf("claim job %q: reload jobs: %w", j.ID, err)
 	}
 	found := false
-	for _, jj := range jobs {
+	for _, jj := range doc.validJobs() {
 		if jj.ID == j.ID {
 			jj.NextRun = nextAfter.Format(time.RFC3339)
 			found = true
@@ -1650,7 +1842,7 @@ func (s *CronScheduler) claimJob(ctx context.Context, b cronBucket, j *CronJob, 
 	if !found {
 		return errCronJobGone
 	}
-	if err := s.persistJobs(b.dir, b.key, jobs); err != nil {
+	if err := s.persistJobs(b.dir, b.key, doc); err != nil {
 		return fmt.Errorf("claim job %q: save jobs: %w", j.ID, err)
 	}
 	return nil
@@ -1906,10 +2098,11 @@ func (s *CronScheduler) applyOutcomes(ctx context.Context, b cronBucket, outcome
 		return fmt.Errorf("lock jobs: %w", err)
 	}
 	defer release()
-	jobs, err := loadCronJobs(s.store, b.dir, b.key)
+	doc, err := loadCronJobs(s.store, b.dir, b.key)
 	if err != nil {
 		return fmt.Errorf("reload jobs: %w", err)
 	}
+	jobs := doc.validJobs()
 	changed := false
 	for _, j := range jobs {
 		oc, ok := byID[j.ID]
@@ -1928,7 +2121,9 @@ func (s *CronScheduler) applyOutcomes(ctx context.Context, b cronBucket, outcome
 	if !changed {
 		return nil
 	}
-	if err := s.persistJobs(b.dir, b.key, jobs); err != nil {
+	// The doc is saved whole, so quarantined entries survive
+	// the outcome apply instead of being silently dropped.
+	if err := s.persistJobs(b.dir, b.key, doc); err != nil {
 		return fmt.Errorf("save jobs: %w", err)
 	}
 	return nil
