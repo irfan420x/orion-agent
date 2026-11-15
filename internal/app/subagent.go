@@ -161,7 +161,7 @@ func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore
 	// means the default registry changed under us, and failing
 	// here beats silently handing a child a tool it must not
 	// have.
-	for _, name := range []string{"enter_plan_mode", "exit_plan_mode", "cron_schedule", "cron_list", "cron_cancel"} {
+	for _, name := range []string{"enter_plan_mode", "exit_plan_mode", "cron_schedule", "cron_list", "cron_cancel", "cron_enable"} {
 		if !reg.Remove(name) {
 			return nil, fmt.Errorf("app: newChildRegistry: default registry has no %q to exclude from the child registry", name)
 		}

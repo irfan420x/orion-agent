@@ -19,8 +19,11 @@ import (
 // is still created, and the rules themselves are untouched (they
 // still apply to interactive turns). Every test here constructs
 // a scheduler over its store, so the F-C11 dormant-job warning
-// never appears in the note — these tests pin the allow-rule
-// warning only.
+// never appears in the note — except the two shadowing tests,
+// which deliberately do NOT construct one (the dormant warning
+// does appear in their notes, so their assertions pin the
+// allow-rule warning with its narrowed text instead of plain
+// "Warning"). These tests pin the allow-rule warning only.
 
 // cronScheduleNote schedules a job with tool and returns the
 // confirmation's note field (the human-readable behaviour +
@@ -207,7 +210,7 @@ func TestCronScheduleWarnsWhenPerChatAllowShadowsGlobalDeny(t *testing.T) {
 	}
 	tool := &cronScheduleTool{store: store, rules: rules}
 	note := cronScheduleNote(t, tool, cronChatCtx(111, 111), "0 9 * * 1-5", "morning brief")
-	if !strings.Contains(note, "Warning") || !strings.Contains(note, "shell_exec") {
+	if !strings.Contains(note, "Warning: this chat has persisted") || !strings.Contains(note, "shell_exec") {
 		t.Errorf("schedule note = %q, want a Warning naming shell_exec (per-chat allow is effective over the global deny)", note)
 	}
 	if got := mustCronList(t, &cronListTool{store: store}, cronChatCtx(111, 111)); got.Count != 1 {

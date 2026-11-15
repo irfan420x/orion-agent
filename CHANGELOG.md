@@ -174,7 +174,7 @@ declared context window instead of a hardcoded 32768 tokens
 ### Cron tool (tool 3 of 14)
 
 Scheduled recurring agent turns: `cron_schedule` / `cron_list` /
-`cron_cancel` (three separate tools, matching the
+`cron_cancel` / `cron_enable` (four separate tools, matching the
 enter/exit_plan_mode pattern). Suite: **1,626 tests total
 (1,622 pass, 0 fail, 4 skip), 24/24 packages**.
 

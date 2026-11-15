@@ -133,6 +133,7 @@ var safeTools = map[string]bool{
 	"ask_user_question": true,
 	"calculator":        true,
 	"cron_cancel":       true,
+	"cron_enable":       true,
 	"cron_list":         true,
 	"cron_schedule":     true,
 	"datetime":          true,

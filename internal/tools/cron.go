@@ -1,8 +1,8 @@
 // Package tools — cron: scheduled jobs (cron_schedule / cron_list /
-// cron_cancel) and the scheduler that fires them.
+// cron_cancel / cron_enable) and the scheduler that fires them.
 //
 // A job is a prompt the agent runs as a turn, on a 5-field cron
-// expression, in the chat that created it. The three tools are
+// expression, in the chat that created it. The four tools are
 // deliberately separate (matching enter_plan_mode / exit_plan_mode)
 // instead of one mega-tool: each has one job, one schema, and one
 // risk story, and the model cannot confuse "list" arguments with
@@ -79,7 +79,9 @@
 //     every 5 minutes — a faster schedule is rejected at creation,
 //     never silently coarsened. A disabled job never
 //     fires; it stays listed until cancelled, so the owner can
-//     see what stopped and re-create it.
+//     see what stopped and re-enable it with cron_enable (same
+//     id, same history, failures reset) instead of re-creating
+//     it.
 //     A job scheduled from a process with no scheduler (F-C11 —
 //     `orion daemon` / `orion telegram poll` never start one,
 //     only oriond does) is created but WARNS in its confirmation
@@ -156,6 +158,7 @@ import (
 
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
+	"github.com/irfan/orion/internal/security"
 )
 
 // cronJobsFile is the per-chat jobs file, next to todos.json,
@@ -189,12 +192,20 @@ const (
 	cronMinInterval = 5 * time.Minute
 	// cronMinIntervalScanWindow bounds the minimum-interval
 	// check: the fastest gap between two consecutive runs is
-	// measured over the next 7 days (or 64 runs, whichever
-	// comes first). A schedule with fewer than two runs in
-	// that window fires days apart by definition, so it
-	// passes without a measurable gap.
+	// measured over the next 7 days. A schedule with fewer than
+	// two runs in that window fires days apart by definition, so
+	// it passes without a measurable gap. The scan covers the
+	// WHOLE window — there is deliberately no run-count cap
+	// (P2-D R3): the fastest gap can sit arbitrarily late in
+	// the window (a schedule firing every 5 minutes all day
+	// with a 22:57 → 23:00 gap puts its 3-minute gap 140+
+	// runs in), and a cap would report a 5-minute minimum for
+	// a schedule that fires 3 minutes apart. The scan stays
+	// cheap without a cap: consecutive nextAfter calls scan
+	// disjoint minutes, so the whole window costs at most its
+	// own length in match tests (~10k), plus one overshoot call
+	// past the window for sparse schedules.
 	cronMinIntervalScanWindow = 7 * 24 * time.Hour
-	cronMinIntervalMaxRuns    = 64
 	// cronMaxFailures is the consecutive-failure count at which
 	// a job is disabled (never a hot loop).
 	cronMaxFailures = 5
@@ -525,12 +536,15 @@ func (j *CronJob) nextRunTime() (time.Time, error) {
 // remove it with cron_cancel instead of hand-editing cron.json
 // on disk. The validation rules are unchanged (missing or
 // duplicate id, invalid expression, empty prompt, unparsable
-// next run, negative failure count); only the handling changed,
-// from whole-file failure to per-job quarantine. The one case
-// that still fails the whole file is a file that cannot be
-// parsed at all (not valid JSON): per-job quarantine is
-// impossible without a parseable file, so that stays a loud
-// error, exactly as before.
+// next run, negative failure count) plus the hand-edit checks
+// (F-C14): a prompt over the 2000-rune cap, a chat id that is
+// missing or does not match this bucket, a requester that is
+// not a Telegram user id, and an unparsable created/last-run
+// time. Only the handling changed, from whole-file failure to
+// per-job quarantine. The one case that still fails the whole
+// file is a file that cannot be parsed at all (not valid JSON):
+// per-job quarantine is impossible without a parseable file, so
+// that stays a loud error, exactly as before.
 func loadCronJobs(s *PlanningStore, dir, key string) (*cronJobsDoc, error) {
 	var raw []*CronJob
 	if dir == "" {
@@ -543,7 +557,7 @@ func loadCronJobs(s *PlanningStore, dir, key string) (*cronJobsDoc, error) {
 			cp := *j
 			raw[i] = &cp
 		}
-		return validateCronJobs(raw), nil
+		return validateCronJobs(raw, cronBucketChatID(s, dir, key)), nil
 	}
 	data, err := readStateFile(filepath.Join(dir, cronJobsFile))
 	if err != nil {
@@ -561,7 +575,33 @@ func loadCronJobs(s *PlanningStore, dir, key string) (*cronJobsDoc, error) {
 	if doc.Jobs == nil {
 		return &cronJobsDoc{}, nil
 	}
-	return validateCronJobs(doc.Jobs), nil
+	return validateCronJobs(doc.Jobs, cronBucketChatID(s, dir, key)), nil
+}
+
+// cronBucketChatID returns the chat id a bucket belongs to, or 0
+// when the bucket carries none to check against. The id is only
+// trusted when the bucket's own shape says it: an on-disk bucket
+// is <dataDir>/chats/<id> (a dirFunc directory, or the "local"
+// directory, has no chat id to match — its parent is not
+// <dataDir>/chats), and an in-memory bucket is "chat:<id>"
+// ("local" has none). Callers pass 0 as "unknown": the shape
+// checks in validateCronJobs still apply, only the bucket-match
+// check is skipped.
+func cronBucketChatID(s *PlanningStore, dir, key string) int64 {
+	if dir != "" {
+		if s != nil && s.dataDir != "" && filepath.Dir(dir) == filepath.Join(s.dataDir, "chats") {
+			if id, err := strconv.ParseInt(filepath.Base(dir), 10, 64); err == nil && id != 0 {
+				return id
+			}
+		}
+		return 0
+	}
+	if strings.HasPrefix(key, "chat:") {
+		if id, err := strconv.ParseInt(strings.TrimPrefix(key, "chat:"), 10, 64); err == nil && id != 0 {
+			return id
+		}
+	}
+	return 0
 }
 
 // cronJobEntry is one entry of a chat's cron file, in file
@@ -673,7 +713,34 @@ func (q cronQuarantinedJob) id() string {
 // id wins it — a later entry with the same id is a duplicate
 // even when the first entry was itself quarantined, so ids stay
 // unambiguous for cancel.
-func validateCronJobs(raw []*CronJob) *cronJobsDoc {
+//
+// Hand-edited fields (F-C14) are validated the same way, after
+// the original rules so their reasons stay stable: a prompt over
+// the 2000-rune creation cap; a chat id that is missing, or does
+// not match the bucket the file was loaded from (chatID, 0 when
+// the bucket carries none — see cronBucketChatID); a requester
+// that is not a Telegram user id (positive, non-zero); a missing
+// or unparsable created time; an unparsable last-run time (empty
+// means "never ran" and is fine). The scheduler already fires
+// with the BUCKET's chat id, never the stored one, so a wrong
+// ChatID cannot redirect a run — but the entry is still
+// quarantined instead of trusted, because a file that disagrees
+// with its bucket about where it belongs is hand-edited evidence
+// and its other fields are suspect too. The stored Requester is
+// the scheduled turn's approval identity (cmd/oriond
+// runScheduledTurn sets the turn's approval context to
+// (job.ChatID, job.Requester)), so a hand-edited Requester is an
+// impersonation risk: load validation closes the shape of it —
+// zero, negative, and non-user values never reach a turn — but
+// a well-formed forgery (a real user id, e.g. the owner's) is
+// indistinguishable from the truth in the file alone. That
+// residual needs a fire-time check against the live allowlist
+// in the runner, not the loader: the gate itself does not let a
+// forged Requester auto-allow anything (unattended turns ignore
+// persisted allow rules), so the remaining surface is the
+// owner-only cron checks and the question/plan routing inside
+// the turn, all of which trust the file's Requester.
+func validateCronJobs(raw []*CronJob, chatID int64) *cronJobsDoc {
 	doc := &cronJobsDoc{entries: make([]cronJobEntry, 0, len(raw))}
 	seen := make(map[string]bool, len(raw))
 	for _, j := range raw {
@@ -688,10 +755,26 @@ func validateCronJobs(raw []*CronJob) *cronJobsDoc {
 				reason = fmt.Sprintf("invalid expression: %v", err)
 			} else if strings.TrimSpace(j.Prompt) == "" {
 				reason = "empty prompt"
+			} else if n := utf8.RuneCountInString(j.Prompt); n > cronMaxPromptRunes {
+				reason = fmt.Sprintf("prompt is too long (%d runes, max %d)", n, cronMaxPromptRunes)
 			} else if _, err := j.nextRunTime(); err != nil {
 				reason = err.Error()
 			} else if j.ConsecutiveFailures < 0 {
 				reason = "negative failure count"
+			} else if j.ChatID == 0 {
+				reason = "missing chat id"
+			} else if chatID != 0 && j.ChatID != chatID {
+				reason = fmt.Sprintf("chat id %d does not match this chat's bucket (%d)", j.ChatID, chatID)
+			} else if j.Requester <= 0 {
+				reason = fmt.Sprintf("invalid requester %d (want a Telegram user id)", j.Requester)
+			} else if j.CreatedAt == "" {
+				reason = "missing created time"
+			} else if _, err := time.Parse(time.RFC3339, j.CreatedAt); err != nil {
+				reason = fmt.Sprintf("unparsable created time %q: %v", j.CreatedAt, err)
+			} else if j.LastRun != "" {
+				if _, err := time.Parse(time.RFC3339, j.LastRun); err != nil {
+					reason = fmt.Sprintf("unparsable last run %q: %v", j.LastRun, err)
+				}
 			}
 		}
 		if j != nil && j.ID != "" {
@@ -890,16 +973,19 @@ func cronRequireOwner(tool string, ownerID, chatID, senderID int64) error {
 
 // minGapWithin returns the fastest gap between two consecutive
 // runs of the schedule, measured from the first run at or after
-// `from` through a full cronMinIntervalScanWindow past it (or
-// cronMinIntervalMaxRuns runs, whichever comes first). ok is
+// `from` through a full cronMinIntervalScanWindow past it. ok is
 // false when the schedule has no second run to measure against
 // (a one-shot-like schedule, or a nextAfter failure) — there is
 // then no sub-minimum gap to find. Scanning a full window past
 // the first run matters: the fastest gap is often the overnight
 // one (last run of one day to first run of the next, e.g.
 // 23:59 to 00:00), which the gap between just the first two
-// runs can miss. The scan is bounded, so a yearly schedule
-// costs two next-run searches, not a scan of the whole window.
+// runs can miss. The scan is bounded by the window, not by a
+// run count (P2-D R3): it walks every run in the window, so the
+// minimum it reports is the true minimum over the window. It
+// always terminates: nextAfter returns a time strictly after its
+// argument, so cur advances at least a minute per iteration and
+// must pass the window limit.
 func (s *cronSchedule) minGapWithin(from time.Time) (gap time.Duration, ok bool) {
 	prev, err := s.nextAfter(from)
 	if err != nil {
@@ -909,7 +995,7 @@ func (s *cronSchedule) minGapWithin(from time.Time) (gap time.Duration, ok bool)
 	cur := prev
 	var min time.Duration
 	seen := false
-	for i := 0; i < cronMinIntervalMaxRuns; i++ {
+	for {
 		next, err := s.nextAfter(cur)
 		if err != nil {
 			break
@@ -925,9 +1011,12 @@ func (s *cronSchedule) minGapWithin(from time.Time) (gap time.Duration, ok bool)
 	return min, seen
 }
 
-// totalCronJobsLocked counts jobs across all chat buckets, for
-// the global cap (F-C10). Call with s.mu held. A chat whose
-// file is unreadable or corrupt is skipped, not fatal: one
+// totalCronJobsLocked counts VALID jobs across all chat buckets,
+// for the global cap (F-C10). Call with s.mu held. It counts the
+// same thing the per-chat cap counts (P2-D R1): a quarantined
+// entry never fires, so it must not consume a slot of the 200-job
+// cap either — the two caps agree on what a "job" is. A chat
+// whose file is unreadable or corrupt is skipped, not fatal: one
 // chat's corrupt file must not block every other chat from
 // scheduling (that chat's own scheduling still fails loudly
 // through loadCronJobs on its own bucket).
@@ -942,7 +1031,8 @@ func (s *PlanningStore) totalCronJobsLocked() int {
 			if !e.IsDir() {
 				continue
 			}
-			if _, err := strconv.ParseInt(e.Name(), 10, 64); err != nil {
+			chatID, err := strconv.ParseInt(e.Name(), 10, 64)
+			if err != nil {
 				continue
 			}
 			data, err := readStateFile(filepath.Join(s.dataDir, "chats", e.Name(), cronJobsFile))
@@ -955,7 +1045,7 @@ func (s *PlanningStore) totalCronJobsLocked() int {
 			if err := json.Unmarshal(data, &doc); err != nil {
 				continue
 			}
-			total += len(doc.Jobs)
+			total += len(validateCronJobs(doc.Jobs, chatID).validJobs())
 		}
 		return total
 	}
@@ -964,7 +1054,7 @@ func (s *PlanningStore) totalCronJobsLocked() int {
 		if !strings.HasPrefix(k, "chat:") || b == nil {
 			continue
 		}
-		total += len(b.cronJobs)
+		total += len(validateCronJobs(b.cronJobs, cronBucketChatID(s, "", k)).validJobs())
 	}
 	return total
 }
@@ -1204,9 +1294,12 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 	now := time.Now().UTC()
 	// F-C10: reject a sub-minimum-interval schedule at creation
 	// — never silently coarsen it into something the user did
-	// not ask for.
+	// not ask for. The floor in the message is formatted from
+	// cronMinInterval (P2-D R2), never a literal, so the message
+	// cannot lie if the constant ever changes.
 	if gap, ok := sched.minGapWithin(now); ok && gap < cronMinInterval {
-		return invalid("cron expression %q fires every %s at its fastest, below the minimum interval of 5 minutes for new jobs; use an expression that fires at most every 5 minutes", expr, gap)
+		minMinutes := int(cronMinInterval.Minutes())
+		return invalid("cron expression %q fires every %s at its fastest, below the minimum interval of %d minutes for new jobs; use an expression that fires at most every %d minutes", expr, gap, minMinutes, minMinutes)
 	}
 	next, err := nextRunAfter(expr, now)
 	if err != nil {
@@ -1300,7 +1393,7 @@ type cronListTool struct{ store *PlanningStore }
 func (t *cronListTool) Name() string { return "cron_list" }
 
 func (t *cronListTool) Description() string {
-	return "List this chat's scheduled cron jobs (id, expression, prompt, next run, last outcome, failure count, disabled flag). Only this chat's jobs are ever listed. Jobs that failed validation are listed separately under \"quarantined\" as corrupt, with the reason they never run; remove one with cron_cancel. Any allowlisted member may list (read-only); in group chats only the bot owner can schedule or cancel. Times are UTC."
+	return "List this chat's scheduled cron jobs (id, expression, prompt, next run, last outcome, failure count, disabled flag). Only this chat's jobs are ever listed. Jobs that failed validation are listed separately under \"quarantined\" as corrupt, with the reason they never run; remove one with cron_cancel. Any allowlisted member may list (read-only); in group chats only the bot owner can schedule or cancel. Times are UTC. Telegram only: needs a chat in the run context."
 }
 
 func (t *cronListTool) Definition() model.ToolDefinition {
@@ -1317,6 +1410,18 @@ func (t *cronListTool) Definition() model.ToolDefinition {
 func (t *cronListTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
 func (t *cronListTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	// F-C17: listing needs a chat in the run context, like
+	// scheduling does — a no-chat run used to silently work on
+	// the "local" bucket, listing jobs no Telegram chat owns.
+	// The scheduler's own scan is unaffected: it loads jobs
+	// directly from the store, never through this tool.
+	chatID, senderID, ok := permissions.ApprovalContextFrom(ctx)
+	if !ok || chatID == 0 {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_list needs a Telegram chat: this run has no chat in its context")}
+	}
+	if senderID == 0 {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_list needs a sender: this run has no sender in its context")}
+	}
 	if t.store == nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_list: no planning store configured")}
 	}
@@ -1403,7 +1508,7 @@ func (t *cronCancelTool) InstallTransport(host *ToolHost) error {
 }
 
 func (t *cronCancelTool) Description() string {
-	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; if its turn is running now, the turn is stopped too. Its past runs are not undone. Only this chat's jobs can be cancelled, and in group chats only the bot owner can cancel. A quarantined (corrupt) job listed by cron_list can be cancelled by id the same way, so a bad job can be cleaned up without editing cron.json on disk."
+	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; if its turn is running now, the turn is stopped too. Its past runs are not undone. Only this chat's jobs can be cancelled, and in group chats only the bot owner can cancel. A quarantined (corrupt) job listed by cron_list can be cancelled by id the same way, so a bad job can be cleaned up without editing cron.json on disk. Telegram only: needs a chat in the run context."
 }
 
 func (t *cronCancelTool) Definition() model.ToolDefinition {
@@ -1491,6 +1596,145 @@ func (t *cronCancelTool) Execute(ctx context.Context, args json.RawMessage) (str
 	return encodeCronJob(t.Name(), map[string]any{"cancelled": true, "job_id": id, "stopped_running": stopped, "quarantined": wasQuarantined})
 }
 
+// ---------------------------------------------------------------- cron_enable
+
+// cronEnableTool re-enables a disabled job (F-C15). A disabled
+// job used to come back only by re-creating it — a new id, and
+// the history (created time, last run, failure streak) lost.
+// Re-enabling keeps the id and the history: only the disabled
+// flag clears, the failure count resets to 0, and the next run
+// is recomputed from now, so the job resumes on its schedule
+// instead of firing a stale slot. The last result records the
+// re-enable, so the list shows why the failure text is gone. A
+// job that is not disabled is already enabled (a no-op success,
+// not an error). A quarantined (corrupt) job cannot be
+// re-enabled — it never ran, so there is nothing to resume; the
+// error says so and points at cron_cancel. Owner and chat rules
+// match cron_cancel: the same Safe class, the same owner-only
+// check in groups, the same chat-context requirement.
+type cronEnableTool struct {
+	store *PlanningStore
+	// ownerID is the bot owner (first allowlisted chat),
+	// installed by InstallTransport (F-C9) — same meaning as
+	// on cronScheduleTool.
+	ownerID int64
+}
+
+// InstallTransport records the owner id for the group-chat
+// owner-only check (F-C9); same pattern as cronScheduleTool.
+func (t *cronEnableTool) InstallTransport(host *ToolHost) error {
+	if host == nil {
+		return nil
+	}
+	t.ownerID = host.OwnerID
+	return nil
+}
+
+func (t *cronEnableTool) Name() string { return "cron_enable" }
+
+func (t *cronEnableTool) Description() string {
+	return "Re-enable a disabled scheduled cron job by id (from cron_list). The job keeps its id and history; its failure count resets to 0 and its next run is recomputed from now, so it resumes on its schedule instead of firing a stale slot. A job that is not disabled is already enabled. A quarantined (corrupt) job cannot be re-enabled — remove it with cron_cancel. In group chats only the bot owner can re-enable. Telegram only: needs a chat in the run context."
+}
+
+func (t *cronEnableTool) Definition() model.ToolDefinition {
+	return model.ToolDefinition{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"job_id": map[string]any{"type": "string", "description": "Job id, e.g. \"cron_...\" from cron_schedule or cron_list."},
+			},
+			"required": []string{"job_id"},
+		},
+	}
+}
+
+func (t *cronEnableTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+
+type cronEnableArgs struct {
+	JobID string `json:"job_id"`
+}
+
+func (t *cronEnableTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var a cronEnableArgs
+	if err := decodeArgs(t.Name(), args, &a); err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(a.JobID)
+	if id == "" {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("job_id must not be empty")}
+	}
+	if utf8.RuneCountInString(id) > cronMaxJobIDRunes {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("job_id is over %d characters", cronMaxJobIDRunes)}
+	}
+	if t.store == nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_enable: no planning store configured")}
+	}
+	// Same context and owner rules as cron_cancel (F-C9/F-C17):
+	// re-enabling commits the chat to recurring turns again,
+	// so in a group only the owner may do it.
+	chatID, senderID, ok := permissions.ApprovalContextFrom(ctx)
+	if !ok || chatID == 0 {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_enable needs a Telegram chat: this run has no chat in its context")}
+	}
+	if senderID == 0 {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_enable needs a sender: this run has no sender in its context")}
+	}
+	if err := cronRequireOwner(t.Name(), t.ownerID, chatID, senderID); err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+	}
+	now := time.Now().UTC()
+	dir, key := t.store.resolveBucket(ctx)
+	t.store.mu.Lock()
+	defer t.store.mu.Unlock()
+	release, err := t.store.lockState(ctx, dir, cronJobsFile)
+	if err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+	}
+	defer release()
+	doc, err := loadCronJobs(t.store, dir, key)
+	if err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+	}
+	for _, j := range doc.validJobs() {
+		if j.ID != id {
+			continue
+		}
+		if !j.Disabled {
+			// Already enabled: a no-op success, not an
+			// error — the desired end state already holds,
+			// and the job is untouched.
+			return encodeCronJob(t.Name(), map[string]any{"enabled": true, "job_id": id, "was_disabled": false, "job": summarizeCronJob(j)})
+		}
+		next, err := nextRunAfter(j.Expression, now)
+		if err != nil {
+			// Unreachable for a loaded job (load validation
+			// quarantines invalid expressions), but a job
+			// must never be re-enabled onto a broken
+			// schedule.
+			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+		}
+		j.Disabled = false
+		j.ConsecutiveFailures = 0
+		j.NextRun = next.Format(time.RFC3339)
+		j.LastResult = "re-enabled by the owner"
+		if err := saveCronJobs(t.store, dir, key, doc); err != nil {
+			return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+		}
+		return encodeCronJob(t.Name(), map[string]any{"enabled": true, "job_id": id, "was_disabled": true, "job": summarizeCronJob(j)})
+	}
+	// No valid job carries this id: say whether it is a
+	// quarantined entry (which cannot be re-enabled) or
+	// nothing at all.
+	for _, q := range doc.quarantined() {
+		if q.id() == id {
+			return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("job %q is quarantined (corrupt): %s — remove it with cron_cancel; it cannot be re-enabled", id, q.reason)}
+		}
+	}
+	return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("unknown job %q: use cron_list to see this chat's jobs", id)}
+}
+
 func init() {
 	RegisterFactory("cron_schedule", func(deps ToolDeps) (Tool, error) {
 		store := deps.PlanningStore
@@ -1512,6 +1756,13 @@ func init() {
 			store = NewPlanningStore("")
 		}
 		return &cronCancelTool{store: store}, nil
+	})
+	RegisterFactory("cron_enable", func(deps ToolDeps) (Tool, error) {
+		store := deps.PlanningStore
+		if store == nil {
+			store = NewPlanningStore("")
+		}
+		return &cronEnableTool{store: store}, nil
 	})
 }
 
@@ -2618,7 +2869,17 @@ func (s *CronScheduler) applyOutcomes(ctx context.Context, b cronBucket, outcome
 		if !oc.lastRun.IsZero() {
 			j.LastRun = oc.lastRun.Format(time.RFC3339)
 		}
-		j.LastResult = oc.lastRes
+		// F-C13: the stored LastResult is secret-redacted here,
+		// at the single point every outcome is persisted — the
+		// same security.RedactSecrets the chat notice gets in
+		// runScheduledTurn, so a runner error carrying a secret
+		// (a provider error echoing a token, a tool error
+		// pasting a credential) never reaches cron.json
+		// verbatim for cron_list to return. Redacting at the
+		// store, not where each outcome is built, means no
+		// outcome kind — error, disabled, budget-exceeded,
+		// skipped, stopped, or a future one — can bypass it.
+		j.LastResult = security.RedactSecrets(oc.lastRes)
 		j.ConsecutiveFailures = oc.failures
 		j.Disabled = oc.disabled
 	}

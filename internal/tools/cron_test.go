@@ -406,10 +406,21 @@ func TestCronScheduleValidation(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "needs a sender") {
 		t.Errorf("no-sender schedule error = %v, want a sender error", err)
 	}
-	// Listing with no chat resolves the local bucket and returns
-	// empty, not an error.
-	if got := mustCronList(t, list, context.Background()); got.Count != 0 {
-		t.Fatalf("no-chat list = %d jobs, want 0", got.Count)
+	// Listing with no chat fails cleanly (F-C17), like
+	// scheduling: a no-chat run must not silently work on the
+	// "local" bucket.
+	if _, err := list.Execute(context.Background(), json.RawMessage(`{}`)); err == nil {
+		t.Errorf("no-chat list: got nil error, want a Telegram-chat error")
+	} else if !strings.Contains(err.Error(), "needs a Telegram chat") {
+		t.Errorf("no-chat list error = %v, want a Telegram-chat error", err)
+	}
+	// No sender either: the approval context would have nobody
+	// to attribute the list to.
+	noSenderList := permissions.WithApprovalContext(context.Background(), 111, 0)
+	if _, err := list.Execute(noSenderList, json.RawMessage(`{}`)); err == nil {
+		t.Errorf("no-sender list: got nil error, want a sender error")
+	} else if !strings.Contains(err.Error(), "needs a sender") {
+		t.Errorf("no-sender list error = %v, want a sender error", err)
 	}
 }
 

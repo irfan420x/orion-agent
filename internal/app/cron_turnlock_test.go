@@ -140,7 +140,7 @@ func TestCronExcludedFromChildRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newChildRegistry: %v", err)
 	}
-	for _, name := range []string{"cron_schedule", "cron_list", "cron_cancel"} {
+	for _, name := range []string{"cron_schedule", "cron_list", "cron_cancel", "cron_enable"} {
 		if _, ok := reg.Get(name); ok {
 			t.Fatalf("child registry has %q, want it excluded", name)
 		}
