@@ -52,6 +52,30 @@ Orion's system prompt taught the model to explain instead of trying
   file appended after core, oversize truncated with valid UTF-8,
   hostile file cannot override a core rule).
 
+### Download default + send from anywhere (user orders 2026-11-15 09:32 + 09:35 SGT)
+
+- **Download default: `~/Downloads`.** The prompt now says that
+  when the agent downloads or saves a file for the user, it saves
+  it in `~/Downloads` by default; when the user names a specific
+  folder or file name, that wins. It also says never to `mkdir` a
+  download directory — the standard folders already exist (and
+  `mkdir` under `/home` is blocked by the shell denylist, which is
+  what broke the 09:23 song-download turn: the `mkdir -p
+  ~/orion-media` segment was refused, not `yt-dlp` itself).
+  Pinned by `TestSystemPromptTryFirstAndHumanized`.
+- **MEDIA is now denylist-only by default.** The allowlist
+  restriction is gone: a file may be sent from anywhere on the
+  laptop except the denylist (`~/.orion`, `~/.ssh`, `~/.gnupg`,
+  `/etc`, credential/key filenames, checked on the resolved
+  path). The old default allowlist (`~/orion-media` + `/tmp`) is
+  removed. An explicitly configured `media_allow_dirs` still
+  restricts delivery to those directories. Size cap (50 MiB) and
+  max 5 files per reply are unchanged. Pinned by
+  `TestWithMediaDeliveryDefaultIsDenylistOnly` (replaces
+  `TestWithMediaDeliveryDefaultAllowlist`), which sends a file
+  from `~/Downloads` and one from `~/Documents` under the default
+  config and still refuses `~/.orion/config.json`.
+
 ### Provider-auto context window
 
 The history budget is now derived from the active provider's

@@ -280,7 +280,7 @@ go tool pprof http://127.0.0.1:6060/debug/pprof/heap
 When the user asks for a file, or the agent created one they should
 have, the agent sends it with a `MEDIA:` line on its own line in its
 reply, with the absolute path and no spaces — for example
-`MEDIA:/home/irfan/orion-media/report.csv`. The gateway uploads the
+`MEDIA:/home/irfan/Downloads/report.csv`. The gateway uploads the
 file to the chat (photo, video, audio, voice, or document by
 extension; unknown extensions go as a document), strips the tag from
 the visible reply, and appends a per-file delivery report (`📎 Sent
@@ -288,12 +288,12 @@ the visible reply, and appends a per-file delivery report (`📎 Sent
 tags send: a path merely mentioned in prose is never sent, and the
 CLI (`orion run`) leaves tags as visible text.
 
-- **Allowlist (default `~/orion-media` and `/tmp`).** Files may be
-  sent only from under an allowlisted directory. Set
-  `media_allow_dirs` in `config.json` to replace the defaults
-  (an explicit list replaces, never appends). A file elsewhere is
-  refused with a visible note naming the allowlist and how to
-  allow the directory — never sent, never silent.
+- **No allowlist by default — denylist only.** Files may be sent
+  from anywhere on the laptop except the denylisted paths below.
+  Set `media_allow_dirs` in `config.json` to restrict sending to
+  specific directories (an explicit list restricts, never
+  appends). A file outside an explicitly configured list is
+  refused with a visible note — never sent, never silent.
 - **Denylist (absolute, non-overridable).** `~/.orion`, `~/.ssh`,
   `~/.gnupg`, `/etc`, and credential/key filenames (`*.env`,
   `*.pem`, `*.key`, `id_*`, `*credentials*`) are never sendable —
