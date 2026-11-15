@@ -5,9 +5,9 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,819 tests total — 1,815 pass, 0 fail, 4 skip;
+> built and tested (1,846 tests total — 1,842 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
-> Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix and the busy-input acknowledgement (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
+> Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement and the computer-use M3 input tool (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -131,9 +131,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,819 tests total (1,815 passing, 0 failing, 4 skipped)
+24/24 packages, 1,846 tests total (1,842 passing, 0 failing, 4 skipped)
 (recount in the working tree after the Audit 22 fix batch, the
-provider-auto context-window change, the cron tool, the behavior fix and the busy-input acknowledgement, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
+provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement and the computer-use M3 input tool, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
 `go test ./...` or `make test`.
 
@@ -500,7 +500,8 @@ after the user approves it / clear a pending plan), `cron_schedule` /
 desktop and return the image to the model; read-only, no input;
 refuses on sensitive windows and in unattended turns), `ground` (ground the screen: numbered-marker
 screenshot plus the exact name/role/bounding box of every interactive element; read-only; stale
-snapshots are refused), `subagent_spawn`
+snapshots are refused), `input` (move the cursor, click, type or press a key on the desktop; gated as
+destructive; refuses on sensitive windows and in unattended turns), `subagent_spawn`
 (run a brief as a managed child agent), `subagent_list`, `subagent_result`,
 `subagent_stop`. MCP servers configured in the data dir add
 `mcp__<server>__<tool>` tools dynamically. Every tool result is capped at

@@ -541,7 +541,7 @@ func TestGroundSnapshotRegistry(t *testing.T) {
 	r := groundSnapshots
 	now := time.Now()
 	id1 := "g-test-1"
-	r.register(id1, now, []int{1, 2, 3})
+	r.register(id1, now, []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}, {ID: 2, Centre: groundPoint{X: 20, Y: 20}}, {ID: 3, Centre: groundPoint{X: 30, Y: 30}}})
 	if err := r.validate(id1, 2, now); err != nil {
 		t.Errorf("fresh snapshot validate = %v, want nil", err)
 	}
@@ -557,7 +557,7 @@ func TestGroundSnapshotRegistry(t *testing.T) {
 	}
 	// A newer grounding supersedes the old one.
 	id2 := "g-test-2"
-	r.register(id2, now.Add(time.Second), []int{1})
+	r.register(id2, now.Add(time.Second), []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}})
 	if err := r.validate(id1, 1, now.Add(2*time.Second)); err == nil || !strings.Contains(err.Error(), "superseded") {
 		t.Errorf("superseded snapshot err = %v, want 'superseded'", err)
 	}
@@ -571,7 +571,7 @@ func TestGroundSnapshotRegistry(t *testing.T) {
 	base := time.Now()
 	ids := []string{"g-a", "g-b", "g-c", "g-d"}
 	for i, id := range ids {
-		r.register(id, base.Add(time.Duration(i)*time.Second), []int{1})
+		r.register(id, base.Add(time.Duration(i)*time.Second), []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}})
 	}
 	if err := groundSnapshots.validate("g-a", 1, base.Add(4*time.Second)); err == nil || !strings.Contains(err.Error(), "not available") {
 		t.Errorf("evicted snapshot err = %v, want 'not available'", err)

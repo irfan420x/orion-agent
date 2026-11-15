@@ -6,6 +6,109 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Computer-use M3 — input (`input`, pin 31, Destructive)
+
+Third computer-use tool (`input`, pin 31 — pins 26–29 reserved
+for future window/browser tools, Destructive): the first tool
+that ACTS on the desktop. One tool, four ops — `move` {x, y},
+`click` {button, clicks, x, y} or {snapshot_id, element_id},
+`type` {text}, `key` {key} — driven by ydotool (ydotoold +
+uinput, the M3 decision 2026-11-15 19:22 under Irfan's
+delegation) through the Wayland-native path. Suite: **1,846
+tests total (1,842 pass, 0 fail, 4 skip), 24/24 packages**.
+
+- **Closed-loop moves (the acceleration answer):** the ydotool
+  device is RELATIVE-only (EV_REL, no EV_ABS — live M3 probe),
+  so `mousemove --absolute` is relative deltas from a start
+  position ydotool cannot know, and libinput pointer
+  acceleration scales every relative move timing-dependently (a
+  +20 raw move reported as 8.00 accelerated, a +10 as 17.50).
+  The loop is the mechanism instead: read the true position
+  from the KWin oracle, issue the exact residual as a RELATIVE
+  move, re-read, correct again — up to 5 iterations, both axes
+  within 5 px, 100 ms settle between move and re-read. A move
+  that does not converge returns an honest "could not reach
+  (x, y) within 5 px after 5 correction moves" error with the
+  final oracle position — it NEVER claims success when the
+  oracle disagrees, and a failed move aborts the click that
+  would have followed it. Disabling acceleration was rejected:
+  it would need a libinput device-config change and would alter
+  the user's own pointer behaviour for every app.
+- **Oracle (KWin, not xdotool):** a separate vendored helper
+  (`internal/tools/input_kwin.py`, embedded, written 0600 —
+  separate from `ground_kwin.py`, whose output contract is
+  pinned by M2, because the cursor query has a different shape
+  and cadence) reads `workspace.cursorPos` plus the virtual
+  screen geometry and the window list, reusing ground's
+  invocation pattern (unique marker, loadScript/start, journal
+  poll, unload — 10/10 reliable for ground). xdotool is never
+  an oracle here: it reads the diverged XWayland pointer
+  (stuck at 960,672 while KWin reported 134,36). Screen size
+  comes from the oracle's `virtualScreenGeometry`, never a
+  hardcoded 1920x1080; when KWin has no such property the
+  upper-bound check is skipped and the loop still fails
+  honestly on an unreachable target.
+- **Snapshot binding (the M2+M3 integration):** click by
+  {snapshot_id, element_id} resolves the target through
+  `GroundSnapshotElementCentre` — the registry's grounded
+  centre, never a model-typed coordinate — and re-validates
+  the snapshot immediately before the click. The registry now
+  stores element centres alongside ids (same 60 s TTL,
+  newest-only, last-3 eviction). Click by coordinates moves
+  closed-loop to the target first, then clicks.
+- **ydotool commands (Debian man page, verified):** relative
+  `mousemove -x/-y`; `click --repeat N 0xC0/0xC1/0xC2` (left /
+  right / middle — the button number OR'd with 0x40 down +
+  0x80 up); `type --file -` with the text on stdin (never in
+  argv, never echoed in the result — only the character
+  count); `key <code>:1 <code>:0` with numeric Linux keycodes
+  (`key` takes numbers only — a name would silently become a
+  delay — so the tool translates its allowlist itself: Return
+  28, Escape 1, Tab 15, BackSpace 14, Delete 111, Home 102,
+  End 107, PageUp 104, PageDown 109, arrows 103/108/105/106,
+  Space 57, F1–F12 59–68/87/88; no modifiers or combinations).
+  The socket (`$YDOTOOL_SOCKET`, else
+  `$XDG_RUNTIME_DIR/.ydotool_socket`) is checked before
+  anything runs: a missing socket is a clear "daemon not
+  running" error, and the tool NEVER starts the daemon.
+- **Risk class Destructive (one tool, one class, max over
+  ops):** move alone would be Safe (position is not an
+  effect), but click can activate/close/submit and type/key
+  can enter text or submit a form in the focused window — so
+  the tool is gated, plan mode blocks it while a plan is
+  pending, and `input` is added to the gate's destructive map
+  (the framework test's exact destructive-set pin is extended
+  with it).
+- **Sensitive windows:** type/key refuse when a sensitive
+  window (password manager / bank / payment / OTP) is focused
+  or visible, and refuse when the windows cannot be enumerated
+  at all (fail closed — typing blind is the highest-risk op).
+  Titles come from ground's AT-SPI tree (the M2 safety layer
+  that sees native Wayland windows) with the screenshot
+  tool's xdotool titles as fallback. Click refuses on any
+  sensitive window EXCEPT when every sensitive window's box is
+  KWin-corrected (the M2 F2 correction) and the target lies
+  outside all of them. Move is allowed under a sensitive
+  window: position is not an effect. Type results never echo
+  the typed text.
+- **Refusals and limits:** refused outright in unattended
+  (cron) turns and when the screen is locked; rate limits
+  follow the M1 discipline (1 s min interval, 15 per turn,
+  120 per hour); text is capped at 1000 runes with control
+  characters refused (Tab/Return only via `key`); `input` is
+  excluded from the tool journal (replaying a turn would
+  re-execute clicks and keystrokes).
+- **Known limits (for live verification, not hidden):** the
+  AT-SPI walk behind every guarded type/key/click costs ~5 s
+  on a heavy page (D-Bus round-trip bound) — a KWin-captions-
+  only title source (~0.1 s) is flagged as a future
+  optimisation, not done here because the brief pins the
+  AT-SPI check. Click is UNTESTED live (no safe target was
+  established); `type --file -` (stdin) and the `--repeat`
+  double-click are the man-page-documented forms but have not
+  been exercised against the live daemon yet — the verifier
+  should confirm both on the laptop.
+
 ### Vision — photos the model can see
 
 A photo sent to the bot is now downloaded (largest size, 10 MiB cap) and run as a real turn — caption as the text, or "এই ছবিটা বর্ণনা করো।" with no caption — when the chat's provider/model supports vision (`deepseek-flash`, `gpt-4o`, `gpt-4o-mini`). Otherwise the bot answers honestly in Bengali and names the fix (DeepSeek `deepseek-flash`). Only the most recent user message carries image parts; older photo turns are sent text-only with a `[ছবি]` placeholder, and image bytes are never stored in memory. The shipped DeepSeek default is now `deepseek-flash` (`deepseek-chat` is a retired 2026-07-24 text-only alias) — NOTE: a live config that explicitly sets `deepseek-chat` is untouched by this change. `/usage` now prices `deepseek-flash` ($0.15 in / $0.60 out per 1M, off-peak cache-miss).

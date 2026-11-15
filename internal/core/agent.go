@@ -1705,6 +1705,12 @@ var journalExcludedTools = map[string]bool{
 	// replayed grounding could only hand the model unclickable
 	// element numbers. Re-ground instead.
 	"ground": true,
+	// input: replaying a turn would re-execute the clicks and
+	// keystrokes — a click is not idempotent (it can activate,
+	// close or submit something twice) and typed text would be
+	// entered twice. A re-delivered turn re-runs the input call
+	// against the live desktop instead.
+	"input": true,
 }
 
 // journalExcludedTool reports whether name is excluded from the

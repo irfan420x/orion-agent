@@ -418,12 +418,15 @@ func applyWindowOffsets(tree *atspiOutput, offsets map[int][2]int) {
 // --- snapshot registry (stale-refusal, design §5) ---
 
 // groundSnapshot is one grounding's registered state: the element
-// ids the future M3 mouse tool may click, and the sequence number
-// that decides supersession (only the newest snapshot is live).
+// ids the M3 input tool may click, their centres (the click
+// targets — the registry, not the model, supplies coordinates),
+// and the sequence number that decides supersession (only the
+// newest snapshot is live).
 type groundSnapshot struct {
 	id       string
 	takenAt  time.Time
 	elements map[int]bool
+	centres  map[int]groundPoint
 	seq      int64
 }
 
@@ -449,16 +452,21 @@ var groundSnapshots = newGroundSnapshotRegistry()
 
 // register stores a grounding and evicts the oldest snapshots
 // past the retention limit. It returns the snapshot's sequence
-// number.
-func (r *groundSnapshotRegistry) register(id string, takenAt time.Time, elementIDs []int) int64 {
+// number. Centres are stored alongside the ids: the M3 input
+// tool clicks an element's registered centre, never a coordinate
+// the model typed (a model-typed coordinate is a guess; the
+// registry's centre is the grounded truth).
+func (r *groundSnapshotRegistry) register(id string, takenAt time.Time, elements []groundElement) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seq++
-	els := make(map[int]bool, len(elementIDs))
-	for _, e := range elementIDs {
-		els[e] = true
+	els := make(map[int]bool, len(elements))
+	cen := make(map[int]groundPoint, len(elements))
+	for _, e := range elements {
+		els[e.ID] = true
+		cen[e.ID] = e.Centre
 	}
-	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, takenAt: takenAt, elements: els, seq: r.seq})
+	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, takenAt: takenAt, elements: els, centres: cen, seq: r.seq})
 	for len(r.snapshots) > groundMaxSnapshots {
 		r.snapshots = r.snapshots[1:]
 	}
@@ -475,7 +483,7 @@ func (r *groundSnapshotRegistry) latest() *groundSnapshot {
 	return r.snapshots[len(r.snapshots)-1]
 }
 
-// ValidateGroundSnapshot is the M3 mouse tool's gate: it refuses a
+// ValidateGroundSnapshot is the M3 input tool's gate: it refuses a
 // click when (a) the snapshot is unknown or evicted, (b) it is
 // older than the 60 s TTL, (c) a newer grounding has superseded
 // it, or (d) the element id is not in that snapshot. The error
@@ -485,6 +493,28 @@ func ValidateGroundSnapshot(id string, elementID int) error {
 }
 
 func (r *groundSnapshotRegistry) validate(id string, elementID int, now time.Time) error {
+	_, err := r.lookup(id, elementID, now)
+	return err
+}
+
+// GroundSnapshotElementCentre is the M3 input tool's target
+// resolver: it validates (snapshot, element) exactly as
+// ValidateGroundSnapshot does and returns the element's centre
+// in absolute screen pixels. The input tool clicks this centre
+// — the registry's grounded truth — never a coordinate from the
+// model. The error always tells the provider to ground again.
+func GroundSnapshotElementCentre(id string, elementID int) (groundPoint, error) {
+	snap, err := groundSnapshots.lookup(id, elementID, time.Now())
+	if err != nil {
+		return groundPoint{}, err
+	}
+	return snap.centres[elementID], nil
+}
+
+// lookup is the shared validation for validate and
+// GroundSnapshotElementCentre: it returns the snapshot only when
+// it is known, fresh, newest, and contains the element.
+func (r *groundSnapshotRegistry) lookup(id string, elementID int, now time.Time) (*groundSnapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var snap *groundSnapshot
@@ -495,18 +525,18 @@ func (r *groundSnapshotRegistry) validate(id string, elementID int, now time.Tim
 		}
 	}
 	if snap == nil {
-		return fmt.Errorf("snapshot %s is not available (unknown or evicted — only the last %d groundings are kept): ground again and use the new snapshot", id, groundMaxSnapshots)
+		return nil, fmt.Errorf("snapshot %s is not available (unknown or evicted — only the last %d groundings are kept): ground again and use the new snapshot", id, groundMaxSnapshots)
 	}
 	if now.Sub(snap.takenAt) > groundSnapshotTTL {
-		return fmt.Errorf("snapshot %s is %v old (max %v): the screen has moved on — ground again and use the new snapshot", id, now.Sub(snap.takenAt).Round(time.Second), groundSnapshotTTL)
+		return nil, fmt.Errorf("snapshot %s is %v old (max %v): the screen has moved on — ground again and use the new snapshot", id, now.Sub(snap.takenAt).Round(time.Second), groundSnapshotTTL)
 	}
 	if len(r.snapshots) > 0 && snap.seq != r.snapshots[len(r.snapshots)-1].seq {
-		return fmt.Errorf("snapshot %s was superseded by a newer grounding: ground again and use the new snapshot", id)
+		return nil, fmt.Errorf("snapshot %s was superseded by a newer grounding: ground again and use the new snapshot", id)
 	}
 	if !snap.elements[elementID] {
-		return fmt.Errorf("element %d is not in snapshot %s: ground again and pick an element from the new list", elementID, id)
+		return nil, fmt.Errorf("element %d is not in snapshot %s: ground again and pick an element from the new list", elementID, id)
 	}
-	return nil
+	return snap, nil
 }
 
 // groundSnapshotForTest exposes a registered snapshot's element ids
@@ -683,25 +713,10 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	}
 
 	// AT-SPI backend probe at Execute start, never cached: python3
-	// present + gi.Atspi importable. A missing backend is not an
-	// error — grounding degrades to vision_only below.
-	helperOK := t.probeHelper(ctx)
-
-	var tree *atspiOutput
-	if helperOK {
-		helperPath, werr := t.writeHelper()
-		if werr == nil {
-			raw, rerr := t.runHelper(ctx, helperPath)
-			if rerr == nil {
-				var out atspiOutput
-				if jerr := json.Unmarshal(raw, &out); jerr == nil {
-					tree = &out
-				}
-			}
-		}
-		// Any helper failure (write, run, parse) leaves tree nil:
-		// vision_only, never a partial or faked element list.
-	}
+	// present + gi.Atspi importable. A missing backend (or any
+	// helper failure) is not an error — grounding degrades to
+	// vision_only below.
+	tree, _ := t.atspiTree(ctx)
 
 	// KWin geometry correction (F2): the compositor knows each
 	// window's true screen position; a Wayland client reports
@@ -825,7 +840,6 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	} else if shotSummary.FocusedWindow != "" {
 		summary.FocusedWindow = &groundWindowRef{Title: shotSummary.FocusedWindow}
 	}
-	ids := make([]int, 0, len(elements))
 	for i, el := range elements {
 		id := i + 1
 		cx, cy := el.X+el.W/2, el.Y+el.H/2
@@ -840,7 +854,6 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 				Y: (cy - originY) * 1000 / viewH,
 			},
 		})
-		ids = append(ids, id)
 	}
 
 	// Draw the numbered markers on the captured image.
@@ -873,8 +886,10 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// click an element from this grounding immediately, and the
 	// registry is what makes that click valid. Registration is
 	// what the last-3 eviction applies to — a 4th grounding
-	// evicts the oldest snapshot here.
-	groundSnapshots.register(summary.SnapshotID, now, ids)
+	// evicts the oldest snapshot here. The registered elements
+	// carry their centres, so the input tool clicks the
+	// registry's centre, never a model-typed coordinate.
+	groundSnapshots.register(summary.SnapshotID, now, summary.Elements)
 
 	text, err := json.Marshal(summary)
 	if err != nil {
@@ -906,21 +921,23 @@ func (t *groundTool) probeHelper(ctx context.Context) bool {
 // ~/.orion/ground-atspi-helper.py (0600, atomic temp+rename) and
 // returns its path. An identical existing file is left untouched.
 func (t *groundTool) defaultWriteHelper() (string, error) {
-	return t.writeEmbeddedHelper(groundHelperFile, atspiHelperSource)
+	return installEmbeddedHelper(t.homeDir, groundHelperFile, atspiHelperSource)
 }
 
 // defaultWriteKWinHelper writes the embedded KWin helper to
 // ~/.orion/ground-kwin-helper.py (0600, atomic temp+rename) and
 // returns its path. Same shape as defaultWriteHelper.
 func (t *groundTool) defaultWriteKWinHelper() (string, error) {
-	return t.writeEmbeddedHelper(groundKWinHelperFile, kwinHelperSource)
+	return installEmbeddedHelper(t.homeDir, groundKWinHelperFile, kwinHelperSource)
 }
 
-// writeEmbeddedHelper installs one embedded helper script under
+// installEmbeddedHelper installs one embedded helper script under
 // ~/.orion/ (0600, atomic temp+rename) and returns its path. An
-// identical existing file is left untouched.
-func (t *groundTool) writeEmbeddedHelper(file, source string) (string, error) {
-	home, err := t.homeDir()
+// identical existing file is left untouched. It is the shared
+// installer for ground's and input's helpers (input_kwin.py),
+// so the install semantics cannot drift between the two tools.
+func installEmbeddedHelper(homeDir func() (string, error), file, source string) (string, error) {
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return "", fmt.Errorf("cannot determine the home directory: %v", err)
 	}
@@ -952,6 +969,32 @@ func (t *groundTool) writeEmbeddedHelper(file, source string) (string, error) {
 		return "", fmt.Errorf("cannot install the helper %s: %v", file, err)
 	}
 	return path, nil
+}
+
+// atspiTree probes the AT-SPI backend and runs the helper,
+// returning the parsed tree. (nil, nil) when the backend is
+// missing — the caller degrades (ground: vision_only; input:
+// xdotool fallback). Any helper failure (write, run, parse) is
+// an error. Extracted from ExecuteResult so the input tool's
+// sensitive-window check runs the same tree walk instead of a
+// second, drifting copy of it.
+func (t *groundTool) atspiTree(ctx context.Context) (*atspiOutput, error) {
+	if !t.probeHelper(ctx) {
+		return nil, nil
+	}
+	helperPath, err := t.writeHelper()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := t.runHelper(ctx, helperPath)
+	if err != nil {
+		return nil, err
+	}
+	var out atspiOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("AT-SPI helper output does not parse: %v", err)
+	}
+	return &out, nil
 }
 
 // defaultRunHelper runs the helper with the depth/node caps and

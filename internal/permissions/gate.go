@@ -98,11 +98,15 @@ func (c Class) String() string {
 
 // destructiveTools are the tools that mutate the machine (or, for
 // subagent_spawn, delegate to a child agent that can mutate it).
+// input is here because click/type/key can activate, close or
+// submit things (its move op alone would be Safe, but one tool
+// carries one class — the max over its ops; see input.go).
 var destructiveTools = map[string]bool{
 	"shell_exec":     true,
 	"file_write":     true,
 	"file_edit":      true,
 	"subagent_spawn": true,
+	"input":          true,
 }
 
 // networkTools are the tools that move data off the machine or fetch

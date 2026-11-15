@@ -413,7 +413,8 @@ func TestKnownBuiltInToolsMatchesFactorySet(t *testing.T) {
 // TestClassifyMapsMatchFactorySet pins the gate's hardcoded maps
 // (permissions.Classify) to the factory set, in both directions:
 // over every built-in tool name, the Destructive set must be
-// exactly {shell_exec, file_write, file_edit, subagent_spawn} and
+// exactly {shell_exec, file_write, file_edit, subagent_spawn,
+// input} and
 // the Network set exactly {web_fetch, web_search}; every built-in
 // name must be EXPLICITLY classified (ClassifyKnown), so a Safe
 // tool is Safe because it is listed in the safe map, never because
@@ -421,7 +422,7 @@ func TestKnownBuiltInToolsMatchesFactorySet(t *testing.T) {
 // (KnownTools) must equal the factory set exactly, so a map entry
 // for a tool that no longer exists fails loudly here too.
 func TestClassifyMapsMatchFactorySet(t *testing.T) {
-	wantDestructive := map[string]bool{"shell_exec": true, "file_write": true, "file_edit": true, "subagent_spawn": true}
+	wantDestructive := map[string]bool{"shell_exec": true, "file_write": true, "file_edit": true, "subagent_spawn": true, "input": true}
 	wantNetwork := map[string]bool{"web_fetch": true, "web_search": true}
 	gotDestructive := map[string]bool{}
 	gotNetwork := map[string]bool{}

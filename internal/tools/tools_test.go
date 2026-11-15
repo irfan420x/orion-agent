@@ -455,7 +455,7 @@ func TestDefaultRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultRegistry failed: %v", err)
 	}
-	want := []string{"ask_user_question", "calculator", "cron_cancel", "cron_enable", "cron_list", "cron_schedule", "datetime", "enter_plan_mode", "exit_plan_mode", "file_edit", "file_list", "file_read", "file_write", "glob", "grep", "ground", "process_list", "screenshot", "shell_exec", "task_create", "task_get", "task_list", "task_update", "todo_write", "web_fetch", "web_search"}
+	want := []string{"ask_user_question", "calculator", "cron_cancel", "cron_enable", "cron_list", "cron_schedule", "datetime", "enter_plan_mode", "exit_plan_mode", "file_edit", "file_list", "file_read", "file_write", "glob", "grep", "ground", "input", "process_list", "screenshot", "shell_exec", "task_create", "task_get", "task_list", "task_update", "todo_write", "web_fetch", "web_search"}
 	if got := len(r.List()); got != len(want) {
 		t.Fatalf("expected %d tools, got %d", len(want), got)
 	}
