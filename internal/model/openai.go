@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -99,11 +100,37 @@ func (f *openAIToolCallFunction) UnmarshalJSON(data []byte) error {
 }
 
 type openAIMessage struct {
-	Role       string           `json:"role"`
-	Content    string           `json:"content"`
+	Role string `json:"role"`
+	// Content is a plain string when the message carries no images
+	// (the historic wire shape, unchanged), or a []openAIContentPart
+	// (text + image_url parts) when it does. It is any — not a
+	// custom marshaller — so the no-image case serialises exactly
+	// as before and no provider ever sees a parts array it did
+	// not ask for.
+	Content    any              `json:"content"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
+
+// openAIContentPart is one block in a multi-part message content
+// (OpenAI Chat Completions format, which DeepSeek's Vision guide
+// documents for image input): a text block, or an image_url block
+// carrying a base64 data URL.
+type openAIContentPart struct {
+	Type     string              `json:"type"` // "text" | "image_url"
+	Text     string              `json:"text,omitempty"`
+	ImageURL *openAIImageURLPart `json:"image_url,omitempty"`
+}
+
+// openAIImageURLPart is the payload of an image_url content part.
+type openAIImageURLPart struct {
+	URL string `json:"url"` // "data:<mime>;base64,..."
+}
+
+// imagePlaceholder marks an older message whose image was stripped
+// by the history rule (see toOpenAIMessages): the turn still shows
+// that a photo was sent, without re-sending its bytes.
+const imagePlaceholder = "[ছবি]"
 
 type openAIChatRequest struct {
 	Model       string          `json:"model"`
@@ -178,9 +205,28 @@ func (e *openAIAPIError) describe() string {
 
 // --- conversion ---
 
+// toOpenAIMessages converts provider-neutral messages to the
+// OpenAI-compatible wire shape.
+//
+// History rule (vision): only the MOST RECENT user message may carry
+// image parts. An older message that still holds images is sent as
+// text-only — its text plus the "[ছবি]" placeholder — so a photo is
+// never re-sent (as base64) on every later turn: that would
+// re-charge the image tokens and bloat the context on each step.
+// Images on non-user messages are dropped the same way (DeepSeek
+// rejects images in assistant messages with a 400); the placeholder
+// keeps the transcript honest about what was sent.
 func toOpenAIMessages(msgs []Message) []openAIMessage {
+	// Find the last user message that carries usable images.
+	lastImageIdx := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" && len(msgs[i].Images) > 0 {
+			lastImageIdx = i
+			break
+		}
+	}
 	out := make([]openAIMessage, 0, len(msgs))
-	for _, m := range msgs {
+	for i, m := range msgs {
 		om := openAIMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
 			args := tc.Arguments
@@ -193,6 +239,62 @@ func toOpenAIMessages(msgs []Message) []openAIMessage {
 			call.Function.Name = tc.Name
 			call.Function.Arguments = args
 			om.ToolCalls = append(om.ToolCalls, call)
+		}
+		if len(m.Images) == 0 {
+			out = append(out, om)
+			continue
+		}
+		if i == lastImageIdx {
+			// Most recent user message with images: text part
+			// (when there is text) plus one image_url part per
+			// image. An image whose bytes are empty or whose
+			// type cannot be sniffed is skipped, never sent
+			// with a guessed MIME type; the MIME type is
+			// sniffed from the bytes when not already set.
+			parts := make([]openAIContentPart, 0, len(m.Images)+1)
+			if m.Content != "" {
+				parts = append(parts, openAIContentPart{Type: "text", Text: m.Content})
+			}
+			for _, img := range m.Images {
+				if len(img.Data) == 0 {
+					continue
+				}
+				// The MIME type is always sniffed from the
+				// bytes: a declared type is never trusted.
+				// An image whose type cannot be sniffed is
+				// skipped, never sent with a guessed type.
+				mime := SniffImageMIME(img.Data)
+				if mime == "" {
+					continue
+				}
+				parts = append(parts, openAIContentPart{
+					Type:     "image_url",
+					ImageURL: &openAIImageURLPart{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data)},
+				})
+			}
+			if len(parts) == 0 {
+				// No text and no sendable image: plain empty
+				// string, as before.
+				out = append(out, om)
+				continue
+			}
+			if len(parts) == 1 && parts[0].Type == "text" {
+				// Only text survived (all images unusable):
+				// keep the historic string shape.
+				out = append(out, om)
+				continue
+			}
+			om.Content = parts
+			out = append(out, om)
+			continue
+		}
+		// Older (or non-user) message with images: text-only
+		// with the placeholder, so the transcript records that
+		// a photo was part of this turn without re-sending it.
+		if m.Content != "" {
+			om.Content = m.Content + " " + imagePlaceholder
+		} else {
+			om.Content = imagePlaceholder
 		}
 		out = append(out, om)
 	}

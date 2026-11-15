@@ -11,11 +11,50 @@ import (
 
 // Message is a single chat turn. ToolCalls is set on assistant messages
 // that request tool execution; ToolCallID links a tool result back.
+// Images carries image input on a user message (vision): the raw
+// bytes plus their MIME type. Images are sent only to providers
+// whose model supports vision (see SupportsVision); other providers
+// send the text Content only and never see the bytes. Images are
+// never persisted with the message in memory — the agent records a
+// text-only copy — so a base64 blob cannot bloat the message store.
 type Message struct {
-	Role       string     `json:"role"` // system, user, assistant, tool
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role       string         `json:"role"` // system, user, assistant, tool
+	Content    string         `json:"content"`
+	Images     []ImageContent `json:"images,omitempty"`
+	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+// ImageContent is one image attached to a user message. Data is the
+// raw image bytes; MIMEType is the type sniffed from the bytes (see
+// SniffImageMIME) — a declared type is never trusted.
+type ImageContent struct {
+	Data     []byte `json:"data,omitempty"`
+	MIMEType string `json:"mime_type,omitempty"`
+}
+
+// SniffImageMIME reports the image type from the magic bytes, for
+// the formats DeepSeek accepts (JPEG, PNG, GIF, WebP — detected
+// from actual file content, not filename or declared MIME type, per
+// DeepSeek's Vision guide). It returns "" for anything else: an
+// unknown type must never be sent with a guessed MIME type.
+func SniffImageMIME(data []byte) string {
+	if len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "image/jpeg"
+	}
+	if len(data) >= 8 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' &&
+		data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A {
+		return "image/png"
+	}
+	if len(data) >= 6 && data[0] == 'G' && data[1] == 'I' && data[2] == 'F' && data[3] == '8' &&
+		(data[4] == '7' || data[4] == '9') && data[5] == 'a' {
+		return "image/gif"
+	}
+	if len(data) >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
+		data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P' {
+		return "image/webp"
+	}
+	return ""
 }
 
 // ToolCall is one requested tool invocation.
