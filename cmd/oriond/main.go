@@ -297,7 +297,8 @@ func run(args []string) int {
 			fmt.Fprintf(os.Stderr, "oriond: "+format+"\n", args...)
 		}),
 		// Media delivery: the agent's MEDIA: tags send files from
-		// ~/orion-media and /tmp (or media_allow_dirs) to the chat.
+		// anywhere on the machine (denylist-only by default, or
+		// media_allow_dirs when set) to the chat.
 		messaging.WithMediaDelivery(a.Config.Media),
 	}
 	if a.Config.AllowAllTelegramChats {

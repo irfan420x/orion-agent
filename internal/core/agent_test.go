@@ -356,6 +356,10 @@ func TestSystemPromptTryFirstAndHumanized(t *testing.T) {
 		"never paste raw tool output",
 		"one line saying why it matters",
 		"search first and use fresh results",
+		"A file can be sent from anywhere on the laptop",
+		"save it in ~/Downloads by default",
+		"if the user names a specific folder or file name",
+		"Never mkdir a download directory",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("SystemPrompt missing try-first/humanized guidance %q", want)

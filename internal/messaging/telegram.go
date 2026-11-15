@@ -580,8 +580,9 @@ type TelegramGateway struct {
 	// no-op and MEDIA: tags stay as visible text.
 	mediaCfg config.MediaDeliveryConfig
 	// mediaAllow holds the resolved allowlist directories (see
-	// resolveMediaAllowDirs): a file may be sent only from under
-	// one of these, and only after passing the denylist.
+	// resolveMediaAllowDirs). Empty means no allowlist: a file may
+	// be sent from anywhere after passing the denylist. A
+	// non-empty list restricts delivery to those dirs.
 	mediaAllow []string
 }
 

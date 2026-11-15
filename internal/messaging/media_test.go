@@ -485,28 +485,53 @@ func TestMediaConfigValidation(t *testing.T) {
 	}
 }
 
-// TestWithMediaDeliveryDefaultAllowlist pins the default allowlist
-// choice: ~/orion-media plus os.TempDir() — NOT the daemon cwd
-// (the laptop unit runs with WorkingDirectory=%h, so the cwd is
-// the whole home and would make the allowlist vacuous).
-func TestWithMediaDeliveryDefaultAllowlist(t *testing.T) {
+// TestWithMediaDeliveryDefaultIsDenylistOnly REPLACES
+// TestWithMediaDeliveryDefaultAllowlist: the default allowlist
+// ([~/orion-media, /tmp]) was removed by the user's order
+// 2026-11-15 09:35 — delivery is denylist-only by default, so a
+// file may be sent from anywhere on the machine (here ~/Downloads
+// and ~/Documents) except the denylist. An explicitly configured
+// media_allow_dirs still restricts (see
+// TestDeliverMediaRefusalIsVisible, which uses an explicit list).
+func TestWithMediaDeliveryDefaultIsDenylistOnly(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	g, err := NewTelegramGateway(testToken, WithMediaDelivery(config.DefaultMediaDeliveryConfig()))
+	song := writeMediaFile(t, filepath.Join(home, "Downloads"), "Akash.mp3", "fake-audio")
+	notes := writeMediaFile(t, filepath.Join(home, "Documents"), "notes.csv", "a,b\n")
+	secret := writeMediaFile(t, filepath.Join(home, ".orion"), "config.json", "x")
+	fake := &mediaFake{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	g, err := NewTelegramGateway(testToken, WithBaseURL(srv.URL), WithMediaDelivery(config.DefaultMediaDeliveryConfig()))
 	if err != nil {
 		t.Fatalf("NewTelegramGateway: %v", err)
 	}
-	want := map[string]bool{
-		resolveMediaDir(filepath.Join(home, "orion-media")): true,
-		resolveMediaDir(os.TempDir()):                       true,
+	if len(g.mediaAllow) != 0 {
+		t.Fatalf("default mediaAllow = %v, want empty (denylist-only, no default dirs)", g.mediaAllow)
 	}
-	if len(g.mediaAllow) != len(want) {
-		t.Fatalf("default mediaAllow = %v, want %v", g.mediaAllow, want)
+	reply := "Done.\nMEDIA:" + song + "\nMEDIA:" + notes + "\nMEDIA:" + secret + "\n"
+	cleaned, report := g.deliverMedia(context.Background(), 77, reply)
+	calls, _ := fake.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("server saw %d file calls, want 2 (Downloads + Documents sent, denylisted file refused)", len(calls))
 	}
-	for _, d := range g.mediaAllow {
-		if !want[d] {
-			t.Fatalf("default mediaAllow = %v, want %v", g.mediaAllow, want)
-		}
+	if calls[0].method != "sendAudio" || calls[0].filename != "Akash.mp3" {
+		t.Errorf("first call = %+v, want sendAudio Akash.mp3", calls[0])
+	}
+	if calls[1].method != "sendDocument" || calls[1].filename != "notes.csv" {
+		t.Errorf("second call = %+v, want sendDocument notes.csv", calls[1])
+	}
+	if strings.Contains(cleaned, "MEDIA:") {
+		t.Errorf("cleaned reply still contains a MEDIA: line: %q", cleaned)
+	}
+	if !strings.Contains(report, "📎 Sent Akash.mp3") {
+		t.Errorf("report = %q, want a 📎 Sent line for Akash.mp3", report)
+	}
+	if !strings.Contains(report, "📎 Sent notes.csv") {
+		t.Errorf("report = %q, want a 📎 Sent line for notes.csv", report)
+	}
+	if !strings.Contains(report, "that path is never sendable") {
+		t.Errorf("report = %q, want the denylist refusal for config.json", report)
 	}
 }
 

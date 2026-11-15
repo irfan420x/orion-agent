@@ -285,9 +285,9 @@ type DebugConfig struct {
 // in the agent's reply; see internal/messaging).
 //
 // Enabled turns extraction on (default true). AllowDirs lists the
-// directories files may be sent from; empty means the defaults
-// (~/orion-media and the OS temp dir). An explicitly set list
-// REPLACES the defaults. MaxFiles caps the files sent per reply
+// directories files may be sent from; empty means no restriction —
+// files may be sent from anywhere except the denylist. An
+// explicitly set list restricts delivery to those directories.
 // (default 5); MaxBytes caps one file's size (default 50 MiB, the
 // Bot API limit). Out-of-range limits are clamped by Resolve,
 // never rejected: a config file that sets an absurd value gets the

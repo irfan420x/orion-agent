@@ -13,8 +13,9 @@ package messaging
 // on the model reply BEFORE the footer is appended (see telegram.go).
 // Media delivery is not a tool: it has no Register/Classify/gate
 // entry and sends nothing the owner did not already have the agent
-// do — the risk is bounded by the denylist + allowlist + refusal
-// in validateMediaPath.
+// do — the risk is bounded by the denylist + refusal in
+// validateMediaPath (an explicitly configured media_allow_dirs
+// restricts delivery further).
 
 import (
 	"context"
@@ -210,8 +211,8 @@ func mediaPathDenied(resolved string) bool {
 }
 
 // displayMediaDir renders an allowlist dir for the refusal note:
-// a dir under the user's home shows with a ~ prefix, so the
-// defaults read "(~/orion-media, /tmp)".
+// a dir under the user's home shows with a ~ prefix, so an
+// explicitly configured list reads "(~/Downloads, /tmp)".
 func displayMediaDir(dir string) string {
 	home, err := os.UserHomeDir()
 	if err == nil && home != "" {
@@ -255,29 +256,25 @@ func resolveMediaDir(dir string) string {
 }
 
 // resolveMediaAllowDirs resolves the allowlist dirs for a gateway.
-// An explicitly set list REPLACES the defaults. The defaults are
-// ~/orion-media (the dedicated media dir next to the data dir) and
-// os.TempDir(). Deliberately NOT the daemon cwd: on the laptop the
-// unit runs with WorkingDirectory=%h, so the cwd is the whole home
-// and would make the allowlist vacuous (design Appendix C).
+// An explicitly set list RESTRICTS delivery to those dirs. With no
+// explicit list there is no allowlist at all: delivery is
+// denylist-only — any path that passes the denylist and size checks
+// may be sent, from anywhere on the machine. There is no default
+// dir list any more: the old [~/orion-media, /tmp] default was
+// removed by the user's order 2026-11-15 09:35 — the bot must be
+// able to send a file from anywhere on the laptop, not only from
+// specific folders. A list of only blank entries counts as no list.
 func resolveMediaAllowDirs(dirs []string) []string {
-	if len(dirs) > 0 {
-		out := make([]string, 0, len(dirs))
-		for _, d := range dirs {
-			if strings.TrimSpace(d) == "" {
-				continue
-			}
-			out = append(out, resolveMediaDir(d))
-		}
-		if len(out) > 0 {
-			return out
-		}
+	if len(dirs) == 0 {
+		return nil
 	}
-	var out []string
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		out = append(out, resolveMediaDir(filepath.Join(home, "orion-media")))
+	out := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		if strings.TrimSpace(d) == "" {
+			continue
+		}
+		out = append(out, resolveMediaDir(d))
 	}
-	out = append(out, resolveMediaDir(os.TempDir()))
 	return out
 }
 
@@ -292,7 +289,11 @@ func resolveMediaAllowDirs(dirs []string) []string {
 //     sockets or FIFOs)
 //  4. denylist on the resolved path (absolute, non-overridable)
 //  5. size against maxBytes (clamped to the 50 MiB Bot API limit)
-//  6. allowlist: the resolved path under a resolved allowlist dir
+//  6. allowlist, only when explicitly configured: an explicit
+//     media_allow_dirs restricts delivery to those dirs. With no
+//     explicit list the default is denylist-only — any path that
+//     passed the checks above may be sent, from anywhere on the
+//     machine.
 //
 // The first failing step wins and its reason is the one shown to
 // the user. Symlink resolution before the denylist is the whole
@@ -337,6 +338,11 @@ func validateMediaPath(path string, allowDirs []string, maxBytes int64) (resolve
 	}
 	if info.Size() > maxBytes {
 		return "", 0, "file is too large (" + formatMediaSize(info.Size()) + "; max " + formatMediaSize(maxBytes) + ")"
+	}
+	if len(allowDirs) == 0 {
+		// No explicit allowlist: denylist-only. Any path that
+		// passed the denylist and size checks above may be sent.
+		return resolvedPath, info.Size(), ""
 	}
 	for _, dir := range allowDirs {
 		if mediaWithin(resolvedPath, dir) {
