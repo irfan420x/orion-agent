@@ -101,6 +101,9 @@ import (
 //go:embed ground_atspi.py
 var atspiHelperSource string
 
+//go:embed ground_kwin.py
+var kwinHelperSource string
+
 func init() {
 	RegisterFactory("ground", func(deps ToolDeps) (Tool, error) {
 		return newGroundTool(), nil
@@ -119,16 +122,29 @@ const (
 	// which silently killed the helper and degraded the tool to
 	// vision_only (live 2026-11-15 20:31). 10 s keeps a bound
 	// against a hung walk while leaving headroom for heavier pages.
-	// This is the helper's own safety bound, not the tool's 3 s
-	// design time budget — the measured whole grounding is ~7.5 s,
-	// over that budget; see the fix report for the raise
-	// recommendation.
-	groundHelperTimeout      = 10 * time.Second
+	groundHelperTimeout = 10 * time.Second
+	// Ground time budget: 10 s (raised from the 3 s design target,
+	// 2026-11-15). Measured floor ~8.1 s: AT-SPI walk 5.44 s
+	// (D-Bus round-trip bound, ~5.8 ms/node on a 942-node tree),
+	// spectacle ~1.0 s, probe 0.36 s, KWin query ~0.1-0.5 s.
+	// Depth caps cannot help — the tree is wide, not deep. The
+	// budget is a design target, not an enforced timeout: the
+	// enforced bounds are groundHelperTimeout (10 s), the KWin
+	// helper timeout (half the budget, below), and the agent's
+	// 120 s step timeout. Grounding is a deliberate
+	// once-per-decision action, not a hot path.
+	groundTimeBudget = 10 * time.Second
+	// KWin helper timeout: half the ground time budget, so a KWin
+	// failure (no KWin, no journal, hung script) can never eat
+	// the whole budget — the grounding degrades to uncorrected
+	// instead. The query itself measured ~0.1 s (10/10 trials).
+	groundKWinTimeout        = groundTimeBudget / 2
 	groundDefaultMaxElements = 60
 	groundMaxMaxElements     = 200
 	groundSnapshotTTL        = 60 * time.Second
 	groundMaxSnapshots       = 3 // mirrors M1's last-3 image eviction
 	groundHelperFile         = "ground-atspi-helper.py"
+	groundKWinHelperFile     = "ground-kwin-helper.py"
 )
 
 // Ground rate limits (M1 screenshot discipline, plan §4.1).
@@ -169,14 +185,33 @@ type groundArgs struct {
 
 // groundSummary is the JSON text returned with the marked image.
 type groundSummary struct {
-	SnapshotID    string           `json:"snapshot_id"`
-	TakenAt       string           `json:"taken_at"`
-	Screen        groundScreen     `json:"screen"`
-	Region        *region          `json:"region,omitempty"`
-	FocusedWindow *groundWindowRef `json:"focused_window,omitempty"`
-	Elements      []groundElement  `json:"elements"`
-	Coverage      string           `json:"coverage"` // grounded | vision_only
-	WalkedNodes   int              `json:"walked_nodes,omitempty"`
+	SnapshotID    string            `json:"snapshot_id"`
+	TakenAt       string            `json:"taken_at"`
+	Screen        groundScreen      `json:"screen"`
+	Region        *region           `json:"region,omitempty"`
+	FocusedWindow *groundWindowRef  `json:"focused_window,omitempty"`
+	Elements      []groundElement   `json:"elements"`
+	Coverage      string            `json:"coverage"` // grounded | vision_only
+	WalkedNodes   int               `json:"walked_nodes,omitempty"`
+	Correction    *groundCorrection `json:"correction,omitempty"`
+}
+
+// groundCorrection records the KWin-measured per-window
+// coordinate correction applied to this grounding (F2): each
+// entry is a window whose AT-SPI coordinates were shifted by
+// (DX, DY) to match the compositor's true geometry. Absent when
+// the KWin query was unavailable — then the elements are raw
+// AT-SPI coordinates, uncorrected. A present correction with an
+// empty Windows list means KWin ran and found nothing to shift.
+type groundCorrection struct {
+	Source  string              `json:"source"` // always "kwin"
+	Windows []groundWindowShift `json:"windows"`
+}
+
+type groundWindowShift struct {
+	Title string `json:"title"`
+	DX    int    `json:"dx"`
+	DY    int    `json:"dy"`
 }
 
 // groundScreen is the grounded view: the returned image's
@@ -256,12 +291,128 @@ type atspiElement struct {
 	Y    int    `json:"y"`
 	W    int    `json:"w"`
 	H    int    `json:"h"`
+	// Win is the index of this element's window in
+	// atspiOutput.Windows (set by the helper). Nil means the
+	// helper did not tag it (older output): the element is left
+	// uncorrected — a missing signal never guesses a window.
+	Win *int `json:"win,omitempty"`
 	// Showing is the AT-SPI SHOWING state reported by the helper.
 	// Nil means the helper did not report it (state query failed):
 	// the element is kept — a missing signal never drops an
 	// element. False means hidden: the element stays in the tree
 	// (closed popups keep their nodes) but is not on screen.
 	Showing *bool `json:"showing,omitempty"`
+}
+
+// --- KWin helper output ---
+
+// kwinWindow is one window's true screen geometry from the KWin
+// compositor (frameGeometry is the outer frame; clientGeometry
+// the content area — identical for Wayland apps without
+// decorations). Caption is the window title, Class the app class
+// (e.g. "firefox-esr").
+type kwinWindow struct {
+	Caption   string `json:"caption"`
+	Class     string `json:"cls"`
+	Active    bool   `json:"active"`
+	Minimized bool   `json:"minimized"`
+	FG        [4]int `json:"fg"` // [x, y, w, h] frame geometry
+	CG        [4]int `json:"cg"` // [x, y, w, h] client geometry
+}
+
+type kwinOutput struct {
+	Windows []kwinWindow `json:"kwin_windows"`
+}
+
+// matchKWinWindows matches KWin's true geometries to the AT-SPI
+// windows and returns the per-window coordinate shift (KWin frame
+// minus AT-SPI box) for each matched window, keyed by the AT-SPI
+// window index. A window matches when exactly one KWin window has
+// the same title, a compatible app class, and the same size; the
+// shift is then a pure translation (the app reports
+// window-relative coordinates — Firefox's window at (0,0) while
+// KWin places it at (0,29)). Anything ambiguous or unmatched gets
+// no shift: an uncorrected element is never worse than a
+// wrongly-shifted one.
+//
+// The focused/active flags are deliberately NOT used for
+// matching: AT-SPI reported focused=false for the active Firefox
+// window (live 2026-11-15), so they are unreliable here.
+func matchKWinWindows(tree *atspiOutput, kwin []kwinWindow) map[int][2]int {
+	offsets := map[int][2]int{}
+	if tree == nil {
+		return offsets
+	}
+	for i, w := range tree.Windows {
+		var matches []kwinWindow
+		for _, kw := range kwin {
+			if w.Title != kw.Caption {
+				continue
+			}
+			if !kwinClassCompatible(w.App, kw.Class) {
+				continue
+			}
+			if w.W != kw.FG[2] || w.H != kw.FG[3] {
+				continue
+			}
+			matches = append(matches, kw)
+		}
+		if len(matches) != 1 {
+			continue
+		}
+		dx, dy := matches[0].FG[0]-w.X, matches[0].FG[1]-w.Y
+		offsets[i] = [2]int{dx, dy}
+	}
+	return offsets
+}
+
+// kwinClassCompatible reports whether an AT-SPI app name and a
+// KWin resource class name the same app: lowercased, equal, or
+// one a prefix of the other at a word boundary ("firefox" matches
+// "firefox-esr" — the next char is '-'; "fire" never matches
+// "firefox", and "firefox" never matches "firefoxesr").
+func kwinClassCompatible(app, class string) bool {
+	a, c := strings.ToLower(strings.TrimSpace(app)), strings.ToLower(strings.TrimSpace(class))
+	if a == "" || c == "" {
+		return false
+	}
+	if a == c {
+		return true
+	}
+	short, long := a, c
+	if len(c) < len(a) {
+		short, long = c, a
+	}
+	if !strings.HasPrefix(long, short) {
+		return false
+	}
+	next := long[len(short)]
+	return next == '-' || next == '_' || next == '.'
+}
+
+// applyWindowOffsets shifts every element (and window box) by its
+// window's matched offset, in place. Elements whose window index
+// is missing or unmatched are left untouched.
+func applyWindowOffsets(tree *atspiOutput, offsets map[int][2]int) {
+	if tree == nil || len(offsets) == 0 {
+		return
+	}
+	for i := range tree.Windows {
+		if off, ok := offsets[i]; ok {
+			tree.Windows[i].X += off[0]
+			tree.Windows[i].Y += off[1]
+		}
+	}
+	for i := range tree.Elements {
+		el := &tree.Elements[i]
+		if el.Win == nil {
+			continue
+		}
+		if off, ok := offsets[*el.Win]; ok {
+			el.X += off[0]
+			el.Y += off[1]
+		}
+	}
 }
 
 // --- snapshot registry (stale-refusal, design §5) ---
@@ -385,13 +536,15 @@ type groundTool struct {
 	// 0600 storage) is never duplicated here.
 	shot *screenshotTool
 
-	// Seams, overridable in tests. Defaults run the real helper.
-	execCmd     func(ctx context.Context, name string, args ...string) (string, error)
-	lookPath    func(name string) (string, error)
-	homeDir     func() (string, error)
-	now         func() time.Time
-	runHelper   func(ctx context.Context, helperPath string) ([]byte, error)
-	writeHelper func() (string, error)
+	// Seams, overridable in tests. Defaults run the real helpers.
+	execCmd         func(ctx context.Context, name string, args ...string) (string, error)
+	lookPath        func(name string) (string, error)
+	homeDir         func() (string, error)
+	now             func() time.Time
+	runHelper       func(ctx context.Context, helperPath string) ([]byte, error)
+	writeHelper     func() (string, error)
+	runKWinHelper   func(ctx context.Context, helperPath string) ([]byte, error)
+	writeKWinHelper func() (string, error)
 }
 
 func newGroundTool() *groundTool {
@@ -404,6 +557,8 @@ func newGroundTool() *groundTool {
 	t.execCmd = defaultExecCmd
 	t.runHelper = t.defaultRunHelper
 	t.writeHelper = t.defaultWriteHelper
+	t.runKWinHelper = t.defaultRunKWinHelper
+	t.writeKWinHelper = t.defaultWriteKWinHelper
 	return t
 }
 
@@ -548,6 +703,39 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		// vision_only, never a partial or faked element list.
 	}
 
+	// KWin geometry correction (F2): the compositor knows each
+	// window's true screen position; a Wayland client reports
+	// window-relative coordinates instead (Firefox's window at
+	// (0,0) while KWin places it at (0,29)), so the AT-SPI boxes
+	// sit ~29 px above the visible elements. The correction is
+	// measured fresh here, per window, from KWin's frameGeometry
+	// — never a hardcoded offset. A KWin failure (no KWin, no
+	// journal, timeout) leaves the tree uncorrected: the grounding
+	// still returns, with no correction field, rather than failing
+	// or faking coordinates.
+	var correction *groundCorrection
+	if tree != nil {
+		if kwinPath, werr := t.writeKWinHelper(); werr == nil {
+			if raw, rerr := t.runKWinHelper(ctx, kwinPath); rerr == nil {
+				var kout kwinOutput
+				if jerr := json.Unmarshal(raw, &kout); jerr == nil {
+					offsets := matchKWinWindows(tree, kout.Windows)
+					if len(offsets) > 0 {
+						correction = &groundCorrection{Source: "kwin", Windows: []groundWindowShift{}}
+						for i := range tree.Windows {
+							if off, ok := offsets[i]; ok && (off[0] != 0 || off[1] != 0) {
+								correction.Windows = append(correction.Windows, groundWindowShift{
+									Title: tree.Windows[i].Title, DX: off[0], DY: off[1],
+								})
+							}
+						}
+						applyWindowOffsets(tree, offsets)
+					}
+				}
+			}
+		}
+	}
+
 	// Sensitive-window refusal BEFORE grounding, on the AT-SPI
 	// window titles when there is a tree — AT-SPI sees native
 	// Wayland windows, which closes the xdotool gap the M1
@@ -622,6 +810,7 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		Region:      a.Region,
 		Elements:    []groundElement{},
 		WalkedNodes: walked,
+		Correction:  correction,
 	}
 	if tree != nil {
 		summary.Coverage = "grounded"
@@ -713,10 +902,24 @@ func (t *groundTool) probeHelper(ctx context.Context) bool {
 	return err == nil
 }
 
-// defaultWriteHelper writes the embedded helper to
+// defaultWriteHelper writes the embedded AT-SPI helper to
 // ~/.orion/ground-atspi-helper.py (0600, atomic temp+rename) and
 // returns its path. An identical existing file is left untouched.
 func (t *groundTool) defaultWriteHelper() (string, error) {
+	return t.writeEmbeddedHelper(groundHelperFile, atspiHelperSource)
+}
+
+// defaultWriteKWinHelper writes the embedded KWin helper to
+// ~/.orion/ground-kwin-helper.py (0600, atomic temp+rename) and
+// returns its path. Same shape as defaultWriteHelper.
+func (t *groundTool) defaultWriteKWinHelper() (string, error) {
+	return t.writeEmbeddedHelper(groundKWinHelperFile, kwinHelperSource)
+}
+
+// writeEmbeddedHelper installs one embedded helper script under
+// ~/.orion/ (0600, atomic temp+rename) and returns its path. An
+// identical existing file is left untouched.
+func (t *groundTool) writeEmbeddedHelper(file, source string) (string, error) {
 	home, err := t.homeDir()
 	if err != nil || home == "" {
 		return "", fmt.Errorf("cannot determine the home directory: %v", err)
@@ -725,28 +928,28 @@ func (t *groundTool) defaultWriteHelper() (string, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("cannot create %s: %v", dir, err)
 	}
-	path := filepath.Join(dir, groundHelperFile)
-	if cur, err := os.ReadFile(path); err == nil && string(cur) == atspiHelperSource {
+	path := filepath.Join(dir, file)
+	if cur, err := os.ReadFile(path); err == nil && string(cur) == source {
 		return path, nil
 	}
 	tmp, err := os.CreateTemp(dir, "ground-helper-*")
 	if err != nil {
-		return "", fmt.Errorf("cannot stage the AT-SPI helper: %v", err)
+		return "", fmt.Errorf("cannot stage the helper %s: %v", file, err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if _, err := tmp.WriteString(atspiHelperSource); err != nil {
+	if _, err := tmp.WriteString(source); err != nil {
 		tmp.Close()
-		return "", fmt.Errorf("cannot write the AT-SPI helper: %v", err)
+		return "", fmt.Errorf("cannot write the helper %s: %v", file, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("cannot write the AT-SPI helper: %v", err)
+		return "", fmt.Errorf("cannot write the helper %s: %v", file, err)
 	}
 	if err := os.Chmod(tmpName, 0600); err != nil {
-		return "", fmt.Errorf("cannot chmod the AT-SPI helper: %v", err)
+		return "", fmt.Errorf("cannot chmod the helper %s: %v", file, err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		return "", fmt.Errorf("cannot install the AT-SPI helper: %v", err)
+		return "", fmt.Errorf("cannot install the helper %s: %v", file, err)
 	}
 	return path, nil
 }
@@ -768,6 +971,25 @@ func (t *groundTool) defaultRunHelper(ctx context.Context, helperPath string) ([
 	}
 	if stdout.Len() == 0 {
 		return nil, fmt.Errorf("AT-SPI helper produced no output")
+	}
+	return stdout.Bytes(), nil
+}
+
+// defaultRunKWinHelper runs the KWin helper with the KWin timeout
+// and returns its stdout. Any failure (exit code, timeout, empty
+// output) is an error — the caller grounds uncorrected.
+func (t *groundTool) defaultRunKWinHelper(ctx context.Context, helperPath string) ([]byte, error) {
+	hctx, cancel := context.WithTimeout(ctx, groundKWinTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(hctx, "python3", helperPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("KWin helper failed: %v (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	}
+	if stdout.Len() == 0 {
+		return nil, fmt.Errorf("KWin helper produced no output")
 	}
 	return stdout.Bytes(), nil
 }

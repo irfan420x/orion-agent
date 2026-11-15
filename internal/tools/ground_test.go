@@ -34,6 +34,8 @@ type fakeGroundEnv struct {
 	captures int
 	helperOK bool   // runHelper succeeds
 	helper   string // canned helper JSON ("" = default tree)
+	kwinOK   bool   // runKWinHelper succeeds
+	kwin     string // canned KWin JSON
 }
 
 func groundTreeJSON() string {
@@ -85,6 +87,12 @@ func newFakeGroundEnv(t *testing.T) *fakeGroundEnv {
 			return []byte(env.helper), nil
 		}
 		return []byte(groundTreeJSON()), nil
+	}
+	tool.runKWinHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		if !env.kwinOK {
+			return nil, errors.New("fake KWin helper failure")
+		}
+		return []byte(env.kwin), nil
 	}
 	// The inner screenshot tool gets the same seams as the
 	// screenshot tests (same fake clock, same capture).
@@ -727,5 +735,272 @@ func TestGroundExecuteTextMatches(t *testing.T) {
 	}
 	if len(a.Elements) != len(b.Elements) || a.Coverage != b.Coverage {
 		t.Errorf("Execute vs ExecuteResult differ: %+v vs %+v", a, b)
+	}
+}
+
+// --- KWin geometry correction (F2) ---
+
+// groundTreeWithWinJSON is the GitHub login page with "win" tags:
+// window 0 is Firefox (0,0,1920,993), window 1 is Kate
+// (0,0,800,600). The Sign in button's AT-SPI centre is (960,540);
+// the visible centre is (960,569) — the +29 KWin correction.
+func groundTreeWithWinJSON() string {
+	return `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 993},
+		{"title": "Kate — notes.txt", "app": "Kate", "role": "frame", "focused": false, "x": 0, "y": 0, "w": 800, "h": 600}],
+	"elements": [
+		{"role": "button", "name": "Sign in", "x": 784, "y": 520, "w": 352, "h": 40, "win": 0, "showing": true},
+		{"role": "entry", "name": "Username or email address", "x": 784, "y": 383, "w": 352, "h": 40, "win": 0, "showing": true},
+		{"role": "entry", "name": "Notes field", "x": 100, "y": 100, "w": 200, "h": 30, "win": 1, "showing": true},
+		{"role": "entry", "name": "Untagged field", "x": 500, "y": 500, "w": 100, "h": 20, "showing": true}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 942}`
+}
+
+// kwinFirefoxJSON is KWin's true geometry for the two windows
+// above, as measured live (2026-11-15): Firefox's frame starts at
+// y=29, Kate's at y=0.
+func kwinFirefoxJSON() string {
+	return `{"kwin_windows": [
+		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]},
+		{"caption": "Kate — notes.txt", "cls": "kate", "active": false, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600]}]}`
+}
+
+func findGroundElement(t *testing.T, s groundSummary, name string) groundElement {
+	t.Helper()
+	for _, e := range s.Elements {
+		if e.Name == name {
+			return e
+		}
+	}
+	t.Fatalf("element %q not in summary: %+v", name, s.Elements)
+	return groundElement{}
+}
+
+func TestGroundKWinCorrectionFirefox(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	env.kwin = kwinFirefoxJSON()
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	// The Firefox window shifts +29 in Y; Kate stays put.
+	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 569 {
+		t.Errorf("Sign in centre = %+v, want (960,569)", got)
+	}
+	if got := findGroundElement(t, s, "Username or email address").Centre; got.X != 960 || got.Y != 432 {
+		t.Errorf("Username centre = %+v, want (960,432)", got)
+	}
+	if got := findGroundElement(t, s, "Notes field").Centre; got.X != 200 || got.Y != 115 {
+		t.Errorf("Notes field centre = %+v, want (200,115) (Kate, unshifted)", got)
+	}
+	if got := findGroundElement(t, s, "Untagged field").Centre; got.X != 550 || got.Y != 510 {
+		t.Errorf("Untagged field centre = %+v, want (550,510) (no win tag, unshifted)", got)
+	}
+	if s.Correction == nil {
+		t.Fatal("summary has no correction, want kwin +29")
+	}
+	if s.Correction.Source != "kwin" {
+		t.Errorf("correction source = %q, want kwin", s.Correction.Source)
+	}
+	if len(s.Correction.Windows) != 1 {
+		t.Fatalf("correction windows = %+v, want one Firefox entry", s.Correction.Windows)
+	}
+	w := s.Correction.Windows[0]
+	if w.Title != "Sign in to GitHub · GitHub — Mozilla Firefox" || w.DX != 0 || w.DY != 29 {
+		t.Errorf("correction window = %+v, want Firefox (0,29)", w)
+	}
+}
+
+func TestGroundKWinNoMatch(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	// No KWin window carries the Firefox title: no correction.
+	env.kwin = `{"kwin_windows": [{"caption": "Some other window", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
+		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
+	}
+	if s.Correction != nil {
+		t.Errorf("summary correction = %+v, want nil (no match)", s.Correction)
+	}
+}
+
+func TestGroundKWinAmbiguous(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	// Two KWin windows match the Firefox title+class+size: fail
+	// safe — no correction rather than a guessed one.
+	env.kwin = `{"kwin_windows": [
+		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]},
+		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": false, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
+		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
+	}
+	if s.Correction != nil {
+		t.Errorf("summary correction = %+v, want nil (ambiguous)", s.Correction)
+	}
+}
+
+func TestGroundKWinClassMismatch(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	// Same title and size, different app class: no correction.
+	env.kwin = `{"kwin_windows": [{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "chromium", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
+		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
+	}
+	if s.Correction != nil {
+		t.Errorf("summary correction = %+v, want nil (class mismatch)", s.Correction)
+	}
+}
+
+func TestGroundKWinFailure(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	// kwinOK stays false: the KWin helper is unavailable. The
+	// grounding still returns, uncorrected — never a failure.
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
+		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
+	}
+	if s.Correction != nil {
+		t.Errorf("summary correction = %+v, want nil (KWin unavailable)", s.Correction)
+	}
+	if s.Coverage != "grounded" {
+		t.Errorf("coverage = %q, want grounded", s.Coverage)
+	}
+}
+
+func TestGroundKWinHelperFile(t *testing.T) {
+	env := newFakeGroundEnv(t)
+	path, err := env.tool.writeKWinHelper()
+	if err != nil {
+		t.Fatalf("writeKWinHelper = %v", err)
+	}
+	if want := filepath.Join(env.home, ".orion", groundKWinHelperFile); path != want {
+		t.Errorf("helper path = %q, want %q", path, want)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat helper: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("helper mode = %o, want 0600", info.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read helper: %v", err)
+	}
+	if string(data) != kwinHelperSource {
+		t.Errorf("helper file differs from the embedded source")
+	}
+	// The KWin helper only reads geometry: it must never ask for
+	// window contents, and it must print the kwin_windows key.
+	if !strings.Contains(kwinHelperSource, "kwin_windows") {
+		t.Errorf("helper source does not print kwin_windows")
+	}
+	if !strings.Contains(kwinHelperSource, "frameGeometry") {
+		t.Errorf("helper source does not read frameGeometry")
+	}
+}
+
+func TestMatchKWinWindows(t *testing.T) {
+	tree := &atspiOutput{
+		Windows: []atspiWindow{
+			{Title: "Sign in to GitHub · GitHub — Mozilla Firefox", App: "Firefox", X: 0, Y: 0, W: 1920, H: 993},
+			{Title: "Kate — notes.txt", App: "Kate", X: 0, Y: 0, W: 800, H: 600},
+			{Title: "Hidden panel", App: "plasmashell", X: 0, Y: 0, W: 1920, H: 45},
+		},
+	}
+	kwin := []kwinWindow{
+		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", FG: [4]int{0, 29, 1920, 993}},
+		{Caption: "Kate — notes.txt", Class: "kate", FG: [4]int{0, 0, 800, 600}},
+		{Caption: "Hidden panel", Class: "plasmashell", FG: [4]int{0, 0, 1920, 45}},
+	}
+	offsets := matchKWinWindows(tree, kwin)
+	if got, want := offsets[0], [2]int{0, 29}; got != want {
+		t.Errorf("Firefox offset = %v, want %v", got, want)
+	}
+	if got, want := offsets[1], [2]int{0, 0}; got != want {
+		t.Errorf("Kate offset = %v, want %v", got, want)
+	}
+	if got, want := offsets[2], [2]int{0, 0}; got != want {
+		t.Errorf("plasmashell offset = %v, want %v", got, want)
+	}
+	// Size mismatch: same title and class, different height.
+	kwin[0].FG = [4]int{0, 29, 1920, 1050}
+	if offsets := matchKWinWindows(tree, kwin); len(offsets) != 2 {
+		t.Errorf("size mismatch still matched: %v", offsets)
+	}
+}
+
+func TestKWinClassCompatible(t *testing.T) {
+	cases := []struct {
+		app, class string
+		want       bool
+	}{
+		{"Firefox", "firefox-esr", true}, // prefix at '-', live case
+		{"firefox", "Firefox", true},     // case-insensitive
+		{"kate", "kate", true},           // equal
+		{"kate", "kate-wayland", true},   // prefix at '-'
+		{"Firefox", "chromium", false},   // different app
+		{"fire", "firefox", false},       // prefix, no word boundary
+		{"firefox", "firefoxesr", false}, // prefix, no separator
+		{"", "firefox", false},           // empty app
+		{"Firefox", "", false},           // empty class
+		{"plasmashell", "plasmashell", true},
+	}
+	for _, c := range cases {
+		if got := kwinClassCompatible(c.app, c.class); got != c.want {
+			t.Errorf("kwinClassCompatible(%q, %q) = %v, want %v", c.app, c.class, got, c.want)
+		}
+	}
+}
+
+func TestApplyWindowOffsets(t *testing.T) {
+	win0, win1 := 0, 1
+	tree := &atspiOutput{
+		Windows: []atspiWindow{
+			{Title: "Firefox", X: 0, Y: 0, W: 1920, H: 993},
+			{Title: "Kate", X: 0, Y: 0, W: 800, H: 600},
+		},
+		Elements: []atspiElement{
+			{Name: "Firefox element", X: 100, Y: 100, Win: &win0},
+			{Name: "Kate element", X: 100, Y: 100, Win: &win1},
+			{Name: "Untagged element", X: 100, Y: 100},
+		},
+	}
+	applyWindowOffsets(tree, map[int][2]int{0: {0, 29}})
+	if tree.Windows[0].Y != 29 {
+		t.Errorf("Firefox window Y = %d, want 29", tree.Windows[0].Y)
+	}
+	if tree.Windows[1].Y != 0 {
+		t.Errorf("Kate window Y = %d, want 0", tree.Windows[1].Y)
+	}
+	if tree.Elements[0].Y != 129 {
+		t.Errorf("Firefox element Y = %d, want 129", tree.Elements[0].Y)
+	}
+	if tree.Elements[1].Y != 100 {
+		t.Errorf("Kate element Y = %d, want 100", tree.Elements[1].Y)
+	}
+	if tree.Elements[2].Y != 100 {
+		t.Errorf("Untagged element Y = %d, want 100", tree.Elements[2].Y)
+	}
+	// An out-of-range window index is left alone, never panics.
+	win9 := 9
+	tree.Elements[0].Win = &win9
+	applyWindowOffsets(tree, map[int][2]int{0: {0, 29}})
+	if tree.Elements[0].Y != 129 {
+		t.Errorf("out-of-range win element Y = %d, want 129", tree.Elements[0].Y)
 	}
 }

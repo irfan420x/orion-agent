@@ -115,6 +115,42 @@ login page in Firefox (default run, 55 elements, walked 942).
   Suite: **1,810 tests total (1,806 pass, 0 fail, 4 skip), 24/24
   packages**.
 
+### Computer-use M2 fix — `ground` KWin geometry correction (F2)
+
+The last blocking M2 bug is fixed: AT-SPI web-content boxes sat
+~28 px above the visible elements because, on Wayland, a client
+reports window-relative coordinates — Firefox's window at (0,0)
+while the compositor places it at (0,29) — and the window's true
+screen position is nowhere in the AT-SPI tree. The correction is
+measured fresh on every grounding from KWin's true window geometry
+(a vendored `ground_kwin.py` helper: KWin scripting over D-Bus,
+10/10 live trials, ~0.1 s each, identical geometry every time) and
+applied per window, never a hardcoded offset.
+
+- **Matching (fail safe):** a KWin window matches an AT-SPI window
+  only on exact title + compatible app class (lowercased, equal or
+  a prefix at a word boundary — `firefox` matches `firefox-esr`)
+  + identical size, with exactly one candidate. Zero or multiple
+  matches → no correction for that window; a KWin failure (no
+  KWin, no journal, timeout) → the grounding returns uncorrected
+  rather than failing or faking coordinates. The focused/active
+  flags are deliberately not used for matching (AT-SPI reported
+  `focused=false` for the active Firefox window).
+- **Correction:** the AT-SPI helper now tags every element with
+  its window index (`"win"`); `matchKWinWindows` computes the
+  per-window shift (KWin frameGeometry minus AT-SPI box) and
+  `applyWindowOffsets` shifts elements and window boxes. The
+  summary gains a `correction` field (`source: "kwin"`, non-zero
+  per-window shifts; absent when KWin was unavailable).
+- **Timing budget 3 s → 10 s:** measured floor ~8.1 s (AT-SPI walk
+  5.44 s D-Bus-bound, spectacle ~1.0 s, probe 0.36 s, KWin
+  ~0.1–0.5 s; depth caps cannot help — the tree is wide, not
+  deep). The budget is a design target, not an enforced timeout:
+  the enforced bounds are the 10 s helper timeout, the 5 s KWin
+  timeout (half the budget), and the agent's 120 s step timeout.
+  Suite: **1,819 tests total (1,815 pass, 0 fail, 4 skip), 24/24
+  packages**.
+
 ### Computer-use M1 — screenshot + describe (no input)
 
 First computer-use tool (`screenshot`, pin 25, Safe): captures the

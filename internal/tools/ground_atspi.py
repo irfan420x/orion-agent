@@ -8,7 +8,9 @@ Walks the AT-SPI desktop tree and prints one JSON document:
 Reads ONLY name / role / screen extents. It NEVER reads text
 content or values — there is no get_text_iface anywhere in this
 file — so a password field's value is never touched: geometry +
-accessible name + role only.
+accessible name + role only. Each element also carries "win", the
+index of its window in the "windows" array, so the caller can
+apply per-window corrections (F2).
 
 Bounds (argv): depth cap, node cap. The Go caller passes both so a
 heavy app (big page, IDE) cannot hang the walk. On ANY failure the
@@ -49,7 +51,7 @@ def main():
     windows = []
     elements = []
 
-    def walk(acc, depth):
+    def walk(acc, depth, win_idx):
         if nodes[0] >= MAX_NODES or depth > MAX_DEPTH:
             return
         nodes[0] += 1
@@ -82,7 +84,7 @@ def main():
                 showing = None
             el = {"role": role, "name": name[:120],
                   "x": box[0], "y": box[1],
-                  "w": box[2], "h": box[3]}
+                  "w": box[2], "h": box[3], "win": win_idx}
             if showing is not None:
                 el["showing"] = showing
             # Name only (the accessible label, e.g. "Password");
@@ -98,8 +100,15 @@ def main():
             except Exception:
                 continue
             if child is not None:
-                walk(child, depth + 1)
+                walk(child, depth + 1, win_idx)
 
+    # win_idx is the index into the "windows" array below: every
+    # element carries the window it was walked from, so the Go side
+    # can apply a per-window coordinate correction (F2: a Wayland
+    # client reports window-relative coords, and only KWin knows the
+    # window's true screen position — the offset differs per
+    # window, so elements must be tagged, never blanket-shifted).
+    win_idx = -1
     for d in range(Atspi.get_desktop_count()):
         desk = Atspi.get_desktop(d)
         for i in range(desk.get_child_count()):
@@ -139,13 +148,14 @@ def main():
                 except Exception:
                     pass
                 box = extents(win)
+                win_idx += 1
                 windows.append({
                     "title": title[:200], "app": app_name, "role": wrole,
                     "focused": focused,
                     "x": box[0] if box else -1, "y": box[1] if box else -1,
                     "w": box[2] if box else -1, "h": box[3] if box else -1,
                 })
-                walk(win, 0)
+                walk(win, 0, win_idx)
 
     focused = None
     for w in windows:
