@@ -44,7 +44,12 @@
 //     gate-denied counts toward the job's consecutive failures
 //     (F-C8) instead of recording "ok" — a job that needs a
 //     gated tool backs off and is disabled after 5 such runs,
-//     instead of firing the same doomed turn forever. Safe tools
+//     instead of firing the same doomed turn forever. A turn
+//     refused for the chat's daily token budget (F-C7) is a third
+//     outcome: it records last_result "budget-exceeded", leaves
+//     the failure count alone, and waits for the UTC-midnight
+//     reset instead of the next cron slot — never "ok", never a
+//     failure, never a minutely re-fire until midnight. Safe tools
 //     still run freely in a scheduled turn, exactly as they do
 //     interactively.
 //   - Safety: a job that fails repeatedly backs off exponentially
@@ -382,7 +387,9 @@ func nextRunAfter(expr string, after time.Time) (time.Time, error) {
 // codebase has no per-chat timezone, so UTC is the stored and
 // displayed timezone (see the header). LastResult is a short
 // human-readable outcome of the last run/skip ("ok", "error: ...",
-// "skipped: ...", "disabled after 5 consecutive failures: ...").
+// "skipped: ...", "disabled after 5 consecutive failures: ...",
+// "budget-exceeded: ..." — the chat's daily token budget was
+// exhausted, see ErrBudgetExceeded).
 type CronJob struct {
 	ID                  string `json:"id"`
 	ChatID              int64  `json:"chat_id"`
@@ -1195,6 +1202,26 @@ type cronRunHandle struct {
 	cancel context.CancelFunc
 }
 
+// ErrBudgetExceeded is the sentinel a CronRunner returns when the
+// turn was refused because the chat's daily token budget is
+// exhausted (F-C7). The scheduler recognises it with errors.Is
+// and records a distinct budget-exceeded outcome (see runJob) —
+// it is NOT a generic turn failure, and it must not be confused
+// with the all-denied error (F-C8): a budget refusal can carry
+// stats with denied tool calls (a mid-turn abort), and it still
+// counts as budget-exceeded, never as all-denied. The runner
+// wraps it around the underlying budget error, e.g.
+// fmt.Errorf("%w: %v", tools.ErrBudgetExceeded, err).
+var ErrBudgetExceeded = errors.New("cron: daily token budget exceeded")
+
+// CronBudgetExceededResult is the last_result prefix the
+// scheduler records for a budget-exceeded run (F-C7). The daemon
+// reads it back to decide whether the chat was already told
+// about this job's budget exhaustion today, so the spelling is
+// part of the runner/scheduler contract — change it in both
+// places at once.
+const CronBudgetExceededResult = "budget-exceeded"
+
 // CronRunner runs one scheduled turn for job (a copy of the
 // stored job): it must run a normal agent turn for job.ChatID
 // with job.Prompt, marked UNATTENDED (F-C3) — the gate ignores
@@ -1206,10 +1233,16 @@ type cronRunHandle struct {
 // when EVERY tool call in the turn was gate-denied: that turn
 // accomplished nothing, so the runner returns an error (after
 // delivering the reply) and the scheduler counts it toward the
-// job's consecutive failures (F-C8). A non-nil error otherwise
-// means the turn itself failed, and counts toward the job's
-// consecutive failures. The runner runs OUTSIDE the store lock,
-// so it may take as long as a turn takes.
+// job's consecutive failures (F-C8). A turn refused for the
+// chat's daily token budget is a third case: the runner sends
+// the budget notice itself (at most once per job per day —
+// whether one already went out today is read back from the
+// job's stored last_result) and returns an error wrapping
+// ErrBudgetExceeded, so the scheduler records a distinct
+// budget-exceeded outcome instead of "ok" (F-C7). A non-nil
+// error otherwise means the turn itself failed, and counts
+// toward the job's consecutive failures. The runner runs OUTSIDE
+// the store lock, so it may take as long as a turn takes.
 type CronRunner func(ctx context.Context, job CronJob) (string, error)
 
 // CronScheduler fires due cron jobs. It scans the store's chat
@@ -2026,6 +2059,29 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 		runErr = fmt.Errorf("scheduled turn timed out after %s", timeout)
 	}
 	if runErr != nil {
+		if errors.Is(runErr, ErrBudgetExceeded) {
+			// F-C7: the chat's daily token budget is exhausted.
+			// This is neither a turn failure nor a success: the
+			// job did nothing wrong, and the budget resets at
+			// UTC midnight — so the outcome is distinct, the
+			// failure count is left exactly where it was
+			// (neither reset to 0, which would erase a real
+			// failure streak, nor incremented, which would
+			// disable a healthy job after 5 over-budget days),
+			// the job is never disabled on this outcome, and
+			// the next run waits for the reset instead of the
+			// next cron slot (a minutely job would otherwise
+			// re-fire every minute until midnight).
+			nextRun := nextBudgetRun(nextAfter, at)
+			return &cronOutcome{
+				jobID:    j.ID,
+				nextRun:  nextRun,
+				lastRun:  at,
+				lastRes:  fmt.Sprintf("%s: daily token budget reached; next run %s (UTC)", CronBudgetExceededResult, nextRun.Format(time.RFC3339)),
+				failures: j.ConsecutiveFailures,
+				disabled: false,
+			}
+		}
 		failures := j.ConsecutiveFailures + 1
 		disabled := failures >= cronMaxFailures
 		lastRes := fmt.Sprintf("error: %v", runErr)
@@ -2049,6 +2105,27 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 		failures: 0,
 		disabled: false,
 	}
+}
+
+// nextBudgetRun advances the next run past the daily budget
+// reset (F-C7): the next cron slot, unless that slot falls
+// before the next UTC midnight — then the reset itself. A
+// minutely job therefore waits until midnight instead of firing
+// every minute; a daily job keeps its next-day slot, which is
+// already past the reset.
+func nextBudgetRun(nextCron, now time.Time) time.Time {
+	if reset := nextUTCMidnight(now); reset.After(nextCron) {
+		return reset
+	}
+	return nextCron
+}
+
+// nextUTCMidnight returns the UTC midnight after at — the moment
+// the per-chat daily token budget resets (internal/budget
+// ResetAt computes the same instant from its own clock).
+func nextUTCMidnight(at time.Time) time.Time {
+	t := at.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, time.UTC)
 }
 
 // backoffNextRun applies the exponential failure backoff to the

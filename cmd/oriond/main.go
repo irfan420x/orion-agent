@@ -854,6 +854,22 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 //     counts it toward the job's consecutive failures and backs
 //     off / disables the job (F-C8) instead of recording "ok"
 //     for a turn that accomplished nothing.
+//   - A turn refused for the chat's daily token budget (F-C7)
+//     is a third outcome: the chat gets the budget notice at
+//     most ONCE per job per day (whether one already went out
+//     today is read back from the job's stored last_result, so
+//     the throttle survives a restart), and the turn returns an
+//     error wrapping tools.ErrBudgetExceeded so the scheduler
+//     records last_result "budget-exceeded", leaves
+//     ConsecutiveFailures alone, and advances NextRun past the
+//     UTC-midnight reset instead of the next cron slot — never
+//     "ok", never a failure, never a minutely re-fire until
+//     midnight. The budget branch returns before the all-denied
+//     check below: a budget refusal is not a gate-denial
+//     outcome, even when the aborted turn happened to deny every
+//     tool call it attempted (a mid-turn abort can carry such
+//     stats; a pre-flight refusal carries nil stats and zero
+//     tool calls, which is not all-denied either).
 //
 // The turn's token usage is recorded in the session like a user
 // turn's. A failed turn notifies the chat (best effort) and
@@ -878,8 +894,28 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 	defer cancel()
 	reply, stats, err := a.HandleStreamForChat(runCtx, job.ChatID, job.Prompt, nil)
 	if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
-		reply = fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err)
-		err = nil
+		// F-C7: the chat is over its daily token budget. This
+		// is NOT an "ok" run: the usage is still recorded (a
+		// mid-turn abort spent tokens before it was refused),
+		// the budget notice goes out at most once per job per
+		// day (see budgetNoticeAlreadySentToday), and the turn
+		// returns the typed budget signal — not a reply, not a
+		// generic failure — so the scheduler records
+		// last_result "budget-exceeded", leaves
+		// ConsecutiveFailures alone, and advances NextRun past
+		// the UTC-midnight reset. This returns before the
+		// all-denied check below, so a budget refusal is never
+		// counted as all-denied (F-C8 stays a separate path).
+		if stats != nil && store != nil {
+			_ = store.AddUsage(job.ChatID, stats.Tokens)
+		}
+		if !budgetNoticeAlreadySentToday(job, time.Now().UTC()) {
+			notice := fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err)
+			if sendErr := gw.SendMessage(ctx, job.ChatID, security.RedactSecrets(notice)); sendErr != nil {
+				fmt.Fprintf(os.Stderr, "oriond: cron: job %s hit the daily budget but the notice could not be sent to chat %d: %v\n", job.ID, job.ChatID, sendErr)
+			}
+		}
+		return "", fmt.Errorf("%w: %v", tools.ErrBudgetExceeded, err)
 	}
 	if stats != nil && store != nil {
 		_ = store.AddUsage(job.ChatID, stats.Tokens)
@@ -933,6 +969,34 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 // the scheduler can back off / disable the job (F-C8).
 func scheduledTurnAllDenied(stats *core.TurnStats) bool {
 	return stats != nil && stats.ToolCalls > 0 && stats.GateDeniedCalls == stats.ToolCalls
+}
+
+// budgetNoticeAlreadySentToday reports whether the chat was
+// already told about this job's budget exhaustion on the UTC day
+// `now` falls on (F-C7). The scheduler records a budget-exceeded
+// run in the job's LastResult, so a stored "budget-exceeded"
+// outcome from a run earlier today means the notice already went
+// out — a second firing today stays silent instead of spamming
+// the chat every minute until the UTC-midnight reset. The signal
+// is the persisted LastResult/LastRun pair, so it survives a
+// daemon restart: no in-memory flag to lose. A missing or
+// unparsable LastRun, or an outcome from another day, means no
+// notice today, so the notice goes out. A failed send is not
+// distinguishable from a delivered one in the stored state, so a
+// send failure may cost the chat that day's notice; the
+// LastResult still shows the budget outcome in /cron list.
+func budgetNoticeAlreadySentToday(job tools.CronJob, now time.Time) bool {
+	if !strings.HasPrefix(job.LastResult, tools.CronBudgetExceededResult) {
+		return false
+	}
+	if job.LastRun == "" {
+		return false
+	}
+	last, err := time.Parse(time.RFC3339, job.LastRun)
+	if err != nil {
+		return false
+	}
+	return last.UTC().Format("2006-01-02") == now.UTC().Format("2006-01-02")
 }
 
 // buildTurnHandler builds the PollStream TurnFunc: slash commands are
