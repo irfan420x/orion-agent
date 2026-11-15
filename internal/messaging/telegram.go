@@ -567,6 +567,57 @@ type TelegramGateway struct {
 	// pending question must not wait on the lock the asking turn
 	// holds). Created on demand.
 	replyChain *replyChain
+	// questions is the pending-question registry installed by
+	// SetQuestionRegistry (nil when none): the busy-input
+	// interrupt path cancels a pending question through it, so
+	// an interrupted run never leaves a live-looking question
+	// card behind. Guarded by mu, like the other installed
+	// hooks below.
+	questions *QuestionRegistry
+	// busyModeHook, when set via SetBusyModeFor, reads a chat's
+	// busy-input mode (nil = interrupt for every chat).
+	// planPendingHook, when set via SetPlanPendingFor, reports
+	// whether a plan decision is pending for a chat (nil =
+	// never pending). steerHook, when set via SetSteerFor,
+	// offers a message to a chat's running turn (nil = never
+	// accepted). steerLeftoversHook, when set via
+	// SetSteerLeftoversFor, collects a chat's unconsumed
+	// steered messages after a turn returns (nil = none).
+	// All four are installed before PollStream starts and never
+	// race polling; each accessor copies the hook under mu and
+	// calls it without holding mu. Guarded by mu.
+	busyModeHook       func(chatID int64) BusyMode
+	planPendingHook    func(chatID int64) bool
+	steerHook          func(chatID int64, text string, updateID int64) (accepted bool)
+	steerLeftoversHook func(chatID int64) []core.SteeredMessage
+	// busy tracks the running turn's busy state per chat (see
+	// busy.go): registered after the per-chat lock, removed
+	// when the turn's handler finishes. Guarded by busyMu.
+	busyMu sync.Mutex
+	busy   map[int64]*busyState
+	// busyStamps snapshots, at dispatch time, which busy state
+	// an update arrived during and which FIFO ticket orders its
+	// turn (see stampDispatch): the poll loop dispatches in
+	// batch order, but a handler goroutine can start late —
+	// after the run it arrived during ended and the next turn
+	// registered — and a lookup at handler time would then ack
+	// against the wrong (fresh) state, producing a spurious
+	// second ack, or take the per-chat lock ahead of an earlier
+	// update. The stamp pins the arrival-time state and the
+	// dispatch order; the ack is still coalesced per state (see
+	// sendBusyAck). Keyed by update id (never reused); entries
+	// are deleted when the handler reads them, and a dispatch
+	// that never spawns a handler (ctx cancelled at the
+	// semaphore) leaves at most one stale entry behind.
+	// Guarded by stampMu.
+	stampMu    sync.Mutex
+	busyStamps map[int64]dispatchStamp
+	// tickets holds one FIFO ticket queue per chat (see
+	// ticketQueue in busy.go): queued text turns run in
+	// dispatch order, not in goroutine-scheduling order.
+	// Guarded by ticketMu.
+	ticketMu sync.Mutex
+	tickets  map[int64]*ticketQueue
 	// logger, when set via WithLogger, receives polling-health notes:
 	// transient getUpdates failures and the recovery after them. It is
 	// nil by default (silent). Only redacted errors are ever passed
@@ -963,6 +1014,15 @@ func (g *TelegramGateway) SetCallbackHandler(h CallbackHandler) error {
 func (g *TelegramGateway) SetQuestionRegistry(q *QuestionRegistry) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.questions = q
+	// The registry edits cards through the gateway (see
+	// QuestionRegistry.CancelForChat): give it the pointer here,
+	// at the same install point, so the two can never drift.
+	if q != nil {
+		q.mu.Lock()
+		q.gw = g
+		q.mu.Unlock()
+	}
 	chain := g.replyChainForLocked()
 	if q == nil {
 		chain.setQuestion(nil)
@@ -2750,6 +2810,26 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				_ = g.SendMessage(ctx, upd.Message.Chat.ID, msg)
 			}
 		}()
+		// Dispatch-time stamp (busy state + FIFO ticket), read
+		// once and deleted here: the handler reads the stamp
+		// instead of looking the state up live (see
+		// stampDispatch). Every return path below — a consumed
+		// reply-chain answer, a steered message, a normal turn,
+		// a panic — releases the ticket, so the queue can never
+		// stall behind a handle that left without running a
+		// turn. The release runs in its own goroutine: it waits
+		// for this ticket's turn in the queue (an early return
+		// behind a still-running turn still releases in order),
+		// and the handle itself must not block on it — its
+		// semaphore slot and its offset confirmation (the defers
+		// above) are due at once, not after earlier queued turns
+		// finish.
+		stamp, stamped := g.dispatchStampFor(upd.UpdateID)
+		if stamped {
+			defer func() {
+				go g.ticketQueueFor(upd.Message.Chat.ID).release(stamp.ticket)
+			}()
+		}
 		// A text message that answers a pending ask_user_question
 		// in this chat is consumed as the answer (no turn, no
 		// lock): the turn that asked is blocked waiting for it and
@@ -2760,14 +2840,85 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		if g.replyChainTryAnswer(upd) {
 			return
 		}
-		lock := chatLock(upd.Message.Chat.ID)
+		chatID := upd.Message.Chat.ID
+
+		// Busy-input handling (before the per-chat lock): a new
+		// message arriving while this chat's turn runs gets an
+		// immediate ack and its mode's action (see busy.go).
+		// Commands never trigger it — they flow to the lock wait
+		// as before, so /stop and /busy sent mid-turn are not
+		// mistaken for new input.
+		//
+		// The check reads the spawn-time stamp, not a live
+		// lookup: the poll loop dispatches in batch order, but
+		// this handler goroutine can start late — after the run
+		// it arrived during ended and the next turn registered
+		// — and a live lookup would then ack against the fresh
+		// state. The stamp pins the arrival-time run; the ack is
+		// still coalesced per state (see sendBusyAck).
+		if !isBusyExemptCommand(upd.Message.Text) {
+			if st := stamp.busy; st != nil {
+				mode := g.busyModeFor(chatID)
+				switch mode {
+				case BusyModeQueue:
+					g.sendBusyAck(ctx, chatID, st, mode, false)
+				case BusyModeSteer:
+					if g.steerFor(chatID, upd.Message.Text, upd.UpdateID) {
+						// Accepted into the running turn: no
+						// turn of its own. The defers above
+						// (markDecided, semaphore release) still
+						// run, so the update is confirmed
+						// exactly once.
+						g.sendBusyAck(ctx, chatID, st, mode, false)
+						return
+					}
+					// Not accepted: the message queues behind
+					// the lock like any other turn, so the ack
+					// it gets is the queue ack — never the
+					// steer ack, which would claim it joined
+					// the run when it did not.
+					g.sendBusyAck(ctx, chatID, st, BusyModeQueue, false)
+				default: // interrupt
+					if g.planPendingFor(chatID) {
+						// Degraded to queue: cancelling a turn
+						// that is waiting on a plan decision
+						// would orphan the plan card, so the
+						// message waits behind it instead.
+						g.sendBusyAck(ctx, chatID, st, mode, true)
+					} else {
+						g.sendBusyAck(ctx, chatID, st, mode, false)
+						// Cancel a pending question FIRST, with
+						// a visible card edit: the run is about
+						// to be cancelled, and a cancelled wait
+						// otherwise leaves a live-looking card.
+						g.cancelQuestionForChat(chatID)
+						st.cancelRun()
+					}
+				}
+			}
+		}
+		// FIFO ticket (see ticketQueue): wait for this update's
+		// turn in the queue before taking the per-chat lock, so
+		// queued messages run in dispatch (arrival) order. The
+		// lock alone cannot guarantee that — two handles spawned
+		// in the same batch race to it in goroutine-scheduling
+		// order. The wait sits after the busy check on purpose:
+		// a reply-chain answer and a steered message never wait
+		// (they return above), and an interrupt cancels the
+		// running turn first, so the chain unblocks.
+		if stamped {
+			g.ticketQueueFor(chatID).wait(stamp.ticket)
+		}
+		lock := chatLock(chatID)
 		lock.Lock()
 		defer lock.Unlock()
 
-		chatID := upd.Message.Chat.ID
-
 		// --- terminal card state (this turn only) ---
 		var cardMu sync.Mutex
+		// busySt is this turn's busy-input state, registered
+		// just before the handler runs (below). emit reads it
+		// for the ack detail; it is nil until registration.
+		var busySt *busyState
 		card := &TerminalCard{}
 		var cardMsgID int64 // 0 until the card is created
 		var lastSent string // last rendered text successfully shown
@@ -2825,6 +2976,12 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				defer cardMu.Unlock()
 				card.Add(ev)
 			}()
+			// The busy ack's live detail (current tool, step)
+			// comes from the same events: a later arrival's ack
+			// names what the run is doing right now.
+			if busySt != nil {
+				busySt.noteEvent(ev)
+			}
 			// Tool-call and compaction events can change the card;
 			// other kinds (step/turn) are ignored by
 			// TerminalCard.Add anyway. A compaction event alone
@@ -2894,38 +3051,82 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// each tool exactly once. Callbacks carry no turn and
 		// get no update id.
 		handlerCtx = core.WithUpdateID(handlerCtx, upd.UpdateID)
-		reply, stats, herr := handler(handlerCtx, chatID, upd.Message.Text, emit)
-		stopTyping()
+		// The turn runs on its own cancellable context: a later
+		// arrival in interrupt mode cancels exactly this turn
+		// (the provider call aborts via the step ctx), and the
+		// daemon's turn handler suppresses the cancelled turn's
+		// reply, so the old turn sends nothing. The busy state
+		// is registered here — after the lock, just before the
+		// handler runs — and unregistered by defer when the
+		// handler finishes (LIFO: unregister runs before the
+		// lock is released, so the next turn never sees a stale
+		// state, and a new arrival in the microsecond teardown
+		// window sees no busy run and simply waits on the lock).
+		turnCtx, turnCancel := context.WithCancel(handlerCtx)
+		defer turnCancel()
+		busySt = g.registerBusy(chatID, turnCancel)
+		defer g.unregisterBusy(chatID, busySt)
+		reply, stats, herr := handler(turnCtx, chatID, upd.Message.Text, emit)
 
-		if herr != nil {
-			// A vision rejection renders as the honest
-			// cannot-see message, not the raw provider 400
-			// (F-A17-10); anything else keeps the redacted
-			// "Sorry, I hit an error" form.
-			msg := userErrorMessage(herr)
-			// Best effort: a failed apology must not kill polling.
-			_ = g.SendMessage(ctx, chatID, msg)
-			return
+		// sendTurnResult is the reply tail shared by the main
+		// turn and every leftover turn below: an error becomes
+		// the apology (a vision rejection renders as the honest
+		// cannot-see message, not the raw provider 400 —
+		// F-A17-10), an empty reply sends nothing, otherwise
+		// media delivery runs on the model reply BEFORE the
+		// footer is appended, so the footer can never contain a
+		// MEDIA tag and the tag strip can never eat footer text.
+		// The delivery report is appended AFTER the footer, so
+		// it is the last thing the user reads. The error path
+		// never gets media treatment: an apology must not
+		// trigger a file send. Best effort throughout: a failed
+		// send never fails the turn or polling.
+		sendTurnResult := func(reply string, stats *core.TurnStats, herr error) {
+			if herr != nil {
+				msg := userErrorMessage(herr)
+				_ = g.SendMessage(ctx, chatID, msg)
+				return
+			}
+			if reply == "" {
+				return
+			}
+			reply, report := g.deliverMedia(ctx, chatID, reply)
+			if stats != nil {
+				reply += "\n\n" + FormatFooter(stats)
+			}
+			if report != "" {
+				reply += "\n\n" + report
+			}
+			_ = g.SendMessage(ctx, chatID, reply)
 		}
-		if reply == "" {
-			return
+
+		// Steered leftovers: messages the run did not consume
+		// (they arrived during the final provider call, or after
+		// the step budget ran out) run here as fresh turns
+		// through the same handler, card and emit — before the
+		// main reply is sent and before stopTyping, so the
+		// typing indicator and card stay live for them.
+		// Re-drain after each leftover turn: steers can land
+		// during one. Each leftover carries its own update id
+		// in ctx (tool-journal identity) and runs on the
+		// PollStream ctx, not the turn ctx: an interrupt has
+		// already cancelled the turn ctx by the time leftovers
+		// run, and a leftover must not die with the run it
+		// outlived. The hook drains (returns and clears), so a
+		// well-behaved hook can never make this loop spin.
+		for {
+			leftovers := g.steerLeftoversFor(chatID)
+			if len(leftovers) == 0 {
+				break
+			}
+			for _, lf := range leftovers {
+				lfCtx := core.WithUpdateID(handlerCtx, lf.UpdateID)
+				lreply, lstats, lerr := handler(lfCtx, chatID, lf.Text, emit)
+				sendTurnResult(lreply, lstats, lerr)
+			}
 		}
-		// Media delivery runs on the model reply BEFORE the footer
-		// is appended, so the footer can never contain a MEDIA tag
-		// and the tag strip can never eat footer text. The delivery
-		// report is appended AFTER the footer, so it is the last
-		// thing the user reads. The error path above (herr != nil)
-		// never gets media treatment: an apology must not trigger
-		// a file send.
-		reply, report := g.deliverMedia(ctx, chatID, reply)
-		if stats != nil {
-			reply += "\n\n" + FormatFooter(stats)
-		}
-		if report != "" {
-			reply += "\n\n" + report
-		}
-		// Best effort: a failed reply must not kill polling.
-		_ = g.SendMessage(ctx, chatID, reply)
+		stopTyping()
+		sendTurnResult(reply, stats, herr)
 	}
 
 	// handleCallback answers one callback query (an inline-keyboard
@@ -3339,6 +3540,21 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				unmarkInFlight(upd.UpdateID)
 				return false
 			}
+			// Busy-input snapshot + FIFO ticket (see
+			// stampDispatch): record which run, if any, this
+			// update arrived during, and the ticket that orders
+			// its turn behind earlier updates from this chat.
+			// The handler reads the stamp instead of looking
+			// the state up live, so a late-starting handler
+			// cannot ack against a newer turn's fresh state or
+			// take the lock ahead of an earlier update. Taken
+			// HERE, after the in-flight claim and the semaphore
+			// acquisition — a re-fetched in-flight update (or a
+			// dispatch aborted at the semaphore by ctx
+			// cancellation) never spawns a handle, and a ticket
+			// taken for it would never be released, stalling
+			// the queue behind a handle that does not exist.
+			g.stampDispatch(upd.UpdateID, upd.Message.Chat.ID)
 			go handle(upd)
 			// No markDecided here: the update is confirmed only
 			// when handle completes (its defer, F-A8-2).

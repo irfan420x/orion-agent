@@ -101,6 +101,12 @@ type QuestionRegistry struct {
 	mu      sync.Mutex
 	m       map[string]*pendingQuestion
 	ownerID int64
+	// gw is the gateway the registry edits cards through (the
+	// cancel edit in CancelForChat). Set by
+	// TelegramGateway.SetQuestionRegistry when the registry is
+	// installed; nil until then (CancelForChat still settles,
+	// it just has nowhere to send the edit).
+	gw *TelegramGateway
 }
 
 // NewQuestionRegistry returns an empty question registry. ownerID
@@ -193,6 +199,68 @@ func (r *QuestionRegistry) PendingCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.m)
+}
+
+// questionCancelledText is the visible card edit when a pending
+// question is cancelled because a new message interrupted the run
+// that asked it. The keyboard is removed with the edit, so nobody
+// can tap a dead button afterwards.
+const questionCancelledText = "❓ Question: cancelled — the run was interrupted."
+
+// CancelForChat cancels the pending question for chatID (if any):
+// it settles the question through the single-winner settle, so the
+// waiting Ask wakes with its context error, and edits the card in
+// place to say the run was interrupted, with the keyboard removed.
+// It reports true only when it won the settle (a question was
+// actually cancelled). When Ask's own cancellation or timer branch
+// won first, it returns false and edits nothing — the card already
+// shows that outcome (or the expiry edit).
+func (r *QuestionRegistry) CancelForChat(chatID int64) bool {
+	if r == nil {
+		return false
+	}
+	p, ok := r.PendingForChat(chatID)
+	if !ok {
+		return false
+	}
+	if !r.settle(p, nil) {
+		return false
+	}
+	// Edit in the background (like expireEdit): the caller is
+	// mid-dispatch and must not block on Telegram.
+	go r.cancelEdit(p)
+	return true
+}
+
+// cancelEdit edits a cancelled question's card: text replaced and
+// keyboard REMOVED. Best-effort: a failed edit is logged, never
+// fatal. The message id is recorded by Ask after the send returns,
+// and a fast interrupt can land before that write, so the edit
+// waits briefly for the id (bounded, 1s) like the typed-reply
+// interceptor does.
+func (r *QuestionRegistry) cancelEdit(p *pendingQuestion) {
+	if r == nil || p == nil {
+		return
+	}
+	r.mu.Lock()
+	gw := r.gw
+	r.mu.Unlock()
+	if gw == nil {
+		return
+	}
+	msgID := r.msgID(p)
+	for i := 0; i < 50 && msgID == 0; i++ {
+		time.Sleep(20 * time.Millisecond)
+		msgID = r.msgID(p)
+	}
+	if msgID == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := gw.EditMessageTextMarkup(ctx, p.chatID, msgID, questionCancelledText, InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}); err != nil {
+		fmt.Fprintf(os.Stderr, "question: chat %d question %s cancel edit failed: %v\n", p.chatID, p.id, err)
+	}
 }
 
 // canAnswer reports whether senderID may answer p: the requester

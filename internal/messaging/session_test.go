@@ -153,3 +153,52 @@ func TestSessionStoreLeavesNoTempFiles(t *testing.T) {
 		t.Errorf("sessions dir = %v, want only [sessions.json]", names)
 	}
 }
+
+// TestSessionStoreBusyModeRoundTrip: the busy-input mode survives a
+// reload from disk, and a chat with no stored mode reads as the
+// default (interrupt).
+func TestSessionStoreBusyModeRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+	store := NewSessionStore(path, true)
+	if got := store.BusyMode(42); got != BusyModeInterrupt {
+		t.Errorf("unstored BusyMode = %v, want interrupt", got)
+	}
+	if err := store.SetBusyMode(42, BusyModeQueue); err != nil {
+		t.Fatalf("SetBusyMode: %v", err)
+	}
+	if err := store.SetBusyMode(7, BusyModeSteer); err != nil {
+		t.Fatalf("SetBusyMode: %v", err)
+	}
+	reloaded := NewSessionStore(path, true)
+	if err := reloaded.LoadError(); err != nil {
+		t.Fatalf("reload LoadError: %v", err)
+	}
+	if got := reloaded.BusyMode(42); got != BusyModeQueue {
+		t.Errorf("reloaded BusyMode(42) = %v, want queue", got)
+	}
+	if got := reloaded.BusyMode(7); got != BusyModeSteer {
+		t.Errorf("reloaded BusyMode(7) = %v, want steer", got)
+	}
+	if got := reloaded.BusyMode(99); got != BusyModeInterrupt {
+		t.Errorf("reloaded BusyMode(99) = %v, want interrupt (default)", got)
+	}
+}
+
+// TestSessionStoreBusyModeUnknownValueIsInterrupt: a hand-edited or
+// corrupt stored value reads as the default instead of crashing or
+// picking a surprising mode.
+func TestSessionStoreBusyModeUnknownValueIsInterrupt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"sessions":{"42":{"chat_id":42,"busy_mode":"sideways"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewSessionStore(path, true)
+	if err := store.LoadError(); err != nil {
+		t.Fatalf("LoadError: %v", err)
+	}
+	if got := store.BusyMode(42); got != BusyModeInterrupt {
+		t.Errorf("unknown stored BusyMode = %v, want interrupt", got)
+	}
+}

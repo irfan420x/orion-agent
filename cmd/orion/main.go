@@ -1070,6 +1070,14 @@ func newRulesCommandEnv(a *app.App) *messaging.CommandEnv {
 			}
 			return g.Rules().SetForChat(chatID, tool, action)
 		},
+		// Busy input (/busy) has no store in this entrypoint (the
+		// CLI loops are turn-only — see daemonTurnHandler): the
+		// mode reads as the default, and setting it reports
+		// unavailability instead of pretending to persist.
+		BusyMode: func(chatID int64) messaging.BusyMode { return messaging.BusyModeInterrupt },
+		SetBusyMode: func(chatID int64, mode messaging.BusyMode) error {
+			return errors.New("busy mode is unavailable in this entrypoint (use oriond)")
+		},
 	}
 }
 

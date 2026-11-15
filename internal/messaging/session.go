@@ -39,6 +39,12 @@ type Session struct {
 	// non-command messages from this chat get a paused reply.
 	// Per chat (P1-O3) and persisted.
 	Paused bool `json:"paused,omitempty"`
+	// BusyMode is this chat's busy-input mode (/busy): how a new
+	// message is handled while a turn is already running for
+	// the chat ("interrupt", "queue", or "steer"). "" means the
+	// default (interrupt); an unknown stored value also reads
+	// as interrupt, never crashes. Persisted.
+	BusyMode string `json:"busy_mode,omitempty"`
 	// TotalTokens and Turns accumulate finished turns for this chat.
 	TotalTokens int `json:"total_tokens"`
 	Turns       int `json:"turns"`
@@ -318,6 +324,31 @@ func (s *SessionStore) IsPaused(chatID int64) bool {
 		return sess.Paused
 	}
 	return false
+}
+
+// BusyMode reports a chat's busy-input mode: how a new message is
+// handled while a turn is already running for the chat. A chat
+// with no stored session, an empty value, or an unknown value
+// reads as the default (interrupt) — a corrupt or hand-edited
+// sessions file must never crash the gateway or pick a surprising
+// mode.
+func (s *SessionStore) BusyMode(chatID int64) BusyMode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sess, ok := s.sessions[chatID]; ok && sess != nil {
+		if mode, err := ParseBusyMode(sess.BusyMode); err == nil {
+			return mode
+		}
+	}
+	return BusyModeInterrupt
+}
+
+// SetBusyMode sets a chat's busy-input mode and persists it.
+func (s *SessionStore) SetBusyMode(chatID int64, mode BusyMode) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionLocked(chatID).BusyMode = mode.String()
+	return s.saveLocked()
 }
 
 // Totals sums TotalTokens and Turns across all chats (daemon-wide

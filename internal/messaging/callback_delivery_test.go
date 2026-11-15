@@ -69,10 +69,11 @@ type queueSent struct {
 
 // queueEdit is one editMessageText call the fake recorded.
 type queueEdit struct {
-	ChatID  int64  `json:"chat_id"`
-	MsgID   int64  `json:"message_id"`
-	Text    string `json:"text"`
-	HasKeys bool   // the edit carried a reply_markup (empty keyboard)
+	ChatID   int64  `json:"chat_id"`
+	MsgID    int64  `json:"message_id"`
+	Text     string `json:"text"`
+	HasKeys  bool   // the edit carried a reply_markup (empty keyboard)
+	Keyboard string // raw reply_markup JSON, "" when none was sent
 }
 
 func newQueueFake() *queueFake { return &queueFake{} }
@@ -146,6 +147,7 @@ func (f *queueFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(body, &raw)
 		e.HasKeys = len(raw.ReplyMarkup) > 0
+		e.Keyboard = string(raw.ReplyMarkup)
 		f.edits = append(f.edits, e)
 		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	case strings.HasSuffix(r.URL.Path, "/sendChatAction"):

@@ -507,6 +507,24 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "oriond: warning: setMyCommands failed (the / menu will be stale): %v\n", err)
 	}
 	turnFn := buildTurnHandler(a, store, registry, env, ownerID, username)
+	// Busy-input hooks (see internal/messaging/busy.go): the
+	// gateway reads the chat's mode from the session store,
+	// degrades an interrupt to queue while a plan decision is
+	// pending, and steers through the app. The plan probe calls
+	// PlanModeBlocks on a destructive tool name ("shell_exec"):
+	// resolveBucket reads the chat from the approval context,
+	// so the probe ctx carries this chat and no sender. All
+	// four hooks are installed before PollStream starts.
+	gw.SetBusyModeFor(func(chatID int64) messaging.BusyMode { return store.BusyMode(chatID) })
+	gw.SetPlanPendingFor(func(chatID int64) bool {
+		ctx := permissions.WithApprovalContext(context.Background(), chatID, 0)
+		blocked, _ := a.Tools.PlanModeBlocks(ctx, "shell_exec")
+		return blocked
+	})
+	gw.SetSteerFor(func(chatID int64, text string, updateID int64) bool {
+		return a.SteerTurn(chatID, text, updateID)
+	})
+	gw.SetSteerLeftoversFor(a.DrainSteeredLeftovers)
 
 	pollErr := make(chan error, 1)
 	go func() { pollErr <- gw.PollStream(ctx, turnFn) }()
@@ -1029,9 +1047,13 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 			}
 			return fmt.Sprintf("Chat ID: %d\nBot: @%s\nAllowlisted: %s\nRole: %s", chatID, name, allowlisted, role)
 		},
-		SetFooter:  store.SetFooter,
-		MemoryInfo: a.MemorySummary,
-		ForgetFact: a.ForgetFact,
+		SetFooter: store.SetFooter,
+		// Busy input (/busy): the mode is per chat and persisted
+		// in the session store, like the footer preference.
+		BusyMode:    store.BusyMode,
+		SetBusyMode: store.SetBusyMode,
+		MemoryInfo:  a.MemorySummary,
+		ForgetFact:  a.ForgetFact,
 		// Memory v2: typed memories, session memory, and the
 		// /compress variant that draws on session memory. The App
 		// methods degrade gracefully when the typed layer is

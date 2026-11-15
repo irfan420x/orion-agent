@@ -186,6 +186,18 @@ type Agent struct {
 	// at the start of every run and only touched while runMu is
 	// held, so it needs no lock of its own.
 	journalOcc map[string]int
+	// pendingSteer holds user messages steered into the running
+	// turn (busy-input mode "steer"): Steer appends while a run
+	// holds runMu, the loop drains at the top of each step, and
+	// DrainPendingSteer returns whatever is left when the run
+	// ends, so a steered message is either consumed by the run
+	// or returned to the caller — never silently lost.
+	// steerMu guards it; the list is only ever appended by
+	// Steer (outside runMu) and drained by the loop (holding
+	// runMu) or by DrainPendingSteer (never holding runMu, so
+	// Steer can never deadlock against a drain).
+	steerMu      sync.Mutex
+	pendingSteer []SteeredMessage
 	// transcript is the per-session JSONL transcript (see
 	// compact.go): every message stored in memory is also
 	// appended there. Nil means no transcript is wired.
@@ -557,6 +569,71 @@ func (a *Agent) HistoryBudget() int {
 	return a.maxHistoryTokens()
 }
 
+// SteeredMessage is one user message steered into a running turn
+// (busy-input mode "steer"). Text is the message; UpdateID is the
+// Telegram update it arrived on, so a leftover turn replays it with
+// the right update id in its context (tool-journal identity).
+type SteeredMessage struct {
+	Text     string
+	UpdateID int64
+}
+
+// Steer appends text to the running turn's pending-steer list and
+// reports true — iff a run is currently active. Activity is probed
+// with runMu.TryLock: a run holds runMu for its whole duration, so
+// a failed lock means a run is active and the message is queued
+// for its next step boundary; a successful lock means no run is
+// active, the lock is released at once, and the caller must handle
+// the message itself (as a fresh turn). Steer never blocks on a
+// run: it holds steerMu only, never runMu.
+func (a *Agent) Steer(text string, updateID int64) bool {
+	if a == nil {
+		return false
+	}
+	if a.runMu.TryLock() {
+		// No run active: nothing to steer into.
+		a.runMu.Unlock()
+		return false
+	}
+	a.steerMu.Lock()
+	defer a.steerMu.Unlock()
+	a.pendingSteer = append(a.pendingSteer, SteeredMessage{Text: text, UpdateID: updateID})
+	return true
+}
+
+// DrainPendingSteer returns every steered message still pending and
+// clears the list. The run loop drains at each step boundary, so
+// what is left here arrived too late for the loop — during the
+// final provider call, or after the step budget ran out — and the
+// caller (the gateway) must run it as a fresh turn instead. A
+// nil agent returns nil.
+func (a *Agent) DrainPendingSteer() []SteeredMessage {
+	if a == nil {
+		return nil
+	}
+	a.steerMu.Lock()
+	defer a.steerMu.Unlock()
+	if len(a.pendingSteer) == 0 {
+		return nil
+	}
+	out := a.pendingSteer
+	a.pendingSteer = nil
+	return out
+}
+
+// drainSteerForStep pulls the pending steered messages into the
+// run's in-flight transcript: each becomes a user message the next
+// provider call sees, recorded in history like any user message.
+// Callers hold runMu (the loop), so no other run can interleave.
+func (a *Agent) drainSteerForStep(messages *[]model.Message) {
+	steered := a.DrainPendingSteer()
+	for _, sm := range steered {
+		m := model.Message{Role: "user", Content: sm.Text}
+		*messages = append(*messages, m)
+		a.recordMessage(m)
+	}
+}
+
 // Run executes one user turn: it sends the user input (with system prompt
 // and recent memory) to the provider, executes any requested tool calls,
 // feeds the results back to the model, and repeats until the model answers
@@ -825,6 +902,17 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 			finishTurn(rerr)
 			return "", rerr
 		}
+
+		// Steered messages join the run at the step boundary:
+		// anything queued since the last step becomes a user
+		// message in the next provider request (and in history).
+		// A steer that lands during the FINAL provider call has
+		// no next boundary — it stays pending, and
+		// DrainPendingSteer returns it to the caller after the
+		// run, which runs it as a fresh turn instead of dropping
+		// it (the no-loss invariant on Steer: consumed by the
+		// run, or returned by DrainPendingSteer).
+		a.drainSteerForStep(&messages)
 
 		// One provider call per step, under its own timeout. The
 		// step timeout is released as soon as the provider call

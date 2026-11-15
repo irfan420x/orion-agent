@@ -276,12 +276,12 @@ func TestSkillsReloadCommandUnwired(t *testing.T) {
 func TestRegistryCountsAndMenu(t *testing.T) {
 	s := newStubBudgetEnv()
 	r := DefaultRegistry(s.env)
-	if got := len(r.Commands()); got != 23 {
-		t.Errorf("registry has %d commands, want 23 (19 + budget + বাজেট + skills + rules)", got)
+	if got := len(r.Commands()); got != 24 {
+		t.Errorf("registry has %d commands, want 24 (19 + budget + বাজেট + skills + rules + busy)", got)
 	}
 	// /help lists the new commands, including the Bengali alias.
 	reply := dispatchBudget(t, s, nil, "/help")
-	for _, want := range []string{"/budget", "/বাজেট", "/skills"} {
+	for _, want := range []string{"/budget", "/বাজেট", "/skills", "/busy"} {
 		if !strings.Contains(reply, want) {
 			t.Errorf("/help missing %s:\n%s", want, reply)
 		}
@@ -300,8 +300,8 @@ func TestRegistryCountsAndMenu(t *testing.T) {
 	// names the Bot API rejects, so both the absolute count and
 	// the relation to the registry are pinned, plus the dropped
 	// set itself (computed as the difference, not assumed).
-	if got := len(r.BotCommands()); got != 22 {
-		t.Errorf("BotCommands (Telegram \"/\" menu) has %d commands, want 22 (23 registered minus the Bengali alias /বাজেট, which the Bot API rejects)", got)
+	if got := len(r.BotCommands()); got != 23 {
+		t.Errorf("BotCommands (Telegram \"/\" menu) has %d commands, want 23 (24 registered minus the Bengali alias /বাজেট, which the Bot API rejects)", got)
 	}
 	if got, want := len(r.BotCommands()), len(r.Commands())-1; got != want {
 		t.Errorf("BotCommands has %d commands, want len(Commands())-1 = %d (exactly one registered name must be dropped for the menu)", got, want)

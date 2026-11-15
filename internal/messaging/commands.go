@@ -112,6 +112,16 @@ type CommandEnv struct {
 	// StopRun cancels the live turn for the chat; false when nothing
 	// was running.
 	StopRun func(chatID int64) bool
+	// BusyMode reports a chat's busy-input mode: how a new message
+	// is handled while a turn is already running for the chat
+	// (interrupt, queue, or steer). Nil in hand-built envs, where
+	// /busy reports the default (interrupt) instead of guessing.
+	BusyMode func(chatID int64) BusyMode
+	// SetBusyMode persists a chat's busy-input mode (survives a
+	// daemon restart). Nil in hand-built envs, where /busy
+	// reports that setting the mode is unavailable. The daemon
+	// wires it to the session store.
+	SetBusyMode func(chatID int64, mode BusyMode) error
 	// Undo removes the last n user turns from memory and returns
 	// their texts.
 	Undo func(chatID int64, n int) ([]string, error)
@@ -692,7 +702,50 @@ func skillsReloadHandler(ctx context.Context, env *CommandEnv, args string) (str
 	return fmt.Sprintf("✅ Reloaded %d skills from the skills directory.", loaded), nil
 }
 
-// DefaultRegistry returns a registry with the 23 core commands. env
+// busyHandler implements /busy: no argument shows the current mode
+// and the three modes; an argument sets it (persisted via
+// SetBusyMode, so it survives restarts). Bad input is a reply, not
+// an error, per the file's convention.
+func busyHandler(ctx context.Context, env *CommandEnv, args string) (string, error) {
+	mode := BusyModeInterrupt
+	if env.BusyMode != nil {
+		mode = env.BusyMode(env.ChatID)
+	}
+	arg := ""
+	if fields := strings.Fields(args); len(fields) > 0 {
+		arg = fields[0]
+	}
+	if arg == "" {
+		return fmt.Sprintf("📨 Busy input mode: %s\n\n"+
+			"While a turn runs, a new message from this chat is handled this way:\n"+
+			"• interrupt — redirect the current run to your new message (default)\n"+
+			"• queue — run your message after the current task finishes\n"+
+			"• steer — inject your message into the current run, after the next step\n\n"+
+			"Change with /busy queue, /busy steer, or /busy interrupt.", mode), nil
+	}
+	newMode, err := ParseBusyMode(arg)
+	if err != nil {
+		return "Usage: /busy [interrupt|queue|steer] — /busy with no argument shows the current mode.", nil
+	}
+	if env.SetBusyMode == nil {
+		return "Setting the busy mode is unavailable (not wired).", nil
+	}
+	if err := env.SetBusyMode(env.ChatID, newMode); err != nil {
+		return fmt.Sprintf("❌ Could not set the busy mode: %v", err), nil
+	}
+	var what string
+	switch newMode {
+	case BusyModeQueue:
+		what = "wait until the current task finishes"
+	case BusyModeSteer:
+		what = "join the current run after the next step"
+	default:
+		what = "redirect the current run to them"
+	}
+	return fmt.Sprintf("✅ Busy input mode set to %s for this chat. New messages while a turn runs will %s.", newMode, what), nil
+}
+
+// DefaultRegistry returns a registry with the 24 core commands. env
 // is captured by the handlers; /help closes over the registry itself
 // so its list can never go stale.
 func DefaultRegistry(env *CommandEnv) *Registry {
@@ -891,6 +944,15 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 		Name:        "বাজেট",
 		Description: "বাজেট দেখুন বা বদলান (owner-only; /budget-এর বাংলা নাম)",
 		Handler:     budgetHandler,
+	})
+
+	// /busy is Orion's busy-input knob (see busy.go): how a new
+	// message is handled while a turn is already running for the
+	// chat. It is per chat and persisted, like /footer.
+	r.Register(Command{
+		Name:        "busy",
+		Description: "Show or set how new messages are handled while a turn runs (interrupt/queue/steer)",
+		Handler:     busyHandler,
 	})
 
 	r.Register(Command{
