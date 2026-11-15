@@ -297,6 +297,21 @@ func newTestAgent(t *testing.T, cfg *config.Config, p model.Provider, reg *tools
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
+	// Hermeticity (2026-11-15): NewAgent loads the personality from
+	// cfg.DataDir, and testConfig uses config.Default(), whose DataDir
+	// is the machine's live ~/.orion — so a test agent on the laptop
+	// picked up the user's 1,771-byte personality.md (system prompt
+	// 1423 tokens) while the VM fell back to the built-in default
+	// (1123 tokens), and the token-budget assertion in
+	// TestRunContinuesAfterMultiMBToolResult diverged by machine
+	// (1533 vs the 1500 budget on the laptop, passing on the VM).
+	// Pin the built-in default whenever the test did not point the
+	// agent at an explicit data dir, so the system prompt is
+	// identical on every machine. Tests that set cfg.DataDir
+	// themselves (personality_test.go) keep their own file.
+	if cfg == nil || cfg.DataDir == "" || cfg.DataDir == config.Default().DataDir {
+		a.personality = defaultPersonality
+	}
 	a.SetLogger(log.New(io.Discard, "", 0))
 	return a
 }
