@@ -92,7 +92,7 @@ var knownBuiltInTools = map[string]bool{
 	"cron_cancel": true, "cron_enable": true, "cron_list": true, "cron_schedule": true,
 	"enter_plan_mode": true, "exit_plan_mode": true,
 	"file_edit": true, "file_list": true, "file_read": true, "file_write": true,
-	"glob": true, "grep": true,
+	"glob": true, "grep": true, "ground": true,
 	"process_list":  true,
 	"screenshot":    true,
 	"shell_exec":    true,

@@ -143,6 +143,7 @@ var safeTools = map[string]bool{
 	"file_read":         true,
 	"glob":              true,
 	"grep":              true,
+	"ground":            true,
 	"process_list":      true,
 	"skill":             true,
 	"screenshot":        true,

@@ -10,6 +10,68 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 A photo sent to the bot is now downloaded (largest size, 10 MiB cap) and run as a real turn — caption as the text, or "এই ছবিটা বর্ণনা করো।" with no caption — when the chat's provider/model supports vision (`deepseek-flash`, `gpt-4o`, `gpt-4o-mini`). Otherwise the bot answers honestly in Bengali and names the fix (DeepSeek `deepseek-flash`). Only the most recent user message carries image parts; older photo turns are sent text-only with a `[ছবি]` placeholder, and image bytes are never stored in memory. The shipped DeepSeek default is now `deepseek-flash` (`deepseek-chat` is a retired 2026-07-24 text-only alias) — NOTE: a live config that explicitly sets `deepseek-chat` is untouched by this change. `/usage` now prices `deepseek-flash` ($0.15 in / $0.60 out per 1M, off-peak cache-miss).
 
+### Computer-use M2 — grounding (`ground`, pin 30, Safe)
+
+Second computer-use tool (`ground`, pin 30 — pins 26–29 reserved
+for future mouse/keyboard/window/browser tools, Safe): the provider
+never guesses coordinates again. One call returns, from the same
+instant, a full-resolution screenshot with numbered Set-of-Mark
+markers plus the exact name/role/bounding-box of every interactive
+element on screen (JSON summary in the text, marked image in
+`ToolResult.Images`). Params: `region` (zoom crop, like M1
+screenshot), `max_elements` (default 60, 1–200), `roles` (default:
+interactive roles only — push button, link, entry, text, password
+text, check box, combo box, menu item). Return shape:
+`snapshot_id` (`g-YYYYMMDD-HHMMSS-xxxx`), `taken_at`, `screen`
+(from the returned image's dimensions, scale 1 at full
+resolution), `focused_window`, `elements` (`id`, `role`, `name`,
+`box` absolute screen px, `centre`, `centre_norm` 0–1000 relative
+to the returned image), `coverage` (`grounded` | `vision_only` —
+never faked elements). Suite: **1,808 tests total (1,804 pass,
+0 fail, 4 skip), 24/24 packages**.
+
+- **AT-SPI source:** Go's stdlib has no D-Bus client, so a
+  vendored Python helper (`internal/tools/ground_atspi.py`,
+  embedded with `go:embed`, written 0600 to
+  `~/.orion/ground-atspi-helper.py` at Execute time, run with a
+  5 s timeout) walks the desktop tree — name/role/screen-extents
+  only, never text values, so a password field contributes role +
+  box and nothing else. Bounded walk: depth cap **12** (the design
+  probe at depth ≤ 8 did not reach GitHub's "Sign in" button —
+  page content sits at depth 6–10, so the button is at depth ≥ 9;
+  12 reaches it with headroom for one more nesting level while
+  the node cap and timeout bound the cost; the live verification
+  must measure the real depth and adjust if it is ever deeper),
+  node cap 1000. Backend probe at every Execute start (python3 +
+  `gi.Atspi` import, never cached); a missing/failed helper
+  degrades cleanly to `vision_only`.
+- **Filters (code-enforced):** interactive roles only;
+  degenerate boxes excluded (`w<=1 || h<=1 || x<0 || y<0`);
+  empty name → the role is the name, never a guess; sensitive
+  window (password manager / bank / payment / OTP) refused BEFORE
+  grounding, checked on the AT-SPI window titles — which see
+  native Wayland windows xdotool cannot — with the screenshot
+  tool's xdotool check as the fallback when there is no tree.
+  Refused in unattended (cron) turns. Rate limits follow the M1
+  screenshot discipline (1 s min interval, 15 per turn, 120 per
+  hour) on top of the inner capture's own identical limits.
+- **Stale-refusal (§5):** a process-wide snapshot registry keeps
+  the last 3 groundings (the M1 last-3 image eviction applied to
+  snapshots). `ValidateGroundSnapshot(id, elementID)` — the gate
+  the future M3 mouse tool will call — refuses when the snapshot
+  is unknown/evicted, older than 60 s, superseded by a newer
+  grounding, or the element id is not in that snapshot. `ground`
+  itself never clicks (read-only). The tool is also excluded from
+  the tool journal (like `screenshot`): a replayed grounding
+  would hand the model unclickable element numbers.
+- **Markers:** Go stdlib `image/draw` only — a tiny 5x7 bitmap
+  digit font embedded in code draws a small readable number badge
+  at each element's centre, clamped inside the element's box when
+  the box holds it. The capture is taken at full resolution
+  (max_width 1920, scale 1.0) so image pixels ARE screen pixels;
+  if the image still has to shrink under the 2 MiB cap, marker
+  positions scale with it.
+
 ### Computer-use M1 — screenshot + describe (no input)
 
 First computer-use tool (`screenshot`, pin 25, Safe): captures the

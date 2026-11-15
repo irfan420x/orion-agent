@@ -1699,6 +1699,12 @@ var journalExcludedTools = map[string]bool{
 	// cheap and idempotent (a fresh file each time), and the
 	// journal never has to store image bytes.
 	"screenshot": true,
+	// ground: same as screenshot, plus its snapshot_id would be
+	// refused by stale-refusal anyway (ValidateGroundSnapshot
+	// rejects anything but the newest <60s snapshot), so a
+	// replayed grounding could only hand the model unclickable
+	// element numbers. Re-ground instead.
+	"ground": true,
 }
 
 // journalExcludedTool reports whether name is excluded from the
