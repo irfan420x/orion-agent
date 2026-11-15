@@ -355,6 +355,7 @@ func TestSystemPromptTryFirstAndHumanized(t *testing.T) {
 		"ask for clarification only when",
 		"never paste raw tool output",
 		"one line saying why it matters",
+		"search first and use fresh results",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("SystemPrompt missing try-first/humanized guidance %q", want)
