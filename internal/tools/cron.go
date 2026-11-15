@@ -84,6 +84,16 @@
 //     missed window at the time it is actually processed, not
 //     the tick start — a job that crossed the window while
 //     queued behind a slow chat is skipped, not run late.
+//     Claim-before-run (F-C4): a due job's NextRun is advanced
+//     in the store BEFORE its turn runs, so a daemon crash or
+//     restart mid-turn cannot re-fire the same slot — the slot
+//     is consumed even if the turn never finishes, and an
+//     outcome-save failure is retried once with the failure
+//     counted instead of silently dropping the outcome and
+//     re-firing. A turn the owner stops deliberately (/stop, or
+//     cron_cancel on the running job — F-C5) records "stopped",
+//     consumes the slot, and does NOT count toward the 5-strike
+//     disable: a stop is not a failure.
 package tools
 
 import (
@@ -839,12 +849,53 @@ func (t *cronListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 
 // ---------------------------------------------------------------- cron_cancel
 
-type cronCancelTool struct{ store *PlanningStore }
+// cronCancelTool removes one job from the chat's cron.json. stopJob,
+// when set (SetCronCancelStopJob — the daemon wires the scheduler's
+// StopJob), also stops the job's live turn: it is called AFTER the
+// job is removed, so a turn that ends after the cancel finds its job
+// gone and its outcome is dropped instead of resurrecting it. The
+// stop runs while the store lock is still held; that is safe because
+// StopJob only takes the scheduler's running lock and cancels a
+// context — it never takes the store lock, and the cancelled turn's
+// outcome apply waits for this lock. A nil stopJob means cancel is
+// future-runs-only (a hand-built registry with no scheduler, or a
+// process that runs no scheduled turns).
+type cronCancelTool struct {
+	store   *PlanningStore
+	stopJob func(jobID string) bool
+}
+
+// setStopJob installs the live-run stop hook. It is unexported:
+// callers use SetCronCancelStopJob, which finds the tool on a registry.
+func (t *cronCancelTool) setStopJob(fn func(jobID string) bool) {
+	t.stopJob = fn
+}
+
+// SetCronCancelStopJob installs fn as the live-run stop the
+// registry's cron_cancel tool calls after removing a job: fn is the
+// scheduler's StopJob, reporting whether the job's turn was running
+// and is now stopped. It is a no-op when the registry has no
+// cron_cancel tool or fn is nil. The daemon calls it from run()
+// next to the scheduler construction, so the tool and the scheduler
+// it stops are the same live pair; a registry without it cancels
+// future runs only.
+func SetCronCancelStopJob(reg *Registry, fn func(jobID string) bool) {
+	if reg == nil || fn == nil {
+		return
+	}
+	t, ok := reg.Get("cron_cancel")
+	if !ok {
+		return
+	}
+	if c, ok := t.(interface{ setStopJob(func(string) bool) }); ok {
+		c.setStopJob(fn)
+	}
+}
 
 func (t *cronCancelTool) Name() string { return "cron_cancel" }
 
 func (t *cronCancelTool) Description() string {
-	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; its past runs are not undone. Only this chat's jobs can be cancelled."
+	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; if its turn is running now, the turn is stopped too. Its past runs are not undone. Only this chat's jobs can be cancelled."
 }
 
 func (t *cronCancelTool) Definition() model.ToolDefinition {
@@ -909,7 +960,18 @@ func (t *cronCancelTool) Execute(ctx context.Context, args json.RawMessage) (str
 	if err := saveCronJobs(t.store, dir, key, kept); err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
-	return encodeCronJob(t.Name(), map[string]any{"cancelled": true, "job_id": id})
+	// The job is gone from the store first; only then stop its live
+	// turn, if it has one. A stop here can only ever cancel this
+	// job's turn: StopJob looks the job id up in the scheduler's
+	// running map, so a user turn in the same chat (or any other
+	// job's turn) is never cancelled by mistake — and a cancel
+	// issued from inside the very turn it would stop is safe, the
+	// turn simply ends as stopped.
+	stopped := false
+	if t.stopJob != nil {
+		stopped = t.stopJob(id)
+	}
+	return encodeCronJob(t.Name(), map[string]any{"cancelled": true, "job_id": id, "stopped_running": stopped})
 }
 
 func init() {
@@ -937,6 +999,21 @@ func init() {
 }
 
 // ---------------------------------------------------------------- scheduler
+
+// ErrCronTurnStopped marks a scheduled turn the owner stopped
+// deliberately — /stop during the turn, or cron_cancel on the
+// running job. The runner returns it (runScheduledTurn translates
+// a cancelled turn context into it) and the scheduler records the
+// run as stopped: the slot is consumed, but the stop is not a
+// failure and does not count toward the job's 5-strike disable.
+var ErrCronTurnStopped = errors.New("cron: scheduled turn stopped by the owner")
+
+// cronRunHandle is one job's live turn: the chat it runs in and
+// the cancel function for the scheduler's per-turn context.
+type cronRunHandle struct {
+	chatID int64
+	cancel context.CancelFunc
+}
 
 // CronRunner runs one scheduled turn for job (a copy of the
 // stored job): it must run a normal agent turn for job.ChatID
@@ -986,6 +1063,27 @@ type CronScheduler struct {
 	// that chat, never the whole tick. The claim is held from
 	// the scan until that chat's runs and outcome apply finish.
 	inFlight map[int64]struct{}
+
+	// saveJobs persists jobs for the scheduler's claim and
+	// outcome writes; nil means saveCronJobs. Tests replace it
+	// to simulate a persist failure (a failing store) — the
+	// tools keep calling saveCronJobs directly, so production
+	// behaviour is unchanged.
+	saveJobs func(s *PlanningStore, dir, key string, jobs []*CronJob) error
+
+	runningMu sync.Mutex // guards running, stopped
+	// running is the per-job live-turn table (F-C5): job ids
+	// whose turn is currently inside runJob, with the cancel
+	// for the scheduler's per-turn context. StopJob cancels
+	// exactly that job's turn — never a user turn in the same
+	// chat, which runs under a different context.
+	running map[string]cronRunHandle
+	// stopped marks jobs whose turn was deliberately stopped
+	// (StopJob) while it was running, so runJob can tell a
+	// deliberate stop from a failure even when the runner
+	// reports it only as a context cancellation. Entries are
+	// removed when the run unregisters.
+	stopped map[string]struct{}
 }
 
 // NewCronScheduler builds a scheduler over store. A nil store
@@ -1106,6 +1204,76 @@ func (s *CronScheduler) currentRunner() CronRunner {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.runner
+}
+
+// persistJobs is the scheduler's job save: saveCronJobs unless a
+// test replaced saveJobs to simulate a persist failure.
+func (s *CronScheduler) persistJobs(dir, key string, jobs []*CronJob) error {
+	save := s.saveJobs
+	if save == nil {
+		save = saveCronJobs
+	}
+	return save(s.store, dir, key, jobs)
+}
+
+// registerRun records jobID's turn as live, with the cancel for
+// its per-turn context. It is called by runJob before the runner
+// is invoked and undone by unregisterRun when the run returns.
+func (s *CronScheduler) registerRun(jobID string, chatID int64, cancel context.CancelFunc) {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	if s.running == nil {
+		s.running = map[string]cronRunHandle{}
+	}
+	s.running[jobID] = cronRunHandle{chatID: chatID, cancel: cancel}
+}
+
+// unregisterRun drops jobID's live-turn record (and any stopped
+// mark for it) when its run returns.
+func (s *CronScheduler) unregisterRun(jobID string) {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	delete(s.running, jobID)
+	delete(s.stopped, jobID)
+}
+
+// wasStopped reports whether jobID's live turn was deliberately
+// stopped (StopJob) while it was running.
+func (s *CronScheduler) wasStopped(jobID string) bool {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	_, ok := s.stopped[jobID]
+	return ok
+}
+
+// StopJob cancels the live turn for jobID, if it is running
+// (F-C5 — wired to cron_cancel by SetCronCancelStopJob). It
+// reports whether a run was running: false when the job is not
+// running (already finished, never started, or unknown), so the
+// caller knows the cancel was future-runs-only. The cancellation
+// is the scheduler's own per-turn context, so it can never cancel
+// a user turn in the same chat: a user turn runs under the daemon
+// context, not this turn's context — and a runner queued behind
+// the per-chat turn lock still ends promptly once the lock frees,
+// because its context is already cancelled. The mark is taken
+// under the same lock as the register/unregister, and the cancel
+// is invoked while holding it, so a run cannot slip from "live"
+// to "finished and unregistered" between the check and the
+// cancel: context cancellation only closes channels and never
+// blocks, so holding the lock across it cannot deadlock.
+func (s *CronScheduler) StopJob(jobID string) bool {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	h, ok := s.running[jobID]
+	if !ok || h.cancel == nil {
+		return false
+	}
+	if s.stopped == nil {
+		s.stopped = map[string]struct{}{}
+	}
+	s.stopped[jobID] = struct{}{}
+	h.cancel()
+	return true
 }
 
 // Run scans once immediately (so a restart fires or skips
@@ -1285,7 +1453,14 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 		if len(outcomes) == 0 {
 			return nil
 		}
-		return s.applyOutcomes(ctx, b, outcomes)
+		// A failed skip-outcome save is retried the same way as
+		// a run outcome (the retry leaves a missed skip
+		// unchanged — it is not a run, so no failure is
+		// counted for it).
+		if err := s.applyOutcomes(ctx, b, outcomes); err != nil {
+			return s.retryOutcomesAsFailures(ctx, b, outcomes, err)
+		}
+		return nil
 	}
 	// A chat with work to run takes a worker slot: at most
 	// cap(sem) chats run turns at once, so one chat's
@@ -1305,8 +1480,23 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 	// crossed the missed window while queued is skipped, not
 	// run late; a job that became due while queued is run.
 	var outcomes []cronOutcome
+	var claimErrs []error
 	for _, j := range jobs {
 		if err := ctx.Err(); err != nil {
+			// The tick is ending (shutdown): turns that
+			// already ran still deserve their outcomes. The
+			// claim already advanced their NextRun, so the
+			// slot cannot re-fire — but without this
+			// best-effort apply their last-run/failure
+			// accounting would be lost with the shutdown.
+			// WithoutCancel bounds it to one flocked save:
+			// the lock still times out after 10s, so a
+			// stuck holder cannot hang shutdown on it.
+			if len(outcomes) > 0 {
+				if aerr := s.applyOutcomes(context.WithoutCancel(ctx), b, outcomes); aerr != nil {
+					s.logf("chat %d: outcome save failed on shutdown: %v", b.chatID, aerr)
+				}
+			}
 			return err
 		}
 		at = now.Add(time.Since(wallStart))
@@ -1315,13 +1505,34 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 		case cronJobMissed:
 			outcomes = append(outcomes, *oc)
 		case cronJobDue:
+			// Claim-before-run (F-C4): persist the advanced
+			// NextRun BEFORE the turn runs. A daemon crash
+			// mid-turn then finds the slot already consumed
+			// on restart instead of re-firing it. A claim
+			// that cannot be persisted is a loud skip, never
+			// a run: running without the claim would risk
+			// the duplicate the claim exists to prevent.
+			// A job cancelled between the tick's load and
+			// the claim is simply gone — skipping it is
+			// correct, not an error.
+			if err := s.claimJob(ctx, b, j, nextAfter); err != nil {
+				if errors.Is(err, errCronJobGone) {
+					continue
+				}
+				s.logf("chat %d: job %q not run: claim failed: %v", b.chatID, j.ID, err)
+				claimErrs = append(claimErrs, err)
+				continue
+			}
 			outcomes = append(outcomes, *s.runJob(ctx, j, at, nextAfter, runner, b.chatID))
 		}
 	}
-	if len(outcomes) == 0 {
-		return nil
+	var applyErr error
+	if len(outcomes) > 0 {
+		if err := s.applyOutcomes(ctx, b, outcomes); err != nil {
+			applyErr = s.retryOutcomesAsFailures(ctx, b, outcomes, err)
+		}
 	}
-	return s.applyOutcomes(ctx, b, outcomes)
+	return errors.Join(append(claimErrs, applyErr)...)
 }
 
 // cronDueAt is the cheap, quiet "is this job due at `at`"
@@ -1400,6 +1611,95 @@ func (s *CronScheduler) classifyCronJob(j *CronJob, at time.Time, chatID int64) 
 	return cronJobDue, nextAfter, nil
 }
 
+// errCronJobGone marks a claim for a job that is absent from a
+// fresh load: it was cancelled between the tick's load and the
+// claim, so skipping the run is correct, not an error.
+var errCronJobGone = errors.New("cron: job no longer exists")
+
+// claimJob persists the advance of job j's NextRun to nextAfter
+// BEFORE its turn runs (F-C4). The slot is consumed on disk
+// before any token is spent or any reply is sent: a daemon crash
+// or restart mid-turn finds NextRun already in the future and
+// cannot re-fire the same slot, and the missed window is judged
+// from the claimed NextRun on the next tick, not from the stale
+// one. The claim loads fresh and updates only this job id, so a
+// concurrent cancel (job gone) or another job's claim cannot
+// clobber it, and the outcome apply after the run overwrites the
+// claimed NextRun with the run's real outcome (same value on
+// success, backed off on failure) — the claim never changes what
+// a normal run records, it only makes the slot crash-safe.
+func (s *CronScheduler) claimJob(ctx context.Context, b cronBucket, j *CronJob, nextAfter time.Time) error {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	release, err := s.store.lockState(ctx, b.dir, cronJobsFile)
+	if err != nil {
+		return fmt.Errorf("claim job %q: lock jobs: %w", j.ID, err)
+	}
+	defer release()
+	jobs, err := loadCronJobs(s.store, b.dir, b.key)
+	if err != nil {
+		return fmt.Errorf("claim job %q: reload jobs: %w", j.ID, err)
+	}
+	found := false
+	for _, jj := range jobs {
+		if jj.ID == j.ID {
+			jj.NextRun = nextAfter.Format(time.RFC3339)
+			found = true
+		}
+	}
+	if !found {
+		return errCronJobGone
+	}
+	if err := s.persistJobs(b.dir, b.key, jobs); err != nil {
+		return fmt.Errorf("claim job %q: save jobs: %w", j.ID, err)
+	}
+	return nil
+}
+
+// retryOutcomesAsFailures is the F-C4 surfacing for an outcome
+// save failure: the turn ran, but its outcome could not be
+// persisted, so the first save's error is retried once with the
+// failure counted — a persist failure is itself a job failure for
+// backoff purposes, so a full disk backs the job off and disables
+// it after 5 instead of re-firing the same slot every 30 seconds.
+// A missed-run skip is not a run, so it is retried unchanged with
+// no failure counted. A job cancelled while its turn was running
+// is absent from the fresh load and its outcome is dropped, as in
+// applyOutcomes. When the retry also fails, the error is returned
+// (and logged loudly by ProcessDue): the claim already advanced
+// NextRun past this slot, so the job still cannot re-fire the
+// same slot in a tight loop — the accounting is lost, but the
+// duplicate is not.
+func (s *CronScheduler) retryOutcomesAsFailures(ctx context.Context, b cronBucket, outcomes []cronOutcome, saveErr error) error {
+	s.logf("chat %d: outcome save failed for %d job(s): %v — retrying once with the failure counted", b.chatID, len(outcomes), saveErr)
+	retry := make([]cronOutcome, 0, len(outcomes))
+	for _, oc := range outcomes {
+		if oc.lastRun.IsZero() {
+			retry = append(retry, oc)
+			continue
+		}
+		failures := oc.failures + 1
+		disabled := failures >= cronMaxFailures
+		lastRes := fmt.Sprintf("error: outcome save failed (%v): %s", saveErr, oc.lastRes)
+		if disabled {
+			lastRes = fmt.Sprintf("disabled after %d consecutive failures: outcome save failed (%v)", failures, saveErr)
+		}
+		retry = append(retry, cronOutcome{
+			jobID:    oc.jobID,
+			nextRun:  backoffNextRun(oc.nextRun, oc.lastRun, failures),
+			lastRun:  oc.lastRun,
+			lastRes:  lastRes,
+			failures: failures,
+			disabled: disabled,
+		})
+	}
+	if err := s.applyOutcomes(ctx, b, retry); err != nil {
+		s.logf("chat %d: outcome save retry failed: %v (original save error: %v)", b.chatID, err, saveErr)
+		return fmt.Errorf("save jobs: %w (retry also failed: %v)", saveErr, err)
+	}
+	return nil
+}
+
 // runJob runs one due job's turn under the per-turn deadline and
 // builds its outcome. nextAfter is the next cron occurrence
 // after `at`, from classifyCronJob; `at` is the time the job was
@@ -1416,7 +1716,10 @@ func (s *CronScheduler) classifyCronJob(j *CronJob, at time.Time, chatID int64) 
 // and the job would re-fire after every timeout until it was
 // disabled. A fast turn is unaffected: its outcome time is
 // `at` plus milliseconds, and the stored next run (second
-// precision) is what it was before.
+// precision) is what it was before. The caller (processChat)
+// has already claimed the slot: the job's NextRun is advanced
+// in the store before runJob is invoked, so a crash mid-turn
+// cannot re-fire it (F-C4).
 //
 // The turn runs in its own goroutine and the scheduler stops
 // waiting at the deadline: a runner that ignores its context
@@ -1428,12 +1731,19 @@ func (s *CronScheduler) classifyCronJob(j *CronJob, at time.Time, chatID int64) 
 // cancellation, so no goroutine is left behind in the normal
 // case.
 //
-// F-C4 hook: a claim-before-run step belongs here, before the
-// runner is invoked — atomically mark the job running in the
-// store (or advance NextRun) so a daemon crash mid-turn cannot
-// re-fire it on restart. The per-chat in-flight claim in
-// ProcessDue only guards overlapping ticks in this process; it
-// does not survive a restart.
+// A deliberate stop is not a failure (F-C5): the run is
+// registered in the scheduler's live-turn table before the
+// runner is invoked, so StopJob (cron_cancel) can cancel exactly
+// this job's per-turn context, and the runner returns
+// ErrCronTurnStopped (runScheduledTurn translates a cancelled
+// turn context into it). Any of the three stop signals — the
+// sentinel, a context.Canceled error, or the stopped mark
+// StopJob left — records the run as "stopped": the slot is
+// consumed and the failure count is untouched. A timeout still
+// counts as a failure: the deadline reports DeadlineExceeded,
+// never Canceled, and the stopped check runs before the timeout
+// override, so a stop racing the deadline is a stop, not a
+// timeout failure.
 func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, nextAfter time.Time, runner CronRunner, chatID int64) *cronOutcome {
 	// Due: run the turn. The copy carries the bucket's chat id
 	// (see cronBucket): the stored ChatID is never trusted to
@@ -1442,6 +1752,8 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 	runJob.ChatID = chatID
 	timeout := s.turnTimeoutDuration()
 	turnCtx, cancel := context.WithTimeout(ctx, timeout)
+	s.registerRun(j.ID, chatID, cancel)
+	defer s.unregisterRun(j.ID)
 	defer cancel()
 	type runResult struct {
 		err error
@@ -1492,6 +1804,23 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 	// time. The failure backoff is anchored here, not at `at`
 	// (see the doc comment above).
 	doneAt := at.Add(time.Since(turnStart))
+	// A deliberate stop (F-C5) is not a failure: the slot is
+	// consumed and the failure count is untouched. The check
+	// runs before the timeout override below, so a stop racing
+	// the deadline is a stop. The bare context.Canceled case
+	// counts as a stop only when the deadline did NOT fire: a
+	// runner echoing the deadline returns a context error too,
+	// and that is a timeout, not a stop.
+	if runErr != nil && (errors.Is(runErr, ErrCronTurnStopped) || s.wasStopped(j.ID) || (errors.Is(runErr, context.Canceled) && turnCtx.Err() != context.DeadlineExceeded)) {
+		return &cronOutcome{
+			jobID:    j.ID,
+			nextRun:  nextAfter,
+			lastRun:  at,
+			lastRes:  "stopped: scheduled turn stopped by the owner",
+			failures: j.ConsecutiveFailures,
+			disabled: false,
+		}
+	}
 	// A turn that hit its deadline — and produced no result, or
 	// produced only the context error itself — is a timeout
 	// failure, with a message that says so. A runner that
@@ -1599,7 +1928,7 @@ func (s *CronScheduler) applyOutcomes(ctx context.Context, b cronBucket, outcome
 	if !changed {
 		return nil
 	}
-	if err := saveCronJobs(s.store, b.dir, b.key, jobs); err != nil {
+	if err := s.persistJobs(b.dir, b.key, jobs); err != nil {
 		return fmt.Errorf("save jobs: %w", err)
 	}
 	return nil

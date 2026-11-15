@@ -475,6 +475,10 @@ func run(args []string) int {
 	cronSched.SetRunner(func(ctx context.Context, job tools.CronJob) (string, error) {
 		return runScheduledTurn(a, store, gw, ctx, job)
 	})
+	// F-C5: cron_cancel stops a running turn as well as future
+	// runs — the scheduler's StopJob cancels exactly the running
+	// job's turn context, never a user turn in the same chat.
+	tools.SetCronCancelStopJob(a.Tools, cronSched.StopJob)
 	go cronSched.Run(ctx)
 	fmt.Fprintln(os.Stderr, "oriond: cron scheduler started (jobs in <dataDir>/chats/<id>/cron.json, times UTC)")
 	// F-A20-9: pending approvals/questions live only in memory,
@@ -881,6 +885,24 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 		_ = store.AddUsage(job.ChatID, stats.Tokens)
 	}
 	if err != nil {
+		// F-C5: a turn cancelled by the owner is a deliberate
+		// stop, not a job failure — /stop during the turn, or
+		// cron_cancel on the running job, cancels this turn's
+		// context, and the agent reports that as a
+		// context.Canceled error. No "failed" notice: the stop
+		// already told the chat, and a failure notice would be
+		// wrong as well as noisy. The scheduler's stopped
+		// sentinel records the run as stopped (slot consumed,
+		// failure count untouched) instead of counting it
+		// toward the 5-strike disable. Any error wrapping
+		// context.Canceled is a stop: the agent only reports
+		// Canceled when a turn context was cancelled, and the
+		// contexts are cancelled by a stop or by daemon
+		// shutdown (whose outcome is dropped anyway) — a
+		// timeout reports DeadlineExceeded, never Canceled.
+		if errors.Is(err, context.Canceled) {
+			return "", tools.ErrCronTurnStopped
+		}
 		notice := fmt.Sprintf("⏰ Scheduled job %s failed: %v", job.ID, err)
 		_ = gw.SendMessage(ctx, job.ChatID, security.RedactSecrets(notice))
 		return "", err

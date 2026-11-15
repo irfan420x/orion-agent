@@ -232,6 +232,30 @@ enter/exit_plan_mode pattern). Suite: **1,626 tests total
   backoff + disable after 5, no-runner refusal, tick-overlap
   skip, registry wiring, child-registry exclusion, and same-chat
   turn serialisation (max 1 concurrent provider call).
+- **F-C4 — Claim-before-run (crash mid-turn cannot re-fire).**
+  `processChat` persists the advanced `NextRun` for a due job
+  BEFORE its turn runs, so a daemon crash/restart mid-turn finds
+  the slot already consumed instead of firing it a second time
+  (duplicate turn, reply and token spend). A claim that cannot be
+  persisted skips the run loudly instead of running unclaimed.
+  An outcome-save failure is retried once with the failure
+  counted (backoff/disable accounting), so a full disk backs the
+  job off instead of re-firing every 30s; when the retry also
+  fails the error is logged loudly and the claim still prevents
+  the re-fire. A shutdown mid-tick best-effort applies the
+  outcomes of turns that already ran.
+- **F-C5 — cron_cancel stops a live run; a stop is not a
+  failure.** `cron_cancel` now calls the scheduler's `StopJob`
+  (wired in `oriond`) after removing the job: it cancels exactly
+  that job's per-turn context, never a user turn in the same chat,
+  and reports `stopped_running` in its result. The runner's
+  `ErrCronTurnStopped` (which `runScheduledTurn` returns for any
+  context-cancelled turn, including `/stop`) records the run as
+  "stopped" — slot consumed, failure count untouched, no "failed"
+  notice to the chat — instead of counting a deliberate stop
+  toward the 5-strike disable. Suite after F-C4/F-C5: **1,661
+  tests total (1,657 pass, 0 fail, 4 skip), 24/24 packages**; 7
+  new tests.
 
 ### F1 — Audit 21 fixes (P1 + P2/P3 leftovers)
 
