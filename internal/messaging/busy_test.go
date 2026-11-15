@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // steerCall is one SteerFor hook call the harness recorded.
@@ -88,18 +89,18 @@ func newBusyHarness(t *testing.T) *busyHarness {
 		return out
 	})
 	h.handler = h.recordingTurn
-	dispatch := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	dispatch := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		h.mu.Lock()
 		fn := h.handler
 		h.mu.Unlock()
-		return fn(ctx, chatID, text, emit)
+		return fn(ctx, chatID, text, images, emit)
 	}
 	h.cancel, h.errCh = runPollStream(t, gw, dispatch)
 	t.Cleanup(func() { stopPollStream(t, h.cancel, h.errCh) })
 	return h
 }
 
-func (h *busyHarness) recordingTurn(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+func (h *busyHarness) recordingTurn(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	h.noteTurn(ctx, chatID, text)
 	return "reply-" + text, nil, nil
 }
@@ -242,7 +243,7 @@ func busyMsg(id int64, text string) Update {
 // nil) exactly like the daemon's turn handler does for a cancelled
 // turn, so the old turn sends no reply.
 func firstTurnBlocker(h *busyHarness, startedCh, release, cancelled chan struct{}) TurnFunc {
-	return func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		h.noteTurn(ctx, chatID, text)
 		if text != "first" {
 			return "reply-" + text, nil, nil
@@ -493,7 +494,7 @@ func TestBusyInterruptWithPendingPlanDegradesToQueue(t *testing.T) {
 func TestBusyInterruptWithPendingQuestion(t *testing.T) {
 	h := newBusyHarness(t)
 	askDone := make(chan error, 1)
-	h.setHandler(func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	h.setHandler(func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		h.noteTurn(ctx, chatID, text)
 		if text != "first" {
 			return "reply-" + text, nil, nil
