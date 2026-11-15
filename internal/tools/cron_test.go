@@ -192,6 +192,34 @@ func TestCronParseBareNumberStep(t *testing.T) {
 	}
 }
 
+func TestCronParseBareNumberStepOtherFields(t *testing.T) {
+	// Same n-max/step rule in other fields (probed by the
+	// independent verifier of 3eeccb0): hour 2/6 runs to the
+	// 23 max, and a step larger than the remaining range
+	// yields just the starting value.
+	cases := []struct {
+		field string
+		min   int
+		max   int
+		want  []int
+	}{
+		{"2/6", 0, 23, []int{2, 8, 14, 20}},
+		{"20/6", 0, 23, []int{20}},
+		{"55/10", 0, 59, []int{55}},
+		{"59/10", 0, 59, []int{59}},
+	}
+	for _, c := range cases {
+		mask, _, err := parseCronField(c.field, "field", c.min, c.max)
+		if err != nil {
+			t.Errorf("parseCronField(%q): unexpected error: %v", c.field, err)
+			continue
+		}
+		if got := cronMaskValues(mask, c.max); !cronIntSlicesEqual(got, c.want) {
+			t.Errorf("parseCronField(%q): values = %v, want %v", c.field, got, c.want)
+		}
+	}
+}
+
 func cronMaskValues(mask uint64, max int) []int {
 	var out []int
 	for v := 0; v <= max; v++ {
