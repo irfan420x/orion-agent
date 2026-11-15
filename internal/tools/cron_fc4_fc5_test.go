@@ -71,7 +71,7 @@ func TestCronSchedulerCrashMidTurnDoesNotRefire(t *testing.T) {
 	// blocks inside the runner.
 	store1 := NewPlanningStore(dir)
 	sched, list, _ := cronTestTools(store1)
-	id := cronDueJob(t, store1, ctx, sched, "* * * * *", "crash mid-turn", now.Add(-time.Minute))
+	id := cronDueJob(t, store1, ctx, sched, "*/5 * * * *", "crash mid-turn", now.Add(-time.Minute))
 	release := make(chan struct{})
 	runner := &cronFakeRunner{block: release}
 	s := NewCronScheduler(store1)
@@ -136,7 +136,7 @@ func TestCronSchedulerClaimSaveFailureSkipsRun(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "needs a claim", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "needs a claim", now.Add(-time.Minute))
 	dueNext := now.Add(-time.Minute).Format(time.RFC3339)
 
 	runner := &cronFakeRunner{}
@@ -185,7 +185,7 @@ func TestCronSchedulerOutcomeSaveFailureCountsAsFailure(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "runs fine, save fails", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "runs fine, save fails", now.Add(-time.Minute))
 
 	runner := &cronFakeRunner{}
 	s := NewCronScheduler(store)
@@ -243,7 +243,7 @@ func TestCronSchedulerOutcomeSaveFailureSurfacedWhenRetryFails(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "save always fails", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "save always fails", now.Add(-time.Minute))
 
 	runner := &cronFakeRunner{}
 	s := NewCronScheduler(store)
@@ -299,7 +299,7 @@ func TestCronCancelStopsRunningJob(t *testing.T) {
 	sched, list, cancel := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "long running job", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "long running job", now.Add(-time.Minute))
 
 	runner := &cronCtxRunner{release: make(chan struct{})}
 	s := NewCronScheduler(store)
@@ -365,7 +365,7 @@ func TestCronSchedulerStoppedTurnDoesNotCountFailure(t *testing.T) {
 		now := time.Now().UTC().Truncate(time.Second)
 		// Start with one failure already, so a miscount would
 		// be visible as 2 (and a stop-then-fail path as 1).
-		id := cronDueJob(t, store, ctx, sched, "* * * * *", "stopped job", now.Add(-time.Minute))
+		id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "stopped job", now.Add(-time.Minute))
 		rewriteCronJob(t, store, ctx, id, func(j *CronJob) {
 			j.ConsecutiveFailures = 1
 		})

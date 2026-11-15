@@ -179,8 +179,8 @@ func TestCronSchedulerSlowChatDoesNotBlockOtherChat(t *testing.T) {
 	ctxA := cronChatCtx(111, 111)
 	ctxB := cronChatCtx(222, 222)
 	now := time.Now().UTC().Truncate(time.Second)
-	cronDueJob(t, store, ctxA, sched, "* * * * *", "slow A", now.Add(-time.Minute))
-	cronDueJob(t, store, ctxB, sched, "* * * * *", "quick B", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxA, sched, "*/5 * * * *", "slow A", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxB, sched, "*/5 * * * *", "quick B", now.Add(-time.Minute))
 
 	runner := newCronBlockingRunner()
 	runner.blockChat(111)
@@ -221,7 +221,7 @@ func TestCronSchedulerHungTurnTimesOut(t *testing.T) {
 		sched, list, _ := cronTestTools(store)
 		ctx := cronChatCtx(111, 111)
 		now := time.Now().UTC().Truncate(time.Second)
-		cronDueJob(t, store, ctx, sched, "* * * * *", "hung job", now.Add(-time.Minute))
+		cronDueJob(t, store, ctx, sched, "*/5 * * * *", "hung job", now.Add(-time.Minute))
 
 		runner := newCronBlockingRunner()
 		runner.respectCtx = respectCtx
@@ -295,8 +295,8 @@ func TestCronSchedulerOverlappingTicksNeverDoubleFire(t *testing.T) {
 	ctxA := cronChatCtx(111, 111)
 	ctxB := cronChatCtx(222, 222)
 	now := time.Now().UTC().Truncate(time.Second)
-	cronDueJob(t, store, ctxA, sched, "* * * * *", "slow A", now.Add(-time.Minute))
-	cronDueJob(t, store, ctxB, sched, "* * * * *", "quick B", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxA, sched, "*/5 * * * *", "slow A", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxB, sched, "*/5 * * * *", "quick B", now.Add(-time.Minute))
 
 	runner := newCronBlockingRunner()
 	runner.blockChat(111)
@@ -345,8 +345,8 @@ func TestCronSchedulerSameChatTurnsSerialise(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id1 := cronDueJob(t, store, ctx, sched, "* * * * *", "first job", now.Add(-time.Minute))
-	id2 := cronDueJob(t, store, ctx, sched, "* * * * *", "second job", now.Add(-time.Minute))
+	id1 := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "first job", now.Add(-time.Minute))
+	id2 := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "second job", now.Add(-time.Minute))
 
 	// Each call holds the per-chat concurrency counter up for
 	// 50ms: if the scheduler ever ran two turns for this chat
@@ -382,14 +382,14 @@ func TestCronSchedulerMissedCheckUsesProcessingTime(t *testing.T) {
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
 	// Job 1: due 1 minute ago; its turn blocks ~3s.
-	id1 := cronDueJob(t, store, ctx, sched, "* * * * *", "slow first job", now.Add(-time.Minute))
+	id1 := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "slow first job", now.Add(-time.Minute))
 	// Job 2: due 9m59s ago — inside the 10-minute window at
 	// tick time, but past it by the time its turn would start:
 	// same chat, so it waits behind job 1's turn. Under the
 	// old tick-start check it would have run; judged at its
 	// real processing time (tick+3s = 10m02s late) it must be
 	// skipped.
-	id2 := cronDueJob(t, store, ctx, sched, "* * * * *", "queued job", now.Add(-9*time.Minute-59*time.Second))
+	id2 := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "queued job", now.Add(-9*time.Minute-59*time.Second))
 
 	runner := newCronBlockingRunner()
 	runner.blockChat(111)
@@ -424,8 +424,8 @@ func TestCronSchedulerWorkerPoolBoundsConcurrency(t *testing.T) {
 	ctxA := cronChatCtx(111, 111)
 	ctxB := cronChatCtx(222, 222)
 	now := time.Now().UTC().Truncate(time.Second)
-	cronDueJob(t, store, ctxA, sched, "* * * * *", "A job", now.Add(-time.Minute))
-	cronDueJob(t, store, ctxB, sched, "* * * * *", "B job", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxA, sched, "*/5 * * * *", "A job", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxB, sched, "*/5 * * * *", "B job", now.Add(-time.Minute))
 
 	runner := newCronBlockingRunner()
 	runner.blockChat(111)
@@ -479,7 +479,7 @@ func TestCronSchedulerLongFailingTurnBackoffAnchoredAtCompletion(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
-	cronDueJob(t, store, ctx, sched, "* * * * *", "slow then fails", now.Add(-time.Minute))
+	cronDueJob(t, store, ctx, sched, "*/5 * * * *", "slow then fails", now.Add(-time.Minute))
 
 	var calls atomic.Int32
 	runner := func(ctx context.Context, job CronJob) (string, error) {
@@ -542,7 +542,7 @@ func TestCronSchedulerLongSuccessfulTurnKeepsSchedule(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
-	cronDueJob(t, store, ctx, sched, "* * * * *", "slow then succeeds", now.Add(-time.Minute))
+	cronDueJob(t, store, ctx, sched, "*/5 * * * *", "slow then succeeds", now.Add(-time.Minute))
 
 	s := NewCronScheduler(store)
 	s.SetRunner(func(ctx context.Context, job CronJob) (string, error) {
@@ -561,7 +561,7 @@ func TestCronSchedulerLongSuccessfulTurnKeepsSchedule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next run %q: %v", j.NextRun, err)
 	}
-	schedExpr, err := parseCronExpression("* * * * *")
+	schedExpr, err := parseCronExpression("*/5 * * * *")
 	if err != nil {
 		t.Fatalf("parseCronExpression: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestCronSchedulerWorkerPoolSharedAcrossOverlappingTicks(t *testing.T) {
 	ctxA := cronChatCtx(111, 111)
 	ctxB := cronChatCtx(222, 222)
 	now := time.Now().UTC().Truncate(time.Second)
-	cronDueJob(t, store, ctxA, sched, "* * * * *", "A job", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxA, sched, "*/5 * * * *", "A job", now.Add(-time.Minute))
 
 	runner := newCronBlockingRunner()
 	runner.blockChat(111)
@@ -603,7 +603,7 @@ func TestCronSchedulerWorkerPoolSharedAcrossOverlappingTicks(t *testing.T) {
 	// A second chat's job appears only now, so the first tick
 	// never saw it: the overlapping second tick has an
 	// unclaimed chat with a due job.
-	cronDueJob(t, store, ctxB, sched, "* * * * *", "B job", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxB, sched, "*/5 * * * *", "B job", now.Add(-time.Minute))
 	secondDone := make(chan error, 1)
 	go func() { secondDone <- s.ProcessDue(ctxA, now) }()
 	// Give the second tick a moment: B's turn must not start
@@ -655,7 +655,7 @@ func TestCronSchedulerDeadlineRaceUsesResult(t *testing.T) {
 		sched, list, _ := cronTestTools(store)
 		ctx := cronChatCtx(111, 111)
 		now := time.Now().UTC().Truncate(time.Second)
-		cronDueJob(t, store, ctx, sched, "* * * * *", "just in time", now.Add(-time.Minute))
+		cronDueJob(t, store, ctx, sched, "*/5 * * * *", "just in time", now.Add(-time.Minute))
 		s := NewCronScheduler(store)
 		s.SetRunner(func(ctx context.Context, job CronJob) (string, error) {
 			time.Sleep(50 * time.Millisecond)

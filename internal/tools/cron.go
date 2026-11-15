@@ -25,7 +25,19 @@
 //     lookup to refuse; the bucket is the boundary). Scheduling
 //     requires a Telegram chat: a CLI run has no chat to deliver
 //     a scheduled turn to, so cron_schedule fails cleanly there
-//     instead of creating an undeliverable job.
+//     instead of creating an undeliverable job. In a GROUP chat,
+//     scheduling and cancelling are OWNER-ONLY (F-C9): any
+//     allowlisted member could otherwise commit the chat to 20
+//     recurring agent turns or cancel the owner's jobs. The
+//     owner is the first allowlisted chat (the same owner the
+//     TransportAware tools already receive as ToolHost.OwnerID,
+//     and the same chat-or-sender rule as CommandEnv.isOwner):
+//     in a group the sender must be the owner; in a private
+//     chat (chat id == sender id) anyone allowlisted may
+//     schedule, and with no owner configured a group refuses
+//     everyone (fail closed). cron_list stays readable by any
+//     allowlisted member: it is read-only, and the ids it
+//     reveals cannot cancel anything without the owner check.
 //   - Approval: the MANAGEMENT tools are Safe — they only write
 //     Orion's own job files. The scheduled TURN is a normal agent
 //     turn on the chat's agent, through the same gate machinery
@@ -62,9 +74,17 @@
 //     keep running. Only a file that is not valid JSON at all
 //     still fails the whole file, since per-job quarantine needs
 //     a parseable file.
-//     A chat may hold at most 20 jobs. A disabled job never
+//     A chat may hold at most 20 jobs, and the daemon at most 200
+//     jobs across all chats (F-C10); a new job must fire at most
+//     every 5 minutes — a faster schedule is rejected at creation,
+//     never silently coarsened. A disabled job never
 //     fires; it stays listed until cancelled, so the owner can
 //     see what stopped and re-create it.
+//     A job scheduled from a process with no scheduler (F-C11 —
+//     `orion daemon` / `orion telegram poll` never start one,
+//     only oriond does) is created but WARNS in its confirmation
+//     that it will not fire until oriond runs, instead of
+//     returning a bare success that silently never delivers.
 //   - Missed runs: a run missed by more than 10 minutes (the
 //     daemon was down at the scheduled time) is SKIPPED, not run
 //     late — a "remind me at 9am" job firing at 6pm after a day
@@ -138,6 +158,33 @@ const (
 	// keeps one chat from scheduling a denial-of-service on its
 	// own budget.
 	cronMaxJobsPerChat = 20
+	// cronMaxJobsTotal bounds jobs across ALL chats (F-C10).
+	// The scheduler scans every chat bucket on each 30s tick
+	// and runs due turns through an 8-worker pool, so the total
+	// number of jobs bounds the tick scan and the worst-case
+	// burst of due turns. 200 is ten chats at the per-chat cap:
+	// far above what a single-operator daemon serves, far below
+	// anything that would swamp the tick. The per-chat cap
+	// still applies on top of this one.
+	cronMaxJobsTotal = 200
+	// cronMinInterval is the minimum interval between two runs
+	// of one job (F-C10): a new job may fire at most every 5
+	// minutes. Without a floor, one chat with 20 minutely jobs
+	// commits 20 full agent turns a minute, and the only brake
+	// is the per-chat daily token budget. 5 minutes matches the
+	// scheduler's own granularity (a 30s tick, minute-granular
+	// schedules) while still allowing genuinely frequent
+	// reminders; anything faster is rejected at creation,
+	// never silently coarsened.
+	cronMinInterval = 5 * time.Minute
+	// cronMinIntervalScanWindow bounds the minimum-interval
+	// check: the fastest gap between two consecutive runs is
+	// measured over the next 7 days (or 64 runs, whichever
+	// comes first). A schedule with fewer than two runs in
+	// that window fires days apart by definition, so it
+	// passes without a measurable gap.
+	cronMinIntervalScanWindow = 7 * 24 * time.Hour
+	cronMinIntervalMaxRuns    = 64
 	// cronMaxFailures is the consecutive-failure count at which
 	// a job is disabled (never a hot loop).
 	cronMaxFailures = 5
@@ -767,10 +814,153 @@ func encodeCronJob(tool string, v any) (string, error) {
 	return string(out), nil
 }
 
+// ---------------------------------------------------------------- shared guards (F-C9/F-C10/F-C11)
+
+// cronRequireOwner enforces the owner-only rule for
+// cron_schedule and cron_cancel in group chats (F-C9). A
+// private chat is recognised by chat id == sender id (a
+// Telegram DM's chat id IS the user's id; group chat ids are
+// negative and never equal a sender's user id), and anyone
+// allowlisted may schedule there. In a group, only the owner
+// may commit the chat to recurring agent turns or cancel its
+// jobs: the owner is the first allowlisted chat, the same
+// chat-or-sender rule as messaging.CommandEnv.isOwner, and no
+// owner configured (ownerID 0) refuses everyone — fail closed.
+// The error names the rule, so the model (and the user reading
+// the reply) learns why the call was refused instead of seeing
+// a bare denial.
+func cronRequireOwner(tool string, ownerID, chatID, senderID int64) error {
+	if senderID == chatID {
+		return nil // private chat: no group members to protect from.
+	}
+	if ownerID != 0 && senderID == ownerID {
+		return nil
+	}
+	return fmt.Errorf("%s is owner-only in group chats: only the bot owner can schedule or cancel recurring jobs in this group (private chats are unaffected)", tool)
+}
+
+// minGapWithin returns the fastest gap between two consecutive
+// runs of the schedule, measured from the first run at or after
+// `from` through a full cronMinIntervalScanWindow past it (or
+// cronMinIntervalMaxRuns runs, whichever comes first). ok is
+// false when the schedule has no second run to measure against
+// (a one-shot-like schedule, or a nextAfter failure) — there is
+// then no sub-minimum gap to find. Scanning a full window past
+// the first run matters: the fastest gap is often the overnight
+// one (last run of one day to first run of the next, e.g.
+// 23:59 to 00:00), which the gap between just the first two
+// runs can miss. The scan is bounded, so a yearly schedule
+// costs two next-run searches, not a scan of the whole window.
+func (s *cronSchedule) minGapWithin(from time.Time) (gap time.Duration, ok bool) {
+	prev, err := s.nextAfter(from)
+	if err != nil {
+		return 0, false
+	}
+	limit := prev.Add(cronMinIntervalScanWindow)
+	cur := prev
+	var min time.Duration
+	seen := false
+	for i := 0; i < cronMinIntervalMaxRuns; i++ {
+		next, err := s.nextAfter(cur)
+		if err != nil {
+			break
+		}
+		if g := next.Sub(cur); !seen || g < min {
+			min, seen = g, true
+		}
+		cur = next
+		if cur.After(limit) {
+			break
+		}
+	}
+	return min, seen
+}
+
+// totalCronJobsLocked counts jobs across all chat buckets, for
+// the global cap (F-C10). Call with s.mu held. A chat whose
+// file is unreadable or corrupt is skipped, not fatal: one
+// chat's corrupt file must not block every other chat from
+// scheduling (that chat's own scheduling still fails loudly
+// through loadCronJobs on its own bucket).
+func (s *PlanningStore) totalCronJobsLocked() int {
+	if s.dataDir != "" {
+		entries, err := os.ReadDir(filepath.Join(s.dataDir, "chats"))
+		if err != nil {
+			return 0
+		}
+		total := 0
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			if _, err := strconv.ParseInt(e.Name(), 10, 64); err != nil {
+				continue
+			}
+			data, err := readStateFile(filepath.Join(s.dataDir, "chats", e.Name(), cronJobsFile))
+			if err != nil {
+				continue
+			}
+			var doc struct {
+				Jobs []*CronJob `json:"jobs"`
+			}
+			if err := json.Unmarshal(data, &doc); err != nil {
+				continue
+			}
+			total += len(doc.Jobs)
+		}
+		return total
+	}
+	total := 0
+	for k, b := range s.mem {
+		if !strings.HasPrefix(k, "chat:") || b == nil {
+			continue
+		}
+		total += len(b.cronJobs)
+	}
+	return total
+}
+
+// markCronSchedulerPresent records that a CronScheduler was
+// constructed over this store in this process (F-C11). Only
+// oriond constructs one (cmd/oriond/main.go); `orion daemon`
+// and `orion telegram poll` never do — so a store whose flag is
+// clear belongs to a process whose scheduled jobs will never
+// fire, and cron_schedule warns instead of returning a bare
+// success. The flag is set at construction, not at Run: oriond
+// constructs the scheduler and starts it immediately, so in
+// production a constructed scheduler is a running one; a
+// constructed-but-never-run scheduler exists only in tests.
+// The flag lives on the store (not a package global) because
+// the store is the object the scheduler and the tools already
+// share, and each process has its own store — so no process
+// can mistake another's scheduler for its own.
+func (s *PlanningStore) markCronSchedulerPresent() {
+	if s == nil {
+		return
+	}
+	s.schedulerPresent.Store(true)
+}
+
+// cronSchedulerPresent reports whether a CronScheduler was
+// constructed over this store in this process. A nil store has
+// none.
+func (s *PlanningStore) cronSchedulerPresent() bool {
+	if s == nil {
+		return false
+	}
+	return s.schedulerPresent.Load()
+}
+
 // ---------------------------------------------------------------- cron_schedule
 
 type cronScheduleTool struct {
 	store *PlanningStore
+	// ownerID is the bot owner (first allowlisted chat),
+	// installed by InstallTransport (F-C9). 0 means "no owner
+	// known": group scheduling then refuses everyone (fail
+	// closed); private chats are unaffected (see
+	// cronRequireOwner).
+	ownerID int64
 	// rules, when set (see SetCronScheduleRuleStore), is the
 	// permission rule store the tool consults READ-ONLY at
 	// schedule time to warn about persisted "always allow"
@@ -786,6 +976,21 @@ type cronScheduleTool struct {
 // SetCronScheduleRuleStore, which finds the tool on a registry.
 func (t *cronScheduleTool) setRuleStore(r *permissions.RuleStore) {
 	t.rules = r
+}
+
+// InstallTransport records the owner id for the group-chat
+// owner-only check (F-C9). It follows the enter_plan_mode
+// pattern: a nil host records nothing, and a repeat call
+// re-installs harmlessly. WireTelegram calls it on every
+// TransportAware tool in every Telegram process (oriond, orion
+// daemon, telegram poll), so the owner is known wherever the
+// tool can run.
+func (t *cronScheduleTool) InstallTransport(host *ToolHost) error {
+	if host == nil {
+		return nil
+	}
+	t.ownerID = host.OwnerID
+	return nil
 }
 
 // SetCronScheduleRuleStore installs store as the permission rule
@@ -856,7 +1061,7 @@ func (t *cronScheduleTool) unattendedAllowWarning(chatID int64) []string {
 func (t *cronScheduleTool) Name() string { return "cron_schedule" }
 
 func (t *cronScheduleTool) Description() string {
-	return "Schedule a recurring agent turn: run a prompt on a cron expression (5 fields: minute hour day-of-month month day-of-week, UTC). The job runs in this chat until cancelled; the scheduled turn is unattended, so persisted \"always allow\" rules never apply to it and a destructive or network action inside it is denied promptly instead of running. Returns the job id and the next run (UTC). Times are UTC — Orion has no per-chat timezone. Telegram only: needs a chat in the run context."
+	return "Schedule a recurring agent turn: run a prompt on a cron expression (5 fields: minute hour day-of-month month day-of-week, UTC). The job runs in this chat until cancelled; the scheduled turn is unattended, so persisted \"always allow\" rules never apply to it and a destructive or network action inside it is denied promptly instead of running. In group chats only the bot owner can schedule. A new job must fire at most every 5 minutes, and the daemon holds at most 200 jobs across all chats (20 per chat). Returns the job id and the next run (UTC). Times are UTC — Orion has no per-chat timezone. Telegram only: needs a chat in the run context."
 }
 
 func (t *cronScheduleTool) Definition() model.ToolDefinition {
@@ -866,7 +1071,7 @@ func (t *cronScheduleTool) Definition() model.ToolDefinition {
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"expression": map[string]any{"type": "string", "description": "5-field cron expression, e.g. \"0 9 * * 1-5\" (weekdays 09:00 UTC). Supports *, lists (1,2), ranges (1-5), steps (*/15, 1-30/5). Month/day names and @-shorthands are not supported."},
+				"expression": map[string]any{"type": "string", "description": "5-field cron expression, e.g. \"0 9 * * 1-5\" (weekdays 09:00 UTC). Supports *, lists (1,2), ranges (1-5), steps (*/15, 1-30/5). Month/day names and @-shorthands are not supported. Minimum interval is 5 minutes: a schedule that fires more often (e.g. \"* * * * *\") is rejected."},
 				"prompt":     map[string]any{"type": "string", "description": "The prompt the agent runs on each scheduled turn (max 2000 characters)."},
 			},
 			"required": []string{"expression", "prompt"},
@@ -899,7 +1104,8 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if expr == "" {
 		return invalid("expression must not be empty")
 	}
-	if _, err := parseCronExpression(expr); err != nil {
+	sched, err := parseCronExpression(expr)
+	if err != nil {
 		return invalid("%v", err)
 	}
 	prompt := strings.TrimSpace(a.Prompt)
@@ -916,10 +1122,20 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if senderID == 0 {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_schedule needs a sender: this run has no sender in its context")}
 	}
+	// F-C9: in a group chat only the owner may schedule.
+	if err := cronRequireOwner(t.Name(), t.ownerID, chatID, senderID); err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+	}
 	if t.store == nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_schedule: no planning store configured")}
 	}
 	now := time.Now().UTC()
+	// F-C10: reject a sub-minimum-interval schedule at creation
+	// — never silently coarsen it into something the user did
+	// not ask for.
+	if gap, ok := sched.minGapWithin(now); ok && gap < cronMinInterval {
+		return invalid("cron expression %q fires every %s at its fastest, below the minimum interval of 5 minutes for new jobs; use an expression that fires at most every 5 minutes", expr, gap)
+	}
 	next, err := nextRunAfter(expr, now)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: err}
@@ -935,6 +1151,11 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 	doc, err := loadCronJobs(t.store, dir, key)
 	if err != nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
+	}
+	// F-C10: the global cap bounds the tick scan across chats;
+	// the per-chat cap below still applies on top of it.
+	if total := t.store.totalCronJobsLocked(); total >= cronMaxJobsTotal {
+		return "", &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf("global job limit reached (%d jobs across all chats); cancel an old job with cron_cancel first", cronMaxJobsTotal)}
 	}
 	valid := doc.validJobs()
 	if len(valid) >= cronMaxJobsPerChat {
@@ -974,6 +1195,15 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 		// holds quarantined jobs that never run.
 		note += fmt.Sprintf(" Warning: this chat has %d quarantined (corrupt) job(s) that never run — see cron_list for the reason and remove one with cron_cancel.", len(quarantined))
 	}
+	if !t.store.cronSchedulerPresent() {
+		// F-C11: warn, never refuse — the job is saved and
+		// will start firing once oriond runs, but a bare
+		// success here would silently never deliver. This is
+		// the same warn-only pattern as the F-C3 rule warning
+		// above: the user must know before the run they
+		// expected never happens.
+		note += " Warning: no cron scheduler is running in this process (orion daemon and telegram poll do not run one) — this job will not fire until oriond is running; it is saved and will start firing once oriond runs."
+	}
 	if warned := t.unattendedAllowWarning(chatID); len(warned) > 0 {
 		// Warn only, never refuse: the user scheduled the job
 		// with these rules standing, and the rules used to
@@ -998,7 +1228,7 @@ type cronListTool struct{ store *PlanningStore }
 func (t *cronListTool) Name() string { return "cron_list" }
 
 func (t *cronListTool) Description() string {
-	return "List this chat's scheduled cron jobs (id, expression, prompt, next run, last outcome, failure count, disabled flag). Only this chat's jobs are ever listed. Jobs that failed validation are listed separately under \"quarantined\" as corrupt, with the reason they never run; remove one with cron_cancel. Times are UTC."
+	return "List this chat's scheduled cron jobs (id, expression, prompt, next run, last outcome, failure count, disabled flag). Only this chat's jobs are ever listed. Jobs that failed validation are listed separately under \"quarantined\" as corrupt, with the reason they never run; remove one with cron_cancel. Any allowlisted member may list (read-only); in group chats only the bot owner can schedule or cancel. Times are UTC."
 }
 
 func (t *cronListTool) Definition() model.ToolDefinition {
@@ -1055,6 +1285,10 @@ func (t *cronListTool) Execute(ctx context.Context, args json.RawMessage) (strin
 type cronCancelTool struct {
 	store   *PlanningStore
 	stopJob func(jobID string) bool
+	// ownerID is the bot owner (first allowlisted chat),
+	// installed by InstallTransport (F-C9) — same meaning as
+	// on cronScheduleTool.
+	ownerID int64
 }
 
 // setStopJob installs the live-run stop hook. It is unexported:
@@ -1086,8 +1320,18 @@ func SetCronCancelStopJob(reg *Registry, fn func(jobID string) bool) {
 
 func (t *cronCancelTool) Name() string { return "cron_cancel" }
 
+// InstallTransport records the owner id for the group-chat
+// owner-only check (F-C9); same pattern as cronScheduleTool.
+func (t *cronCancelTool) InstallTransport(host *ToolHost) error {
+	if host == nil {
+		return nil
+	}
+	t.ownerID = host.OwnerID
+	return nil
+}
+
 func (t *cronCancelTool) Description() string {
-	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; if its turn is running now, the turn is stopped too. Its past runs are not undone. Only this chat's jobs can be cancelled. A quarantined (corrupt) job listed by cron_list can be cancelled by id the same way, so a bad job can be cleaned up without editing cron.json on disk."
+	return "Cancel one scheduled cron job by id (from cron_schedule or cron_list). The job stops firing; if its turn is running now, the turn is stopped too. Its past runs are not undone. Only this chat's jobs can be cancelled, and in group chats only the bot owner can cancel. A quarantined (corrupt) job listed by cron_list can be cancelled by id the same way, so a bad job can be cleaned up without editing cron.json on disk."
 }
 
 func (t *cronCancelTool) Definition() model.ToolDefinition {
@@ -1124,6 +1368,20 @@ func (t *cronCancelTool) Execute(ctx context.Context, args json.RawMessage) (str
 	}
 	if t.store == nil {
 		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_cancel: no planning store configured")}
+	}
+	// F-C9: cancelling needs a sender to check, and in a group
+	// chat only the owner may cancel. (Previously cron_cancel
+	// read no approval context at all, so any allowlisted
+	// member could cancel the owner's jobs by id.)
+	chatID, senderID, ok := permissions.ApprovalContextFrom(ctx)
+	if !ok || chatID == 0 {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_cancel needs a Telegram chat: this run has no chat in its context")}
+	}
+	if senderID == 0 {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: errors.New("cron_cancel needs a sender: this run has no sender in its context")}
+	}
+	if err := cronRequireOwner(t.Name(), t.ownerID, chatID, senderID); err != nil {
+		return "", &ToolError{Tool: t.Name(), Kind: "execution", Err: err}
 	}
 	dir, key := t.store.resolveBucket(ctx)
 	t.store.mu.Lock()
@@ -1301,7 +1559,14 @@ type CronScheduler struct {
 
 // NewCronScheduler builds a scheduler over store. A nil store
 // fails ProcessDue loudly instead of silently firing nothing.
+// Construction marks the store as scheduler-present (F-C11),
+// so cron_schedule can tell a process that runs a scheduler
+// (oriond) from one that does not (orion daemon / telegram
+// poll) and warn instead of returning a bare success.
 func NewCronScheduler(store *PlanningStore) *CronScheduler {
+	if store != nil {
+		store.markCronSchedulerPresent()
+	}
 	return &CronScheduler{
 		store: store,
 		tick:  cronDefaultTick,

@@ -52,7 +52,7 @@ func TestCronSchedulerBudgetExceededOutcome(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Date(2026, 11, 14, 15, 30, 0, 0, time.UTC)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "minutely brief", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "minutely brief", now.Add(-time.Minute))
 	// A real failure streak must survive a budget refusal: it is
 	// neither reset (as "ok" used to) nor grown.
 	rewriteCronJob(t, store, ctx, id, func(j *CronJob) {
@@ -93,7 +93,7 @@ func TestCronSchedulerBudgetExceededSecondFiringSameDay(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Date(2026, 11, 14, 15, 30, 0, 0, time.UTC)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "minutely brief", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "minutely brief", now.Add(-time.Minute))
 	rewriteCronJob(t, store, ctx, id, func(j *CronJob) {
 		j.ConsecutiveFailures = 2
 	})
@@ -170,7 +170,7 @@ func TestCronSchedulerBudgetExceededNeverDisables(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Date(2026, 11, 14, 15, 30, 0, 0, time.UTC)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "always over budget", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "always over budget", now.Add(-time.Minute))
 
 	runner := cronBudgetRunner()
 	s := NewCronScheduler(store)

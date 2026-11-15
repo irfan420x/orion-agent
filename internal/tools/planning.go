@@ -61,6 +61,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -208,6 +209,11 @@ type PlanningStore struct {
 	dataDir string
 	dirFunc func(ctx context.Context) string
 	mem     map[string]*memBucket
+	// schedulerPresent records whether a CronScheduler was
+	// constructed over this store in this process (F-C11, see
+	// markCronSchedulerPresent in cron.go). It is an atomic so
+	// the schedule tool can read it without taking mu.
+	schedulerPresent atomic.Bool
 }
 
 // NewPlanningStore builds a store. dataDir "" means "no persistence

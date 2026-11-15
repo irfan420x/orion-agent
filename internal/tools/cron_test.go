@@ -564,7 +564,7 @@ func TestCronSchedulerFiresDueJob(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "do the thing", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "do the thing", now.Add(-time.Minute))
 
 	runner := &cronFakeRunner{}
 	s := NewCronScheduler(store)
@@ -648,7 +648,7 @@ func TestCronSchedulerBackoffAndDisable(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "always fails", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "always fails", now.Add(-time.Minute))
 
 	runner := &cronFakeRunner{err: fmt.Errorf("provider exploded")}
 	s := NewCronScheduler(store)
@@ -706,7 +706,7 @@ func TestCronSchedulerBackoffAndDisable(t *testing.T) {
 	runner2 := &cronFakeRunner{err: fmt.Errorf("boom once")}
 	s2 := NewCronScheduler(store)
 	s2.SetRunner(runner2.run)
-	id2 := cronDueJob(t, store, ctx, sched, "* * * * *", "fails then works", now.Add(-time.Minute))
+	id2 := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "fails then works", now.Add(-time.Minute))
 	if err := s2.ProcessDue(ctx, now); err != nil {
 		t.Fatalf("failing tick: %v", err)
 	}
@@ -740,7 +740,7 @@ func TestCronSchedulerNoRunner(t *testing.T) {
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	id := cronDueJob(t, store, ctx, sched, "* * * * *", "needs a runner", now.Add(-time.Minute))
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "needs a runner", now.Add(-time.Minute))
 	s := NewCronScheduler(store)
 	// No runner installed.
 	if err := s.ProcessDue(ctx, now); err == nil {
@@ -761,8 +761,8 @@ func TestCronSchedulerPerChatIsolation(t *testing.T) {
 	ctxA := cronChatCtx(111, 111)
 	ctxB := cronChatCtx(222, 222)
 	now := time.Now().UTC().Truncate(time.Second)
-	cronDueJob(t, store, ctxA, sched, "* * * * *", "A prompt", now.Add(-time.Minute))
-	cronDueJob(t, store, ctxB, sched, "* * * * *", "B prompt", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxA, sched, "*/5 * * * *", "A prompt", now.Add(-time.Minute))
+	cronDueJob(t, store, ctxB, sched, "*/5 * * * *", "B prompt", now.Add(-time.Minute))
 	// A third job, in chat A, not due yet.
 	mustCronSchedule(t, sched, ctxA, "0 9 * * *", "A later")
 
@@ -789,7 +789,7 @@ func TestCronSchedulerTickOverlapSkipped(t *testing.T) {
 	sched, _, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
 	now := time.Now().UTC().Truncate(time.Second)
-	cronDueJob(t, store, ctx, sched, "* * * * *", "slow job", now.Add(-time.Minute))
+	cronDueJob(t, store, ctx, sched, "*/5 * * * *", "slow job", now.Add(-time.Minute))
 
 	release := make(chan struct{})
 	runner := &cronFakeRunner{block: release}
@@ -838,7 +838,7 @@ func TestCronSchedulerReloadAcrossRestart(t *testing.T) {
 
 	store1 := NewPlanningStore(dir)
 	sched1, _, _ := cronTestTools(store1)
-	cronDueJob(t, store1, ctx, sched1, "* * * * *", "survives restart", now.Add(-time.Minute))
+	cronDueJob(t, store1, ctx, sched1, "*/5 * * * *", "survives restart", now.Add(-time.Minute))
 
 	// Fresh store + fresh scheduler on the same dir: a restart.
 	store2 := NewPlanningStore(dir)

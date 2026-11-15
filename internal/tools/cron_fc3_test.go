@@ -17,7 +17,10 @@ import (
 // rules a scheduled turn now ignores — so the user learns the job
 // will be denied instead of auto-running. It warns only: the job
 // is still created, and the rules themselves are untouched (they
-// still apply to interactive turns).
+// still apply to interactive turns). Every test here constructs
+// a scheduler over its store, so the F-C11 dormant-job warning
+// never appears in the note — these tests pin the allow-rule
+// warning only.
 
 // cronScheduleNote schedules a job with tool and returns the
 // confirmation's note field (the human-readable behaviour +
@@ -45,6 +48,7 @@ func cronScheduleNote(t *testing.T, tool *cronScheduleTool, ctx context.Context,
 
 func TestCronScheduleWarnsAboutAllowRules(t *testing.T) {
 	store := NewPlanningStore("")
+	_ = NewCronScheduler(store) // a scheduler runs: no F-C11 dormant warning in the note
 	rules := permissions.NewRuleStore("")
 	if err := rules.SetForChat(111, "shell_exec", permissions.ActionAllow); err != nil {
 		t.Fatal(err)
@@ -86,6 +90,7 @@ func TestCronScheduleWarnsAboutAllowRules(t *testing.T) {
 
 func TestCronScheduleNoWarningWithoutAllowRules(t *testing.T) {
 	store := NewPlanningStore("")
+	_ = NewCronScheduler(store) // a scheduler runs: no F-C11 dormant warning in the note
 	rules := permissions.NewRuleStore("")
 	// A deny rule alone changes nothing about scheduled turns.
 	if err := rules.SetForChat(111, "shell_exec", permissions.ActionDeny); err != nil {
@@ -105,6 +110,7 @@ func TestCronScheduleNoWarningWithoutRuleStore(t *testing.T) {
 	// No rule store wired (a hand-built registry without a gate):
 	// the job is still created and the note carries no warning.
 	store := NewPlanningStore("")
+	_ = NewCronScheduler(store) // a scheduler runs: no F-C11 dormant warning in the note
 	tool := &cronScheduleTool{store: store}
 	note := cronScheduleNote(t, tool, cronChatCtx(111, 111), "0 9 * * 1-5", "morning brief")
 	if strings.Contains(note, "Warning") {
@@ -114,6 +120,7 @@ func TestCronScheduleNoWarningWithoutRuleStore(t *testing.T) {
 
 func TestCronScheduleWarnsOnlyForRequestingChat(t *testing.T) {
 	store := NewPlanningStore("")
+	_ = NewCronScheduler(store) // a scheduler runs: no F-C11 dormant warning in the note
 	rules := permissions.NewRuleStore("")
 	// The allow rule lives in chat 222, not in the requesting
 	// chat 111: it must not warn here (per-chat isolation).
@@ -136,6 +143,7 @@ func TestCronScheduleWarnsAboutMcpAndUnclassifiedAllowRules(t *testing.T) {
 	// unattended — so a chat holding such a rule got no warning
 	// yet was denied every run.
 	store := NewPlanningStore("")
+	_ = NewCronScheduler(store) // a scheduler runs: no F-C11 dormant warning in the note
 	rules := permissions.NewRuleStore("")
 	if err := rules.SetForChat(111, "mcp__example", permissions.ActionAllow); err != nil {
 		t.Fatal(err)
@@ -181,6 +189,7 @@ func TestCronScheduleWarnsAboutMcpAndUnclassifiedAllowRules(t *testing.T) {
 // store is installed, and stays silent before it.
 func TestSetCronScheduleRuleStoreWiring(t *testing.T) {
 	store := NewPlanningStore("")
+	_ = NewCronScheduler(store) // a scheduler runs: no F-C11 dormant warning in the note
 	rules := permissions.NewRuleStore("")
 	if err := rules.SetForChat(111, "shell_exec", permissions.ActionAllow); err != nil {
 		t.Fatal(err)
