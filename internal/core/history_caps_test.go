@@ -260,7 +260,10 @@ func TestRunContinuesAfterMultiMBToolResult(t *testing.T) {
 	if totalTokens(req.Messages) > 1500 {
 		t.Fatalf("provider request %d tokens, over the 1500-token budget", totalTokens(req.Messages))
 	}
-	if req.Messages[0].Content != systemPrompt {
+	// The run must not modify the system prompt: the provider request
+	// carries exactly the agent's assembled prompt (core instructions
+	// + personality), byte for byte.
+	if req.Messages[0].Content != agent.SystemPrompt() {
 		t.Fatal("system prompt was modified in the provider request")
 	}
 	var toolMsg *model.Message

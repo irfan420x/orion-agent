@@ -339,6 +339,38 @@ func TestSystemPrompt(t *testing.T) {
 	}
 }
 
+// TestSystemPromptTryFirstAndHumanized pins the 2026-11-15 behavior fix
+// (Irfan's order 08:28 SGT): Orion must TRY before predicting failure,
+// and must present results as a human answer, not a raw tool dump.
+// The old wording taught the opposite — a predicted block was treated
+// as a refusal and answered with an explanation plus options (the
+// 2026-11-15 08:16 song turn: YouTube links found, download never
+// attempted, user asked to pick instead).
+func TestSystemPromptTryFirstAndHumanized(t *testing.T) {
+	a := newTestAgent(t, testConfig(5), &fakeProvider{}, tools.NewRegistry(), newFakeStore())
+	p := a.SystemPrompt()
+	for _, want := range []string{
+		"try a different way first",
+		"Never predict a tool will fail without trying it",
+		"ask for clarification only when",
+		"never paste raw tool output",
+		"one line saying why it matters",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("SystemPrompt missing try-first/humanized guidance %q", want)
+		}
+	}
+	for _, gone := range []string{
+		"do not retry the same call",
+		"offer a safe alternative",
+		"ask for clarification before acting",
+	} {
+		if strings.Contains(p, gone) {
+			t.Errorf("SystemPrompt still contains the old explain-instead-of-trying wording %q", gone)
+		}
+	}
+}
+
 func TestRunDirectAnswer(t *testing.T) {
 	prov := &fakeProvider{}
 	mem := newFakeStore()
