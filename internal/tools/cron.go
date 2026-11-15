@@ -40,8 +40,9 @@
 //     not silently run the action, and the denial is visible in
 //     the reply the scheduler sends to the chat.
 //   - Safety: a job that fails repeatedly backs off exponentially
-//     (1, 2, 4, 8, 16, 32, 60 minutes, capped at 60) and is
-//     DISABLED after 5 consecutive failures — never a hot loop.
+//     (1, 2, 4, 8, 16 minutes) and is DISABLED after 5 consecutive
+//     failures, so the backoff never grows past 16 minutes — never
+//     a hot loop.
 //     A chat may hold at most 20 jobs. A disabled job never
 //     fires; it stays listed until cancelled, so the owner can
 //     see what stopped and re-create it.
