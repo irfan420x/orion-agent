@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +37,7 @@ type cronJobOut struct {
 		Disabled            bool   `json:"disabled"`
 	} `json:"job"`
 	Timezone string `json:"timezone"`
+	Note     string `json:"note"`
 }
 
 type cronListOut struct {
@@ -369,6 +372,32 @@ func TestCronScheduleListCancel(t *testing.T) {
 	}
 }
 
+// TestCronScheduleNoteStatesNextRunUTC (F-C16 mitigation): the
+// schedule confirmation must state the concrete consequence of
+// UTC-only scheduling — the job's first run in UTC, and how to
+// convert it — so an SGT user writing `0 9 * * *` sees the
+// 17:00-local trap before the job ever fires. It must not invent
+// a local time: there is no per-chat timezone source.
+func TestCronScheduleNoteStatesNextRunUTC(t *testing.T) {
+	store := NewPlanningStore("")
+	sched, _, _ := cronTestTools(store)
+	ctx := cronChatCtx(111, 111)
+
+	created := mustCronSchedule(t, sched, ctx, "0 9 * * 1-5", "morning brief")
+	if created.Note == "" {
+		t.Fatalf("schedule note is empty, want the UTC consequence stated")
+	}
+	if !strings.Contains(created.Note, created.Job.NextRun) {
+		t.Fatalf("note %q does not state the first run %s", created.Note, created.Job.NextRun)
+	}
+	if !strings.Contains(created.Note, "no per-chat timezone") {
+		t.Fatalf("note %q does not say there is no per-chat timezone", created.Note)
+	}
+	if !strings.Contains(created.Note, "UTC offset") || !strings.Contains(created.Note, "UTC+8") {
+		t.Fatalf("note %q does not give the UTC-offset conversion (want the UTC+8 worked example)", created.Note)
+	}
+}
+
 func TestCronScheduleValidation(t *testing.T) {
 	store := NewPlanningStore("")
 	sched, list, _ := cronTestTools(store)
@@ -614,6 +643,52 @@ func TestCronSchedulerFiresDueJob(t *testing.T) {
 	}
 	if runner.count() != 1 {
 		t.Fatalf("runner calls after second tick = %d, want 1", runner.count())
+	}
+}
+
+// TestCronSchedulerFiresDirFuncJob (F-C25): a job scheduled into
+// a dirFunc-resolved bucket must be found by the scheduler's
+// scan and fired — before the fix, cronBuckets only scanned
+// <dataDir>/chats/<id> and the in-memory chat: buckets, so a
+// job in a dirFunc dir never fired at all.
+func TestCronSchedulerFiresDirFuncJob(t *testing.T) {
+	dataDir := t.TempDir()
+	store := NewPlanningStore(dataDir)
+	custom := filepath.Join(dataDir, "custom-session")
+	store.SetDirFunc(func(ctx context.Context) string { return custom })
+	sched, list, _ := cronTestTools(store)
+	ctx := cronChatCtx(111, 111)
+	now := time.Now().UTC().Truncate(time.Second)
+	id := cronDueJob(t, store, ctx, sched, "*/5 * * * *", "dirfunc job", now.Add(-time.Minute))
+
+	// Sanity: the job really landed in the dirFunc dir, not
+	// in the chat dir the scan already covers.
+	if _, err := os.Stat(filepath.Join(custom, "cron.json")); err != nil {
+		t.Fatalf("job not in dirFunc dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "chats", "111", "cron.json")); !os.IsNotExist(err) {
+		t.Fatalf("job leaked into the chat dir")
+	}
+
+	runner := &cronFakeRunner{}
+	s := NewCronScheduler(store)
+	s.SetRunner(runner.run)
+	if err := s.ProcessDue(ctx, now); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	if runner.count() != 1 {
+		t.Fatalf("runner calls = %d, want 1 (dirFunc job was not found by the scan)", runner.count())
+	}
+	if runner.calls[0].Prompt != "dirfunc job" || runner.calls[0].ChatID != 111 || runner.calls[0].Requester != 111 {
+		t.Fatalf("runner call = %+v, want chat 111 / requester 111 / the prompt", runner.calls[0])
+	}
+	got := mustCronList(t, list, ctx)
+	if got.Count != 1 {
+		t.Fatalf("list = %d jobs, want 1", got.Count)
+	}
+	j := got.Jobs[0]
+	if j.ID != id || j.LastResult != "ok" || j.ConsecutiveFailures != 0 || j.Disabled {
+		t.Fatalf("job after run = %+v, want ok/0 failures/not disabled", j)
 	}
 }
 

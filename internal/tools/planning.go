@@ -209,6 +209,21 @@ type PlanningStore struct {
 	dataDir string
 	dirFunc func(ctx context.Context) string
 	mem     map[string]*memBucket
+	// dirFuncBuckets records per-chat bucket directories resolved
+	// through dirFunc (F-C25): resolveBucket remembers every
+	// (dir, chatID) pair a dirFunc resolution yields, so the
+	// scheduler's scan (cronBuckets) can find jobs written into
+	// a dirFunc bucket — the data-dir/in-memory scan alone never
+	// sees those dirs. A dir is recorded only when the resolving
+	// context carries a chat (a dirFunc dir resolved without a
+	// chat can hold no cron job: cron_schedule requires one).
+	// The record is in-memory only: a dirFunc bucket first
+	// resolved in an earlier process lifetime is not known to
+	// this process until a tool call resolves it again — see
+	// cronBuckets. A dir recorded for one chat and later
+	// resolved for another (a host reusing one dir across
+	// chats) keeps the latest chat id.
+	dirFuncBuckets map[string]int64
 	// schedulerPresent records whether a CronScheduler was
 	// constructed over this store in this process (F-C11, see
 	// markCronSchedulerPresent in cron.go). It is an atomic so
@@ -271,6 +286,14 @@ func (s *PlanningStore) resolveBucket(ctx context.Context) (dir, key string) {
 	s.mu.Unlock()
 	if dirFunc != nil {
 		if d := dirFunc(ctx); d != "" {
+			// F-C25: remember the dirFunc-resolved bucket
+			// with the chat it was resolved for, so the
+			// scheduler's scan can find jobs written here.
+			// The dirFunc runs outside mu (see above); the
+			// record takes mu itself.
+			if chatID, _, ok := permissions.ApprovalContextFrom(ctx); ok && chatID != 0 {
+				s.recordDirFuncBucket(d, chatID)
+			}
 			return d, ""
 		}
 	}
@@ -284,6 +307,25 @@ func (s *PlanningStore) resolveBucket(ctx context.Context) (dir, key string) {
 		return filepath.Join(dataDir, "local"), ""
 	}
 	return "", "local"
+}
+
+// recordDirFuncBucket remembers that chatID's state lives in
+// dir, a directory a dirFunc resolution yielded (F-C25). The
+// scheduler's scan merges these records with the data-dir and
+// in-memory buckets, so a job written into a dirFunc bucket is
+// found and fired. Call with any lock state: it takes mu itself.
+// An empty dir or a zero chat id is not recorded — the former
+// never resolves to a bucket, the latter can hold no cron job.
+func (s *PlanningStore) recordDirFuncBucket(dir string, chatID int64) {
+	if dir == "" || chatID == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dirFuncBuckets == nil {
+		s.dirFuncBuckets = map[string]int64{}
+	}
+	s.dirFuncBuckets[dir] = chatID
 }
 
 // bucket returns the in-memory bucket for key, creating it.

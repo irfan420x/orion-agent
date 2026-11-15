@@ -782,9 +782,44 @@ func buildApprovalGate(a *app.App, gw *messaging.TelegramGateway, ownerID int64)
 	return gate, cards, nil
 }
 
+// runAgentTurn runs one agent turn for a chat and returns the raw
+// reply, stats and error (F-C24): the shared core of runTurn and
+// runScheduledTurn, so the two paths cannot drift apart. It builds
+// the run context — the turn runs on the CHAT's agent (P1-O3) with
+// the approval context the permission gate reads (P1-O2): the chat
+// the prompt goes to, and the sender who may answer it (P1-O4) —
+// registers the turn's cancel function so /stop can cancel it
+// (the wrapped ctx is also the registered one, so /stop cancels
+// exactly this turn), and runs HandleStreamForChatWithImages.
+// images carries any photo attached to the triggering message
+// (nil for a text-only turn — scheduled turns never carry photos).
+// A scheduled turn passes unattended=true: the gate then IGNORES
+// persisted "always allow" rules and denies gated tools promptly
+// (F-C3) — interactive turns never carry that marker. Callers
+// classify the error themselves (budget refusal, cancellation,
+// other) and record token usage in the session as their path
+// requires: this helper records nothing, so a budget refusal keeps
+// each caller's treatment (runTurn drops the usage,
+// runScheduledTurn records it — see F-C7).
+func runAgentTurn(a *app.App, ctx context.Context, chatID, senderID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent), unattended bool) (string, *core.TurnStats, error) {
+	if a == nil {
+		return "", nil, errors.New("oriond: app is nil")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	runCtx = permissions.WithApprovalContext(runCtx, chatID, senderID)
+	if unattended {
+		runCtx = permissions.WithUnattendedContext(runCtx)
+	}
+	registered := a.RegisterRun(chatID, runCtx, cancel)
+	if registered {
+		defer a.UnregisterRun(chatID, runCtx)
+	}
+	defer cancel()
+	return a.HandleStreamForChatWithImages(runCtx, chatID, text, images, emit)
+}
+
 // runTurn runs one real agent turn for a chat: it records the input
-// for /retry, registers the turn's cancel function so /stop can
-// cancel it, runs HandleStreamForChatWithImages (the emit is the
+// for /retry, runs the turn through runAgentTurn (the emit is the
 // terminal-card feed), and records the turn's token usage in the
 // session — including on error, since a failed turn still consumed
 // tokens. images carries any photo attached to the triggering
@@ -794,19 +829,7 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 	if a == nil {
 		return "", nil, errors.New("oriond: app is nil")
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	// The turn runs on the CHAT's agent (P1-O3) with the approval
-	// context the permission gate reads (P1-O2): the chat the
-	// prompt goes to, and the sender who may answer it (P1-O4).
-	// The wrapped ctx is also the registered one, so /stop cancels
-	// exactly this turn.
 	senderID, _ := messaging.SenderIDFromContext(ctx)
-	runCtx = permissions.WithApprovalContext(runCtx, chatID, senderID)
-	registered := a.RegisterRun(chatID, runCtx, cancel)
-	if registered {
-		defer a.UnregisterRun(chatID, runCtx)
-	}
-	defer cancel()
 	if store != nil {
 		store.SetLastInput(chatID, text)
 	}
@@ -819,7 +842,7 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 	// error" handler error): the turn was refused on purpose, and
 	// the message names the usage, the limit and the UTC-midnight
 	// reset.
-	reply, stats, err := a.HandleStreamForChatWithImages(runCtx, chatID, text, images, emit)
+	reply, stats, err := runAgentTurn(a, ctx, chatID, senderID, text, images, emit, false)
 	if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
 		return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil, nil
 	}
@@ -837,7 +860,8 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 
 // runScheduledTurn runs one scheduled cron job as a real agent
 // turn for its chat, and delivers the reply to that chat. It
-// mirrors runTurn, with two deliberate differences:
+// shares runAgentTurn with runTurn (F-C24); the scheduled path's
+// outcome handling differs deliberately:
 //
 //   - It does NOT record the prompt as the chat's last input:
 //     /retry is for the user's last message, and a scheduled
@@ -881,18 +905,7 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 	if a == nil {
 		return "", errors.New("oriond: app is nil")
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	runCtx = permissions.WithApprovalContext(runCtx, job.ChatID, job.Requester)
-	// Unattended (F-C3): the gate ignores persisted allow rules
-	// in this turn and denies gated tools promptly — see the doc
-	// comment above. Interactive turns never carry this marker.
-	runCtx = permissions.WithUnattendedContext(runCtx)
-	registered := a.RegisterRun(job.ChatID, runCtx, cancel)
-	if registered {
-		defer a.UnregisterRun(job.ChatID, runCtx)
-	}
-	defer cancel()
-	reply, stats, err := a.HandleStreamForChat(runCtx, job.ChatID, job.Prompt, nil)
+	reply, stats, err := runAgentTurn(a, ctx, job.ChatID, job.Requester, job.Prompt, nil, nil, true)
 	if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
 		// F-C7: the chat is over its daily token budget. This
 		// is NOT an "ok" run: the usage is still recorded (a

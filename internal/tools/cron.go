@@ -853,9 +853,21 @@ type cronBucket struct {
 
 // cronBuckets lists every chat bucket that may hold jobs: the
 // <dataDir>/chats/<id> directories when a data dir is set, the
-// in-memory "chat:<id>" buckets otherwise. Sorted by chat id, so
-// a tick's scan order is deterministic. A missing chats dir (no
-// chat has ever persisted state) is an empty list, not an error.
+// in-memory "chat:<id>" buckets otherwise — and, in both cases,
+// the dirFunc-resolved buckets resolveBucket recorded (F-C25):
+// a job written into a dirFunc dir lives outside <dataDir>/chats
+// and outside the in-memory buckets, so without the recorded
+// set the scan would never see it and it would never fire. The
+// recorded set is exactly the set of buckets the tools resolved
+// through dirFunc in this process: a bucket is recorded when a
+// tool call resolves it (see recordDirFuncBucket), and a
+// dirFunc bucket first resolved in an earlier process lifetime
+// is not known until a tool call resolves it again — the store
+// keeps no persisted registry of them. Sorted by chat id (ties
+// by directory, so a tick's scan order is deterministic). A
+// missing chats dir (no chat has ever persisted state) is an
+// empty list, not an error — but recorded dirFunc buckets are
+// still returned, since they do not depend on the chats dir.
 func (s *PlanningStore) cronBuckets() []cronBucket {
 	s.mu.Lock()
 	dataDir := s.dataDir
@@ -863,38 +875,63 @@ func (s *PlanningStore) cronBuckets() []cronBucket {
 	for k := range s.mem {
 		memKeys = append(memKeys, k)
 	}
+	dirFuncBuckets := make(map[string]int64, len(s.dirFuncBuckets))
+	for dir, chatID := range s.dirFuncBuckets {
+		dirFuncBuckets[dir] = chatID
+	}
 	s.mu.Unlock()
+
+	var out []cronBucket
+	seenDirs := map[string]struct{}{}
 	if dataDir != "" {
 		entries, err := os.ReadDir(filepath.Join(dataDir, "chats"))
-		if err != nil {
-			return nil
+		if err == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				id, err := strconv.ParseInt(e.Name(), 10, 64)
+				if err != nil || id == 0 {
+					continue
+				}
+				dir := filepath.Join(dataDir, "chats", e.Name())
+				seenDirs[dir] = struct{}{}
+				out = append(out, cronBucket{dir: dir, chatID: id})
+			}
 		}
-		out := make([]cronBucket, 0, len(entries))
-		for _, e := range entries {
-			if !e.IsDir() {
+	} else {
+		for _, k := range memKeys {
+			if !strings.HasPrefix(k, "chat:") {
 				continue
 			}
-			id, err := strconv.ParseInt(e.Name(), 10, 64)
+			id, err := strconv.ParseInt(strings.TrimPrefix(k, "chat:"), 10, 64)
 			if err != nil || id == 0 {
 				continue
 			}
-			out = append(out, cronBucket{dir: filepath.Join(dataDir, "chats", e.Name()), chatID: id})
+			out = append(out, cronBucket{key: k, chatID: id})
 		}
-		sort.Slice(out, func(i, j int) bool { return out[i].chatID < out[j].chatID })
-		return out
 	}
-	out := make([]cronBucket, 0, len(memKeys))
-	for _, k := range memKeys {
-		if !strings.HasPrefix(k, "chat:") {
+	// F-C25: a dirFunc dir is a real bucket even though it is
+	// neither under <dataDir>/chats nor an in-memory key. A
+	// recorded dir that coincides with a scanned chat dir (a
+	// dirFunc returning the default path) is skipped as a
+	// duplicate — the scan must cover each bucket once.
+	for dir, chatID := range dirFuncBuckets {
+		if chatID == 0 {
 			continue
 		}
-		id, err := strconv.ParseInt(strings.TrimPrefix(k, "chat:"), 10, 64)
-		if err != nil || id == 0 {
+		if _, dup := seenDirs[dir]; dup {
 			continue
 		}
-		out = append(out, cronBucket{key: k, chatID: id})
+		seenDirs[dir] = struct{}{}
+		out = append(out, cronBucket{dir: dir, chatID: chatID})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].chatID < out[j].chatID })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].chatID != out[j].chatID {
+			return out[i].chatID < out[j].chatID
+		}
+		return out[i].dir < out[j].dir
+	})
 	return out
 }
 
@@ -1381,7 +1418,19 @@ func (t *cronScheduleTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if toolErr != nil {
 		return "", toolErr
 	}
-	note := "Times are UTC (Orion has no per-chat timezone). The scheduled turn is unattended: persisted \"always allow\" rules never apply to it, and a destructive or network action inside it is denied promptly instead of running."
+	// F-C16: state the concrete consequence, not just "UTC": the
+	// job's first run in UTC, and how to convert it — an SGT user
+	// writing `0 9 * * *` gets a 17:00 local run, and "Times are
+	// UTC" alone never says so. The worked example names no
+	// timezone for this chat: Orion has no per-chat timezone
+	// anywhere (no timezone source exists in the run context —
+	// Telegram exposes only a language code, and no per-chat or
+	// per-user timezone is stored), so the note gives the
+	// conversion rule instead of a local time. A per-chat
+	// timezone (store one per chat, convert at schedule and at
+	// fire time, migrate existing jobs) is a feature, not a fix,
+	// and is deliberately not built here.
+	note := fmt.Sprintf("Times are UTC (Orion has no per-chat timezone): this job first runs %s. A UTC time is not your local time — add your UTC offset to convert (09:00 UTC is 17:00 at UTC+8, 10:00 at UTC+1, 01:00 at UTC-8). The scheduled turn is unattended: persisted \"always allow\" rules never apply to it, and a destructive or network action inside it is denied promptly instead of running.", next.Format(time.RFC3339))
 	if quarantined := doc.quarantined(); len(quarantined) > 0 {
 		// Surface the corruption the schedule just worked
 		// around: the new job is fine, but the chat still
