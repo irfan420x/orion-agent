@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // stubBudgetEnv is a CommandEnv stub for /budget and /skills tests.
@@ -388,7 +389,7 @@ func TestPhotoMessageGetsCannotSeeReply(t *testing.T) {
 	defer srv.Close()
 	g := newTestGateway(t, srv)
 	turns := 0
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		turns++
 		return "turn reply", nil, nil
 	}
@@ -418,7 +419,7 @@ func TestPhotoFromNonAllowlistedChatGetsNoReply(t *testing.T) {
 		t.Fatalf("NewTelegramGateway: %v", err)
 	}
 	turns := 0
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		turns++
 		return "turn reply", nil, nil
 	}
@@ -448,7 +449,7 @@ func TestPhotoWithTextStillCannotSee(t *testing.T) {
 	defer srv.Close()
 	g := newTestGateway(t, srv)
 	turns := 0
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		turns++
 		return "turn reply", nil, nil
 	}
@@ -476,7 +477,7 @@ func TestVisionErrorTranslatedToCannotSee(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 	g := newTestGateway(t, srv)
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "", nil, errors.New("core: provider call at step 1: deepseek: status 400: image input is not supported for this model")
 	}
 	cancel, errCh := runPollStream(t, g, handler)
@@ -506,7 +507,7 @@ func TestNonVisionErrorKeepsSorryForm(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 	g := newTestGateway(t, srv)
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "", nil, errors.New("core: provider call at step 1: context too long (status 400)")
 	}
 	cancel, errCh := runPollStream(t, g, handler)

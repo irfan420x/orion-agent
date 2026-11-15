@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // w2OffsetFake is a Telegram-faithful fake Bot API for the F-A8-2
@@ -176,7 +177,7 @@ func TestOffsetNotAdvancedPastInFlightTurn(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
 	var entered atomic.Int32
-	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnHandler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		entered.Add(1)
 		<-release
 		return "done", nil, nil
@@ -264,7 +265,7 @@ func TestOffsetNotAdvancedPastInFlightCallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Turns return immediately; the test is about the callback.
-	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnHandler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "done", nil, nil
 	}
 
@@ -330,7 +331,7 @@ func TestOffsetWatermarkWaitsForSlowestTurn(t *testing.T) {
 	var release1Once sync.Once
 	release1All := func() { release1Once.Do(func() { close(release1) }) }
 	var entered1, entered2 atomic.Int32
-	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnHandler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		if chatID == 77 {
 			entered1.Add(1)
 			<-release1

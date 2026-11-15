@@ -20,13 +20,15 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
-// TurnFunc runs one user turn. emit receives live core.ProgressEvents;
-// the gateway renders them into the terminal card. Returning stats
-// != nil appends the runtime footer to the final reply; nil means no
-// footer.
-type TurnFunc func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (reply string, stats *core.TurnStats, err error)
+// TurnFunc runs one user turn. images carries any photo attached to
+// the triggering message (nil for a text-only turn); emit receives
+// live core.ProgressEvents; the gateway renders them into the
+// terminal card. Returning stats != nil appends the runtime footer
+// to the final reply; nil means no footer.
+type TurnFunc func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (reply string, stats *core.TurnStats, err error)
 
 // FormatFooter renders the one-line runtime footer appended to a final
 // reply, e.g. "— deepseek-chat · 1,240 tokens · 3 steps · 4.2s". It

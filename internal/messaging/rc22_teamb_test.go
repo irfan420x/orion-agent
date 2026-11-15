@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 )
 
@@ -125,7 +126,7 @@ func TestRC22AllowedUpdatesSentOnceViaPollStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	received := make(chan struct{}, 1)
-	cancel, errCh := runPollStream(t, gw, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	cancel, errCh := runPollStream(t, gw, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		select {
 		case received <- struct{}{}:
 		default:
@@ -183,7 +184,7 @@ func TestRC22PollStreamSurvivesFailedFilterReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	received := make(chan struct{}, 1)
-	cancel, errCh := runPollStream(t, gw, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	cancel, errCh := runPollStream(t, gw, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		select {
 		case received <- struct{}{}:
 		default:

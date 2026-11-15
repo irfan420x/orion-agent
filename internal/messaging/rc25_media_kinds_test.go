@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // remainingMediaKinds is every kind F-A19-1 adds, in MediaKind's
@@ -103,7 +104,7 @@ func TestRemainingMediaGetsHonestReply(t *testing.T) {
 			defer srv.Close()
 			g := newTestGateway(t, srv)
 			turns := 0
-			handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+			handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 				turns++
 				return "turn reply", nil, nil
 			}
@@ -139,7 +140,7 @@ func TestCaptionedAnimationStillHonestReply(t *testing.T) {
 	defer srv.Close()
 	g := newTestGateway(t, srv)
 	turns := 0
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		turns++
 		return "turn reply", nil, nil
 	}

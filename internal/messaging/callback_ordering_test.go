@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // fillTurnSlots starts PollStream with turns that block until
@@ -44,7 +45,7 @@ func fillTurnSlots(t *testing.T, fake *queueFake, g *TelegramGateway) (context.C
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
 	var entered atomic.Int32
-	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnHandler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		entered.Add(1)
 		<-release
 		return "done", nil, nil

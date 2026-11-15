@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // --- Sender check + owner tier + callbacks (P1-O4) -----------------------
@@ -245,7 +246,7 @@ func TestCallbackQueryReachesHandler(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	cancel, errCh := runPollStream(t, g, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	cancel, errCh := runPollStream(t, g, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "unexpected turn", nil, nil
 	})
 	defer stopPollStream(t, cancel, errCh)
@@ -295,7 +296,7 @@ func TestCallbackQueryFromStrangerDropped(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	cancel, errCh := runPollStream(t, g, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	cancel, errCh := runPollStream(t, g, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "unexpected turn", nil, nil
 	})
 	defer stopPollStream(t, cancel, errCh)

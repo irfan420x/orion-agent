@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // stallFake is a stand-in Telegram server for poll-recovery tests. It
@@ -146,7 +147,7 @@ type okTurn struct {
 	seen []string
 }
 
-func (h *okTurn) fn(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+func (h *okTurn) fn(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	h.mu.Lock()
 	h.seen = append(h.seen, text)
 	h.mu.Unlock()

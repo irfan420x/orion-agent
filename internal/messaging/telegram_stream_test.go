@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // streamFake is a fake Telegram server for PollStream tests. It records
@@ -39,7 +40,17 @@ type streamFake struct {
 	// kills polling nor loses the reset (it is retried on the
 	// next fetch). 0 (the default) fails nothing.
 	failGetUpdates int
-	nextMsgID      int64
+	// fileBytes serves photo downloads (vision fix): getFile
+	// resolves file_id -> "photos/file-<file_id>.jpg" and the
+	// /file/bot<token>/... download returns fileBytes[file_id].
+	// Absent entries download as empty bytes. failGetFile makes
+	// every getFile call fail with HTTP 400. getFileIDs records
+	// the file_ids getFile was asked for, in order — the vision
+	// tests assert the LARGEST photo size was requested.
+	fileBytes   map[string][]byte
+	failGetFile bool
+	getFileIDs  []string
+	nextMsgID   int64
 	// failFirstEdit makes the first editMessageText call fail with a
 	// "message to edit not found" error, to exercise the fallback.
 	failFirstEdit bool
@@ -168,6 +179,30 @@ func (f *streamFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write(data)
 	case strings.HasSuffix(r.URL.Path, "/getMe"):
 		fmt.Fprint(w, `{"ok":true,"result":{"id":1,"username":"orion_test_bot","first_name":"Orion"}}`)
+	case strings.HasSuffix(r.URL.Path, "/getFile"):
+		// Vision fix: resolve file_id to a fake file path. The
+		// download URL is {base}/file/bot<token>/<path>.
+		fileID := r.URL.Query().Get("file_id")
+		f.mu.Lock()
+		f.getFileIDs = append(f.getFileIDs, fileID)
+		fail := f.failGetFile
+		f.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: wrong file_id"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"ok":true,"result":{"file_id":%q,"file_path":"photos/file-%s.jpg"}}`, fileID, fileID)
+	case strings.Contains(r.URL.Path, "/file/bot"):
+		// Vision fix: serve the bytes getFile resolved. The
+		// file_id is the middle of "file-<file_id>.jpg".
+		base := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		fileID := strings.TrimSuffix(strings.TrimPrefix(base, "file-"), ".jpg")
+		f.mu.Lock()
+		data := f.fileBytes[fileID]
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(data)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 		fmt.Fprint(w, `{"ok":false,"description":"not found"}`)
@@ -274,7 +309,7 @@ func stopPollStream(t *testing.T, cancel context.CancelFunc, errCh chan error) {
 // scriptedTurn is the fake end-to-end TurnFunc: shell_exec,
 // file_write, the same shell_exec twice, calculator — with finishes.
 func scriptedTurn(stats *core.TurnStats) TurnFunc {
-	return func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		shell := func(cmd string) {
 			args := mustJSONArgsForTest("command", cmd)
 			emit(started("shell_exec", args))
@@ -396,7 +431,7 @@ func TestPollStreamNoFooterWhenStatsNil(t *testing.T) {
 	defer srv.Close()
 	g := newTestGateway(t, srv)
 
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "plain reply", nil, nil
 	}
 	cancel, errCh := runPollStream(t, g, handler)
@@ -430,7 +465,7 @@ func TestPollStreamNoToolCallsSendsNoCard(t *testing.T) {
 	defer srv.Close()
 	g := newTestGateway(t, srv)
 
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "just text", nil, nil
 	}
 	cancel, errCh := runPollStream(t, g, handler)
@@ -513,7 +548,7 @@ func TestPollStreamHandlerError(t *testing.T) {
 	defer srv.Close()
 	g := newTestGateway(t, srv)
 
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		args := mustJSONArgsForTest("command", "false")
 		emit(started("shell_exec", args))
 		emit(finished("shell_exec", args, errors.New("exit status 1")))

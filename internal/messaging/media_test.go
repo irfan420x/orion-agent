@@ -19,6 +19,7 @@ import (
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // mediaFake is a fake Telegram server for the media tests. It
@@ -799,7 +800,7 @@ func TestPollStreamMediaDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTelegramGateway: %v", err)
 	}
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "Here is the file.\nMEDIA:" + csv + "\n", nil, nil
 	}
 	cancel, errCh := runPollStream(t, g, handler)

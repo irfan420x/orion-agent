@@ -29,6 +29,7 @@ import (
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/security"
 )
@@ -137,9 +138,10 @@ type TGChat struct {
 
 // TGPhotoSize is one size variant of a photo attached to a message.
 // Telegram sends the same image in several sizes; the largest is
-// last. Only FileID matters to Orion (it never downloads the file:
-// see CannotSeeImagesMessage) — Width/Height are kept so tests and
-// logs can tell a photo from any other attachment.
+// last. Only FileID matters to Orion — the largest size is
+// downloaded (see downloadPhoto) when the chat's model supports
+// vision. Width/Height are kept so tests and logs can tell a photo
+// from any other attachment.
 type TGPhotoSize struct {
 	FileID   string `json:"file_id"`
 	Width    int    `json:"width"`
@@ -149,8 +151,8 @@ type TGPhotoSize struct {
 
 // TGSticker is a sticker attached to a message (F-A18-9). Only
 // FileID matters to Orion — the sticker bytes are never fetched:
-// Orion has no vision support, so a sticker is answered with an
-// honest cannot-process reply, never downloaded.
+// a sticker is answered with an honest cannot-process reply, never
+// downloaded (stickers are not photo input).
 type TGSticker struct {
 	FileID string `json:"file_id"`
 	Width  int    `json:"width"`
@@ -268,9 +270,14 @@ type TGMessage struct {
 	// Photo holds the size variants of an attached photo, if any
 	// (F-A17-9). A photo message carries its caption in "caption",
 	// not "text", so Text is empty for a photo even with a caption
-	// — HasPhoto is the only reliable photo test. The photo bytes
-	// are never fetched: Orion has no vision support.
+	// — HasPhoto is the only reliable photo test. Caption is kept
+	// (vision fix): it is the user's question about the photo.
+	// The largest size (last element) is the one downloaded when
+	// the chat's model supports vision.
 	Photo []TGPhotoSize `json:"photo,omitempty"`
+	// Caption is the caption of a photo message, if any. It is
+	// empty for a plain-text message and for a caption-less photo.
+	Caption string `json:"caption,omitempty"`
 	// Sticker, Voice, Video, Document, Location, Animation, Audio,
 	// VideoNote, Contact, Poll, Venue, Dice and Game hold a
 	// non-photo attachment, if any (F-A18-9, F-A19-1). Like a photo,
@@ -386,12 +393,36 @@ func cannotProcessMediaMessage(kind string) string {
 }
 
 // CannotSeeImagesMessage is the honest reply sent when a photo
-// arrives (F-A17-9) and when a provider rejects image input
-// (F-A17-10): Orion has no vision support in rc23, so it must say
-// so instead of silently dropping the photo or surfacing a raw
-// provider "status 400". The reply asks for a text description,
-// which is the only image input Orion can use today.
-const CannotSeeImagesMessage = "📷 I can't see images yet — Orion has no vision support, so I can't view photos or screenshots sent here. Please describe the image in words and I'll help from your description."
+// arrives but the chat's provider/model cannot see images
+// (F-A17-9), and when a provider rejects image input (F-A17-10).
+// It is in Bengali — the user's language — and it names the fix:
+// DeepSeek's deepseek-flash has vision, so switching the model
+// enables it. It never claims the photo was seen, and never asks
+// the user to re-send what the bot cannot process.
+const CannotSeeImagesMessage = "📷 আমি এই ছবিটি দেখতে পারছি না — এই চ্যাটের মডেলের ভিশন সাপোর্ট নেই। মডেলটি DeepSeek `deepseek-flash`-এ বদলালে আমি ছবি দেখতে পারব। আপাতত ছবিটি কথায় বর্ণনা করলে আমি সেখান থেকে সাহায্য করতে পারব।"
+
+// PhotoTooLargeMessage is the honest reply when a photo exceeds
+// MaxPhotoBytes: the bot refuses the download instead of sending a
+// multi-megabyte base64 blob to the provider.
+const PhotoTooLargeMessage = "📷 ছবিটি অনেক বড় — আমি ১০ MiB পর্যন্ত ছবি নিতে পারি। ছোট করে পাঠালে দেখতে পারব।"
+
+// PhotoDownloadFailedMessage is the honest reply when a photo
+// could not be downloaded from Telegram (network error, expired
+// file_id, ...): the bot says so instead of running a turn on a
+// caption about an image it never received.
+const PhotoDownloadFailedMessage = "📷 ছবিটি ডাউনলোড করা যায়নি, তাই দেখতে পারছি না। আবার পাঠিয়ে দেখুন, অথবা ছবিটি কথায় বর্ণনা করুন।"
+
+// PhotoDefaultPrompt is the user text for a photo sent with no
+// caption: the model is asked to describe the image.
+const PhotoDefaultPrompt = "এই ছবিটা বর্ণনা করো।"
+
+// MaxPhotoBytes caps a downloaded Telegram photo (vision fix).
+// Telegram photos are small (a 1280px photo is typically well
+// under a few MiB) and DeepSeek allows 32 MiB per image, but the
+// request body caps at 48 MiB and base64 inflates bytes by ~33%,
+// so 10 MiB keeps a photo turn comfortably inside the request
+// budget even with history attached.
+const MaxPhotoBytes = 10 << 20
 
 // TGCallbackQuery is a Telegram callback query: a tap on an inline
 // keyboard button. Message is the message the button belongs to
@@ -551,6 +582,14 @@ type TelegramGateway struct {
 	// callback-query updates (inline-keyboard taps). It is invoked
 	// outside any per-chat lock (see CallbackHandler).
 	callbackHandler CallbackHandler
+	// modelInfo, when set via WithModelInfo, reports the chat's
+	// current (provider, model) for vision decisions: a photo is
+	// downloaded and run as a turn only when SupportsVision says
+	// that pair can see images. Nil (the default, e.g. in tests
+	// that never set it) means "unknown": vision is treated as
+	// unsupported and the photo gets the honest Bengali
+	// cannot-see reply — fail closed, never pretend.
+	modelInfo func(chatID int64) (provider, model string)
 	// router, when installed via InstallCallbackRouter, dispatches
 	// taps by callback_data prefix to the tool that owns the
 	// prefix (framework-registered tools) and falls back to the
@@ -681,6 +720,21 @@ func WithLogger(logf func(format string, args ...any)) GatewayOption {
 	return func(g *TelegramGateway) {
 		if logf != nil {
 			g.logger = logf
+		}
+	}
+}
+
+// WithModelInfo installs the per-chat (provider, model) lookup the
+// gateway uses for vision decisions (see modelInfo): a photo is
+// downloaded and run as a turn only when SupportsVision says that
+// pair can see images. The daemon wires this to
+// App.ModelInfoForChat, so a /model switch in one chat decides
+// vision for that chat only. A nil lookup is ignored and the
+// gateway keeps treating vision as unsupported.
+func WithModelInfo(fn func(chatID int64) (provider, model string)) GatewayOption {
+	return func(g *TelegramGateway) {
+		if fn != nil {
+			g.modelInfo = fn
 		}
 	}
 }
@@ -2519,6 +2573,77 @@ func userErrorMessage(err error) string {
 	return security.RedactSecrets(fmt.Sprintf("Sorry, I hit an error: %v", err))
 }
 
+// visionSupported reports whether the chat's current provider/model
+// can see images (model.SupportsVision). No modelInfo installed, or
+// an unknown pair, means unsupported — fail closed, never pretend.
+func (g *TelegramGateway) visionSupported(chatID int64) bool {
+	if g == nil || g.modelInfo == nil {
+		return false
+	}
+	provider, modelName := g.modelInfo(chatID)
+	return model.SupportsVision(provider, modelName)
+}
+
+// errPhotoTooLarge marks a download refused for exceeding
+// MaxPhotoBytes, so handlePhoto can answer with the too-large
+// message instead of the generic download-failed one.
+var errPhotoTooLarge = errors.New("messaging: telegram photo exceeds MaxPhotoBytes")
+
+// downloadPhoto fetches one Telegram photo by file_id: getFile
+// resolves the file path, then the bytes are downloaded from the
+// file host ({baseURL}/file/bot<token>/<path>) — the same base URL
+// the gateway already uses, so tests can point it at a fake server
+// with WithBaseURL. Only the bytes are returned; the MIME type is
+// sniffed from them by the caller (never trusted from Telegram).
+// The download is capped at MaxPhotoBytes: a larger photo is
+// refused with errPhotoTooLarge before its bytes are held in
+// memory. The token never appears in a returned error or log line:
+// the URL is built with PathEscape like call() does, and errors
+// name only the method.
+func (g *TelegramGateway) downloadPhoto(ctx context.Context, fileID string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := g.call(ctx, "getFile", url.Values{"file_id": {fileID}}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("messaging: telegram getFile: %w", err)
+	}
+	var file struct {
+		FilePath string `json:"file_path"`
+	}
+	if err := json.Unmarshal(result, &file); err != nil {
+		return nil, fmt.Errorf("messaging: telegram getFile: decode response: %w", err)
+	}
+	if strings.TrimSpace(file.FilePath) == "" {
+		return nil, errors.New("messaging: telegram getFile: empty file_path")
+	}
+	endpoint := fmt.Sprintf("%s/file/bot%s/%s", g.baseURL, url.PathEscape(g.token), strings.TrimPrefix(file.FilePath, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("messaging: telegram download photo: %w", err)
+	}
+	client := g.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("messaging: telegram download photo: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("messaging: telegram download photo: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxPhotoBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("messaging: telegram download photo: read response: %w", err)
+	}
+	if len(data) > MaxPhotoBytes {
+		return nil, errPhotoTooLarge
+	}
+	return data, nil
+}
+
 func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) error {
 	if handler == nil {
 		return errors.New("messaging: telegram PollStream: handler must not be nil")
@@ -2738,29 +2863,6 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		}
 	}
 
-	// handlePhoto answers a photo message (F-A17-9): Orion has no
-	// vision support, so the honest reply is "I can't see images"
-	// — never a turn on the caption (the model would answer about
-	// an image it never saw: confabulation), and never silence.
-	// It mirrors handle's confirmation discipline (markDecided on
-	// completion, never at spawn) and takes the per-chat lock, so
-	// a photo reply cannot overtake a turn for the same chat. The
-	// send is best-effort, like every other reply: a failed send
-	// must not kill polling.
-	handlePhoto := func(upd Update) {
-		// Registered first, so it runs LAST: the handler is
-		// fully done (reply sent, update confirmed, slot
-		// released) before PollStream's wait returns (rc25).
-		defer handlers.Done()
-		defer markDecided(upd.UpdateID)
-		defer func() { <-sem }()
-		lock := chatLock(upd.Message.Chat.ID)
-		lock.Lock()
-		defer lock.Unlock()
-		g.logf("telegram poll: photo from chat %d answered with cannot-see reply (no vision support)", upd.Message.Chat.ID)
-		_ = g.SendMessage(ctx, upd.Message.Chat.ID, CannotSeeImagesMessage)
-	}
-
 	// handleMedia answers a non-photo media message (F-A18-9):
 	// the honest cannot-process reply for its kind, never a turn
 	// (the model never received the attachment) and never
@@ -2782,19 +2884,21 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		_ = g.SendMessage(ctx, upd.Message.Chat.ID, cannotProcessMediaMessage(kind))
 	}
 
-	handle := func(upd Update) {
-		// Registered first, so it runs LAST (LIFO): after the
-		// reply/apology is sent, after the panic recovery, and
-		// after the semaphore slot is released. The update is
-		// confirmed only once this handler has fully completed
-		// (F-A8-2) — never at spawn.
-		defer markDecided(upd.UpdateID)
-		defer func() { <-sem }()
+	// handleTurn runs one turn for an update: the body shared by the
+	// text path (handle) and the photo path (handlePhoto, when the
+	// chat's model supports vision). text is the user text — the
+	// message text, or a photo's caption (or the default prompt
+	// when the photo has no caption) — and images is nil for a
+	// text-only turn. It owns the per-chat lock and the panic
+	// recovery; the caller owns markDecided and the semaphore slot
+	// (see handle / handlePhoto). A photo turn never answers a
+	// pending ask_user_question: replyChainTryAnswer reads the
+	// message text, which is empty for a photo, so it returns
+	// false and the photo runs as a normal turn.
+	handleTurn := func(upd Update, text string, images []model.ImageContent) {
 		// A panic in the handler (the agent loop) must not kill the
 		// daemon: report it to the chat like any other handler error
-		// and keep polling. This defer is registered after the
-		// semaphore release, so on a panic it runs first (LIFO) and
-		// the slot is still released.
+		// and keep polling.
 		defer func() {
 			if r := recover(); r != nil {
 				var msg string
@@ -3066,7 +3170,8 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		defer turnCancel()
 		busySt = g.registerBusy(chatID, turnCancel)
 		defer g.unregisterBusy(chatID, busySt)
-		reply, stats, herr := handler(turnCtx, chatID, upd.Message.Text, emit)
+		reply, stats, herr := handler(turnCtx, chatID, text, images, emit)
+		stopTyping()
 
 		// sendTurnResult is the reply tail shared by the main
 		// turn and every leftover turn below: an error becomes
@@ -3121,12 +3226,103 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			}
 			for _, lf := range leftovers {
 				lfCtx := core.WithUpdateID(handlerCtx, lf.UpdateID)
-				lreply, lstats, lerr := handler(lfCtx, chatID, lf.Text, emit)
+				// Leftover steers are text-only by construction
+				// (core.SteeredMessage carries Text + UpdateID,
+				// no images — photos never enter the steer path),
+				// so the images argument is nil.
+				lreply, lstats, lerr := handler(lfCtx, chatID, lf.Text, nil, emit)
 				sendTurnResult(lreply, lstats, lerr)
 			}
 		}
 		stopTyping()
 		sendTurnResult(reply, stats, herr)
+	}
+
+	// handle runs one plain-text turn: the text path into
+	// handleTurn. It owns the confirmation discipline (markDecided
+	// on completion, never at spawn — F-A8-2) and the semaphore
+	// slot; handleTurn owns the lock, the card and the recovery.
+	handle := func(upd Update) {
+		// Registered first, so it runs LAST (LIFO): after the
+		// reply/apology is sent, after the panic recovery, and
+		// after the semaphore slot is released. The update is
+		// confirmed only once this handler has fully completed
+		// (F-A8-2) — never at spawn.
+		defer markDecided(upd.UpdateID)
+		defer func() { <-sem }()
+		handleTurn(upd, upd.Message.Text, nil)
+	}
+
+	// handlePhoto answers a photo message (F-A17-9). Two paths:
+	//   - The chat's provider/model supports vision: the largest
+	//     size is downloaded and the photo runs as a real turn
+	//     (handleTurn) with the caption as the text — or the
+	//     default Bengali "describe this photo" prompt when there
+	//     is no caption — and the image bytes attached. Never a
+	//     turn on the caption alone (the model would answer about
+	//     an image it never saw: confabulation).
+	//   - Anything else (non-vision model, or no modelInfo
+	//     installed): the honest Bengali cannot-see reply, which
+	//     names the fix (DeepSeek deepseek-flash). Never silence.
+	// A download that fails, or a photo over MaxPhotoBytes, gets
+	// its own honest Bengali reply instead of a turn. It mirrors
+	// handle's confirmation discipline (markDecided on completion,
+	// never at spawn). The download runs outside the per-chat lock
+	// (it can take seconds); handleTurn takes the lock for the
+	// turn, and the fallback sends take it for the reply, so a
+	// photo reply still cannot overtake a turn for the same chat.
+	// Every send is best-effort, like every other reply: a failed
+	// send must not kill polling.
+	handlePhoto := func(upd Update) {
+		// Registered first, so it runs LAST: the handler is
+		// fully done (reply sent, update confirmed, slot
+		// released) before PollStream's wait returns (rc25).
+		defer handlers.Done()
+		defer markDecided(upd.UpdateID)
+		defer func() { <-sem }()
+		chatID := upd.Message.Chat.ID
+		if !g.visionSupported(chatID) {
+			lock := chatLock(chatID)
+			lock.Lock()
+			defer lock.Unlock()
+			g.logf("telegram poll: photo from chat %d answered with cannot-see reply (model has no vision support)", chatID)
+			_ = g.SendMessage(ctx, chatID, CannotSeeImagesMessage)
+			return
+		}
+		// Telegram sends the largest size last.
+		sizes := upd.Message.Photo
+		largest := sizes[len(sizes)-1]
+		data, err := g.downloadPhoto(ctx, largest.FileID)
+		if err != nil {
+			msg := PhotoDownloadFailedMessage
+			if errors.Is(err, errPhotoTooLarge) {
+				msg = PhotoTooLargeMessage
+			}
+			g.logf("telegram poll: photo from chat %d could not be downloaded: %v", chatID, err)
+			lock := chatLock(chatID)
+			lock.Lock()
+			defer lock.Unlock()
+			_ = g.SendMessage(ctx, chatID, msg)
+			return
+		}
+		mime := model.SniffImageMIME(data)
+		if mime == "" {
+			// Telegram said "photo" but the bytes are none of
+			// the formats a vision model accepts: say so
+			// honestly instead of sending unusable bytes.
+			g.logf("telegram poll: photo from chat %d has an unrecognised image format, not sent to the model", chatID)
+			lock := chatLock(chatID)
+			lock.Lock()
+			defer lock.Unlock()
+			_ = g.SendMessage(ctx, chatID, PhotoDownloadFailedMessage)
+			return
+		}
+		text := strings.TrimSpace(upd.Message.Caption)
+		if text == "" {
+			text = PhotoDefaultPrompt
+		}
+		g.logf("telegram poll: photo from chat %d (%d bytes, %s) running as a vision turn", chatID, len(data), mime)
+		handleTurn(upd, text, []model.ImageContent{{Data: data, MIMEType: mime}})
 	}
 
 	// handleCallback answers one callback query (an inline-keyboard
@@ -3431,8 +3627,11 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 			// photo message's caption lives in "caption", not
 			// "text", so Text is empty for a captioned photo —
 			// and a photo WITH text still shows an image the
-			// model cannot see, so answering the text while
-			// ignoring the photo would mislead. Non-photo media
+			// model may not see, so answering the text while
+			// ignoring the photo would mislead. handlePhoto
+			// decides: a vision-capable model gets the photo
+			// (caption as the text), anything else gets the
+			// honest Bengali cannot-see reply. Non-photo media
 			// (F-A18-9) is the same: a voice note, video,
 			// document, sticker or location the model never
 			// received must be answered honestly, never run as
@@ -3475,12 +3674,13 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				progress++
 				return true
 			}
-			// Photo (F-A17-9): answer honestly instead of
-			// running a turn. The sender is already authorised
-			// (above); the reply goes through the same
-			// in-flight/sem discipline as a turn, so a crash
-			// mid-reply re-delivers the photo instead of
-			// confirming and losing it.
+			// Photo (F-A17-9): handlePhoto decides — a vision
+			// turn when the chat's model can see images, the
+			// honest Bengali cannot-see reply otherwise. The
+			// sender is already authorised (above); the reply
+			// goes through the same in-flight/sem discipline as
+			// a turn, so a crash mid-reply re-delivers the photo
+			// instead of confirming and losing it.
 			if hasPhoto {
 				if !markInFlight(upd.UpdateID) {
 					return true
@@ -3615,7 +3815,7 @@ func (g *TelegramGateway) Poll(ctx context.Context, handler func(ctx context.Con
 	if handler == nil {
 		return errors.New("messaging: telegram Poll: handler must not be nil")
 	}
-	return g.PollStream(ctx, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return g.PollStream(ctx, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		reply, err := handler(ctx, chatID, text)
 		return reply, nil, err
 	})

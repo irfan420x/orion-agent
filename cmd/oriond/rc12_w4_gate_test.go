@@ -26,6 +26,7 @@ import (
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/messaging"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/tools"
 )
@@ -90,7 +91,7 @@ func TestW4BuildApprovalGateInstallsGateAndCallbackHandler(t *testing.T) {
 	defer cancel()
 	pollErr := make(chan error, 1)
 	go func() {
-		pollErr <- gw.PollStream(ctx, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		pollErr <- gw.PollStream(ctx, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 			return "ok", nil, nil
 		})
 	}()

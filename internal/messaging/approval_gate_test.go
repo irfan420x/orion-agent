@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 )
 
@@ -74,7 +75,7 @@ func TestSharedApprovalWiringPromptsAndResolvesViaInstalledHandler(t *testing.T)
 		t.Fatal("InstallApprovalCallbackHandler did not install a callback handler on the gateway")
 	}
 
-	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnHandler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "ok", nil, nil
 	}
 	cancel, errCh := runPollStream(t, gw, turnHandler)

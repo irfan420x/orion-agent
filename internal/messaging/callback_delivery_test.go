@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // --- Callback delivery under a full turn semaphore (rc11 W7) --------
@@ -190,7 +191,7 @@ func TestCallbackDeliveredWhileTurnSlotsFull(t *testing.T) {
 	// one turn-semaphore slot for its whole duration.
 	release := make(chan struct{})
 	var entered atomic.Int32
-	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnHandler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		entered.Add(1)
 		<-release
 		return "done", nil, nil

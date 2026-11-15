@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 )
 
@@ -269,7 +270,7 @@ func newW6Harness(t *testing.T, gateTimeout time.Duration) *w6Harness {
 // turnHandler mirrors the live turn: approval context from the
 // sender, then the gate, then (only if allowed) the "command".
 func (h *w6Harness) turnHandler() TurnFunc {
-	return func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		senderID, _ := SenderIDFromContext(ctx)
 		ctx = permissions.WithApprovalContext(ctx, chatID, senderID)
 		allowed, reason := h.gate.Check(ctx, "shell_exec", `{"command":"echo hi"}`)
@@ -642,7 +643,7 @@ func TestW6CallbackSameBatchAsMessage(t *testing.T) {
 	defer cancel()
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- gw.PollStream(ctx, func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		errCh <- gw.PollStream(ctx, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 			msgCount.Add(1)
 			return "ok", nil, nil
 		})

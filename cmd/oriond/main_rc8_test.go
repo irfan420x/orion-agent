@@ -66,7 +66,7 @@ func rc8TurnHandler(t *testing.T, a *app.App, store *messaging.SessionStore) (me
 func turnAs(t *testing.T, fn messaging.TurnFunc, sender, chat int64, text string) (string, error) {
 	t.Helper()
 	ctx := messaging.WithSenderID(context.Background(), sender)
-	reply, _, err := fn(ctx, chat, text, nil)
+	reply, _, err := fn(ctx, chat, text, nil, nil)
 	return reply, err
 }
 

@@ -640,7 +640,17 @@ func (a *Agent) drainSteerForStep(messages *[]model.Message) {
 // directly or the step budget is exhausted. A tool failure is fed back to
 // the model as the tool result; it never aborts the loop on its own.
 func (a *Agent) Run(ctx context.Context, input string) (string, error) {
-	return a.run(ctx, input, false, nil, nil)
+	return a.run(ctx, input, nil, false, nil, nil)
+}
+
+// RunWithImages is Run with image input attached to the user turn
+// (vision): the images travel in the user message to a provider
+// whose model supports vision. Callers must check SupportsVision
+// first — sending images to a non-vision provider is an error at
+// best and a silent "[Unsupported Image]" substitution at worst —
+// so this method itself only carries, never decides.
+func (a *Agent) RunWithImages(ctx context.Context, input string, images []model.ImageContent) (string, error) {
+	return a.run(ctx, input, images, false, nil, nil)
 }
 
 // RunWithEventHandler is Run with a per-run progress-event handler:
@@ -650,7 +660,14 @@ func (a *Agent) Run(ctx context.Context, input string) (string, error) {
 // This is what HandleStream uses: two concurrent chats on one Agent
 // must not steal each other's TurnFinished events (Audit 4 B P1-2).
 func (a *Agent) RunWithEventHandler(ctx context.Context, input string, h EventHandler) (string, error) {
-	return a.run(ctx, input, false, nil, h)
+	return a.run(ctx, input, nil, false, nil, h)
+}
+
+// RunWithEventHandlerWithImages is RunWithEventHandler with image
+// input attached to the user turn (vision). This is the path a
+// Telegram photo turn takes.
+func (a *Agent) RunWithEventHandlerWithImages(ctx context.Context, input string, images []model.ImageContent, h EventHandler) (string, error) {
+	return a.run(ctx, input, images, false, nil, h)
 }
 
 // RunStream is Run, except every step is produced through
@@ -668,7 +685,16 @@ func (a *Agent) RunStream(ctx context.Context, input string, fn func(chunk strin
 	if fn == nil {
 		return "", errors.New("core: stream callback must not be nil")
 	}
-	return a.run(ctx, input, true, fn, nil)
+	return a.run(ctx, input, nil, true, fn, nil)
+}
+
+// RunStreamWithImages is RunStream with image input attached to the
+// user turn (vision).
+func (a *Agent) RunStreamWithImages(ctx context.Context, input string, images []model.ImageContent, fn func(chunk string) error) (string, error) {
+	if fn == nil {
+		return "", errors.New("core: stream callback must not be nil")
+	}
+	return a.run(ctx, input, images, true, fn, nil)
 }
 
 // run is the shared loop for Run and RunStream. When stream is true
@@ -676,8 +702,10 @@ func (a *Agent) RunStream(ctx context.Context, input string, fn func(chunk strin
 // per step); otherwise every step goes through provider.Chat.
 // handler, when non-nil, is the per-run event handler for this run
 // only (see RunWithEventHandler); nil means "use the agent-wide
-// handler".
-func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn func(chunk string) error, handler EventHandler) (string, error) {
+// handler". images, when non-nil, ride on the user message of this
+// turn only (vision); they are never recorded in memory (see the
+// userMsg comment below), so a later turn never re-sends them.
+func (a *Agent) run(ctx context.Context, input string, images []model.ImageContent, stream bool, streamFn func(chunk string) error, handler EventHandler) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -855,11 +883,19 @@ func (a *Agent) run(ctx context.Context, input string, stream bool, streamFn fun
 		}
 		messages = append(messages, history...)
 	}
-	userMsg := model.Message{Role: "user", Content: input}
+	userMsg := model.Message{Role: "user", Content: input, Images: images}
 	messages = append(messages, userMsg)
 	// recordMessage stores in memory AND appends to the wired
 	// per-session transcript (best-effort on the transcript leg).
-	a.recordMessage(userMsg)
+	// The recorded copy is TEXT-ONLY: image bytes are never
+	// persisted in memory, so a photo cannot bloat the message
+	// store and a later turn can never re-send it — the wire
+	// history rule (toOpenAIMessages) is the backstop, this is
+	// the first line of defence. The live messages slice above
+	// keeps the images for this turn's provider calls.
+	recorded := userMsg
+	recorded.Images = nil
+	a.recordMessage(recorded)
 
 	// Fact-aware recall: facts and statements from older turns that
 	// the recent window no longer covers are injected into the system

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/tools"
 )
@@ -77,18 +78,18 @@ func newQuestionHarness(t *testing.T) *questionHarness {
 		gate:  gate,
 	}
 	h.handler = h.recordingTurn
-	dispatch := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	dispatch := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		h.mu.Lock()
 		fn := h.handler
 		h.mu.Unlock()
-		return fn(ctx, chatID, text, emit)
+		return fn(ctx, chatID, text, images, emit)
 	}
 	h.cancel, h.errCh = runPollStream(t, gw, dispatch)
 	t.Cleanup(func() { stopPollStream(t, h.cancel, h.errCh) })
 	return h
 }
 
-func (h *questionHarness) recordingTurn(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+func (h *questionHarness) recordingTurn(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	h.mu.Lock()
 	h.turns = append(h.turns, turnCall{chatID, text})
 	h.mu.Unlock()
@@ -412,7 +413,7 @@ func TestAskQuestionTurnAsksAndReplyResolves(t *testing.T) {
 	// at the 5s waitFor.
 	h := newQuestionHarness(t)
 	h.mu.Lock()
-	h.handler = func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	h.handler = func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		if text != "ask me" {
 			return "ok", nil, nil
 		}

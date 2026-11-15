@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // TestPollStreamPassesUpdateIDToHandler (F-A9-1) proves the turn
@@ -32,7 +33,7 @@ func TestPollStreamPassesUpdateIDToHandler(t *testing.T) {
 	}
 	var gotID int64
 	var calls int32
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		gotID = core.UpdateIDFromContext(ctx)
 		atomic.AddInt32(&calls, 1)
 		return "ok", nil, nil
@@ -69,7 +70,7 @@ func TestPollStreamPanickedTurnStopsTyping(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls int32
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		atomic.AddInt32(&calls, 1)
 		panic("test panic: boom")
 	}

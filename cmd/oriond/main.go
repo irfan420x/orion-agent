@@ -20,6 +20,7 @@ import (
 	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/messaging"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/sandbox"
 	"github.com/irfan/orion/internal/security"
@@ -300,6 +301,15 @@ func run(args []string) int {
 		// anywhere on the machine (denylist-only by default, or
 		// media_allow_dirs when set) to the chat.
 		messaging.WithMediaDelivery(a.Config.Media),
+		// Vision: the gateway needs the chat's current provider
+		// and model to decide whether a photo can be seen
+		// (SupportsVision) or must get the honest Bengali
+		// cannot-see reply. Per-chat, so a /model switch in one
+		// chat never decides vision for another.
+		messaging.WithModelInfo(func(chatID int64) (string, string) {
+			provider, modelName, _ := a.ModelInfoForChat(chatID)
+			return provider, modelName
+		}),
 	}
 	if a.Config.AllowAllTelegramChats {
 		// P2-O5 / F-A17-4: the opt-in is time-boxed — IsChatAllowed
@@ -498,7 +508,7 @@ func run(args []string) int {
 		if last == "" {
 			return "", nil, errors.New("nothing to retry yet — send a message first")
 		}
-		return runTurn(a, store, ctx, chatID, last, nil)
+		return runTurn(a, store, ctx, chatID, last, nil, nil)
 	}
 	env := buildCommandEnv(a, store, username, allowed, ownerID, restart, retry)
 	registry := messaging.DefaultRegistry(env)
@@ -770,10 +780,13 @@ func buildApprovalGate(a *app.App, gw *messaging.TelegramGateway, ownerID int64)
 
 // runTurn runs one real agent turn for a chat: it records the input
 // for /retry, registers the turn's cancel function so /stop can
-// cancel it, runs HandleStreamForChat (the emit is the terminal-card feed),
-// and records the turn's token usage in the session — including on
-// error, since a failed turn still consumed tokens.
-func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+// cancel it, runs HandleStreamForChatWithImages (the emit is the
+// terminal-card feed), and records the turn's token usage in the
+// session — including on error, since a failed turn still consumed
+// tokens. images carries any photo attached to the triggering
+// message (nil for a text-only turn); a /retry replays text only,
+// so it passes nil.
+func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	if a == nil {
 		return "", nil, errors.New("oriond: app is nil")
 	}
@@ -802,7 +815,7 @@ func runTurn(a *app.App, store *messaging.SessionStore, ctx context.Context, cha
 	// error" handler error): the turn was refused on purpose, and
 	// the message names the usage, the limit and the UTC-midnight
 	// reset.
-	reply, stats, err := a.HandleStreamForChat(runCtx, chatID, text, emit)
+	reply, stats, err := a.HandleStreamForChatWithImages(runCtx, chatID, text, images, emit)
 	if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
 		return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil, nil
 	}
@@ -886,7 +899,7 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 // before Dispatch — the shared env's Restart cannot refuse (it
 // returns nothing), so the check lives at this layer.
 func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messaging.Registry, env *messaging.CommandEnv, ownerID int64, botUsername string) messaging.TurnFunc {
-	return func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		senderID, _ := messaging.SenderIDFromContext(ctx)
 		if registry != nil && env != nil {
 			// Per-turn copy of the env with this chat's ID: the
@@ -944,7 +957,7 @@ func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messa
 		if store != nil {
 			footerOn = store.Get(chatID).FooterEnabled
 		}
-		reply, stats, err := runTurn(a, store, ctx, chatID, text, emit)
+		reply, stats, err := runTurn(a, store, ctx, chatID, text, images, emit)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return "", nil, nil

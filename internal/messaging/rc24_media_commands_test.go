@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 )
 
@@ -226,7 +227,7 @@ func TestNonPhotoMediaGetsHonestReply(t *testing.T) {
 			defer srv.Close()
 			g := newTestGateway(t, srv)
 			turns := 0
-			handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+			handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 				turns++
 				return "turn reply", nil, nil
 			}
@@ -259,7 +260,7 @@ func TestNonPhotoMediaFromNonAllowlistedChatGetsNoReply(t *testing.T) {
 		t.Fatalf("NewTelegramGateway: %v", err)
 	}
 	turns := 0
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		turns++
 		return "turn reply", nil, nil
 	}
@@ -292,7 +293,7 @@ func TestMediaWithTextStillHonestReply(t *testing.T) {
 	defer srv.Close()
 	g := newTestGateway(t, srv)
 	turns := 0
-	handler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	handler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		turns++
 		return "turn reply", nil, nil
 	}

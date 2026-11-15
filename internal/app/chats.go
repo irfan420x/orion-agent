@@ -493,6 +493,14 @@ func (a *App) turnLock(chatID int64) *sync.Mutex {
 // prompt/completion/subagent split, so the footer and /usage can
 // show the turn honestly.
 func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return a.runChatTurnWithImages(ctx, chatID, input, nil, emit)
+}
+
+// runChatTurnWithImages is runChatTurn with image input attached to
+// the user turn (vision): the images ride the agent run for this
+// turn only and are never persisted in the chat's message store
+// (see Agent.RunWithEventHandlerWithImages).
+func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	// Per-chat turn serialisation (cron): a scheduled turn fires
 	// from the scheduler goroutine, outside PollStream's per-chat
 	// lock, so this lock — taken here, for every chat turn — is
@@ -554,7 +562,7 @@ func (a *App) runChatTurn(ctx context.Context, chatID int64, input string, emit 
 			emit(ev)
 		}
 	}
-	reply, err := agent.RunWithEventHandler(ctx, input, wrapped)
+	reply, err := agent.RunWithEventHandlerWithImages(ctx, input, images, wrapped)
 	if stats != nil {
 		// Subagent sweep (F-A5-7): charge finished tasks the
 		// parent never fetched. Note the subagent tools' sink
@@ -807,6 +815,13 @@ func (a *App) sweepAndRecordSubagents(chatID int64) int {
 // per-chat daily token budget is enforced (see runChatTurn).
 func (a *App) HandleStreamForChat(ctx context.Context, chatID int64, input string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 	return a.runChatTurn(ctx, chatID, input, emit)
+}
+
+// HandleStreamForChatWithImages is HandleStreamForChat with image
+// input attached to the user turn (vision). This is the path a
+// Telegram photo turn takes, via cmd/oriond's runTurnWithImages.
+func (a *App) HandleStreamForChatWithImages(ctx context.Context, chatID int64, input string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	return a.runChatTurnWithImages(ctx, chatID, input, images, emit)
 }
 
 // SwitchProviderForChat switches ONLY this chat's provider: it

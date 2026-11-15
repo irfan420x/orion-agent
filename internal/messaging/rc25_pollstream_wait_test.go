@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/model"
 )
 
 // TestPollStreamWaitsForCallbackHandler: a callback handler that is
@@ -42,7 +43,7 @@ func TestPollStreamWaitsForCallbackHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	turnHandler := func(ctx context.Context, chatID int64, text string, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+	turnHandler := func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		return "ok", nil, nil
 	}
 	cancel, errCh := runPollStream(t, g, turnHandler)
