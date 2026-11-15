@@ -39,9 +39,12 @@ func TestDaemonTurnHandlerRulesViaOrionBinary(t *testing.T) {
 	handler := daemonTurnHandler(a)
 
 	// The owner lists the rules; no agent turn runs.
-	reply, err := handler(context.Background(), owner, "/rules")
+	reply, stats, err := handler(context.Background(), owner, "/rules", nil, nil)
 	if err != nil {
 		t.Fatalf("owner /rules: err = %v", err)
+	}
+	if stats != nil {
+		t.Errorf("owner /rules stats = %+v, want nil (a handled command produces no footer)", stats)
 	}
 	if !strings.Contains(reply, "shell_exec") {
 		t.Errorf("owner /rules = %q, want the shell_exec rule listed", reply)
@@ -52,9 +55,12 @@ func TestDaemonTurnHandlerRulesViaOrionBinary(t *testing.T) {
 
 	// The owner sending from a group chat is recognised (F-A18-10).
 	groupOwnerCtx := messaging.WithSenderID(context.Background(), owner)
-	reply, err = handler(groupOwnerCtx, group, "/rules")
+	reply, stats, err = handler(groupOwnerCtx, group, "/rules", nil, nil)
 	if err != nil {
 		t.Fatalf("owner-in-group /rules: err = %v", err)
+	}
+	if stats != nil {
+		t.Errorf("owner-in-group /rules stats = %+v, want nil (a handled command produces no footer)", stats)
 	}
 	if strings.Contains(reply, "owner-only") {
 		t.Errorf("owner-in-group /rules = %q, want the rule list, not a refusal", reply)
@@ -64,9 +70,12 @@ func TestDaemonTurnHandlerRulesViaOrionBinary(t *testing.T) {
 	}
 
 	// The owner in the group can delete a rule, too.
-	reply, err = handler(groupOwnerCtx, group, "/rules delete shell_exec")
+	reply, stats, err = handler(groupOwnerCtx, group, "/rules delete shell_exec", nil, nil)
 	if err != nil {
 		t.Fatalf("owner-in-group /rules delete: err = %v", err)
+	}
+	if stats != nil {
+		t.Errorf("owner-in-group /rules delete stats = %+v, want nil (a handled command produces no footer)", stats)
 	}
 	if strings.Contains(reply, "owner-only") {
 		t.Errorf("owner-in-group /rules delete = %q, want the deletion confirmation", reply)
@@ -77,25 +86,34 @@ func TestDaemonTurnHandlerRulesViaOrionBinary(t *testing.T) {
 
 	// A non-owner chat is refused, and a non-owner member of the
 	// same group is refused too.
-	reply, err = handler(context.Background(), 999, "/rules")
+	reply, stats, err = handler(context.Background(), 999, "/rules", nil, nil)
 	if err != nil {
 		t.Fatalf("non-owner /rules: err = %v", err)
+	}
+	if stats != nil {
+		t.Errorf("non-owner /rules stats = %+v, want nil (a handled command produces no footer)", stats)
 	}
 	if !strings.Contains(reply, "owner-only") {
 		t.Errorf("non-owner /rules = %q, want an owner-only refusal", reply)
 	}
-	reply, err = handler(messaging.WithSenderID(context.Background(), 555), group, "/rules")
+	reply, stats, err = handler(messaging.WithSenderID(context.Background(), 555), group, "/rules", nil, nil)
 	if err != nil {
 		t.Fatalf("non-owner group member /rules: err = %v", err)
+	}
+	if stats != nil {
+		t.Errorf("non-owner group member /rules stats = %+v, want nil (a handled command produces no footer)", stats)
 	}
 	if !strings.Contains(reply, "owner-only") {
 		t.Errorf("non-owner group member /rules = %q, want an owner-only refusal", reply)
 	}
 
 	// Anything else still runs a turn: only /rules is intercepted.
-	reply, err = handler(context.Background(), owner, "hi")
+	reply, stats, err = handler(context.Background(), owner, "hi", nil, nil)
 	if err != nil {
 		t.Fatalf("plain text turn: err = %v", err)
+	}
+	if stats == nil {
+		t.Error("plain text turn stats = nil, want non-nil (a real turn carries footer data)")
 	}
 	if reply != "ok" {
 		t.Errorf("plain text turn reply = %q, want %q", reply, "ok")

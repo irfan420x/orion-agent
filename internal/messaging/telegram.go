@@ -3802,20 +3802,39 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 
 // Poll loops on GetUpdates until ctx is cancelled, delivering each
 // incoming message with non-empty text to handler and sending the
-// handler's reply back to the same chat. A photo message is answered
-// with the cannot-see reply, and a non-photo media message
-// (sticker, voice, video, document, location) with its
-// cannot-process reply, inside PollStream; neither reaches the
-// handler. It is a thin wrapper over
-// PollStream: the handler receives no progress events and no footer
-// is appended (stats nil). All PollStream semantics apply — backoff
-// on transient GetUpdates errors, fatal 401/403/409, allowlist,
+// handler's reply back to the same chat. A photo message from a
+// chat whose model has no vision support is answered with the
+// cannot-see reply, and a non-photo media message (sticker, voice,
+// video, document, location) with its cannot-process reply, inside
+// PollStream; neither reaches the handler. But a photo from a
+// vision-capable chat DOES reach PollStream's handler with its
+// image — and Poll's handler is text-only, so Poll FAILS CLOSED on
+// it: the turn is rejected with CannotSeeImagesMessage and the
+// handler is never called, rather than running a caption-only turn
+// (F-V1: the model would answer about an image it never saw).
+// Poll is therefore a text-only API — use PollStream + TurnFunc
+// for image turns. It is a thin wrapper over PollStream: the
+// handler receives no progress events and no footer is appended
+// (stats nil). All PollStream semantics apply — backoff on
+// transient GetUpdates errors, fatal 401/403/409, allowlist,
 // per-chat ordering, panic recovery, and nil on ctx cancellation.
 func (g *TelegramGateway) Poll(ctx context.Context, handler func(ctx context.Context, chatID int64, text string) (string, error)) error {
 	if handler == nil {
 		return errors.New("messaging: telegram Poll: handler must not be nil")
 	}
 	return g.PollStream(ctx, func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		if len(images) > 0 {
+			// F-V1: Poll's handler cannot receive images, so
+			// never run a caption-only turn. Reaching here
+			// with images means vision IS supported (a
+			// non-vision photo is answered inside
+			// PollStream before the handler is reached), so
+			// this reply is about Poll's limitation, not the
+			// model's — but it is the one honest reply for a
+			// photo the caller cannot see, and the guard is
+			// unreachable for callers that use PollStream.
+			return CannotSeeImagesMessage, nil, nil
+		}
 		reply, err := handler(ctx, chatID, text)
 		return reply, nil, err
 	})

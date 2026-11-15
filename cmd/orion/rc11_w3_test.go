@@ -47,6 +47,15 @@ type rc11FakeBot struct {
 	answered []rc11BotAnswer
 	getMe    int
 	nextID   int64
+	// fileBytes serves photo downloads (F-V1 vision tests):
+	// getFile resolves file_id -> "photos/file-<file_id>.jpg"
+	// and the /file/bot<token>/... download returns
+	// fileBytes[file_id]. Absent entries download as empty
+	// bytes. getFileIDs records the file_ids getFile was asked
+	// for, in order — the vision tests assert the LARGEST photo
+	// size was requested.
+	fileBytes  map[string][]byte
+	getFileIDs []string
 }
 
 type rc11BotSent struct {
@@ -125,9 +134,29 @@ func (f *rc11FakeBot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.getMe++
 		f.mu.Unlock()
 		f.write(w, map[string]any{"id": 123456, "username": "TestBot", "is_bot": true})
+	case "getFile":
+		// F-V1: resolve file_id to a fake file path. The
+		// download URL is {base}/file/bot<token>/<path>.
+		fileID := r.URL.Query().Get("file_id")
+		f.mu.Lock()
+		f.getFileIDs = append(f.getFileIDs, fileID)
+		f.mu.Unlock()
+		f.write(w, map[string]any{"file_id": fileID, "file_path": "photos/file-" + fileID + ".jpg"})
 	case "sendChatAction", "setMyCommands":
 		f.write(w, true)
 	default:
+		// F-V1: serve a photo download. The file_id is the
+		// middle of "file-<file_id>.jpg".
+		if strings.Contains(r.URL.Path, "/file/bot") {
+			base := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			fileID := strings.TrimSuffix(strings.TrimPrefix(base, "file-"), ".jpg")
+			f.mu.Lock()
+			data := f.fileBytes[fileID]
+			f.mu.Unlock()
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(data)
+			return
+		}
 		http.Error(w, "unknown method "+method, http.StatusNotFound)
 	}
 }
@@ -428,9 +457,12 @@ func TestW3DaemonTurnHandlerSetsApprovalContext(t *testing.T) {
 
 	handler := daemonTurnHandler(a)
 	ctx := messaging.WithSenderID(context.Background(), 111)
-	reply, err := handler(ctx, 111, "delegate this")
+	reply, stats, err := handler(ctx, 111, "delegate this", nil, nil)
 	if err != nil {
 		t.Fatalf("daemonTurnHandler: %v", err)
+	}
+	if stats == nil {
+		t.Error("daemon turn stats = nil, want non-nil (a real turn carries footer data)")
 	}
 	if reply != "ok" {
 		t.Errorf("daemon turn reply = %q, want %q", reply, "ok")

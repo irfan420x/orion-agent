@@ -694,6 +694,14 @@ func TestPollWrapperStillStreams(t *testing.T) {
 	if sent[0].Text != "pong: hi" {
 		t.Fatalf("Poll reply = %q, want %q", sent[0].Text, "pong: hi")
 	}
+	// T3 (F-V1): Poll's legacy contract is pinned — the reply
+	// carries NO footer (stats nil), unlike PollStream turns.
+	// The exact-equality check above already pins this; the
+	// marker check names it, so a future footer leak fails here
+	// with its cause attached instead of a bare mismatch.
+	if strings.Contains(sent[0].Text, "tokens") {
+		t.Errorf("Poll reply %q carries a footer marker, want none (Poll returns stats nil)", sent[0].Text)
+	}
 	cancel()
 	select {
 	case err := <-errCh:

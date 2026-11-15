@@ -19,8 +19,10 @@ import (
 	"github.com/irfan/orion/internal/app"
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
+	"github.com/irfan/orion/internal/core"
 	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/messaging"
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/sandbox"
 	"github.com/irfan/orion/internal/version"
@@ -1083,15 +1085,32 @@ func newRulesCommandEnv(a *app.App) *messaging.CommandEnv {
 
 // daemonTurnHandler is the turn function for `orion daemon` AND
 // `orion telegram poll` (F-A6-3): each chat runs on its own
-// per-chat agent through App.HandleForChat, so a chat's history,
-// provider and usage are isolated from every other chat (P1-O3) —
-// and the per-chat daily token budget is enforced (rc9 follow-up
-// 2): the budget gate lives in app.runChatTurn, shared with
-// oriond's Telegram turns, so this path refuses an over-budget
-// chat exactly the way oriond does. Before rc9 this handler called
-// the GLOBAL App.Handle, which had no chat context and no budget
-// check at all: any allowlisted chat could spend without limit on
-// this path while oriond enforced the budget.
+// per-chat agent through App.HandleStreamForChatWithImages, so a
+// chat's history, provider and usage are isolated from every other
+// chat (P1-O3) — and the per-chat daily token budget is enforced
+// (rc9 follow-up 2): the budget gate lives in
+// app.runChatTurnWithImages, shared with oriond's Telegram turns,
+// so this path refuses an over-budget chat exactly the way oriond
+// does. Before rc9 this handler called the GLOBAL App.Handle,
+// which had no chat context and no budget check at all: any
+// allowlisted chat could spend without limit on this path while
+// oriond enforced the budget.
+//
+// Images ride the turn (F-V1): the handler is a messaging.TurnFunc,
+// so a photo turn reaches the agent with its image attached —
+// never a caption-only turn. Text turns pass images == nil, so
+// their provider input is byte-identical to before.
+//
+// The handler returns turn stats, so CLI turns gain oriond parity
+// on the terminal card + footer: PollStream feeds emit into the
+// live card and appends FormatFooter(stats) to the reply. That is
+// a deliberate, accepted user-visible change to every CLI-path
+// turn (coordinator decision for the F-V1 fix), not an accident
+// of the signature change: the CLI has no session store, so unlike
+// oriond there is no per-chat footer preference to consult — the
+// footer is always on when stats are returned. Handled commands
+// (/rules) and budget refusals still return stats == nil, so they
+// carry no footer, matching oriond's buildTurnHandler.
 //
 // TURN-ONLY (F-A7-P2-8) with one exception, /rules (F-A18-10):
 // every slash command except /rules goes to the agent as plain
@@ -1120,10 +1139,10 @@ func newRulesCommandEnv(a *app.App) *messaging.CommandEnv {
 // (the gateway reports them as "Sorry, I hit an error: ...").
 //
 // The turn is registered with the App (F-A10-5, mirroring oriond's
-// runTurn): pollTelegram drains registered turns after Poll
+// runTurn): pollTelegram drains registered turns after PollStream
 // returns, so the command does not exit while a turn is still
 // writing its transcript/memory into the data dir.
-func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string, error) {
+func daemonTurnHandler(a *app.App) messaging.TurnFunc {
 	// /rules (F-A18-10): the one slash command this binary
 	// dispatches — see newRulesCommandEnv. The registry is the
 	// shared DefaultRegistry, so the handler is oriond's handler;
@@ -1132,7 +1151,7 @@ func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string,
 	// suffix, so /rules@bot in a group works).
 	rulesEnv := newRulesCommandEnv(a)
 	rulesRegistry := messaging.DefaultRegistry(rulesEnv)
-	return func(c context.Context, chatID int64, text string) (string, error) {
+	return func(c context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
 		runCtx, cancel := context.WithCancel(c)
 		registered := a.RegisterRun(chatID, runCtx, cancel)
 		if registered {
@@ -1150,15 +1169,15 @@ func daemonTurnHandler(a *app.App) func(context.Context, int64, string) (string,
 			turnEnv := *rulesEnv
 			turnEnv.ChatID = chatID
 			if reply, handled, err := rulesRegistry.Dispatch(runCtx, &turnEnv, text); handled {
-				return reply, err
+				return reply, nil, err
 			}
 		}
 		c = permissions.WithApprovalContext(runCtx, chatID, senderID)
-		reply, err := a.HandleForChat(c, chatID, text)
+		reply, stats, err := a.HandleStreamForChatWithImages(c, chatID, text, images, emit)
 		if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
-			return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil
+			return fmt.Sprintf("⏸ Daily token budget reached for this chat: %v", err), nil, nil
 		}
-		return reply, err
+		return reply, stats, err
 	}
 }
 
@@ -1176,7 +1195,7 @@ const drainTimeout = 30 * time.Second
 
 // pollTelegram runs the Telegram gateway until ctx is cancelled,
 // then waits for the cancelled in-flight turns to wind down before
-// returning (F-A10-5): Poll returns on ctx cancellation without
+// returning (F-A10-5): PollStream returns on ctx cancellation without
 // waiting for the turn handlers it spawned, so without the wait the
 // command returns while a turn is still writing its transcript/memory
 // into the data dir — and a caller that tears the data dir down (a
@@ -1196,7 +1215,7 @@ func pollTelegram(a *app.App, gw *messaging.TelegramGateway, ctx context.Context
 	// deliberate.
 	signal.Ignore(syscall.SIGHUP)
 	fmt.Fprintln(os.Stderr, "orion: ignoring SIGHUP (terminal close will not stop polling; use SIGTERM/Ctrl+C to stop)")
-	err := gw.Poll(ctx, daemonTurnHandler(a))
+	err := gw.PollStream(ctx, daemonTurnHandler(a))
 	if !a.Drain(drainTimeout) {
 		fmt.Fprintf(os.Stderr, "orion: poll stopped; cancelled turns had not wound down after %s; exiting anyway (their replies are lost)\n", drainTimeout)
 	}
@@ -1221,6 +1240,19 @@ func newTelegramGateway(a *app.App) (*messaging.TelegramGateway, error) {
 		// anywhere on the machine (denylist-only by default, or
 		// media_allow_dirs when set) to the chat.
 		messaging.WithMediaDelivery(a.Config.Media),
+		// Vision (F-V1): the gateway needs the chat's current
+		// provider and model to decide whether a photo can be
+		// seen (SupportsVision) or must get the honest Bengali
+		// cannot-see reply. Per-chat, so a /model switch (or a
+		// persisted per-chat override) in one chat never
+		// decides vision for another. Same closure as oriond
+		// (cmd/oriond/main.go). Without this, visionSupported
+		// is always false and every photo gets the cannot-see
+		// reply even for a vision-capable model.
+		messaging.WithModelInfo(func(chatID int64) (string, string) {
+			provider, modelName, _ := a.ModelInfoForChat(chatID)
+			return provider, modelName
+		}),
 	}
 	if a.Config.AllowAllTelegramChats {
 		// P2-O5 / F-A17-4: the opt-in is time-boxed — IsChatAllowed
