@@ -68,6 +68,13 @@ func TestNewProviderDefaults(t *testing.T) {
 	if got := p.(*openAIProvider).cfg.Model; got != defaultDeepSeekModel {
 		t.Fatalf("deepseek Model = %q, want %q", got, defaultDeepSeekModel)
 	}
+	// The DeepSeek default must be the literal vision model, not
+	// the retired text-only alias (vision fix): defaultDeepSeekModel
+	// is pinned to deepseek-flash, and the const above is not the
+	// only thing asserting it — this literal is the tripwire.
+	if defaultDeepSeekModel != "deepseek-flash" {
+		t.Fatalf("defaultDeepSeekModel = %q, want deepseek-flash", defaultDeepSeekModel)
+	}
 
 	// Ollama needs no API key and gets a local default.
 	p, err = NewProvider(ProviderConfig{Name: "ollama"})

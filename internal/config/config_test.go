@@ -23,6 +23,23 @@ func TestDefaultValid(t *testing.T) {
 	}
 }
 
+// TestDefaultDeepSeekModelIsFlash pins the shipped DeepSeek default
+// deliberately (vision fix): deepseek-chat is a retired (2026-07-24)
+// text-only alias, so the default must be deepseek-flash, the
+// current vision-capable model. NOTE: this changes the SHIPPED
+// default only — a live config that explicitly sets deepseek-chat
+// (as the laptop's does) is untouched by this change.
+func TestDefaultDeepSeekModelIsFlash(t *testing.T) {
+	cfg := Default()
+	entry, ok := cfg.Providers["deepseek"]
+	if !ok {
+		t.Fatal("default config should include deepseek")
+	}
+	if entry.Model != "deepseek-flash" {
+		t.Fatalf("default deepseek model = %q, want deepseek-flash (deepseek-chat is retired and text-only)", entry.Model)
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	cfg := Default()
 	cfg.MaxSteps = 0

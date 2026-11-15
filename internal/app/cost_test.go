@@ -239,7 +239,11 @@ func TestUsageLineForChat(t *testing.T) {
 	got := a.UsageLineForChat(111)
 	for _, want := range []string{
 		"Tokens today (this chat): 3,337 (3,000 prompt + 337 completion, incl. 0 subagent)",
-		"Est. cost today (this chat): $0.0010 (est., deepseek-chat, price table v2026-11-13 effective 2026-11-13)",
+		// Priced at the chat's provider/model: the test app's
+		// DeepSeek default is now deepseek-flash (vision fix),
+		// so 3,000 prompt + 337 completion at $0.15/$0.60 per 1M
+		// is $0.0007 — not the old deepseek-chat $0.0010.
+		"Est. cost today (this chat): $0.0007 (est., deepseek-flash, price table v2026-11-13 effective 2026-11-13)",
 		"Daily token budget: 100,000 tokens (96,663 remaining, resets ",
 	} {
 		if !strings.Contains(got, want) {

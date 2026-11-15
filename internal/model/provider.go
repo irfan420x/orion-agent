@@ -26,7 +26,7 @@ const (
 	defaultOllamaBaseURL    = "http://localhost:11434"
 
 	defaultOpenAIModel    = "gpt-4o-mini"
-	defaultDeepSeekModel  = "deepseek-chat"
+	defaultDeepSeekModel  = "deepseek-flash"
 	defaultAnthropicModel = "claude-sonnet-4-5"
 	defaultOllamaModel    = "llama3.1"
 

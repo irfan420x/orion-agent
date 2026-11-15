@@ -350,7 +350,7 @@ func defaultConfig(dataDir string) *Config {
 		DefaultProvider: "ollama",
 		Providers: map[string]ProviderConfig{
 			"openai":    {Name: "openai", Model: "gpt-4o-mini"},
-			"deepseek":  {Name: "deepseek", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"},
+			"deepseek":  {Name: "deepseek", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-flash"},
 			"anthropic": {Name: "anthropic", Model: "claude-sonnet-4-5"},
 			"ollama":    {Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.1"},
 		},

@@ -5,7 +5,7 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,654 tests total — 1,650 pass, 0 fail, 4 skip;
+> built and tested (1,673 tests total — 1,669 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
 > Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix and the busy-input acknowledgement (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
@@ -131,7 +131,7 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,654 tests total (1,650 passing, 0 failing, 4 skipped)
+24/24 packages, 1,673 tests total (1,669 passing, 0 failing, 4 skipped)
 (recount in the working tree after the Audit 22 fix batch, the
 provider-auto context-window change, the cron tool, the behavior fix and the busy-input acknowledgement, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
@@ -146,7 +146,7 @@ Run the suite with
   "default_provider": "ollama",
   "providers": {
     "openai":    { "name": "openai",    "api_key": "", "model": "gpt-4o-mini" },
-    "deepseek":  { "name": "deepseek",  "api_key": "", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat" },
+    "deepseek":  { "name": "deepseek",  "api_key": "", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-flash" },
     "anthropic": { "name": "anthropic", "api_key": "", "model": "claude-sonnet-4-5" },
     "ollama":    { "name": "ollama",    "base_url": "http://localhost:11434", "model": "llama3.1" }
   },

@@ -6,6 +6,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Vision — photos the model can see
+
+A photo sent to the bot is now downloaded (largest size, 10 MiB cap) and run as a real turn — caption as the text, or "এই ছবিটা বর্ণনা করো।" with no caption — when the chat's provider/model supports vision (`deepseek-flash`, `gpt-4o`, `gpt-4o-mini`). Otherwise the bot answers honestly in Bengali and names the fix (DeepSeek `deepseek-flash`). Only the most recent user message carries image parts; older photo turns are sent text-only with a `[ছবি]` placeholder, and image bytes are never stored in memory. The shipped DeepSeek default is now `deepseek-flash` (`deepseek-chat` is a retired 2026-07-24 text-only alias) — NOTE: a live config that explicitly sets `deepseek-chat` is untouched by this change. `/usage` now prices `deepseek-flash` ($0.15 in / $0.60 out per 1M, off-peak cache-miss).
+
 ### Busy-input acknowledgement — interrupt/queue/steer
 
 A new message arriving while a turn runs no longer waits silently
