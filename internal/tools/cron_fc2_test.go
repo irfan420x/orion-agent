@@ -8,6 +8,7 @@ package tools
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -472,13 +473,20 @@ func TestCronSchedulerLongFailingTurnBackoffAnchoredAtCompletion(t *testing.T) {
 	// anchor it is (at+3s)+1min. The 3s turn stands in for the
 	// production 10-minute timeout, where the stale anchor
 	// puts the next run ~9 minutes in the past and the job
-	// re-fires on the next tick. `now` is mid-minute so the
-	// next cron slot is exactly now+30s and the arithmetic
-	// below has no boundary ambiguity.
+	// re-fires on the next tick. `now` is pinned to a minute
+	// with minute%5==4 (+30s) so the next `*/5` slot is
+	// exactly now+30s and the arithmetic below has no boundary
+	// ambiguity — at any other minute the next `*/5` slot is
+	// up to now+4m30s, which swamps the 1-minute backoff and
+	// the test would pass with the stale anchor too.
 	store := NewPlanningStore("")
 	sched, list, _ := cronTestTools(store)
 	ctx := cronChatCtx(111, 111)
-	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	base := time.Now().UTC().Truncate(time.Minute)
+	for base.Minute()%5 != 4 {
+		base = base.Add(time.Minute)
+	}
+	now := base.Add(30 * time.Second)
 	cronDueJob(t, store, ctx, sched, "*/5 * * * *", "slow then fails", now.Add(-time.Minute))
 
 	var calls atomic.Int32
@@ -670,5 +678,59 @@ func TestCronSchedulerDeadlineRaceUsesResult(t *testing.T) {
 		if j.LastResult != "ok" || j.ConsecutiveFailures != 0 {
 			t.Fatalf("iteration %d: job = %+v, want ok/0 failures (a turn that finished before its deadline is a success, not a timeout)", i, j)
 		}
+	}
+}
+
+// TestCronSchedulerCancelWaitsForDispatchedChat pins the dispatch
+// contract: when the tick ctx is cancelled mid-dispatch, ProcessDue
+// returns only once every dispatched chat's work is done — it must
+// wait out a dispatched chat's shutdown outcome-apply instead of
+// returning early and abandoning the chat's goroutine. (Found by
+// the F-C2 fix-up verifier: the fixer had claimed this was
+// "fix-verified-by-inspection only"; it is deterministically
+// testable.)
+func TestCronSchedulerCancelWaitsForDispatchedChat(t *testing.T) {
+	store := NewPlanningStore("")
+	sched, _, _ := cronTestTools(store)
+	ctx111 := cronChatCtx(111, 111)
+	now := time.Now().UTC().Truncate(time.Second)
+	// Two due jobs in chat 111: job 1 runs (and cancels the tick
+	// ctx from inside the runner), job 2 is never reached — the
+	// per-job loop's ctx check then applies job 1's outcome with
+	// a context that survives the cancel, which is the slow spot
+	// the dispatch loop must wait for.
+	cronDueJob(t, store, ctx111, sched, "*/5 * * * *", "first job", now.Add(-time.Minute))
+	cronDueJob(t, store, ctx111, sched, "*/5 * * * *", "second job", now.Add(-time.Minute))
+	// Many trailing buckets stretch the dispatch loop so the
+	// runner's cancel lands while it is still dispatching.
+	for id := int64(1000); id < 3000; id++ {
+		store.bucket(fmt.Sprintf("chat:%d", id))
+	}
+	ctx, cancel := context.WithCancel(cronChatCtx(111, 111))
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var once sync.Once
+	runner := func(rctx context.Context, job CronJob) (string, error) {
+		once.Do(func() { cancel() })
+		<-release // block, ignoring ctx; released by t.Cleanup
+		return "", nil
+	}
+	s := NewCronScheduler(store)
+	s.SetRunner(runner)
+	var calls atomic.Int32
+	s.saveJobs = func(st *PlanningStore, dir, key string, doc *cronJobsDoc) error {
+		if calls.Add(1) == 2 { // the shutdown outcome apply (claim is call 1)
+			time.Sleep(2 * time.Second)
+		}
+		return saveCronJobs(st, dir, key, doc)
+	}
+	start := time.Now()
+	err := s.ProcessDue(ctx, now)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ProcessDue err = %v, want context.Canceled", err)
+	}
+	if elapsed < 1500*time.Millisecond {
+		t.Fatalf("ProcessDue returned after %v, want >=1.5s (must wait for the dispatched chat's outcome apply)", elapsed)
 	}
 }
