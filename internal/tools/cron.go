@@ -228,6 +228,13 @@ func parseCronField(field, name string, min, max int) (mask uint64, star bool, e
 					return 0, false, err
 				}
 				lo, hi = n, n
+				// A bare number with a step ("2/10") means
+				// n-max/step, as in standard cron: the step
+				// runs from n up to the field max, so "2/10"
+				// matches 2, 12, 22, ... — not just 2.
+				if hasStep {
+					hi = max
+				}
 			}
 		} else if item == "*" && !hasStep && len(strings.Split(field, ",")) == 1 {
 			star = true

@@ -165,6 +165,85 @@ func TestCronParseInvalid(t *testing.T) {
 	}
 }
 
+func TestCronParseBareNumberStep(t *testing.T) {
+	// A bare number with a step ("2/10") means n-max/step, as in
+	// standard cron — not just the number itself.
+	cases := []struct {
+		field string
+		want  []int
+	}{
+		{"2/10", []int{2, 12, 22, 32, 42, 52}},
+		{"5/15", []int{5, 20, 35, 50}},
+		{"0/30", []int{0, 30}},
+		// Unchanged behaviour: "*" and ranges already ran to max.
+		{"*/15", []int{0, 15, 30, 45}},
+		{"1-30/5", []int{1, 6, 11, 16, 21, 26}},
+		{"2", []int{2}}, // bare number without a step still means just 2
+	}
+	for _, c := range cases {
+		mask, _, err := parseCronField(c.field, "minute", 0, 59)
+		if err != nil {
+			t.Errorf("parseCronField(%q): unexpected error: %v", c.field, err)
+			continue
+		}
+		if got := cronMaskValues(mask, 59); !cronIntSlicesEqual(got, c.want) {
+			t.Errorf("parseCronField(%q): minutes = %v, want %v", c.field, got, c.want)
+		}
+	}
+}
+
+func cronMaskValues(mask uint64, max int) []int {
+	var out []int
+	for v := 0; v <= max; v++ {
+		if mask&(1<<uint(v)) != 0 {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func cronIntSlicesEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestCronNextRunBareNumberStep(t *testing.T) {
+	cases := []struct {
+		expr  string
+		after string
+		want  string
+	}{
+		{"2/10 * * * *", "2026-11-15T10:00:00Z", "2026-11-15T10:02:00Z"},
+		{"2/10 * * * *", "2026-11-15T10:02:00Z", "2026-11-15T10:12:00Z"},
+		{"2/10 * * * *", "2026-11-15T10:52:00Z", "2026-11-15T11:02:00Z"},
+		{"5/15 * * * *", "2026-11-15T10:00:00Z", "2026-11-15T10:05:00Z"},
+		{"5/15 * * * *", "2026-11-15T10:05:00Z", "2026-11-15T10:20:00Z"},
+		{"0/30 * * * *", "2026-11-15T10:00:00Z", "2026-11-15T10:30:00Z"},
+		{"0/30 * * * *", "2026-11-15T10:30:00Z", "2026-11-15T11:00:00Z"},
+	}
+	for _, c := range cases {
+		after, err := time.Parse(time.RFC3339, c.after)
+		if err != nil {
+			t.Fatalf("bad test time %q: %v", c.after, err)
+		}
+		got, err := nextRunAfter(c.expr, after)
+		if err != nil {
+			t.Errorf("nextRunAfter(%q, %s): %v", c.expr, c.after, err)
+			continue
+		}
+		if got.Format(time.RFC3339) != c.want {
+			t.Errorf("nextRunAfter(%q, %s) = %s, want %s", c.expr, c.after, got.Format(time.RFC3339), c.want)
+		}
+	}
+}
+
 func TestCronNextRun(t *testing.T) {
 	// 2026-11-15 is a Sunday; 2026-11-16 a Monday.
 	cases := []struct {
