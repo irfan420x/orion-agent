@@ -1134,9 +1134,9 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 			toolCtx, toolCancel := context.WithTimeout(ctx, a.timeout())
 			toolStart := time.Now()
 			a.emit(ProgressEvent{Kind: EventToolCallStarted, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Usage: usage})
-			result := a.executeTool(toolCtx, tc)
+			result, gateDenied := a.executeTool(toolCtx, tc)
 			turnToolCalls++
-			if isGateDenialResult(result) {
+			if gateDenied {
 				turnGateDeniedCalls++
 			}
 			toolCancel()
@@ -1464,20 +1464,22 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 	return kept, stats
 }
 
-// isGateDenialResult reports whether an executeTool result string is
-// a permission-gate denial. The gate branch of executeTool is the
-// only producer of the "Error: permission denied for tool" prefix
-// (hook blocks say "blocked by hook", skill blocks say "not allowed
-// while a skill is active", tool failures carry the tool's own
-// text), so the prefix identifies a denial exactly. The run loop
-// counts these per turn for TurnStats (F-C8).
-func isGateDenialResult(result string) bool {
-	return strings.HasPrefix(result, "Error: permission denied for tool ")
-}
-
-// executeTool runs one tool call. Arguments must be a JSON object string;
+// executeTool runs one tool call and reports whether the
+// permission gate denied it. Arguments must be a JSON object string;
 // invalid JSON and tool failures are returned as error text so the caller
 // can feed them back to the model instead of aborting the loop.
+//
+// The second return value is the TYPED gate-denial signal: it is true
+// only when the gate branch below actually denied the call, and false
+// for every other outcome — including a tool that RAN and returned
+// content that happens to start with the denial text. The run loop
+// counts these per turn for TurnStats (F-C8); it must never sniff the
+// result string for a denial, because file_read and web_fetch return
+// file/page content verbatim, so a genuine success whose content
+// starts with "Error: permission denied for tool ..." would be
+// miscounted as a denial and could disable a scheduled job. The
+// result string itself is unchanged: the model still sees the exact
+// denial text (and the exact tool content) as before.
 //
 // Re-delivery dedup (F-A9-1): when the turn carries a Telegram update
 // id (see WithUpdateID) and a journal is installed, a call the killed
@@ -1492,11 +1494,11 @@ func isGateDenialResult(result string) bool {
 // skill invoke's effect is agent-loop activation state — replaying
 // it would never fire setActiveSkill, so the skill restriction
 // would drop on a re-delivered turn (F-A10-1).
-func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
+func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, bool) {
 	args, ok := parseToolArguments(tc)
 	if !ok {
 		a.logf("tool %q: invalid JSON arguments, feeding error back to model", tc.Name)
-		return fmt.Sprintf("Error: invalid arguments for tool %q: %q is not a JSON object", tc.Name, tc.Arguments)
+		return fmt.Sprintf("Error: invalid arguments for tool %q: %q is not a JSON object", tc.Name, tc.Arguments), false
 	}
 	// Permission/confirmation gate (P1-O2): consulted before the
 	// registry runs anything. A denial is returned as error text
@@ -1509,7 +1511,15 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 	if g := a.permissionGate(); g != nil {
 		if allowed, reason := g.Check(ctx, tc.Name, tc.Arguments); !allowed {
 			a.logf("tool %q denied by permission gate: %s", tc.Name, reason)
-			return fmt.Sprintf("Error: permission denied for tool %q: %s", tc.Name, reason)
+			// The typed denial signal (second return value):
+			// this single return is the ONLY place a gate
+			// denial is produced — the denylist, unclassified,
+			// deny-rule, unattended prompt-denial, no-approver,
+			// prompter-error, timeout, cancel and user-decline
+			// paths all funnel through Gate.Check above — so
+			// counting it here counts every real denial and
+			// nothing else.
+			return fmt.Sprintf("Error: permission denied for tool %q: %s", tc.Name, reason), true
 		}
 	}
 	// Hook bus, PreToolUse (rc9, audit P0 #6): consulted after the
@@ -1524,7 +1534,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 	if bus := a.hooks(); bus != nil {
 		if out := bus.PreToolUse(ctx, tc.Name, args); out.Blocked {
 			a.logf("tool %q blocked by hook: %s", tc.Name, out.Reason)
-			return fmt.Sprintf("Error: tool %q blocked by hook: %s", tc.Name, out.Reason)
+			return fmt.Sprintf("Error: tool %q blocked by hook: %s", tc.Name, out.Reason), false
 		} else if out.Warning != "" {
 			a.logf("tool %q pre-tool hooks: %s", tc.Name, out.Warning)
 		}
@@ -1549,7 +1559,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 				journalOcc = a.nextJournalOccurrence(tc.Name, journalCanon)
 				if result, ok := j.Lookup(uid, tc.Name, journalCanon, journalOcc); ok {
 					a.logf("tool %q: replaying recorded result for update %d (occurrence %d); not re-executed", tc.Name, uid, journalOcc)
-					return result
+					return result, false
 				}
 				journal = j
 				journalUpdateID = uid
@@ -1576,7 +1586,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 		// re-decides it (and its occurrence was already consumed
 		// above, so the sequence still agrees).
 		a.logf("tool %q blocked by active skill: %s", tc.Name, reason)
-		return fmt.Sprintf("Error: tool %q is not allowed while a skill is active: %s. End the skill with the skill tool (action \"end\") or use an allowed tool.", tc.Name, reason)
+		return fmt.Sprintf("Error: tool %q is not allowed while a skill is active: %s. End the skill with the skill tool (action \"end\") or use an allowed tool.", tc.Name, reason), false
 	} else if blocked, reason := a.tools.PlanModeBlocks(ctx, tc.Name); blocked {
 		// Plan-mode enforcement: while a plan is pending approval
 		// for this chat, no mutating tool runs — the agent
@@ -1585,7 +1595,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 		// never executed, so it is not journalled: a re-delivered
 		// turn re-decides it (like the skill restriction above).
 		a.logf("tool %q blocked by plan mode: %s", tc.Name, reason)
-		return fmt.Sprintf("Error: tool %q is blocked while a plan is pending approval: %s. Wait for the plan decision, or call exit_plan_mode to abandon the plan.", tc.Name, reason)
+		return fmt.Sprintf("Error: tool %q is blocked while a plan is pending approval: %s. Wait for the plan decision, or call exit_plan_mode to abandon the plan.", tc.Name, reason), false
 	} else if res, err := a.tools.Execute(ctx, tc.Name, args); err != nil {
 		// The registry enforces the security denylist for shell tools; log
 		// denials here so they are visible in the agent log.
@@ -1616,7 +1626,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 		}
 	}
 	a.postToolHooks(ctx, tc.Name, args, result)
-	return result
+	return result, false
 }
 
 // journalExcludedTools are the tools the journal never records

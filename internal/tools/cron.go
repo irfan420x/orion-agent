@@ -588,19 +588,40 @@ func SetCronScheduleRuleStore(reg *Registry, store *permissions.RuleStore) {
 // execution, and that a scheduled turn now ignores (F-C3). It
 // returns nil when the store is nil or no such rule exists. The
 // caller warns only — it never refuses to schedule.
+//
+// The warning iterates the rule store's own entries for the chat,
+// not KnownTools(): KnownTools lists only the explicitly classified
+// built-ins, so it misses MCP tools (which classify by the mcp__
+// prefix rule) and unclassified names — yet SetForChat accepts any
+// non-empty name, and the gate denies those promptly when
+// unattended. A legacy global rule (chat 0) applies to every chat,
+// so it warns here too; another chat's rule never does. Deny rules
+// never warn. Names are deduplicated (a tool can hold both a
+// global and a per-chat allow rule) and sorted, so the warning is
+// stable.
 func (t *cronScheduleTool) unattendedAllowWarning(chatID int64) []string {
 	if t.rules == nil {
 		return nil
 	}
+	seen := map[string]bool{}
 	var warned []string
-	for _, tool := range permissions.KnownTools() {
-		if permissions.Classify(tool) == permissions.ClassSafe {
+	for _, rule := range t.rules.List() {
+		if rule.Action != permissions.ActionAllow {
 			continue
 		}
-		if action, ok := t.rules.LookupForChat(chatID, tool); ok && action == permissions.ActionAllow {
-			warned = append(warned, tool)
+		if rule.ChatID != chatID && rule.ChatID != 0 {
+			continue
 		}
+		if permissions.Classify(rule.Tool) == permissions.ClassSafe {
+			continue
+		}
+		if seen[rule.Tool] {
+			continue
+		}
+		seen[rule.Tool] = true
+		warned = append(warned, rule.Tool)
 	}
+	sort.Strings(warned)
 	return warned
 }
 

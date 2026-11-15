@@ -186,23 +186,66 @@ func TestTurnWithMixedCallsNotAllDenied(t *testing.T) {
 	}
 }
 
-// TestIsGateDenialResult pins the classifier the run loop counts
-// with: only the gate's exact denial prefix counts. Hook blocks,
-// skill blocks and ordinary tool errors must not inflate the
-// gate-denied count (they are not gate denials).
-func TestIsGateDenialResult(t *testing.T) {
-	cases := map[string]bool{
-		`Error: permission denied for tool "shell_exec": denied: unattended scheduled turn — tool "shell_exec" needs approval`: true,
-		`Error: permission denied for tool "file_write": denied by permission rule for tool "file_write"`:                      true,
-		`Error: tool "shell_exec" blocked by hook: nope`:                                                                       false,
-		`Error: tool "shell_exec" is not allowed while a skill is active: nope`:                                                false,
-		`Error: something went wrong`: false,
-		`ok:shell_exec`:               false,
-		``:                            false,
+// TestToolResultStartingWithDenialPrefixIsNotCountedAsDenial is the
+// regression test for the F-C8 false positive: a SUCCESSFUL file_read
+// whose content starts with the gate's denial prefix ("Error:
+// permission denied for tool ...") must NOT be counted as a gate
+// denial. file_read returns file content verbatim, so a file whose
+// first line is that prefix — and likewise a fetched page — used to
+// be miscounted by the old prefix-sniffing classifier, and five
+// such turns disabled the job. The denial is now a typed signal
+// from the gate branch of executeTool, so no tool-output content
+// can ever count as a denial. The content itself is still fed to
+// the model verbatim (asserted on the second provider call's
+// messages), and a real denial still counts (see
+// TestUnattendedTurnIgnoresAllowRuleAndCountsDenial).
+func TestToolResultStartingWithDenialPrefixIsNotCountedAsDenial(t *testing.T) {
+	const denialLike = `Error: permission denied for tool "shell_exec": denied: unattended scheduled turn`
+	rules := permissions.NewRuleStore("")
+	gate := permissions.NewGate(rules, nil)
+	readStub := &gateStubTool{name: "file_read", result: denialLike}
+	reg := tools.NewRegistry()
+	if err := reg.Register(readStub); err != nil {
+		t.Fatal(err)
 	}
-	for result, want := range cases {
-		if got := isGateDenialResult(result); got != want {
-			t.Errorf("isGateDenialResult(%q) = %v, want %v", result, got, want)
+	modelSawContent := false
+	prov := &fakeProvider{
+		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
+			switch call {
+			case 1:
+				return toolCallResponse("call-1", "file_read", `{"path":"/tmp/x"}`), nil
+			default:
+				for _, m := range req.Messages {
+					if m.Role == "tool" && m.Content == denialLike {
+						modelSawContent = true
+					}
+				}
+				return textResponse("done"), nil
+			}
+		},
+	}
+	a := newTestAgent(t, testConfig(5), prov, reg, newFakeStore())
+	a.SetPermissionGate(gate)
+	ctx := permissions.WithUnattendedContext(permissions.WithApprovalContext(context.Background(), 42, 42))
+	var finished ProgressEvent
+	out, err := a.RunWithEventHandler(ctx, "read the file", func(ev ProgressEvent) {
+		if ev.Kind == EventTurnFinished {
+			finished = ev
 		}
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("Run = %q, want %q", out, "done")
+	}
+	if got := readStub.callCount(); got != 1 {
+		t.Errorf("file_read executions = %d, want 1 (the safe tool ran: this was a success, not a denial)", got)
+	}
+	if !modelSawContent {
+		t.Error("the model never saw the file content verbatim: the denial-like result must still reach the model unchanged")
+	}
+	if finished.ToolCalls != 1 || finished.GateDeniedCalls != 0 {
+		t.Errorf("TurnFinished ToolCalls/GateDeniedCalls = %d/%d, want 1/0 (a success whose content starts with the denial prefix is not a denial)", finished.ToolCalls, finished.GateDeniedCalls)
 	}
 }

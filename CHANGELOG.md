@@ -197,11 +197,12 @@ enter/exit_plan_mode pattern). Suite: **1,626 tests total
 - **Approval.** The management tools are Safe (they only write
   Orion's own job files). The scheduled turn is a normal turn on
   the chat's agent through the same gate, with the approval
-  context set to the job's chat and requester — a destructive
-  action inside a scheduled turn prompts exactly as it would
-  interactively, and is never auto-approved. An unanswered
-  approval denies that call and the turn completes with the
-  denial recorded.
+  context set to the job's chat and requester — but the turn is
+  unattended: persisted "always allow" rules are ignored, so a
+  gated (destructive or network) action inside a scheduled turn
+  is denied promptly, with no prompt card and no wait for an
+  answer, and is never auto-approved. A turn in which every tool
+  call was gate-denied counts as a failure for backoff/disable.
 - **Safety + missed runs.** Exponential backoff on failure (1,
   2, 4, 8, 16 minutes) and the job is DISABLED after 5
   consecutive failures, so the backoff never grows past 16

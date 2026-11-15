@@ -57,7 +57,7 @@ func TestAgentPlanModeBlocksDestructiveTool(t *testing.T) {
 	}
 	a := newTestAgent(t, testConfig(5), &fakeProvider{}, reg, newFakeStore())
 
-	got := a.executeTool(context.Background(), model.ToolCall{
+	got, _ := a.executeTool(context.Background(), model.ToolCall{
 		ID:        "1",
 		Name:      "shell_exec",
 		Arguments: `{"command":"echo hi"}`,
@@ -67,7 +67,7 @@ func TestAgentPlanModeBlocksDestructiveTool(t *testing.T) {
 	}
 
 	// The checker itself and other tools are not blocked.
-	got = a.executeTool(context.Background(), model.ToolCall{
+	got, _ = a.executeTool(context.Background(), model.ToolCall{
 		ID:        "2",
 		Name:      "calculator",
 		Arguments: `{}`,
@@ -84,7 +84,7 @@ func TestAgentPlanModeNoCheckerPassesThrough(t *testing.T) {
 	empty := tools.NewRegistry()
 	a := newTestAgent(t, testConfig(5), &fakeProvider{}, empty, newFakeStore())
 
-	got := a.executeTool(context.Background(), model.ToolCall{
+	got, _ := a.executeTool(context.Background(), model.ToolCall{
 		ID:        "1",
 		Name:      "shell_exec",
 		Arguments: `{"command":"echo hi"}`,
@@ -184,11 +184,11 @@ func TestAgentPlanModeRealToolBlocksExecution(t *testing.T) {
 
 	// While the plan is pending, a destructive call through the
 	// agent loop is refused — and a safe call is not.
-	got := a.executeTool(ctx, model.ToolCall{ID: "1", Name: "shell_exec", Arguments: `{"command":"echo hi"}`})
+	got, _ := a.executeTool(ctx, model.ToolCall{ID: "1", Name: "shell_exec", Arguments: `{"command":"echo hi"}`})
 	if !strings.Contains(got, "blocked while a plan is pending approval") {
 		t.Errorf("executeTool(shell_exec) with a pending plan = %q, want the plan-mode block text", got)
 	}
-	got = a.executeTool(ctx, model.ToolCall{ID: "2", Name: "file_read", Arguments: `{"path":"/nonexistent-xyz"}`})
+	got, _ = a.executeTool(ctx, model.ToolCall{ID: "2", Name: "file_read", Arguments: `{"path":"/nonexistent-xyz"}`})
 	if strings.Contains(got, "blocked while a plan is pending approval") {
 		t.Errorf("executeTool(file_read) with a pending plan = %q, want no plan-mode block (safe tools stay allowed)", got)
 	}

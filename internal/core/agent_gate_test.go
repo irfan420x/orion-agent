@@ -22,6 +22,11 @@ type gateStubTool struct {
 	mu    sync.Mutex
 	name  string
 	calls int
+	// result overrides the returned content when non-empty
+	// (default "ok:<name>"): a stub can then return content that
+	// looks like a denial, to prove the counting does not sniff
+	// the result string.
+	result string
 }
 
 func (t *gateStubTool) Name() string        { return t.name }
@@ -41,6 +46,9 @@ func (t *gateStubTool) Execute(_ context.Context, _ json.RawMessage) (string, er
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.calls++
+	if t.result != "" {
+		return t.result, nil
+	}
 	return "ok:" + t.name, nil
 }
 func (t *gateStubTool) callCount() int {

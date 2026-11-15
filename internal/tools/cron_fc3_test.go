@@ -127,6 +127,54 @@ func TestCronScheduleWarnsOnlyForRequestingChat(t *testing.T) {
 	}
 }
 
+func TestCronScheduleWarnsAboutMcpAndUnclassifiedAllowRules(t *testing.T) {
+	// The warning must cover allow rules for ALL gated tools held
+	// for the chat, not only the built-ins KnownTools() lists:
+	// SetForChat accepts any non-empty name, and the gate denies
+	// MCP tools (mcp__ prefix, ClassNetwork) and unclassified
+	// names (fail-closed ClassDestructive) promptly when
+	// unattended — so a chat holding such a rule got no warning
+	// yet was denied every run.
+	store := NewPlanningStore("")
+	rules := permissions.NewRuleStore("")
+	if err := rules.SetForChat(111, "mcp__example", permissions.ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	if err := rules.SetForChat(111, "some_future_tool", permissions.ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	// Controls: a deny rule for an MCP tool must not warn, and
+	// another chat's MCP allow rule must not warn here.
+	if err := rules.SetForChat(111, "mcp__other", permissions.ActionDeny); err != nil {
+		t.Fatal(err)
+	}
+	if err := rules.SetForChat(222, "mcp__elsewhere", permissions.ActionAllow); err != nil {
+		t.Fatal(err)
+	}
+	tool := &cronScheduleTool{store: store, rules: rules}
+	note := cronScheduleNote(t, tool, cronChatCtx(111, 111), "0 9 * * 1-5", "morning brief")
+	if !strings.Contains(note, "Warning") {
+		t.Fatalf("schedule note = %q, want a Warning about the allow rules", note)
+	}
+	for _, want := range []string{"mcp__example", "some_future_tool"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("schedule note = %q, want it to name the allow-ruled tool %q", note, want)
+		}
+	}
+	for _, unwanted := range []string{"mcp__other", "mcp__elsewhere"} {
+		if strings.Contains(note, unwanted) {
+			t.Errorf("schedule note = %q, want no mention of %q (deny rule / another chat's rule)", note, unwanted)
+		}
+	}
+	// Warn only: the job was still created, the rules untouched.
+	if got := mustCronList(t, &cronListTool{store: store}, cronChatCtx(111, 111)); got.Count != 1 {
+		t.Fatalf("list after warned schedule = %d jobs, want 1 (warn, do not refuse)", got.Count)
+	}
+	if action, ok := rules.LookupForChat(111, "mcp__example"); !ok || action != permissions.ActionAllow {
+		t.Errorf("LookupForChat(mcp__example) = %q/%v, want allow/true (warning must not revoke the rule)", action, ok)
+	}
+}
+
 // TestSetCronScheduleRuleStoreWiring covers the daemon wiring path
 // (App.NewPermissionGate calls SetCronScheduleRuleStore on the
 // registry): a registry-built cron_schedule tool warns once the
