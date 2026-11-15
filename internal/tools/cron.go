@@ -135,13 +135,14 @@ const (
 	// delay under a minute without busy-scanning.
 	cronDefaultTick = 30 * time.Second
 	// cronMaxWorkers bounds how many chats' scheduled turns run
-	// at once in one tick (F-C2). A tick with more due chats
-	// than this queues the rest behind the pool — bounded, so a
-	// burst of due jobs cannot spawn an unbounded pile of agent
-	// turns, and one chat's long turn delays other chats only
-	// up to the pool bound. 8 is far above the chats a daemon
-	// normally serves at once, and far below any resource
-	// concern.
+	// at once (F-C2), across all concurrent ticks: the pool is
+	// scheduler-level, not per tick, so overlapping ticks share
+	// one bound. A tick with more due chats than this queues
+	// the rest behind the pool — bounded, so a burst of due
+	// jobs cannot spawn an unbounded pile of agent turns, and
+	// one chat's long turn delays other chats only up to the
+	// pool bound. 8 is far above the chats a daemon normally
+	// serves at once, and far below any resource concern.
 	cronMaxWorkers = 8
 	// cronTurnTimeout bounds one scheduled turn (F-C2). A turn
 	// that has not finished within this long ends as a failure
@@ -961,15 +962,22 @@ type CronRunner func(ctx context.Context, job CronJob) (string, error)
 type CronScheduler struct {
 	store *PlanningStore
 
-	mu     sync.Mutex // guards runner, tick, log, turnTimeout, maxWorkers
+	mu     sync.Mutex // guards runner, tick, log, turnTimeout, maxWorkers, sem
 	runner CronRunner
 	tick   time.Duration
 	log    *log.Logger
 	// turnTimeout is the per-turn deadline; 0 = cronTurnTimeout.
 	turnTimeout time.Duration
-	// maxWorkers is the worker-pool bound for one tick; 0 =
-	// cronMaxWorkers.
+	// maxWorkers is the worker-pool bound; 0 = cronMaxWorkers.
+	// It is read when the pool is first created (first tick);
+	// changing it after ticks have started does not resize
+	// the live pool.
 	maxWorkers int
+	// sem is the scheduler-level worker pool (F-C2), shared by
+	// every ProcessDue call: at most cap(sem) chats run turns
+	// at once, even across overlapping ticks. Created lazily
+	// by workerPool, under mu, at the then-current bound.
+	sem chan struct{}
 
 	claimMu sync.Mutex // guards inFlight
 	// inFlight is the per-chat claim (F-C2): chats whose tick
@@ -1023,9 +1031,12 @@ func (s *CronScheduler) SetTurnTimeout(d time.Duration) {
 	s.turnTimeout = d
 }
 
-// SetMaxWorkers overrides how many chats' turns run at once in
-// one tick (F-C2). A non-positive value restores the default
-// (cronMaxWorkers).
+// SetMaxWorkers overrides how many chats' turns run at once
+// (F-C2), across all concurrent ticks. A non-positive value
+// restores the default (cronMaxWorkers). The bound is read
+// when the worker pool is first created on the first tick;
+// changing it after ticks have started does not resize the
+// live pool.
 func (s *CronScheduler) SetMaxWorkers(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1044,13 +1055,22 @@ func (s *CronScheduler) turnTimeoutDuration() time.Duration {
 	return s.turnTimeout
 }
 
-func (s *CronScheduler) maxWorkerCount() int {
+// workerPool returns the scheduler-level worker semaphore,
+// created once (lazily, at the then-current maxWorkers bound)
+// and shared by every ProcessDue call, so the pool bound holds
+// across overlapping ticks, not per tick. A per-call pool
+// would let two concurrent ticks run 2×maxWorkers turns.
+func (s *CronScheduler) workerPool() chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.maxWorkers <= 0 {
-		return cronMaxWorkers
+	if s.sem == nil {
+		n := s.maxWorkers
+		if n <= 0 {
+			n = cronMaxWorkers
+		}
+		s.sem = make(chan struct{}, n)
 	}
-	return s.maxWorkers
+	return s.sem
 }
 
 // SetLogger replaces the scheduler's diagnostic logger. A nil
@@ -1153,16 +1173,22 @@ func (s *CronScheduler) ProcessDue(ctx context.Context, now time.Time) error {
 	// the real delay it waited), not the tick start — see
 	// processChat.
 	wallStart := time.Now()
-	// The pool is per tick: one goroutine per chat bucket, but
-	// only maxWorkerCount of them may run turns at once. (In
-	// production Run serialises ticks, so the live bound is
-	// one pool; overlapping ticks — concurrent ProcessDue calls
-	// — each bring their own, still bounded, pool.)
-	sem := make(chan struct{}, s.maxWorkerCount())
+	// The pool is scheduler-level (see workerPool): one
+	// goroutine per chat bucket, but only cap(sem) of them may
+	// run turns at once, even across overlapping ticks.
+	sem := s.workerPool()
 	var wg sync.WaitGroup
+	// dispatchErr is a ctx error seen while dispatching: the
+	// loop stops dispatching further chats, but ProcessDue
+	// still waits for every dispatched chat to finish before
+	// returning, so its "returns only once every dispatched
+	// chat's work is done" contract holds on the cancel path
+	// too.
+	var dispatchErr error
 	for _, b := range buckets {
 		if err := ctx.Err(); err != nil {
-			return err
+			dispatchErr = err
+			break
 		}
 		if !s.tryClaim(b.chatID) {
 			s.logf("chat %d: tick skipped: previous tick still running", b.chatID)
@@ -1178,7 +1204,7 @@ func (s *CronScheduler) ProcessDue(ctx context.Context, now time.Time) error {
 		}(b)
 	}
 	wg.Wait()
-	return nil
+	return dispatchErr
 }
 
 // tryClaim marks chatID as having a tick's work in progress. It
@@ -1226,14 +1252,20 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Fast filter at tick time: does this chat have anything
-	// due? Chats with nothing due never take a worker slot.
-	// The authoritative decision is re-made per job below, at
-	// the time it is actually processed — this filter only
-	// decides whether the chat needs a slot at all.
+	// Fast filter at processing time: does this chat have
+	// anything due? Chats with nothing due never take a worker
+	// slot. The authoritative decision is re-made per job
+	// below, at the time it is actually processed — this filter
+	// only decides whether the chat needs a slot at all. The
+	// filter is judged at the same processing time (`at`, tick
+	// time plus the load delay) as the no-worker branch below,
+	// not at tick time: a job that crossed the missed window
+	// during the load is skipped, not silently left for the
+	// next tick.
+	at := now.Add(time.Since(wallStart))
 	needsWorker := false
 	for _, j := range jobs {
-		if cronDueAt(j, now) {
+		if cronDueAt(j, at) {
 			needsWorker = true
 			break
 		}
@@ -1241,11 +1273,12 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 	if !needsWorker {
 		// Nothing can run this tick, but a job already past
 		// the missed window still needs its skip outcome
-		// recorded (this chat never waited for a worker, so
-		// tick time IS its processing time here).
+		// recorded, judged at the same processing time `at`
+		// (this chat never waited for a worker, so the load
+		// delay is its whole wait).
 		var outcomes []cronOutcome
 		for _, j := range jobs {
-			if kind, _, oc := s.classifyCronJob(j, now, b.chatID); kind == cronJobMissed {
+			if kind, _, oc := s.classifyCronJob(j, at, b.chatID); kind == cronJobMissed {
 				outcomes = append(outcomes, *oc)
 			}
 		}
@@ -1255,7 +1288,7 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 		return s.applyOutcomes(ctx, b, outcomes)
 	}
 	// A chat with work to run takes a worker slot: at most
-	// maxWorkerCount chats run turns at once, so one chat's
+	// cap(sem) chats run turns at once, so one chat's
 	// long turn delays other chats only up to the pool bound,
 	// never indefinitely. A cancelled tick stops waiting for a
 	// slot instead of starting work during shutdown.
@@ -1276,7 +1309,7 @@ func (s *CronScheduler) processChat(ctx context.Context, b cronBucket, now time.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		at := now.Add(time.Since(wallStart))
+		at = now.Add(time.Since(wallStart))
 		kind, nextAfter, oc := s.classifyCronJob(j, at, b.chatID)
 		switch kind {
 		case cronJobMissed:
@@ -1370,7 +1403,20 @@ func (s *CronScheduler) classifyCronJob(j *CronJob, at time.Time, chatID int64) 
 // runJob runs one due job's turn under the per-turn deadline and
 // builds its outcome. nextAfter is the next cron occurrence
 // after `at`, from classifyCronJob; `at` is the time the job was
-// actually processed, and is the base for lastRun and backoff.
+// actually processed, and is the base for lastRun. The failure
+// backoff is NOT based on `at`: it is anchored at the time the
+// turn finished (doneAt, below), so a turn that runs long and
+// then fails — a timeout, or a 9-minute turn that errors —
+// gets a next run at least the backoff after its outcome, never
+// a next run already in the past that would re-fire on the next
+// tick. Anchoring at `at` would do exactly that: a turn that
+// times out ends at at+timeout, while failures=1 backs off only
+// at+1min, so the backed-off next run would be ~9 minutes stale
+// the moment it was applied, still inside the missed window,
+// and the job would re-fire after every timeout until it was
+// disabled. A fast turn is unaffected: its outcome time is
+// `at` plus milliseconds, and the stored next run (second
+// precision) is what it was before.
 //
 // The turn runs in its own goroutine and the scheduler stops
 // waiting at the deadline: a runner that ignores its context
@@ -1400,6 +1446,13 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 	type runResult struct {
 		err error
 	}
+	// turnStart anchors the outcome time (below) in real
+	// elapsed time: the scheduler's clock is the tick time
+	// `at`, which a test (or a delayed tick) may hold ahead of
+	// the wall clock, so the outcome time must be `at` plus
+	// the real duration of the turn — never time.Now()
+	// itself, which would mix the two clocks.
+	turnStart := time.Now()
 	resCh := make(chan runResult, 1)
 	go func() {
 		_, err := runner(turnCtx, runJob)
@@ -1410,19 +1463,45 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 	case res := <-resCh:
 		runErr = res.err
 	case <-turnCtx.Done():
-		// The wait ended at the deadline (or the parent ctx
-		// was cancelled). The runner goroutine is left to
-		// finish on its own; its late result is discarded
-		// (the buffered channel lets it exit without a reader).
-		runErr = ctx.Err()
-		if runErr == nil {
-			runErr = turnCtx.Err()
+		// Deadline race: the runner may have returned at the
+		// exact instant the deadline fired, so a result may
+		// already be sitting in the buffered channel. A result
+		// that is there is the turn's real outcome — use it
+		// instead of recording a healthy turn as a timeout.
+		select {
+		case res := <-resCh:
+			runErr = res.err
+		default:
+			// The wait ended at the deadline (or the parent
+			// ctx was cancelled). The runner goroutine is
+			// left to finish on its own; its late result is
+			// discarded (the buffered channel lets it exit
+			// without a reader).
+			runErr = ctx.Err()
+			if runErr == nil {
+				runErr = turnCtx.Err()
+			}
 		}
 	}
-	// A turn that hit its deadline — whether the runner
-	// reported it or the scheduler stopped waiting — is a
-	// timeout failure, with a message that says so.
-	if turnCtx.Err() == context.DeadlineExceeded {
+	// doneAt is the turn's outcome time: the moment the
+	// scheduler stopped waiting, whether the runner returned
+	// or the deadline fired. It is `at` plus the real time
+	// the turn took, so it stays on the tick's clock (see
+	// turnStart above) — a wall-clock time.Now() here would
+	// mix clocks whenever the tick time runs ahead of real
+	// time. The failure backoff is anchored here, not at `at`
+	// (see the doc comment above).
+	doneAt := at.Add(time.Since(turnStart))
+	// A turn that hit its deadline — and produced no result, or
+	// produced only the context error itself — is a timeout
+	// failure, with a message that says so. A runner that
+	// honours its context returns ctx.Err() when the deadline
+	// fires, and that echo of the deadline is not a turn
+	// outcome: it is recorded as a timeout, as before. But a
+	// result that arrived with the deadline is the turn's real
+	// outcome, so a success or a real error is kept as-is and
+	// is never rewritten into a timeout.
+	if turnCtx.Err() == context.DeadlineExceeded && runErr != nil && (errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runErr, context.Canceled)) {
 		runErr = fmt.Errorf("scheduled turn timed out after %s", timeout)
 	}
 	if runErr != nil {
@@ -1434,7 +1513,7 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 		}
 		return &cronOutcome{
 			jobID:    j.ID,
-			nextRun:  backoffNextRun(nextAfter, at, failures),
+			nextRun:  backoffNextRun(nextAfter, doneAt, failures),
 			lastRun:  at,
 			lastRes:  lastRes,
 			failures: failures,
@@ -1453,11 +1532,16 @@ func (s *CronScheduler) runJob(ctx context.Context, j *CronJob, at time.Time, ne
 
 // backoffNextRun applies the exponential failure backoff to the
 // next cron occurrence: 2^(failures-1) minutes, capped at
-// cronMaxBackoff. A job whose cron would fire again in 30
-// seconds after a failure waits at least a minute instead; a
-// daily job keeps its daily slot (the backoff is far shorter
-// than a day), so backoff only delays, never advances, the next
-// cron time.
+// cronMaxBackoff. `now` is the turn's OUTCOME time (when the
+// scheduler stopped waiting), not the time the turn started:
+// anchoring the backoff at the start would put the next run in
+// the past for any turn that ran longer than its backoff (a
+// timeout, or any long turn that then fails), and the job would
+// re-fire on the next tick. A job whose cron would fire again
+// in 30 seconds after a failure waits at least a minute
+// instead; a daily job keeps its daily slot (the backoff is far
+// shorter than a day), so backoff only delays, never advances,
+// the next cron time.
 func backoffNextRun(nextCron, now time.Time, failures int) time.Time {
 	if failures < 1 {
 		return nextCron

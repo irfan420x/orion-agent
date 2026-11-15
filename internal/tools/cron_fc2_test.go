@@ -7,8 +7,10 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -248,21 +250,39 @@ func TestCronSchedulerHungTurnTimesOut(t *testing.T) {
 		if runner.count() != 1 {
 			t.Fatalf("runner calls = %d, want 1", runner.count())
 		}
-		// Releasing the hung runner must not apply a second
-		// outcome or re-fire the job: its late result is
-		// discarded, and the backed-off next run is in the
-		// future.
-		runner.releaseChat(111)
-		time.Sleep(100 * time.Millisecond) // let the orphan exit
-		if err := s.ProcessDue(ctx, now); err != nil {
+		// The backed-off next run must be after the timeout
+		// instant (tick time + 200ms deadline), not merely
+		// after the tick: a backoff anchored at the time the
+		// job was classified would already be stale by the
+		// time the turn timed out.
+		next, err := time.Parse(time.RFC3339, j.NextRun)
+		if err != nil {
+			t.Fatalf("next run %q: %v", j.NextRun, err)
+		}
+		if !next.After(now.Add(200 * time.Millisecond)) {
+			t.Fatalf("next run %s is not after the timeout instant %s (backoff not anchored at the turn's outcome)", j.NextRun, now.Add(200*time.Millisecond).Format(time.RFC3339))
+		}
+		// Re-tick with ADVANCED time — a real next tick, 30s
+		// after the first one, while the hung runner is still
+		// blocked: the timed-out job must NOT re-fire, its
+		// backed-off next run is in the future. (The old
+		// test re-ticked with the SAME time, which masked a
+		// stale backoff: with the production 10-minute
+		// deadline the next real tick lands ~10 minutes after
+		// classification, long past a backoff anchored there.)
+		if err := s.ProcessDue(ctx, now.Add(30*time.Second)); err != nil {
 			t.Fatalf("second ProcessDue: %v", err)
 		}
 		if runner.count() != 1 {
-			t.Fatalf("runner calls after second tick = %d, want 1 (no re-fire)", runner.count())
+			t.Fatalf("runner calls after second tick = %d, want 1 (no re-fire at the advanced tick)", runner.count())
 		}
+		// Releasing the hung runner must not apply a second
+		// outcome: its late result is discarded.
+		runner.releaseChat(111)
+		time.Sleep(100 * time.Millisecond) // let the orphan exit
 		got = mustCronList(t, list, ctx)
 		if got.Jobs[0].ConsecutiveFailures != 1 {
-			t.Fatalf("failures after second tick = %d, want 1 (late result discarded)", got.Jobs[0].ConsecutiveFailures)
+			t.Fatalf("failures after release = %d, want 1 (late result discarded)", got.Jobs[0].ConsecutiveFailures)
 		}
 	}
 	t.Run("ignores-context", func(t *testing.T) { runCase(t, false) })
@@ -441,5 +461,214 @@ func TestCronSchedulerWorkerPoolBoundsConcurrency(t *testing.T) {
 	}
 	if runner.count() != 2 {
 		t.Fatalf("runner calls = %d, want 2 (both chats ran, one after the other)", runner.count())
+	}
+}
+
+func TestCronSchedulerLongFailingTurnBackoffAnchoredAtCompletion(t *testing.T) {
+	// A turn that runs long (3s) and THEN fails: the failure
+	// backoff must be anchored at the turn's outcome time, not
+	// at the time the job was classified. With a classification
+	// anchor the next run would be at+1min; with the outcome
+	// anchor it is (at+3s)+1min. The 3s turn stands in for the
+	// production 10-minute timeout, where the stale anchor
+	// puts the next run ~9 minutes in the past and the job
+	// re-fires on the next tick. `now` is mid-minute so the
+	// next cron slot is exactly now+30s and the arithmetic
+	// below has no boundary ambiguity.
+	store := NewPlanningStore("")
+	sched, list, _ := cronTestTools(store)
+	ctx := cronChatCtx(111, 111)
+	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	cronDueJob(t, store, ctx, sched, "* * * * *", "slow then fails", now.Add(-time.Minute))
+
+	var calls atomic.Int32
+	runner := func(ctx context.Context, job CronJob) (string, error) {
+		calls.Add(1)
+		time.Sleep(3 * time.Second)
+		return "", errors.New("provider exploded")
+	}
+	s := NewCronScheduler(store)
+	s.SetRunner(runner)
+	if err := s.ProcessDue(ctx, now); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("runner calls = %d, want 1", calls.Load())
+	}
+	got := mustCronList(t, list, ctx)
+	j := got.Jobs[0]
+	if j.ConsecutiveFailures != 1 || j.Disabled {
+		t.Fatalf("job after long failure = %+v, want 1 failure / enabled", j)
+	}
+	next, err := time.Parse(time.RFC3339, j.NextRun)
+	if err != nil {
+		t.Fatalf("next run %q: %v", j.NextRun, err)
+	}
+	// Outcome-anchored: next run is at least 1 minute after
+	// the turn ENDED (~now+63s). Classification-anchored it
+	// would be ~now+60s. The 61s threshold separates the two
+	// with a 2s margin on the fixed side and a 1s margin on
+	// the stale side (the stored value is second precision).
+	if !next.After(now.Add(61 * time.Second)) {
+		t.Fatalf("next run %s is not after now+61s (want the 1m backoff anchored at the turn's outcome, ~now+63s)", j.NextRun)
+	}
+	// A real next tick at now+61s — past the stale next run,
+	// before the outcome-anchored one — must NOT re-fire the
+	// job: with the stale anchor the job would run again here,
+	// 1s after its (already past) next run.
+	if err := s.ProcessDue(ctx, now.Add(61*time.Second)); err != nil {
+		t.Fatalf("second ProcessDue: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("runner calls after second tick = %d, want 1 (no re-fire: the backoff had not expired)", calls.Load())
+	}
+	got = mustCronList(t, list, ctx)
+	if got.Jobs[0].ConsecutiveFailures != 1 {
+		t.Fatalf("failures after second tick = %d, want 1", got.Jobs[0].ConsecutiveFailures)
+	}
+}
+
+func TestCronSchedulerLongSuccessfulTurnKeepsSchedule(t *testing.T) {
+	// The outcome anchoring applies to the FAILURE backoff
+	// only. A long turn that SUCCEEDS keeps its schedule-based
+	// next run (the next cron slot after it started): the
+	// missed-window policy deliberately lets a run that is up
+	// to 10 minutes late still fire, so a successful turn's
+	// next run is the next slot, not completion+anything. This
+	// pins the boundary so a future "fix" does not move
+	// successful turns onto the outcome clock and skip slots.
+	// `now` is mid-minute so the next slot is exactly now+30s.
+	store := NewPlanningStore("")
+	sched, list, _ := cronTestTools(store)
+	ctx := cronChatCtx(111, 111)
+	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	cronDueJob(t, store, ctx, sched, "* * * * *", "slow then succeeds", now.Add(-time.Minute))
+
+	s := NewCronScheduler(store)
+	s.SetRunner(func(ctx context.Context, job CronJob) (string, error) {
+		time.Sleep(3 * time.Second)
+		return "ok", nil
+	})
+	if err := s.ProcessDue(ctx, now); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	got := mustCronList(t, list, ctx)
+	j := got.Jobs[0]
+	if j.LastResult != "ok" || j.ConsecutiveFailures != 0 {
+		t.Fatalf("job after long success = %+v, want ok/0 failures", j)
+	}
+	next, err := time.Parse(time.RFC3339, j.NextRun)
+	if err != nil {
+		t.Fatalf("next run %q: %v", j.NextRun, err)
+	}
+	schedExpr, err := parseCronExpression("* * * * *")
+	if err != nil {
+		t.Fatalf("parseCronExpression: %v", err)
+	}
+	wantNext, err := schedExpr.nextAfter(now)
+	if err != nil {
+		t.Fatalf("nextAfter: %v", err)
+	}
+	if !next.Equal(wantNext) {
+		t.Fatalf("next run %s, want the next cron slot %s (success keeps the schedule, it is not outcome-anchored)", j.NextRun, wantNext.Format(time.RFC3339))
+	}
+}
+
+func TestCronSchedulerWorkerPoolSharedAcrossOverlappingTicks(t *testing.T) {
+	// The worker pool is scheduler-level, not per tick: two
+	// overlapping ProcessDue calls share one pool of
+	// maxWorkers, so the bound holds across ticks. With a
+	// per-call pool the second tick would bring its own pool
+	// of 1 and run its chat's turn concurrently with the
+	// first tick's blocked turn (2 turns at once, bound 1).
+	store := NewPlanningStore("")
+	sched, _, _ := cronTestTools(store)
+	ctxA := cronChatCtx(111, 111)
+	ctxB := cronChatCtx(222, 222)
+	now := time.Now().UTC().Truncate(time.Second)
+	cronDueJob(t, store, ctxA, sched, "* * * * *", "A job", now.Add(-time.Minute))
+
+	runner := newCronBlockingRunner()
+	runner.blockChat(111)
+	runner.blockChat(222)
+	s := NewCronScheduler(store)
+	s.SetRunner(runner.run)
+	s.SetMaxWorkers(1)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- s.ProcessDue(ctxA, now) }()
+	// A's turn enters the runner and blocks, holding the only
+	// worker.
+	waitForRunnerCalls(t, runner, 111, 1)
+	// A second chat's job appears only now, so the first tick
+	// never saw it: the overlapping second tick has an
+	// unclaimed chat with a due job.
+	cronDueJob(t, store, ctxB, sched, "* * * * *", "B job", now.Add(-time.Minute))
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- s.ProcessDue(ctxA, now) }()
+	// Give the second tick a moment: B's turn must not start
+	// while A holds the only (shared) worker.
+	time.Sleep(300 * time.Millisecond)
+	if runner.count() != 1 {
+		runner.releaseChat(111)
+		runner.releaseChat(222)
+		t.Fatalf("runner calls = %d while the only worker is held, want 1 (second tick ran B on its own pool)", runner.count())
+	}
+	runner.releaseChat(111)
+	runner.releaseChat(222)
+	for _, done := range []chan error{firstDone, secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ProcessDue: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("ProcessDue did not return after releasing both chats")
+		}
+	}
+	if runner.count() != 2 {
+		t.Fatalf("runner calls = %d, want 2 (both chats ran, one after the other)", runner.count())
+	}
+}
+
+func TestCronSchedulerDeadlineRaceUsesResult(t *testing.T) {
+	// Best-effort race test: a turn that returns success well
+	// before its deadline must be recorded as a success, not
+	// a timeout. The scheduler's select can take the Done
+	// branch at the exact instant the result lands; the fix
+	// checks the result channel first in that branch. The race
+	// itself cannot be forced deterministically from outside —
+	// landing the result in the microsecond window where both
+	// the result and the deadline are ready is a matter of
+	// scheduling, and a sleep that ends only just before the
+	// deadline is itself flaky on a loaded machine (a 90ms
+	// sleep against a 100ms deadline failed here for that
+	// reason, the runner simply being scheduled late) — so
+	// the margin is deliberately wide (50ms turn, 200ms
+	// deadline). What this pins is the near-deadline success
+	// path, repeated: on the fixed code every iteration is a
+	// success by construction, either because the result
+	// branch wins, or because the Done branch finds the
+	// already-sent result.
+	for i := 0; i < 5; i++ {
+		store := NewPlanningStore("")
+		sched, list, _ := cronTestTools(store)
+		ctx := cronChatCtx(111, 111)
+		now := time.Now().UTC().Truncate(time.Second)
+		cronDueJob(t, store, ctx, sched, "* * * * *", "just in time", now.Add(-time.Minute))
+		s := NewCronScheduler(store)
+		s.SetRunner(func(ctx context.Context, job CronJob) (string, error) {
+			time.Sleep(50 * time.Millisecond)
+			return "ok", nil
+		})
+		s.SetTurnTimeout(200 * time.Millisecond)
+		if err := s.ProcessDue(ctx, now); err != nil {
+			t.Fatalf("iteration %d: ProcessDue: %v", i, err)
+		}
+		got := mustCronList(t, list, ctx)
+		j := got.Jobs[0]
+		if j.LastResult != "ok" || j.ConsecutiveFailures != 0 {
+			t.Fatalf("iteration %d: job = %+v, want ok/0 failures (a turn that finished before its deadline is a success, not a timeout)", i, j)
+		}
 	}
 }
