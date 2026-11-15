@@ -6,7 +6,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
-	"github.com/irfan/orion/internal/security"
 )
 
 // Tool is the interface for one callable tool.
@@ -305,65 +303,14 @@ func (r *Registry) Definitions() []model.ToolDefinition {
 // TruncateToolResult: a truncated result carries a marker with its
 // original size, so the model knows data was cut.
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (result string, err error) {
-	// A panicking tool must not crash the daemon (or the agent run):
-	// recover here and report the panic as an execution error, the
-	// same way any other tool failure is reported.
-	defer func() {
-		if rec := recover(); rec != nil {
-			result = ""
-			err = &ToolError{
-				Tool: name,
-				Kind: "execution",
-				Err:  errors.New(security.RedactSecrets(fmt.Sprintf("tool panicked: %v", rec))),
-			}
-		}
-	}()
-	t, ok := r.Get(name)
-	if !ok {
-		return "", &ToolError{Tool: name, Kind: "unknown_tool", Err: fmt.Errorf("unknown tool")}
-	}
-	// Central schema validation: required parameters and declared
-	// JSON types are enforced here, for every caller, before the
-	// tool runs — a call that fails validation never reaches tool
-	// code, so it cannot cause a side effect or bypass the
-	// denylist, and a validation failure is a clean invalid_args
-	// error, never a panic. The agent's permission gate has
-	// already decided the call before Execute is reached (see
-	// core.executeTool), so validation cannot bypass it either:
-	// a denied call never gets here, and a validated call still
-	// goes through the tool's own denylist checks underneath.
-	if err := validateArgs(t.Definition(), args); err != nil {
-		var toolErr *ToolError
-		if errors.As(err, &toolErr) {
-			return "", &ToolError{
-				Tool: toolErr.Tool,
-				Kind: toolErr.Kind,
-				Err:  errors.New(TruncateToolResult(security.RedactSecrets(toolErr.Err.Error()), r.MaxResultBytes())),
-			}
-		}
+	// Text-only view of ExecuteResult (see result.go): the same
+	// validation, redaction and truncation, with the images
+	// dropped. Callers that need images use ExecuteResult
+	// directly; this stays so the text-only tools and every
+	// existing caller keep working unchanged.
+	res, err := r.ExecuteResult(ctx, name, args)
+	if err != nil {
 		return "", err
 	}
-	result, err = t.Execute(ctx, args)
-	if err != nil {
-		var toolErr *ToolError
-		if errors.As(err, &toolErr) {
-			// Tool errors are fed back to the model as text too,
-			// so they get the same size cap as results: a failing
-			// tool must not be able to flood the context through
-			// its error string either.
-			return "", &ToolError{
-				Tool: toolErr.Tool,
-				Kind: toolErr.Kind,
-				Err:  errors.New(TruncateToolResult(security.RedactSecrets(toolErr.Err.Error()), r.MaxResultBytes())),
-			}
-		}
-		return "", fmt.Errorf("%s", TruncateToolResult(security.RedactSecrets(err.Error()), r.MaxResultBytes()))
-	}
-	// Central choke point for tool-result size: every tool's output
-	// passes through here, so no tool — built-in or added later —
-	// can return unbounded data to the model. Per-tool caps bound
-	// memory while a tool runs; this bounds what the model sees.
-	// Over-cap results are truncated with a marker carrying the
-	// original size, never dropped and never an error.
-	return TruncateToolResult(security.RedactSecrets(result), r.MaxResultBytes()), nil
+	return res.Text, nil
 }

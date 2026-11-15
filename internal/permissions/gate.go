@@ -145,6 +145,7 @@ var safeTools = map[string]bool{
 	"grep":              true,
 	"process_list":      true,
 	"skill":             true,
+	"screenshot":        true,
 	"subagent_list":     true,
 	"subagent_result":   true,
 	"subagent_stop":     true,

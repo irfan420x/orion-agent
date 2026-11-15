@@ -905,7 +905,17 @@ func runScheduledTurn(a *app.App, store *messaging.SessionStore, gw *messaging.T
 	if a == nil {
 		return "", errors.New("oriond: app is nil")
 	}
-	reply, stats, err := runAgentTurn(a, ctx, job.ChatID, job.Requester, job.Prompt, nil, nil, true)
+	// runAgentTurn builds the run context (approval context,
+	// unattended marker F-C3, RegisterRun for /stop), then runs
+	// HandleStreamForChatWithImages — the same pipeline as a user
+	// message, so the two paths cannot drift apart. The context
+	// is also wrapped with tools.WithUnattendedTurn so Gate.Check
+	// denies any prompt-required action instead of asking
+	// (screenshot §5.3): a scheduled turn runs with nobody
+	// present to approve or to click a portal dialog, so
+	// computer-use stays off in unattended turns (plan §11.3).
+	// WithCancel inside runAgentTurn preserves the marker.
+	reply, stats, err := runAgentTurn(a, tools.WithUnattendedTurn(ctx), job.ChatID, job.Requester, job.Prompt, nil, nil, true)
 	if err != nil && errors.Is(err, budget.ErrBudgetExceeded) {
 		// F-C7: the chat is over its daily token budget. This
 		// is NOT an "ok" run: the usage is still recorded (a

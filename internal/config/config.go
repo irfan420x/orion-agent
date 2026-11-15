@@ -354,9 +354,12 @@ func defaultConfig(dataDir string) *Config {
 			"anthropic": {Name: "anthropic", Model: "claude-sonnet-4-5"},
 			"ollama":    {Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.1"},
 		},
-		Model:              "",
-		DataDir:            dataDir,
-		MaxSteps:           20,
+		Model:   "",
+		DataDir: dataDir,
+		// MaxSteps 40 (was 20): a computer-use grounding loop
+		// needs 15-25 steps on a medium task (plan §4.7-2);
+		// matches core.defaultMaxSteps.
+		MaxSteps:           40,
 		TimeoutSeconds:     120,
 		MaxToolResultBytes: DefaultMaxToolResultBytes,
 		MaxHistoryTokens:   0, // auto: half the provider's window

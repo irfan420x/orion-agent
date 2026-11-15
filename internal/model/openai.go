@@ -117,14 +117,16 @@ type openAIMessage struct {
 // documents for image input): a text block, or an image_url block
 // carrying a base64 data URL.
 type openAIContentPart struct {
-	Type     string              `json:"type"` // "text" | "image_url"
-	Text     string              `json:"text,omitempty"`
-	ImageURL *openAIImageURLPart `json:"image_url,omitempty"`
+	Type     string          `json:"type"` // "text" | "image_url"
+	Text     string          `json:"text,omitempty"`
+	ImageURL *openAIImageURL `json:"image_url,omitempty"`
 }
 
-// openAIImageURLPart is the payload of an image_url content part.
-type openAIImageURLPart struct {
-	URL string `json:"url"` // "data:<mime>;base64,..."
+// openAIImageURL is the payload of an image_url content part: a data
+// URL ("data:<mime>;base64,..."), so no image ever leaves the machine
+// except inside the provider request it belongs to.
+type openAIImageURL struct {
+	URL string `json:"url"`
 }
 
 // imagePlaceholder marks an older message whose image was stripped
@@ -213,9 +215,12 @@ func (e *openAIAPIError) describe() string {
 // text-only — its text plus the "[ছবি]" placeholder — so a photo is
 // never re-sent (as base64) on every later turn: that would
 // re-charge the image tokens and bloat the context on each step.
-// Images on non-user messages are dropped the same way (DeepSeek
-// rejects images in assistant messages with a 400); the placeholder
-// keeps the transcript honest about what was sent.
+// Tool messages keep their screenshot images (rendered by
+// openAIContent; core eviction bounds them to the last 3).
+// Images on assistant messages are dropped the same way as older
+// photos (DeepSeek rejects images in assistant messages with a
+// 400); the placeholder keeps the transcript honest about what
+// was sent.
 func toOpenAIMessages(msgs []Message) []openAIMessage {
 	// Find the last user message that carries usable images.
 	lastImageIdx := -1
@@ -244,6 +249,16 @@ func toOpenAIMessages(msgs []Message) []openAIMessage {
 			out = append(out, om)
 			continue
 		}
+		if m.Role == "tool" {
+			// Tool screenshot images: text plus one image_url
+			// part per usable image (see openAIContent). The
+			// eviction in core keeps at most the last 3
+			// screenshot images in the request, so tool images
+			// stay bounded.
+			om.Content = openAIContent(m)
+			out = append(out, om)
+			continue
+		}
 		if i == lastImageIdx {
 			// Most recent user message with images: text part
 			// (when there is text) plus one image_url part per
@@ -269,7 +284,7 @@ func toOpenAIMessages(msgs []Message) []openAIMessage {
 				}
 				parts = append(parts, openAIContentPart{
 					Type:     "image_url",
-					ImageURL: &openAIImageURLPart{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data)},
+					ImageURL: &openAIImageURL{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data)},
 				})
 			}
 			if len(parts) == 0 {
@@ -288,7 +303,7 @@ func toOpenAIMessages(msgs []Message) []openAIMessage {
 			out = append(out, om)
 			continue
 		}
-		// Older (or non-user) message with images: text-only
+		// Older (or non-user, non-tool) message with images: text-only
 		// with the placeholder, so the transcript records that
 		// a photo was part of this turn without re-sending it.
 		if m.Content != "" {
@@ -299,6 +314,45 @@ func toOpenAIMessages(msgs []Message) []openAIMessage {
 		out = append(out, om)
 	}
 	return out
+}
+
+// openAIContent renders a message's content for the wire: a plain
+// string when there are no images, otherwise content parts — the
+// text first, then one image_url part per image (base64 data URL).
+// The MIME type is always sniffed from the bytes (see
+// SniffImageMIME): a declared type is never trusted, and an image
+// whose type cannot be sniffed (or whose data is empty) is skipped,
+// so a malformed image degrades to text instead of producing a 400;
+// when every image is skipped the content is the plain string.
+func openAIContent(m Message) any {
+	if len(m.Images) == 0 {
+		return m.Content
+	}
+	parts := []openAIContentPart{}
+	if strings.TrimSpace(m.Content) != "" {
+		parts = append(parts, openAIContentPart{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		if len(img.Data) == 0 {
+			continue
+		}
+		mime := SniffImageMIME(img.Data)
+		if mime == "" {
+			continue
+		}
+		parts = append(parts, openAIContentPart{
+			Type:     "image_url",
+			ImageURL: &openAIImageURL{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img.Data)},
+		})
+	}
+	if len(parts) == 0 {
+		return m.Content
+	}
+	// A text-only parts list is still returned as parts when an
+	// image was present but skipped: the caller already decided
+	// this message is image-bearing, and a single text part is a
+	// valid content shape.
+	return parts
 }
 
 func toOpenAITools(tools []ToolDefinition) []openAITool {

@@ -4,6 +4,7 @@ package model
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,16 +27,29 @@ func (p *anthropicProvider) Name() string { return "anthropic" }
 // anthropicContentBlock is one block in a message content array, or in a
 // response. Fields are used per block type.
 type anthropicContentBlock struct {
-	Type string `json:"type"` // text | tool_use | tool_result
+	Type string `json:"type"` // text | tool_use | tool_result | image
 	// text
 	Text string `json:"text,omitempty"`
 	// tool_use
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
-	// tool_result
+	// tool_result: a plain string for text-only results, or an array
+	// of content blocks (text + image) when the result carries
+	// images — Anthropic accepts both shapes for tool_result
+	// content. The field is any for exactly that reason; every
+	// other use of this struct keeps it a string.
 	ToolUseID string `json:"tool_use_id,omitempty"`
-	Content   string `json:"content,omitempty"`
+	Content   any    `json:"content,omitempty"`
+	// image
+	Source *anthropicImageSource `json:"source,omitempty"`
+}
+
+// anthropicImageSource is the base64 payload of an image block.
+type anthropicImageSource struct {
+	Type      string `json:"type"` // base64
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 type anthropicMessage struct {
@@ -130,7 +144,7 @@ func toAnthropicMessages(msgs []Message) (system string, out []anthropicMessage,
 				blocks = append(blocks, anthropicContentBlock{
 					Type:      "tool_result",
 					ToolUseID: msgs[i].ToolCallID,
-					Content:   msgs[i].Content,
+					Content:   anthropicToolResultContent(msgs[i]),
 				})
 				i++
 			}
@@ -166,11 +180,65 @@ func toAnthropicMessages(msgs []Message) (system string, out []anthropicMessage,
 			// "user" is passed through as a user turn. Any unknown role
 			// is also mapped to user: Anthropic only accepts
 			// user/assistant (plus extracted system), so passing an
-			// unknown role verbatim would produce a 400.
+			// unknown role verbatim would produce a 400. A user
+			// message carrying images becomes content blocks (text
+			// + one image block per image) instead of a plain
+			// string.
+			if len(m.Images) > 0 {
+				out = appendAnthropicMessage(out, anthropicMessage{Role: "user", Content: anthropicImageBlocks(m)})
+				continue
+			}
 			out = appendAnthropicMessage(out, anthropicMessage{Role: "user", Content: m.Content})
 		}
 	}
 	return strings.Join(systemParts, "\n"), out, nil
+}
+
+// anthropicToolResultContent renders a tool result for a tool_result
+// block: the plain text when there are no images, otherwise content
+// blocks — the text first, then one image block per image. Images
+// with an unknown media type or empty data are skipped, so a
+// malformed image degrades to text instead of producing a 400.
+func anthropicToolResultContent(m Message) any {
+	if len(m.Images) == 0 {
+		return m.Content
+	}
+	return anthropicImageBlocks(m)
+}
+
+// anthropicImageBlocks renders a message as content blocks: the text
+// (when non-empty) plus one image block per usable image. Callers
+// use it for image-bearing user messages and tool results alike.
+func anthropicImageBlocks(m Message) []anthropicContentBlock {
+	blocks := []anthropicContentBlock{}
+	if strings.TrimSpace(m.Content) != "" {
+		blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		if len(img.Data) == 0 {
+			continue
+		}
+		mediaType := img.MIMEType
+		if mediaType != "image/jpeg" && mediaType != "image/png" {
+			continue
+		}
+		blocks = append(blocks, anthropicContentBlock{
+			Type: "image",
+			Source: &anthropicImageSource{
+				Type:      "base64",
+				MediaType: mediaType,
+				Data:      base64.StdEncoding.EncodeToString(img.Data),
+			},
+		})
+	}
+	if len(blocks) == 0 {
+		// No text and no usable image: an empty block list would
+		// be a 400, so fall back to the plain text (possibly
+		// empty, which the caller already accepted for text
+		// messages).
+		return []anthropicContentBlock{{Type: "text", Text: m.Content}}
+	}
+	return blocks
 }
 
 // appendAnthropicMessage appends a turn, merging it into the previous

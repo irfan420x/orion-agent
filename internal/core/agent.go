@@ -33,7 +33,11 @@ import (
 
 // Defaults applied when the config omits a limit.
 const (
-	defaultMaxSteps       = 20
+	// defaultMaxSteps is 40, not 20: a computer-use grounding loop
+	// (screenshot -> decide -> act -> verify screenshot) eats
+	// 15-25 steps on a medium task (plan §4.7-2), and 20 starves
+	// it. The config default matches (see internal/config).
+	defaultMaxSteps       = 40
 	defaultTimeoutSeconds = 120
 	// maxRecentMessages is how many recent conversation messages from
 	// memory are included as context for each run.
@@ -749,6 +753,11 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 	// occurrence 0, matching the killed run's first call.
 	a.journalOcc = map[string]int{}
 
+	// A new turn resets per-turn tool state (the screenshot rate
+	// limit's per-turn counter). Nil-safe: a registry without
+	// turn-scoped tools is unaffected.
+	a.tools.BeginTurn()
+
 	// Progress-event bookkeeping. Everything below this point is a
 	// real turn, so every return from here on emits exactly one
 	// TurnFinished (guarded by turnFinished); the early validation
@@ -977,6 +986,11 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 			a.logf("step %d: history trimmed to %d-token budget: dropped %d message(s), truncated %d bytes", step+1, a.maxHistoryTokens(), stats.dropped, stats.truncated)
 			reqMessages = trimmed
 		}
+		// Screenshot eviction (plan §4.7-3): the request keeps at
+		// most the last 3 screenshot images; earlier ones are
+		// replaced by a text summary in the copy only — the
+		// in-flight transcript keeps its images.
+		reqMessages = evictOldScreenshotImages(reqMessages)
 		req := model.ChatRequest{
 			Messages:    append([]model.Message(nil), reqMessages...),
 			Tools:       a.toolDefinitions(),
@@ -1134,7 +1148,8 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 			toolCtx, toolCancel := context.WithTimeout(ctx, a.timeout())
 			toolStart := time.Now()
 			a.emit(ProgressEvent{Kind: EventToolCallStarted, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Usage: usage})
-			result, gateDenied := a.executeTool(toolCtx, tc)
+			toolResult, gateDenied := a.executeToolResult(toolCtx, tc)
+			result := toolResult.Text
 			turnToolCalls++
 			if gateDenied {
 				turnGateDeniedCalls++
@@ -1150,7 +1165,7 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 				toolErr = errors.New(result)
 			}
 			a.emit(ProgressEvent{Kind: EventToolCallFinished, Step: step + 1, ToolName: tc.Name, Arguments: tc.Arguments, Duration: time.Since(toolStart), Err: toolErr, Usage: usage})
-			toolMsg := model.Message{Role: "tool", Content: result, ToolCallID: tc.ID}
+			toolMsg := model.Message{Role: "tool", Content: result, ToolCallID: tc.ID, Images: toolResult.Images}
 			messages = append(messages, toolMsg)
 			a.recordMessage(toolMsg)
 		}
@@ -1284,6 +1299,10 @@ func repairHistory(msgs []model.Message) ([]model.Message, int) {
 // window, not predict the provider's exact count.
 func messageTokens(m model.Message) int {
 	n := model.CountTokens(m.Content) + 4
+	// Images cost vision tokens the text estimator cannot see:
+	// charge the estimated per-image cost so a screenshot-heavy
+	// request trims history instead of blowing the window.
+	n += len(m.Images) * model.EstimatedTokensPerImage
 	for _, tc := range m.ToolCalls {
 		n += model.CountTokens(tc.Name) + model.CountTokens(tc.Arguments) + 4
 	}
@@ -1494,11 +1513,27 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 // skill invoke's effect is agent-loop activation state — replaying
 // it would never fire setActiveSkill, so the skill restriction
 // would drop on a re-delivered turn (F-A10-1).
+// executeTool is the text-only view of executeToolResult, for
+// callers (and tests) that only need the result text. The second
+// return value is the gate-denial signal (see executeToolResult):
+// it is true only when the permission gate denied the call.
 func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, bool) {
+	res, denied := a.executeToolResult(ctx, tc)
+	return res.Text, denied
+}
+
+// executeToolResult runs one tool call and returns its full result,
+// text plus images, and whether the permission gate denied the
+// call. The journal stores and replays text only (a
+// replayed screenshot returns its JSON summary without the image —
+// the file it names still exists on disk); a re-delivered
+// screenshot is re-captured instead, because a stale image is worse
+// than a fresh one (see journalExcludedTools).
+func (a *Agent) executeToolResult(ctx context.Context, tc model.ToolCall) (tools.ToolResult, bool) {
 	args, ok := parseToolArguments(tc)
 	if !ok {
 		a.logf("tool %q: invalid JSON arguments, feeding error back to model", tc.Name)
-		return fmt.Sprintf("Error: invalid arguments for tool %q: %q is not a JSON object", tc.Name, tc.Arguments), false
+		return tools.ToolResult{Text: fmt.Sprintf("Error: invalid arguments for tool %q: %q is not a JSON object", tc.Name, tc.Arguments)}, false
 	}
 	// Permission/confirmation gate (P1-O2): consulted before the
 	// registry runs anything. A denial is returned as error text
@@ -1519,7 +1554,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 			// paths all funnel through Gate.Check above — so
 			// counting it here counts every real denial and
 			// nothing else.
-			return fmt.Sprintf("Error: permission denied for tool %q: %s", tc.Name, reason), true
+			return tools.ToolResult{Text: fmt.Sprintf("Error: permission denied for tool %q: %s", tc.Name, reason)}, true
 		}
 	}
 	// Hook bus, PreToolUse (rc9, audit P0 #6): consulted after the
@@ -1534,7 +1569,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 	if bus := a.hooks(); bus != nil {
 		if out := bus.PreToolUse(ctx, tc.Name, args); out.Blocked {
 			a.logf("tool %q blocked by hook: %s", tc.Name, out.Reason)
-			return fmt.Sprintf("Error: tool %q blocked by hook: %s", tc.Name, out.Reason), false
+			return tools.ToolResult{Text: fmt.Sprintf("Error: tool %q blocked by hook: %s", tc.Name, out.Reason)}, false
 		} else if out.Warning != "" {
 			a.logf("tool %q pre-tool hooks: %s", tc.Name, out.Warning)
 		}
@@ -1559,7 +1594,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 				journalOcc = a.nextJournalOccurrence(tc.Name, journalCanon)
 				if result, ok := j.Lookup(uid, tc.Name, journalCanon, journalOcc); ok {
 					a.logf("tool %q: replaying recorded result for update %d (occurrence %d); not re-executed", tc.Name, uid, journalOcc)
-					return result, false
+					return tools.ToolResult{Text: result}, false
 				}
 				journal = j
 				journalUpdateID = uid
@@ -1571,6 +1606,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 	// while activation — which skill is active, which tools it
 	// allows — is agent-loop state (see executeSkillTool).
 	var result string
+	var images []model.ImageContent
 	var executed bool
 	if tc.Name == "skill" {
 		result = a.executeSkillTool(ctx, tc, args)
@@ -1586,7 +1622,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 		// re-decides it (and its occurrence was already consumed
 		// above, so the sequence still agrees).
 		a.logf("tool %q blocked by active skill: %s", tc.Name, reason)
-		return fmt.Sprintf("Error: tool %q is not allowed while a skill is active: %s. End the skill with the skill tool (action \"end\") or use an allowed tool.", tc.Name, reason), false
+		return tools.ToolResult{Text: fmt.Sprintf("Error: tool %q is not allowed while a skill is active: %s. End the skill with the skill tool (action \"end\") or use an allowed tool.", tc.Name, reason)}, false
 	} else if blocked, reason := a.tools.PlanModeBlocks(ctx, tc.Name); blocked {
 		// Plan-mode enforcement: while a plan is pending approval
 		// for this chat, no mutating tool runs — the agent
@@ -1595,8 +1631,8 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 		// never executed, so it is not journalled: a re-delivered
 		// turn re-decides it (like the skill restriction above).
 		a.logf("tool %q blocked by plan mode: %s", tc.Name, reason)
-		return fmt.Sprintf("Error: tool %q is blocked while a plan is pending approval: %s. Wait for the plan decision, or call exit_plan_mode to abandon the plan.", tc.Name, reason), false
-	} else if res, err := a.tools.Execute(ctx, tc.Name, args); err != nil {
+		return tools.ToolResult{Text: fmt.Sprintf("Error: tool %q is blocked while a plan is pending approval: %s. Wait for the plan decision, or call exit_plan_mode to abandon the plan.", tc.Name, reason)}, false
+	} else if res, err := a.tools.ExecuteResult(ctx, tc.Name, args); err != nil {
 		// The registry enforces the security denylist for shell tools; log
 		// denials here so they are visible in the agent log.
 		var toolErr *tools.ToolError
@@ -1611,7 +1647,8 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 		// a call whose side effects may already have happened.
 		executed = true
 	} else {
-		result = res
+		result = res.Text
+		images = res.Images
 		executed = true
 	}
 	// Record the executed call durably (F-A9-1) before the result
@@ -1626,7 +1663,7 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) (string, boo
 		}
 	}
 	a.postToolHooks(ctx, tc.Name, args, result)
-	return result, false
+	return tools.ToolResult{Text: result, Images: images}, false
 }
 
 // journalExcludedTools are the tools the journal never records
@@ -1656,6 +1693,12 @@ var journalExcludedTools = map[string]bool{
 	"subagent_spawn": true, "subagent_list": true,
 	"subagent_result": true, "subagent_stop": true,
 	"skill": true,
+	// screenshot: a replayed image is stale by definition — the
+	// screen has moved on — so a re-delivered turn re-captures
+	// instead of replaying yesterday's pixels. The capture is
+	// cheap and idempotent (a fresh file each time), and the
+	// journal never has to store image bytes.
+	"screenshot": true,
 }
 
 // journalExcludedTool reports whether name is excluded from the

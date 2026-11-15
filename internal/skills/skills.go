@@ -94,6 +94,7 @@ var knownBuiltInTools = map[string]bool{
 	"file_edit": true, "file_list": true, "file_read": true, "file_write": true,
 	"glob": true, "grep": true,
 	"process_list":  true,
+	"screenshot":    true,
 	"shell_exec":    true,
 	"skill":         true,
 	"subagent_list": true, "subagent_result": true, "subagent_spawn": true, "subagent_stop": true,

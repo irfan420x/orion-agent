@@ -4,6 +4,7 @@ package model
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,8 +22,12 @@ func (p *ollamaProvider) Name() string { return "ollama" }
 // --- wire types ---
 
 type ollamaMessage struct {
-	Role       string           `json:"role"`
-	Content    string           `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	// Images is Ollama's native vision field: base64-encoded images
+	// (JPEG/PNG) the model can see with this message. Only
+	// well-formed images are carried (see toOllamaMessages).
+	Images     []string         `json:"images,omitempty"`
 	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
@@ -77,6 +82,15 @@ func toOllamaMessages(msgs []Message) ([]ollamaMessage, error) {
 	out := make([]ollamaMessage, 0, len(msgs))
 	for _, m := range msgs {
 		om := ollamaMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		for _, img := range m.Images {
+			if len(img.Data) == 0 {
+				continue
+			}
+			if img.MIMEType != "image/jpeg" && img.MIMEType != "image/png" {
+				continue
+			}
+			om.Images = append(om.Images, base64.StdEncoding.EncodeToString(img.Data))
+		}
 		for _, tc := range m.ToolCalls {
 			args := strings.TrimSpace(tc.Arguments)
 			if args == "" {

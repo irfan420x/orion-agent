@@ -11,11 +11,13 @@ import (
 
 // Message is a single chat turn. ToolCalls is set on assistant messages
 // that request tool execution; ToolCallID links a tool result back.
-// Images carries image input on a user message (vision): the raw
-// bytes plus their MIME type. Images are sent only to providers
-// whose model supports vision (see SupportsVision); other providers
-// send the text Content only and never see the bytes. Images are
-// never persisted with the message in memory — the agent records a
+// Images carries image input on a message (vision): the raw bytes
+// plus their MIME type. Tool results carry their images here (see
+// internal/tools ToolResult); user messages carry them when a photo
+// arrives with the turn. Images are sent only to providers whose
+// model supports vision (see SupportsVision); other providers send
+// the text Content only and never see the bytes. Images are never
+// persisted with the message in memory — the agent records a
 // text-only copy — so a base64 blob cannot bloat the message store.
 type Message struct {
 	Role       string         `json:"role"` // system, user, assistant, tool
@@ -25,7 +27,7 @@ type Message struct {
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
 
-// ImageContent is one image attached to a user message. Data is the
+// ImageContent is one image attached to a message. Data is the
 // raw image bytes; MIMEType is the type sniffed from the bytes (see
 // SniffImageMIME) — a declared type is never trusted.
 type ImageContent struct {
@@ -56,6 +58,13 @@ func SniffImageMIME(data []byte) string {
 	}
 	return ""
 }
+
+// EstimatedTokensPerImage is the rough vision-token cost of one
+// screenshot in a provider request (plan §7: ~1,000–1,700 for a
+// 1280px screenshot on deepseek-flash). It is an estimate for the
+// history budget only — never a billed count — and errs high so
+// the request stays inside the window.
+const EstimatedTokensPerImage = 1500
 
 // ToolCall is one requested tool invocation.
 type ToolCall struct {

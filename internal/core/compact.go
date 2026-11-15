@@ -346,6 +346,13 @@ func (a *Agent) SetTranscript(s transcriptSink) {
 // (a test fake, or one that grew past it) never pins at the cap, so
 // no spill is recorded for it.
 func (a *Agent) recordMessage(msg model.Message) {
+	// Screenshots are stored as text summaries, never as image
+	// bytes (see screenshot_history.go): the file store rewrites
+	// the whole session JSON on every message, and image bytes
+	// would make every later turn rewrite megabytes. The
+	// in-flight transcript — what the provider actually sees this
+	// turn — is unaffected; only the persisted copy is stripped.
+	msg = stripImagesForStorage(msg)
 	var before []model.Message
 	if all, err := a.memory.RecentMessages(0); err == nil && len(all) >= memory.MaxMessages {
 		before = all

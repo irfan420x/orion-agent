@@ -10,6 +10,50 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 A photo sent to the bot is now downloaded (largest size, 10 MiB cap) and run as a real turn — caption as the text, or "এই ছবিটা বর্ণনা করো।" with no caption — when the chat's provider/model supports vision (`deepseek-flash`, `gpt-4o`, `gpt-4o-mini`). Otherwise the bot answers honestly in Bengali and names the fix (DeepSeek `deepseek-flash`). Only the most recent user message carries image parts; older photo turns are sent text-only with a `[ছবি]` placeholder, and image bytes are never stored in memory. The shipped DeepSeek default is now `deepseek-flash` (`deepseek-chat` is a retired 2026-07-24 text-only alias) — NOTE: a live config that explicitly sets `deepseek-chat` is untouched by this change. `/usage` now prices `deepseek-flash` ($0.15 in / $0.60 out per 1M, off-peak cache-miss).
 
+### Computer-use M1 — screenshot + describe (no input)
+
+First computer-use tool (`screenshot`, pin 25, Safe): captures the
+desktop with spectacle and returns the image to the model plus a JSON
+summary (focused window, numeric cursor position, file). Read-only —
+no click, no key, no window control. Suite: **1,794 tests total
+(1,790 pass, 0 fail, 4 skip), 24/24 packages**.
+
+- **Framework:** new `ToolResult{Text, Images}` (max 4 images per
+  result, 2 MiB each) with `Registry.ExecuteResult`; the other
+  tools keep working unchanged through the `Execute` adapter.
+  `model.Message` gains `Images`; OpenAI-compatible (DeepSeek),
+  Anthropic and Ollama providers serialise them (data-URL parts /
+  image blocks / native `images` field). History eviction keeps at
+  most the last 3 screenshot images in the provider-facing request
+  (earlier ones become a text summary, never a FIFO drop), each
+  image counts ~1,500 estimated tokens in the history budget, and
+  the persisted session history stores text summaries, never image
+  bytes. `MaxSteps` 20 → 40 (config default and agent default) for
+  computer-use grounding loops.
+- **Screenshot tool:** params `display` (primary only — `all`/name
+  return clean `invalid_args`), `region` crop, `scale` 0.25–1.0,
+  `format` jpeg (default) / PNG, `max_width` default 1280
+  (640–1920); pure-stdlib crop/scale/encode with a shrink loop to
+  the 2 MiB cap. Backends: spectacle first (proven non-interactive,
+  no dialog); portal ScreenCast returns clean `invalid_args` ("not
+  supported yet") — the PipeWire consumer was proven by the M1
+  probe (`~/orion-computer-use/m1/m1-pw-capture.c`) but its home
+  (Go cgo vs vendored C helper) is still undecided, and every
+  ScreenCast session costs a portal dialog click because grants do
+  not persist. KWin ScreenShot2 is dead on this session.
+  Rate limits: 1 s min interval, 15 per turn, 120 per hour.
+  Files 0600 in `~/.orion/screenshots/`, 24 h auto-delete.
+  Screenshots on this laptop never render the pointer (M1 probe),
+  so the cursor position is reported numerically, never from the
+  image. Screen locked / display off is an error, no retry.
+- **Safety (code-enforced, plan §5.3):** a password-manager /
+  bank / payment / OTP window focused or visible refuses the
+  capture before anything is taken (negative test included);
+  screenshots stay local; cron/unattended turns refuse outright
+  (the daemon marks scheduled turns via `WithUnattendedTurn`).
+  A re-delivered turn re-captures instead of replaying a stale
+  image (screenshot is excluded from the tool journal).
+
 ### Busy-input acknowledgement — interrupt/queue/steer
 
 A new message arriving while a turn runs no longer waits silently
