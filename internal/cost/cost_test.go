@@ -27,6 +27,7 @@ func TestPriceForKnownModels(t *testing.T) {
 	}{
 		{"deepseek", "deepseek-chat", 0.28, 0.42},
 		{"deepseek", "deepseek-reasoner", 0.55, 2.19},
+		{"deepseek", "deepseek-flash", 0.15, 0.60},
 		{"openai", "gpt-4o", 2.50, 10.00},
 		{"openai", "gpt-4o-mini", 0.15, 0.60},
 		{"anthropic", "claude-sonnet-4", 3.00, 15.00},
@@ -100,6 +101,13 @@ func TestEstimateMath(t *testing.T) {
 	// Unknown model: no price, never $0.
 	if usd, ok := tbl.Estimate("deepseek", "deepseek-v99", model.Usage{PromptTokens: 100}, 0); ok || usd != 0 {
 		t.Errorf("Estimate unknown model = $%v/%v, want $0/false", usd, ok)
+	}
+	// deepseek-flash (vision fix): 1M prompt + 1M completion at
+	// the off-peak cache-miss rates is $0.15 + $0.60 — so /usage
+	// no longer reports "unknown" for the vision model.
+	usd, ok = tbl.Estimate("deepseek", "deepseek-flash", model.Usage{PromptTokens: 1_000_000, CompletionTokens: 1_000_000, TotalTokens: 2_000_000}, 0)
+	if !ok || usd < 0.75-1e-12 || usd > 0.75+1e-12 {
+		t.Errorf("Estimate deepseek-flash 1M/1M = $%v/%v, want $0.75/true", usd, ok)
 	}
 	// Negative counts are caller errors: no price.
 	if _, ok := tbl.Estimate("deepseek", "deepseek-chat", model.Usage{PromptTokens: -1}, 0); ok {

@@ -77,8 +77,15 @@ func DefaultTable() *Table {
 	// DeepSeek (api-docs.deepseek.com rate card, via the
 	// widely-reported list prices checked 2026-11-13; deepseek-chat
 	// $0.28/$0.42, deepseek-reasoner $0.55/$2.19 — cache-miss input).
+	// deepseek-flash $0.15/$0.60 is the OFF-PEAK cache-miss input /
+	// output price from DeepSeek's Models & Pricing page, checked
+	// 2026-11-15 (vision fix): peak hours are 2x ($0.30/$1.20)
+	// and cache-hit input is $0.003 off-peak / $0.006 peak — the
+	// table holds one price per model, so it holds the off-peak
+	// cache-miss figure, like the other DeepSeek entries.
 	add("deepseek", "deepseek-chat", 0.28, 0.42)
 	add("deepseek", "deepseek-reasoner", 0.55, 2.19)
+	add("deepseek", "deepseek-flash", 0.15, 0.60)
 	// OpenAI (openai.com/api/pricing list prices).
 	add("openai", "gpt-4o", 2.50, 10.00)
 	add("openai", "gpt-4o-mini", 0.15, 0.60)
