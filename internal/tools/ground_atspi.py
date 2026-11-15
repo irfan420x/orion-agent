@@ -63,11 +63,31 @@ def main():
             role = ""
         box = extents(acc)
         if box is not None:
+            # SHOWING distinguishes elements that are actually on
+            # screen from hidden-popup elements that stay in the
+            # AT-SPI tree after the popup closes (calendar days,
+            # session buttons). Without this the 60-element default
+            # cap is exhausted by hidden plasmashell elements and
+            # the focused app's elements never reach the provider
+            # (live 2026-11-15 20:26: 60/60 listed were hidden
+            # plasmashell, Firefox's "Sign in" absent). The Go side
+            # skips showing=false; a missing key (state query
+            # failed) is kept, never dropped.
+            showing = None
+            try:
+                ss = acc.get_state_set()
+                if ss is not None:
+                    showing = ss.contains(Atspi.StateType.SHOWING)
+            except Exception:
+                showing = None
+            el = {"role": role, "name": name[:120],
+                  "x": box[0], "y": box[1],
+                  "w": box[2], "h": box[3]}
+            if showing is not None:
+                el["showing"] = showing
             # Name only (the accessible label, e.g. "Password");
             # never a value — the helper has no way to read one.
-            elements.append({"role": role, "name": name[:120],
-                             "x": box[0], "y": box[1],
-                             "w": box[2], "h": box[3]})
+            elements.append(el)
         try:
             n = acc.get_child_count()
         except Exception:

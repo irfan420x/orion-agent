@@ -309,6 +309,122 @@ func TestGroundRolesAndMaxElements(t *testing.T) {
 	}
 }
 
+// TestGroundButtonRoleIncluded pins the F1 live bug (M2 live
+// verification 19:58–20:03 SGT): Firefox reports HTML buttons as
+// role "button", not "push button" — the 939-node tree had zero
+// "push button" nodes, so the page's primary action ("Sign in",
+// depth 7, box 784,520 352x40) and five more interactive buttons
+// were missing from the element list. The default roles must
+// include "button" (and the other button variants), and all six
+// must appear.
+func TestGroundButtonRoleIncluded(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 993}],
+	"elements": [
+		{"role": "entry", "name": "Username or email address", "x": 784, "y": 383, "w": 352, "h": 40},
+		{"role": "button", "name": "Sign in", "x": 784, "y": 520, "w": 352, "h": 40},
+		{"role": "button", "name": "Continue with Google", "x": 784, "y": 621, "w": 352, "h": 40},
+		{"role": "button", "name": "Continue with Apple", "x": 784, "y": 669, "w": 352, "h": 40},
+		{"role": "button", "name": "Sign in with a passkey", "x": 887, "y": 766, "w": 146, "h": 21},
+		{"role": "button", "name": "Manage cookies", "x": 965, "y": 959, "w": 91, "h": 18},
+		{"role": "button", "name": "Do not share my personal information", "x": 1104, "y": 959, "w": 216, "h": 18},
+		{"role": "toggle button", "name": "Firefox View", "x": 0, "y": 0, "w": 40, "h": 44},
+		{"role": "push button menu", "name": "Session", "x": 631, "y": 508, "w": 30, "h": 30},
+		{"role": "radio button", "name": "Option A", "x": 100, "y": 200, "w": 20, "h": 20},
+		{"role": "heading", "name": "Sign in to GitHub", "x": 784, "y": 300, "w": 200, "h": 30},
+		{"role": "label", "name": "Some text", "x": 100, "y": 100, "w": 100, "h": 20},
+		{"role": "list item", "name": "Item", "x": 100, "y": 300, "w": 100, "h": 20}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 939}`
+	res := env.call(t, `{}`)
+	s := parseGroundSummary(t, res)
+	// entry + 6 buttons + toggle + push-button-menu + radio = 10.
+	// heading, label and list item are not interactive roles.
+	if len(s.Elements) != 10 {
+		t.Fatalf("got %d elements, want 10: %+v", len(s.Elements), s.Elements)
+	}
+	byName := make(map[string]groundElement, len(s.Elements))
+	for _, el := range s.Elements {
+		byName[el.Name] = el
+	}
+	for _, name := range []string{"Sign in", "Continue with Google", "Continue with Apple", "Sign in with a passkey", "Manage cookies", "Do not share my personal information"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("button %q missing from the element list", name)
+		}
+	}
+	signin := byName["Sign in"]
+	if signin.Role != "button" {
+		t.Errorf("Sign in role = %q, want button", signin.Role)
+	}
+	if signin.Box != (groundBox{X: 784, Y: 520, W: 352, H: 40}) {
+		t.Errorf("Sign in box = %+v, want {784 520 352 40}", signin.Box)
+	}
+	if signin.Centre != (groundPoint{X: 960, Y: 540}) {
+		t.Errorf("Sign in centre = %+v, want {960 540}", signin.Centre)
+	}
+	if signin.CentreNorm != (groundPoint{X: 500, Y: 500}) {
+		t.Errorf("Sign in centre_norm = %+v, want {500 500}", signin.CentreNorm)
+	}
+	if _, ok := byName["Firefox View"]; !ok {
+		t.Errorf("toggle button %q missing", "Firefox View")
+	}
+	if _, ok := byName["Session"]; !ok {
+		t.Errorf("push button menu %q missing", "Session")
+	}
+	if _, ok := byName["Option A"]; !ok {
+		t.Errorf("radio button %q missing", "Option A")
+	}
+}
+
+// TestGroundHiddenElementsExcluded pins the F7 live bug (M2 live
+// verification 2026-11-15 20:26 SGT): a default ground run listed
+// 60/60 hidden plasmashell elements (calendar days, Sleep /
+// Hibernate / Restart / Shut Down session buttons) and none of
+// Firefox's — the closed popups' nodes stay in the AT-SPI tree.
+// The helper reports the SHOWING state per element; the tool must
+// drop showing=false elements, keep showing=true ones, and keep
+// elements with no showing field (back-compat: a failed state
+// query must never drop an element).
+func TestGroundHiddenElementsExcluded(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 993}],
+	"elements": [
+		{"role": "button", "name": "Sign in", "x": 784, "y": 520, "w": 352, "h": 40, "showing": true},
+		{"role": "entry", "name": "Username or email address", "x": 784, "y": 383, "w": 352, "h": 40},
+		{"role": "button", "name": "Sleep", "x": 269, "y": 508, "w": 68, "h": 30, "showing": false},
+		{"role": "button", "name": "Sunday, 25 October 2026", "x": 803, "y": 133, "w": 55, "h": 40, "showing": false},
+		{"role": "button", "name": "Hibernate", "x": 341, "y": 508, "w": 68, "h": 30, "showing": false},
+		{"role": "heading", "name": "Sunday, 15 November 2026", "x": 12, "y": 5, "w": 50, "h": 25, "showing": false}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 942}`
+	res := env.call(t, `{}`)
+	s := parseGroundSummary(t, res)
+	// Only the visible Sign in button and the entry with no
+	// showing field (kept by back-compat) survive: 2 elements.
+	if len(s.Elements) != 2 {
+		t.Fatalf("got %d elements, want 2: %+v", len(s.Elements), s.Elements)
+	}
+	byName := make(map[string]groundElement, len(s.Elements))
+	for _, el := range s.Elements {
+		byName[el.Name] = el
+	}
+	if _, ok := byName["Sign in"]; !ok {
+		t.Errorf("visible button %q missing from the element list", "Sign in")
+	}
+	if _, ok := byName["Username or email address"]; !ok {
+		t.Errorf("element with no showing field %q missing (must be kept)", "Username or email address")
+	}
+	for _, name := range []string{"Sleep", "Sunday, 25 October 2026", "Hibernate"} {
+		if _, ok := byName[name]; ok {
+			t.Errorf("hidden element %q listed, want excluded", name)
+		}
+	}
+}
+
 func TestGroundVisionOnly(t *testing.T) {
 	resetGroundSnapshots()
 	// Helper run fails: screenshot still returned, empty list.

@@ -72,6 +72,49 @@ never faked elements). Suite: **1,808 tests total (1,804 pass,
   if the image still has to shrink under the 2 MiB cap, marker
   positions scale with it.
 
+### Computer-use M2 fix — `ground` role filter + hidden elements (F1, F7)
+
+Live verification of the M2 build found two blocking bugs and one
+new one; all three are fixed here, verified live on the GitHub
+login page in Firefox (default run, 55 elements, walked 942).
+
+- **F1 — role filter:** Firefox reports HTML buttons as role
+  `button`, not `push button` — the 939-node tree had zero `push
+  button` nodes, so the page's primary action ("Sign in") and five
+  more interactive buttons were missing from the element list. The
+  default interactive roles now include `button`, `radio button`,
+  `toggle button` and `push button menu`. Test
+  `TestGroundButtonRoleIncluded` pins all six buttons.
+- **F7 — hidden-element flooding (new):** a default run listed
+  60/60 hidden plasmashell elements (calendar days, Sleep /
+  Hibernate / Restart / Shut Down session buttons) and none of
+  Firefox's — closed popups' nodes stay in the AT-SPI tree and the
+  60-element default cap was exhausted before the focused app was
+  reached. The helper now reports the AT-SPI SHOWING state per
+  element (verified live: SHOWING separates visible from hidden
+  7/7), and the tool drops `showing == false` elements; a missing
+  signal is kept, never dropped. Test
+  `TestGroundHiddenElementsExcluded` pins it.
+- **Helper timeout 5 s → 10 s:** the SHOWING query pushed the
+  measured walk on a 942-node tree from 4.83 s to 5.44 s — past the
+  old 5 s bound, which silently killed the helper and degraded the
+  tool to `vision_only`. 10 s keeps a bound against a hung walk
+  with headroom for heavier pages.
+- **F2 — NOT fixed (reported, not faked):** AT-SPI web-content
+  boxes sit ~28 px above visible elements, window-wide (chrome
+  included), and the tree gives no reliable correction signal — the
+  window's true screen position is not anywhere in the AT-SPI tree
+  (likely: on Wayland the client doesn't know its own absolute
+  position). No hardcoded offset was added. See
+  `~/workspace/orion-verification/computer-use-m2/FIX-SUMMARY.md`.
+- **Timing:** measured whole grounding ~8.1 s vs the 3 s design
+  budget (walk 5.44 s D-Bus-bound, spectacle ~1.0 s, probe 0.36 s);
+  the budget constant was NOT changed — recommendation (raise to
+  10 s with the reason documented) is recorded in FIX-SUMMARY.md
+  for the parent to decide.
+  Suite: **1,810 tests total (1,806 pass, 0 fail, 4 skip), 24/24
+  packages**.
+
 ### Computer-use M1 — screenshot + describe (no input)
 
 First computer-use tool (`screenshot`, pin 25, Safe): captures the

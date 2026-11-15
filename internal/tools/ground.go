@@ -110,9 +110,20 @@ func init() {
 // Grounding bounds (design §2.1 — see the package comment for the
 // depth-cap rationale).
 const (
-	groundMaxDepth           = 12
-	groundMaxNodes           = 1000
-	groundHelperTimeout      = 5 * time.Second
+	groundMaxDepth = 12
+	groundMaxNodes = 1000
+	// Helper timeout: the walk is D-Bus round-trip bound (~5 ms per
+	// node), and the SHOWING query (one extra call per boxed node,
+	// for the hidden-popup filter) pushed the measured walk on a
+	// 942-node tree from 4.83 s to 5.44 s — past the old 5 s bound,
+	// which silently killed the helper and degraded the tool to
+	// vision_only (live 2026-11-15 20:31). 10 s keeps a bound
+	// against a hung walk while leaving headroom for heavier pages.
+	// This is the helper's own safety bound, not the tool's 3 s
+	// design time budget — the measured whole grounding is ~7.5 s,
+	// over that budget; see the fix report for the raise
+	// recommendation.
+	groundHelperTimeout      = 10 * time.Second
 	groundDefaultMaxElements = 60
 	groundMaxMaxElements     = 200
 	groundSnapshotTTL        = 60 * time.Second
@@ -131,9 +142,22 @@ const (
 // user can act on. Headings, frames, panels and document text are
 // not clickable, so they never appear — the provider must never be
 // offered a target it cannot use.
+//
+// "button" is the HTML button role: Firefox reports every web
+// button (Sign in, Continue with Google, ...) as "button", NOT
+// "push button" — the M2 live verification found zero "push
+// button" nodes in a 939-node tree, so without "button" the
+// page's primary action was missing (F1). "toggle button" and
+// "push button menu" are button variants found in the same tree;
+// "radio button" is the check-box sibling (same selection-control
+// class). "page tab", "list item", "canvas" and "menu" are NOT
+// here: tabs are a separate switching affordance, and list
+// items / canvases / menus are containers or non-button surfaces
+// whose nodes would add noise.
 var defaultInteractiveRoles = []string{
-	"push button", "link", "entry", "text", "password text",
-	"check box", "combo box", "menu item",
+	"push button", "button", "link", "entry", "text", "password text",
+	"check box", "radio button", "toggle button", "push button menu",
+	"combo box", "menu item",
 }
 
 // groundArgs is the tool's JSON arguments.
@@ -232,6 +256,12 @@ type atspiElement struct {
 	Y    int    `json:"y"`
 	W    int    `json:"w"`
 	H    int    `json:"h"`
+	// Showing is the AT-SPI SHOWING state reported by the helper.
+	// Nil means the helper did not report it (state query failed):
+	// the element is kept — a missing signal never drops an
+	// element. False means hidden: the element stays in the tree
+	// (closed popups keep their nodes) but is not on screen.
+	Showing *bool `json:"showing,omitempty"`
 }
 
 // --- snapshot registry (stale-refusal, design §5) ---
@@ -404,7 +434,7 @@ func (t *groundTool) Definition() model.ToolDefinition {
 				"max_elements": map[string]any{"type": "integer", "minimum": 1, "maximum": 200, "description": "Most elements to list (default 60)."},
 				"roles": map[string]any{
 					"type":        "array",
-					"description": "Only list elements with these AT-SPI roles. Default: interactive roles only (push button, link, entry, text, password text, check box, combo box, menu item).",
+					"description": "Only list elements with these AT-SPI roles. Default: interactive roles only (push button, button, link, entry, text, password text, check box, radio button, toggle button, push button menu, combo box, menu item).",
 					"items":       map[string]any{"type": "string"},
 				},
 			},
@@ -786,6 +816,16 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 			break
 		}
 		if !roleSet[el.Role] {
+			continue
+		}
+		// Hidden elements: AT-SPI keeps closed popups' nodes in
+		// the tree (calendar days, session buttons), and without
+		// this filter they exhaust the max_elements cap before
+		// the focused app's elements are reached (live 2026-11-15
+		// 20:26: 60/60 listed were hidden plasmashell elements).
+		// SHOWING separates visible from hidden cleanly (probe
+		// 2026-11-15 20:27: 7/7). A missing signal (nil) is kept.
+		if el.Showing != nil && !*el.Showing {
 			continue
 		}
 		// Degenerate box: offscreen (-1,-1) or 1x1 placeholders
