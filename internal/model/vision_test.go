@@ -25,11 +25,17 @@ func TestSupportsVision(t *testing.T) {
 		{"openai", "gpt-4.1", false},
 		{"openai", "o4-mini", false},
 		{"openai", "", false},
-		// Anthropic / Ollama: false even for vision-capable
-		// models — no image wire path exists yet (note-and-skip).
-		{"anthropic", "claude-sonnet-4-5", false},
-		{"ollama", "llava", false},
-		{"ollama", "llama3.2-vision", false},
+		// Anthropic / Ollama: the wire paths exist (F-M2R-31) —
+		// anthropic.go renders image blocks, ollama.go carries
+		// base64 Images — so the vision models report true.
+		{"anthropic", "claude-sonnet-4-5", true},
+		{"anthropic", "claude-opus-4-5", true},
+		{"anthropic", "claude-haiku-4-5", true},
+		{"anthropic", "claude-3-opus", false}, // unlisted: never assumed
+		{"ollama", "llava", true},
+		{"ollama", "llama3.2-vision", true},
+		{"ollama", "llama3.1", false},     // text-only local model
+		{"ollama", "qwen2.5-0.5b-local", false},
 		// Unknown provider / empty input: honest false, never a guess.
 		{"unknown-provider", "deepseek-flash", false},
 		{"", "deepseek-flash", false},

@@ -20,14 +20,17 @@
 // "deepseek-v4-pro" is text-only; the retired aliases
 // "deepseek-v4-flash" and "deepseek-v4-flash-vision-exp" still route
 // to V4.1 Flash. OpenAI's gpt-4o / gpt-4o-mini are multimodal.
-//
-// NOTE-AND-SKIP (deliberate, not an oversight): Anthropic and Ollama
-// return false even for vision-capable models, because their wire
-// paths do not exist yet — the Anthropic client has no image block
-// type (anthropic.go) and the Ollama client has no images field
-// (ollama.go). When those wire paths land, add the models here.
-// A dedicated image-model slot and live probing of a provider's
-// capabilities are likewise out of scope.
+// Anthropic's Claude 4.5 models are multimodal, and the wire path
+// exists: anthropic.go renders image content blocks for user
+// messages (anthropicImageBlocks) and tool results
+// (anthropicToolResultContent) — proven by images_test.go.
+// Ollama's vision models carry base64 images in the native Images
+// field (ollama.go toOllamaMessages) — likewise proven by
+// images_test.go. F-M2R-31: the table used to claim both wire
+// paths did not exist; they do, so the table now says so — the
+// photo path (fail-closed on !SupportsVision) and the
+// ground/screenshot path (which always sends tool images) finally
+// agree.
 package model
 
 import "strings"
@@ -63,12 +66,31 @@ func SupportsVision(provider, model string) bool {
 		default:
 			return false
 		}
-	case "anthropic", "ollama":
-		// Vision-capable models exist on both providers, but
-		// Orion has no image wire path for them yet (see the
-		// package doc): capability here means "can see AND this
-		// client can send images", so this is false for now.
-		return false
+	case "anthropic":
+		// Claude 4.5 models are multimodal, and the wire path
+		// exists (anthropic.go image blocks for user messages
+		// and tool results). Any other Anthropic model name is
+		// unknown here until added explicitly.
+		switch m {
+		case "claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5":
+			return true
+		default:
+			return false
+		}
+	case "ollama":
+		// The Ollama wire path carries base64 images in the
+		// native Images field (ollama.go). Only the vision
+		// models Orion knows are listed: llava and
+		// llama3.2-vision. A local model tag with a version
+		// suffix (e.g. "llava:13b") is NOT matched — the tag is
+		// part of the model name, and guessing that every
+		// suffixed tag sees images would over-claim.
+		switch m {
+		case "llava", "llama3.2-vision":
+			return true
+		default:
+			return false
+		}
 	default:
 		return false
 	}
