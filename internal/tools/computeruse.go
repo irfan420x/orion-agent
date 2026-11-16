@@ -23,6 +23,8 @@ package tools
 import (
 	"context"
 	"strings"
+
+	"github.com/irfan/orion/internal/permissions"
 )
 
 type unattendedContextKey struct{}
@@ -40,12 +42,29 @@ func WithUnattendedTurn(ctx context.Context) context.Context {
 // UnattendedTurnFromContext reports whether ctx is marked as an
 // unattended turn. It is false for every context that was never
 // marked — interactive Telegram turns, CLI runs, tests.
+//
+// It honours EITHER unattended marker (F-A23W3-18): this package's
+// own WithUnattendedTurn marker, and the permission gate's
+// WithUnattendedContext marker (permissions.UnattendedFrom). The
+// two are set at different call sites — runScheduledTurn sets the
+// tools marker, runAgentTurn(unattended=true) sets the gate marker
+// — so a turn marked by only one of them used to pass the other
+// package's check: a direct runAgentTurn(unattended=true) call
+// (or any new scheduled path) would have the gate deny gated tools
+// while screenshot/ground/input silently ran. Every computer-use
+// tool reads this one function, so checking both here closes the
+// gap for all three at once. (permissions does not import tools,
+// so the reverse check — gate honouring the tools marker — would
+// be an import cycle; the gate marker is the one runAgentTurn
+// sets, and it is checked here.)
 func UnattendedTurnFromContext(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
-	v, _ := ctx.Value(unattendedContextKey{}).(bool)
-	return v
+	if v, _ := ctx.Value(unattendedContextKey{}).(bool); v {
+		return true
+	}
+	return permissions.UnattendedFrom(ctx)
 }
 
 // sensitiveWindowTitles are case-insensitive substrings of window

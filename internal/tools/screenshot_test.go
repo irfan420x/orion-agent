@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/irfan/orion/internal/permissions"
 )
 
 // fakeScreenshotEnv is a stubbed screenshot tool plus its clock.
@@ -298,6 +300,29 @@ func TestScreenshotRefusesUnattendedTurn(t *testing.T) {
 	}
 	if env.captures != 0 {
 		t.Errorf("spectacle ran %d captures in an unattended turn, want 0", env.captures)
+	}
+}
+
+// TestScreenshotRefusesGateUnattendedTurn (F-A23W3-18): a turn
+// marked unattended ONLY by the permission gate's marker
+// (permissions.WithUnattendedContext — what runAgentTurn sets for
+// unattended=true) must refuse exactly like one marked by the
+// tools marker. It FAILS on the old code: the screenshot tool
+// checked only the tools marker, so this ctx sailed through to a
+// capture.
+func TestScreenshotRefusesGateUnattendedTurn(t *testing.T) {
+	env := newFakeScreenshotEnv(t)
+	ctx := permissions.WithUnattendedContext(context.Background())
+	_, err := env.tool.ExecuteResult(ctx, json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatalf("ExecuteResult(gate-marked unattended) = nil, want a denial")
+	}
+	terr, ok := err.(*ToolError)
+	if !ok || terr.Kind != "denied" {
+		t.Fatalf("ExecuteResult(gate-marked unattended) error = %v, want kind denied", err)
+	}
+	if env.captures != 0 {
+		t.Errorf("spectacle ran %d captures in a gate-marked unattended turn, want 0", env.captures)
 	}
 }
 

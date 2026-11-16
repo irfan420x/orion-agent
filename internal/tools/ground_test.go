@@ -507,6 +507,27 @@ func TestGroundUnattendedRefused(t *testing.T) {
 	}
 }
 
+// TestGroundUnattendedRefusedViaGateMarker (F-A23W3-18): grounding
+// must refuse a turn marked unattended ONLY by the permission
+// gate's marker, like TestGroundUnattendedRefused does for the
+// tools marker. It FAILS on the old code.
+func TestGroundUnattendedRefusedViaGateMarker(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	ctx := permissions.WithUnattendedContext(context.Background())
+	_, err := env.tool.ExecuteResult(ctx, json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("gate-marked unattended turn should refuse grounding")
+	}
+	var terr *ToolError
+	if !errors.As(err, &terr) || terr.Kind != "denied" {
+		t.Errorf("error = %v, want denied ToolError", err)
+	}
+	if env.captures != 0 {
+		t.Errorf("gate-marked unattended refusal still captured %d screenshot(s)", env.captures)
+	}
+}
+
 func TestGroundRateLimit(t *testing.T) {
 	resetGroundSnapshots()
 	env := newFakeGroundEnv(t)

@@ -575,6 +575,29 @@ func TestInputUnattendedRefused(t *testing.T) {
 	}
 }
 
+// TestInputUnattendedRefusedViaGateMarker (F-A23W3-18): input must
+// refuse a turn marked unattended ONLY by the permission gate's
+// marker, like TestInputUnattendedRefused does for the tools
+// marker. It FAILS on the old code.
+func TestInputUnattendedRefusedViaGateMarker(t *testing.T) {
+	env := newFakeInputEnv(t)
+	ctx := permissions.WithUnattendedContext(context.Background())
+	for _, args := range []string{
+		`{"op": "move", "x": 1, "y": 1}`,
+		`{"op": "click", "x": 1, "y": 1}`,
+		`{"op": "type", "text": "hi"}`,
+		`{"op": "key", "key": "Return"}`,
+	} {
+		_, err := env.tool.ExecuteResult(ctx, json.RawMessage(args))
+		if err == nil || !strings.Contains(err.Error(), "unattended") {
+			t.Errorf("ExecuteResult(%s) err = %v, want the unattended refusal", args, err)
+		}
+	}
+	if len(env.ydotoolCalls) != 0 || env.kwinCalls != 0 {
+		t.Errorf("gate-marked unattended calls touched the desktop (%d ydotool, %d KWin)", len(env.ydotoolCalls), env.kwinCalls)
+	}
+}
+
 func TestInputTypeSensitiveRefused(t *testing.T) {
 	env := newFakeInputEnv(t)
 	env.tree = sensitiveInputTreeJSON()

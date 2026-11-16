@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/irfan/orion/internal/permissions"
 )
 
 func TestToolResultValidate(t *testing.T) {
@@ -152,5 +154,13 @@ func TestUnattendedTurnContext(t *testing.T) {
 	marked := WithUnattendedTurn(ctx)
 	if !UnattendedTurnFromContext(marked) {
 		t.Errorf("UnattendedTurnFromContext(marked) = false, want true")
+	}
+	// F-A23W3-18: the gate's marker alone must also count — a
+	// turn run through runAgentTurn(unattended=true) carries
+	// only permissions.WithUnattendedContext, and computer-use
+	// must still refuse on it.
+	gateMarked := permissions.WithUnattendedContext(ctx)
+	if !UnattendedTurnFromContext(gateMarked) {
+		t.Errorf("UnattendedTurnFromContext(gate-marked) = false, want true")
 	}
 }
