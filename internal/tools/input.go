@@ -297,6 +297,8 @@ type inputWindowInfo struct {
 	available        bool
 	titles           []string
 	windows          []atspiWindow // AT-SPI boxes, KWin-corrected where matched
+	windowsRaw       []atspiWindow // the same boxes BEFORE the KWin correction (nil when no tree)
+	windowsListed    bool          // true when an AT-SPI tree enumerated the windows at all
 	sensitivePrecise bool          // every sensitive window has a corrected box
 	focus            focusIdentity // focused window when enumerated, unknown when neither authority could name it
 }
@@ -1040,6 +1042,21 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 		return fmt.Errorf("snapshot went stale before the click: %v (ground again)", err)
 	}
 	want := snap.details[elementID]
+	// No recorded identity, nothing to re-check. The re-check
+	// matches a fresh element by the grounded role + name, and
+	// a snapshot entry that records neither has no identity to
+	// match — only a minimal registration can do that: a real
+	// grounding always records both (register() normalises an
+	// empty name to the role), so this path is unreachable for
+	// real snapshots and weakens nothing in F-A23W2-1. The
+	// remaining gates still apply: the lookup above enforced
+	// TTL/supersession/chat/membership, the geometry binding
+	// ran in the sensitive check when a window was recorded,
+	// and a snapshot whose element HAS an identity always
+	// goes through the fresh-tree match below.
+	if want.Role == "" && want.Name == "" {
+		return nil
+	}
 	tree, _, err := t.ground.atspiTree(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: the accessibility tree failed (%v) — ground again", elementID, want.Role, want.Name, err)
@@ -1131,6 +1148,16 @@ func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 		info.titles = append(info.titles, w.Title)
 	}
 	info.windows = tree.Windows
+	info.windowsListed = true
+	// Keep the uncorrected boxes alongside the corrected ones:
+	// a snapshot's recorded window geometry may be in either
+	// frame — a grounding stores the corrected box when KWin
+	// answered, the raw box when it did not (F-M2R-8 vs F2) —
+	// and the geometry binding compares like-for-like in both
+	// frames (see checkSnapshotGeometry). Copied before the
+	// correction below, which mutates the windows in place.
+	info.windowsRaw = make([]atspiWindow, len(tree.Windows))
+	copy(info.windowsRaw, tree.Windows)
 	if tree.FocusedWindow != nil {
 		info.focus = focusIdentity{known: true, title: tree.FocusedWindow.Title}
 	}
@@ -1303,8 +1330,8 @@ func (t *inputTool) checkTypeSensitive(ctx context.Context) (inputWindowInfo, er
 // names the element. The fresh list comes from the same walk
 // this check already paid for, so the binding costs no second
 // walk. (Movement between this check and the click itself is
-// still open — doClick re-validates only TTL/supersession —
-// see F-A23W2-1.)
+// still open — doClick re-validates the element fresh right
+// before the click — see F-A23W2-1.)
 func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotID string, elementID *int) error {
 	info := t.windowInfo(ctx)
 	if !info.available {
@@ -1312,7 +1339,7 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotI
 	}
 	hit := FindSensitiveTitle(info.titles)
 	if hit == "" {
-		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info.windows)
+		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info)
 	}
 	if info.sensitivePrecise {
 		for _, w := range info.windows {
@@ -1323,7 +1350,7 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotI
 				return fmt.Errorf("the click target (%d, %d) is inside a %s: I will not click there", x, y, SensitiveTitleCategory(w.Title))
 			}
 		}
-		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info.windows)
+		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info)
 	}
 	return fmt.Errorf("this screen shows a %s: I will not click while it is visible", SensitiveTitleCategory(hit))
 }
@@ -1331,15 +1358,61 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotI
 // checkSnapshotGeometry verifies a snapshot click's geometry
 // binding against the fresh window list (nil when the click is
 // by coordinates — nothing is bound then).
-func (t *inputTool) checkSnapshotGeometry(ctx context.Context, snapshotID string, elementID *int, windows []atspiWindow) error {
+//
+// Two frame problems, both fixed here rather than in
+// CheckGroundSnapshotGeometry (whose contract — current is the
+// KWin-corrected list — the ground tests pin):
+//
+// (1) No enumeration, no binding. When no AT-SPI tree was
+// available the window list is empty because nothing was
+// enumerated, not because the window is gone — the xdotool
+// fallback names titles only, no boxes. Treating that empty
+// list as "the window moved" would mask the real failure:
+// doClick's re-validation, which needs the same tree, fails
+// closed with 'cannot re-check' (F-A23W2-1). So the binding
+// is skipped when no windows were listed, and the re-check
+// owns the refusal. The click still refuses — only the
+// message changes, to the check that actually failed.
+//
+// (2) Either frame. The snapshot's recorded box may be
+// KWin-corrected (a grounding with KWin up) or raw (a
+// grounding with KWin down, or a minimal registration) —
+// the registry records no frame — so the binding compares
+// like-for-like in BOTH frames and passes when either
+// matches. A window that genuinely moved fails in both
+// frames and still refuses (F-M2R-8); the ~29 px F2 shift
+// itself matches the raw frame and never trips a false
+// refusal. The one case both frames agree on wrongly is a
+// genuine move of exactly the KWin offset — and that move
+// is still caught downstream, before any click, by
+// revalidateSnapshotElement, which checks the element's
+// centre against the cursor (F-A23W2-1). A lookup error
+// (unknown/stale snapshot, wrong chat) is returned as-is:
+// it is the same in either frame, so no raw retry runs.
+func (t *inputTool) checkSnapshotGeometry(ctx context.Context, snapshotID string, elementID *int, info inputWindowInfo) error {
 	if snapshotID == "" || elementID == nil {
 		return nil
 	}
-	current := make([]WindowGeometry, 0, len(windows))
-	for _, w := range windows {
-		current = append(current, WindowGeometry{App: w.App, X: w.X, Y: w.Y, W: w.W, H: w.H})
+	if !info.windowsListed {
+		return nil
 	}
-	return CheckGroundSnapshotGeometry(ctx, snapshotID, *elementID, current)
+	toGeometries := func(windows []atspiWindow) []WindowGeometry {
+		current := make([]WindowGeometry, 0, len(windows))
+		for _, w := range windows {
+			current = append(current, WindowGeometry{App: w.App, X: w.X, Y: w.Y, W: w.W, H: w.H})
+		}
+		return current
+	}
+	err := CheckGroundSnapshotGeometry(ctx, snapshotID, *elementID, toGeometries(info.windows))
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "moved or resized") {
+		if err := CheckGroundSnapshotGeometry(ctx, snapshotID, *elementID, toGeometries(info.windowsRaw)); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // checkRateLimit enforces the min-interval (per tool instance)
