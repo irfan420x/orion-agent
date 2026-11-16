@@ -197,6 +197,13 @@ func TestGroundHappyPath(t *testing.T) {
 	if len(s.Elements) != 6 {
 		t.Fatalf("got %d elements, want 6: %+v", len(s.Elements), s.Elements)
 	}
+	// F-M2R-25: nothing truncated — the total equals the list.
+	if s.TotalMatched != 6 {
+		t.Errorf("total_matched = %d, want 6", s.TotalMatched)
+	}
+	if s.Truncated {
+		t.Errorf("truncated = true, want false (6 matched, 6 listed)")
+	}
 	// Element 1: username entry — the design §4.2 example numbers.
 	username := s.Elements[0]
 	if username.ID != 1 || username.Role != "entry" || username.Name != "Username or email address" {
@@ -418,6 +425,14 @@ func TestGroundRolesAndMaxElements(t *testing.T) {
 	s = parseGroundSummary(t, res)
 	if len(s.Elements) != 2 {
 		t.Errorf("max_elements=2 gave %d elements, want 2", len(s.Elements))
+	}
+	// F-M2R-25: the cap truncates silently no more — the summary
+	// says 6 matched and the list was cut.
+	if s.TotalMatched != 6 {
+		t.Errorf("total_matched = %d, want 6 (all role-matching elements, past the cap)", s.TotalMatched)
+	}
+	if !s.Truncated {
+		t.Errorf("truncated = false, want true (6 matched, 2 listed)")
 	}
 	// Argument validation.
 	for _, args := range []string{

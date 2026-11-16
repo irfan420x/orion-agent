@@ -284,6 +284,11 @@ type groundSummary struct {
 	// failed, so the hidden-element filter kept them on a missing
 	// signal. Zero means every element was verified showing.
 	ShowingUnknown int `json:"showing_unknown,omitempty"`
+	// TotalMatched (F-M2R-25): how many elements passed every
+	// filter. Without it the provider cannot tell a complete
+	// list from a truncated one on a dense page; Truncated
+	// above says whether the max_elements cap cut the list.
+	TotalMatched int `json:"total_matched,omitempty"`
 }
 
 // groundWindowSummary is one window's share of a grounding
@@ -1308,8 +1313,10 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// alongside the helper's own walk truncation, so a partial
 	// list is never silent. Minimized windows (KWin) are dropped
 	// with the hidden elements (F-M2R-21); the grounded view
-	// bounds the off-screen-centre check.
-	elements, walked, listTruncated := filterGroundElements(tree, roleSet, a.Region, maxElements, originX, originY, viewW, viewH, kwinMinimizedWindowIndexes(tree, kwin))
+	// bounds the off-screen-centre check. totalMatched counts
+	// every element that passed all filters, past the cap
+	// (F-M2R-25), so the provider knows how many were cut.
+	elements, walked, totalMatched, listTruncated := filterGroundElements(tree, roleSet, a.Region, maxElements, originX, originY, viewW, viewH, kwinMinimizedWindowIndexes(tree, kwin))
 
 	// Number the elements (ids from 1, in tree order) and compute
 	// centres. Centre_norm is relative to the returned image
@@ -1324,6 +1331,7 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		Elements:         []groundElement{},
 		WalkedNodes:      walked,
 		Correction:       correction,
+		TotalMatched:     totalMatched,
 		TreeWalkMs:       walkTime.Milliseconds(),
 		TreeAgeMs:        treeAge.Milliseconds(),
 		GeometryVerified: geometryVerified,
@@ -1665,10 +1673,12 @@ func (t *groundTool) checkRateLimit() error {
 // filterGroundElements applies the design §4.3 filters to the
 // tree, capped at maxElements. A nil tree yields no elements
 // (vision_only). Returns the kept elements, the walked node
-// count, and whether the element list itself was truncated by
-// the maxElements cap (eligible elements dropped — a second
-// truncation source beside the helper's node budget, disclosed
-// the same way by the caller).
+// count, the total number of elements that passed every filter
+// (F-M2R-25 — counted past the cap, so the provider knows how
+// many were cut), and whether the element list itself was
+// truncated by the maxElements cap (eligible elements dropped
+// — a second truncation source beside the helper's node budget,
+// disclosed the same way by the caller).
 //
 // Selection is window-fair (F-A23-W4-1 / F-M2R-12): the old code
 // took the first maxElements in tree order, so one window's
@@ -1695,9 +1705,9 @@ func (t *groundTool) checkRateLimit() error {
 // virtual desktops still cannot be detected from the signals
 // available here (KWin reports no stacking or desktop per
 // window) — that part of F-M2R-21 stays open.
-func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *region, maxElements int, viewX, viewY, viewW, viewH int, minimizedWins map[int]bool) ([]atspiElement, int, bool) {
+func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *region, maxElements int, viewX, viewY, viewW, viewH int, minimizedWins map[int]bool) ([]atspiElement, int, int, bool) {
 	if tree == nil {
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 	// Filter first, preserving tree order, grouped by window.
 	// Group key -1 is the untagged group (older helper output).
@@ -1797,7 +1807,9 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		eligible += len(groups[g])
 	}
 	// Round-robin: one element per group per pass, until the
-	// cap or the eligible pool runs out.
+	// cap or the eligible pool runs out. totalMatched is every
+	// element that passed all filters (F-M2R-25), counted past
+	// the cap; the list is truncated when eligible exceeds kept.
 	kept := []atspiElement{}
 	pos := make(map[int]int, len(ordered))
 	for len(kept) < maxElements && len(kept) < eligible {
@@ -1817,7 +1829,7 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 			break
 		}
 	}
-	return kept, tree.WalkedNodes, eligible > len(kept)
+	return kept, tree.WalkedNodes, eligible, eligible > len(kept)
 }
 
 // clampNorm clamps a centre_norm coordinate to the documented

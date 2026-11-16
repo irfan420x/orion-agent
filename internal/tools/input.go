@@ -1070,7 +1070,7 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 	if cur.Screen != nil {
 		viewW, viewH = cur.Screen.W, cur.Screen.H
 	}
-	fresh, _, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements, 0, 0, viewW, viewH, kwinMinimizedWindowIndexes(tree, cur.Windows))
+	fresh, _, _, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements, 0, 0, viewW, viewH, kwinMinimizedWindowIndexes(tree, cur.Windows))
 	var moved *atspiElement // same role+name, centre elsewhere
 	for i := range fresh {
 		el := &fresh[i]
