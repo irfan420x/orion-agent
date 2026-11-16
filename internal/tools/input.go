@@ -347,7 +347,7 @@ func newInputToolWithBudget(budget *CaptureBudget, owner bool) *inputTool {
 func (t *inputTool) Name() string { return "input" }
 
 func (t *inputTool) Description() string {
-	return "Act on the desktop: move the cursor, click, type text or press a single key (ydotool). move takes absolute {x, y} and corrects itself against the compositor's cursor position until it lands within a few pixels or gives up honestly; click takes {button, clicks} plus either {x, y} or {snapshot_id, element_id} from a ground call (the snapshot form is preferred — it clicks a grounded element, never a guessed coordinate); type takes printable {text} (no control characters — Tab/Return only via key); key takes one key from the allowlist (Return, Escape, Tab, BackSpace, Delete, Home, End, PageUp, PageDown, arrows, Space, F1–F12 — no modifiers or combinations). Gated (destructive): click/type/key can activate, close or submit things. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns, and when the ydotool daemon is not running."
+	return "Act on the desktop: move the cursor, click, type text or press a single key (ydotool). move takes absolute {x, y} and corrects itself against the compositor's cursor position until it lands within a few pixels or gives up honestly; click takes {button, clicks} plus either {x, y} or {snapshot_id, element_id} from a ground call (the snapshot form is preferred — it clicks a grounded element, never a guessed coordinate; a coordinate click needs a grounding from the last 60 s, or it is refused — ground first); type takes printable {text} (no control characters — Tab/Return only via key); key takes one key from the allowlist (Return, Escape, Tab, BackSpace, Delete, Home, End, PageUp, PageDown, arrows, Space, F1–F12 — no modifiers or combinations). Gated (destructive): click/type/key can activate, close or submit things. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns, and when the ydotool daemon is not running."
 }
 
 func (t *inputTool) Definition() model.ToolDefinition {
@@ -358,8 +358,8 @@ func (t *inputTool) Definition() model.ToolDefinition {
 			"type": "object",
 			"properties": map[string]any{
 				"op":          map[string]any{"type": "string", "enum": []string{"move", "click", "type", "key"}, "description": "Which input action to perform."},
-				"x":           map[string]any{"type": "integer", "description": "Target x in screen pixels (move, or click by coordinates)."},
-				"y":           map[string]any{"type": "integer", "description": "Target y in screen pixels (move, or click by coordinates)."},
+				"x":           map[string]any{"type": "integer", "description": "Target x in screen pixels (move, or click by coordinates — a coordinate click needs a grounding from the last 60 s)."},
+				"y":           map[string]any{"type": "integer", "description": "Target y in screen pixels (move, or click by coordinates — a coordinate click needs a grounding from the last 60 s)."},
 				"button":      map[string]any{"type": "string", "enum": []string{"left", "right", "middle"}, "description": "Click button (default left)."},
 				"clicks":      map[string]any{"type": "integer", "minimum": 1, "maximum": 2, "description": "Number of clicks: 1 (default) or 2 for a double-click."},
 				"snapshot_id": map[string]any{"type": "string", "description": "Click by element: the snapshot_id from a ground call (with element_id). The snapshot must be the newest grounding and under 60 s old, or the click is refused — ground again."},
@@ -495,6 +495,15 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 				return invalid("click by coordinates needs both x and y")
 			}
 			if err := t.validatePoint(*a.X, *a.Y); err != nil {
+				return invalid("%v", err)
+			}
+			// A coordinate is only meaningful against a recent
+			// grounding (F-A23W2-8): without one the model is
+			// clicking a remembered number from an old screen,
+			// with no TTL, supersession or eviction applying.
+			// Checked again in doClick right before the click —
+			// the sensitive check and the move take seconds.
+			if err := requireFreshGrounding(); err != nil {
 				return invalid("%v", err)
 			}
 			target = &cursorPos{X: *a.X, Y: *a.Y}
@@ -833,12 +842,30 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 		if err := t.revalidateSnapshotElement(ctx, snapshotID, *elementID, final); err != nil {
 			return cursorPos{}, iters, err
 		}
+	} else if err := requireFreshGrounding(); err != nil {
+		// Coordinate click: the grounding may have gone stale
+		// during the sensitive check and the move.
+		return cursorPos{}, iters, err
 	}
 	code := inputClickCodes[button]
 	if _, err := t.ydotool(ctx, "", "click", "--repeat", strconv.Itoa(clicks), fmt.Sprintf("0x%02X", code)); err != nil {
 		return cursorPos{}, iters, fmt.Errorf("ydotool click failed: %v", err)
 	}
 	return final, iters, nil
+}
+
+// requireFreshGrounding is the F-A23W2-8 gate for coordinate
+// clicks: a coordinate click is refused unless the newest
+// grounding is still within its 60 s TTL. The snapshot form is
+// preferred — it clicks a grounded element, never a guessed
+// coordinate — but coordinates stay available for targets the
+// grounding could not list (the W4 live click was one), as long
+// as the screen they came from is still fresh.
+func requireFreshGrounding() error {
+	if !groundSnapshots.latestFresh(time.Now()) {
+		return fmt.Errorf("coordinate click needs a grounding from the last %v: ground first, then click — or click by snapshot_id + element_id", groundSnapshotTTL)
+	}
+	return nil
 }
 
 // revalidateSnapshotElement re-reads the live accessibility tree
@@ -865,7 +892,7 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 		return fmt.Errorf("snapshot went stale before the click: %v (ground again)", err)
 	}
 	want := snap.details[elementID]
-	tree, err := t.ground.atspiTree(ctx)
+	tree, _, err := t.ground.atspiTree(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: the accessibility tree failed (%v) — ground again", elementID, want.Role, want.Name, err)
 	}

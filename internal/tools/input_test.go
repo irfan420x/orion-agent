@@ -328,6 +328,8 @@ func TestInputMoveOracleFailure(t *testing.T) {
 }
 
 func TestInputClickByCoordinates(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
 	env := newFakeInputEnv(t)
 	res := env.call(t, `{"op": "click", "x": 500, "y": 300}`)
 	s := parseInputSummary(t, res)
@@ -347,6 +349,8 @@ func TestInputClickByCoordinates(t *testing.T) {
 }
 
 func TestInputClickButtonsAndDouble(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
 	env := newFakeInputEnv(t)
 	env.call(t, `{"op": "click", "button": "right", "x": 500, "y": 300}`)
 	env.advance()
@@ -672,6 +676,8 @@ func TestInputTypeSensitiveFailClosedWhenUnenumerable(t *testing.T) {
 }
 
 func TestInputClickSensitivePreciseBox(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
 	env := newFakeInputEnv(t)
 	env.tree = sensitiveInputTreeJSON()
 	// KWin places the KeePassXC window 29 px lower than AT-SPI
@@ -700,6 +706,8 @@ func TestInputClickSensitivePreciseBox(t *testing.T) {
 }
 
 func TestInputClickSensitiveUncorrectedRefused(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
 	env := newFakeInputEnv(t)
 	env.tree = sensitiveInputTreeJSON()
 	env.oracleErr = true // no KWin -> boxes uncorrected -> coarse refusal
@@ -992,10 +1000,12 @@ func treeWithButtonJSON(x, y, w, h int) string {
 }
 
 // firefoxKWinWindow is the KWin window matching the Firefox
-// window in treeWithButtonJSON: same title, class and size, so
+// window in treeWithButtonJSON: same class and size, so
 // the correction is (dx, dy) — (0, 0) unless dy is given.
+// (No title: the KWin helper no longer reports captions,
+// F-M2R-15, and matching is class+size.)
 func firefoxKWinWindow(dy int) []kwinWindow {
-	return []kwinWindow{{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", FG: [4]int{0, dy, 1920, 1080}, CG: [4]int{0, dy, 1920, 1080}}}
+	return []kwinWindow{{Class: "firefox-esr", FG: [4]int{0, dy, 1920, 1080}, CG: [4]int{0, dy, 1920, 1080}}}
 }
 
 func registerSignInSnapshot() {
@@ -1003,6 +1013,15 @@ func registerSignInSnapshot() {
 		{ID: 1, Role: "button", Name: "Sign in", Box: groundBox{X: 910, Y: 378, W: 100, H: 50}, Centre: groundPoint{X: 960, Y: 403}},
 	}, map[int]WindowGeometry{
 		1: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},
+	})
+}
+
+// registerFreshGrounding registers a just-taken grounding for
+// tests that click by coordinates (F-A23W2-8): a coordinate
+// click needs a grounding from the last 60 s.
+func registerFreshGrounding() {
+	groundSnapshots.register("g-fake-fresh", time.Now(), []groundElement{
+		{ID: 1, Role: "button", Name: "Sign in", Centre: groundPoint{X: 960, Y: 403}},
 	})
 }
 
@@ -1092,5 +1111,35 @@ func TestInputClickRecheckAppliesKWinCorrection(t *testing.T) {
 	}
 	if got := len(env.clickCalls()); got != 1 {
 		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+// --- F-A23W2-8 (coordinate click bypass): a coordinate click
+// needs a recent grounding, like a snapshot click does. ---
+
+func TestInputCoordClickRefusedWithoutGrounding(t *testing.T) {
+	env := newFakeInputEnv(t)
+	resetGroundSnapshots() // the fake env's fresh grounding is gone
+	err := env.callErr(t, `{"op": "click", "x": 500, "y": 300}`)
+	if !strings.Contains(err.Error(), "ground first") {
+		t.Errorf("coord click with no grounding err = %v, want the 'ground first' refusal", err)
+	}
+	if got := len(env.ydotoolCalls); got != 0 {
+		t.Errorf("got %d ydotool calls, want 0 (refused before touching the desktop)", got)
+	}
+}
+
+func TestInputCoordClickRefusedWhenGroundingStale(t *testing.T) {
+	env := newFakeInputEnv(t)
+	resetGroundSnapshots()
+	groundSnapshots.register("g-old", time.Now().Add(-61*time.Second), []groundElement{
+		{ID: 1, Role: "button", Name: "Sign in", Centre: groundPoint{X: 960, Y: 403}},
+	})
+	err := env.callErr(t, `{"op": "click", "x": 500, "y": 300}`)
+	if !strings.Contains(err.Error(), "ground first") {
+		t.Errorf("coord click with a stale grounding err = %v, want the 'ground first' refusal", err)
+	}
+	if got := len(env.ydotoolCalls); got != 0 {
+		t.Errorf("got %d ydotool calls, want 0", got)
 	}
 }

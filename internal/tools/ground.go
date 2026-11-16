@@ -609,6 +609,19 @@ func chatIDFromContext(ctx context.Context) int64 {
 	return chatID
 }
 
+// latestFresh reports whether the newest snapshot is still
+// within its TTL. A coordinate click (F-A23W2-8) is only
+// meaningful against a recent grounding: without one the model
+// is clicking a remembered number from an old screen.
+func (r *groundSnapshotRegistry) latestFresh(now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.snapshots) == 0 {
+		return false
+	}
+	return now.Sub(r.snapshots[len(r.snapshots)-1].takenAt) <= groundSnapshotTTL
+}
+
 // ValidateGroundSnapshot is the M3 input tool's gate: it refuses a
 // click when (a) the snapshot is unknown or evicted, (b) it is
 // older than the 60 s TTL, (c) a newer grounding has superseded

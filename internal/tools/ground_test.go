@@ -1491,3 +1491,25 @@ func TestGroundNameTruncation(t *testing.T) {
 		t.Errorf("short name = %q, want it untouched", s.Elements[1].Name)
 	}
 }
+
+// TestGroundSnapshotLatestFresh pins the F-A23W2-8 freshness
+// gate: a coordinate click is only meaningful against a recent
+// grounding.
+func TestGroundSnapshotLatestFresh(t *testing.T) {
+	now := time.Now()
+	els := []groundElement{{ID: 1, Centre: groundPoint{X: 1, Y: 1}}}
+	resetGroundSnapshots()
+	if groundSnapshots.latestFresh(now) {
+		t.Errorf("latestFresh with no snapshots = true, want false")
+	}
+	groundSnapshots.register("g-fresh", 0, now, els, nil)
+	if !groundSnapshots.latestFresh(now) {
+		t.Errorf("latestFresh just after grounding = false, want true")
+	}
+	// A newer but stale snapshot makes the latest stale: the
+	// gate follows the newest grounding, not any grounding.
+	groundSnapshots.register("g-old", 0, now.Add(-61*time.Second), els, nil)
+	if groundSnapshots.latestFresh(now) {
+		t.Errorf("latestFresh with a stale newest snapshot = true, want false")
+	}
+}
