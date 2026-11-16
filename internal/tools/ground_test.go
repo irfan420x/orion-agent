@@ -882,6 +882,101 @@ func TestGroundUnattendedRefusedViaGateMarker(t *testing.T) {
 		t.Errorf("gate-marked unattended refusal still captured %d screenshot(s)", env.captures)
 	}
 }
+// TestGroundSixteenthAfterBeginTurn is the F-M2R-35 regression
+// test for F-M2R-1: the ground limiter was tested in isolation,
+// but no test went through the real registry — BeginTurn, ground
+// 15 times, BeginTurn again, then the 16th grounding overall
+// (1st of turn 2) — and asserted it still works. Ground's own
+// per-turn counter resets on BeginTurn; the embedded screenshot
+// tool's counter does not (its BeginTurn is never called — that
+// is F-M2R-1, owned by W-A), so the 16th grounding dies in the
+// inner screenshot's 15-per-turn limit. This test FAILS until the
+// F-M2R-1 fix lands; it is committed failing on purpose, so
+// integration proves the fix.
+func TestGroundSixteenthAfterBeginTurn(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	r, err := DefaultRegistry()
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	regTool, ok := r.Get("ground")
+	if !ok {
+		t.Fatal("ground is not in the default registry")
+	}
+	gt, ok := regTool.(*groundTool)
+	if !ok {
+		t.Fatalf("registry ground tool is %T, want *groundTool", regTool)
+	}
+	// Point the registry tool at the fake seams (same stubs as
+	// newFakeGroundEnv, which close over env).
+	stub := env.tool
+	gt.homeDir = stub.homeDir
+	gt.now = stub.now
+	gt.lookPath = stub.lookPath
+	gt.execCmd = stub.execCmd
+	gt.runHelper = stub.runHelper
+	gt.runKWinHelper = stub.runKWinHelper
+	gt.shot.homeDir = stub.shot.homeDir
+	gt.shot.now = stub.shot.now
+	gt.shot.lookPath = stub.shot.lookPath
+	gt.shot.execCmd = stub.shot.execCmd
+	gt.shot.windowTitles = stub.shot.windowTitles
+	gt.shot.activeWindow = stub.shot.activeWindow
+	gt.shot.cursor = stub.shot.cursor
+	gt.shot.screenLocked = stub.shot.screenLocked
+
+	r.BeginTurn()
+	for i := 1; i <= 15; i++ {
+		if i > 1 {
+			env.advance()
+		}
+		if _, err := gt.ExecuteResult(context.Background(), json.RawMessage(`{}`)); err != nil {
+			t.Fatalf("grounding #%d (turn 1) = %v, want nil", i, err)
+		}
+	}
+	// New turn: both counters must reset. The 16th grounding
+	// overall is the 1st of turn 2 — it must work.
+	r.BeginTurn()
+	env.advance()
+	res, err := gt.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("grounding #16 (turn 2) after BeginTurn = %v, want nil (F-M2R-1: the embedded screenshot counter never resets)", err)
+	}
+	s := parseGroundSummary(t, res)
+	if len(s.Elements) != 6 {
+		t.Fatalf("grounding #16 gave %d elements, want 6", len(s.Elements))
+	}
+}
+
+// TestGroundSensitiveRefusalKWinFailed is the second F-M2R-35
+// regression test: with the KWin helper failing, a sensitive
+// title visible ONLY via AT-SPI (xdotool sees generic titles)
+// must still refuse — the AT-SPI title check is the fallback,
+// not an optimisation the KWin pre-check replaced.
+func TestGroundSensitiveRefusalKWinFailed(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.kwinOK = false // KWin helper fails: no title pre-check
+	env.helper = `{"windows": [
+		{"title": "Bitwarden — Vault", "app": "Bitwarden", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 800, "h": 600}],
+	"elements": [], "focused_window": {"title": "Bitwarden — Vault", "app": "Bitwarden"}, "walked_nodes": 3}`
+	// xdotool sees nothing sensitive: only the AT-SPI tree names it.
+	env.tool.shot.windowTitles = func(ctx context.Context) ([]string, error) {
+		return []string{"Firefox", "Kate — notes.txt"}, nil
+	}
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("AT-SPI-only sensitive title should refuse grounding even with KWin failed")
+	}
+	var terr *ToolError
+	if !errors.As(err, &terr) || terr.Kind != "denied" {
+		t.Errorf("error = %v, want denied ToolError", err)
+	}
+	if env.captures != 0 {
+		t.Errorf("sensitive refusal still captured %d screenshot(s)", env.captures)
+	}
+}
 
 func TestGroundRateLimit(t *testing.T) {
 	resetGroundSnapshots()
