@@ -899,3 +899,49 @@ func TestInputScreenCacheInvalidation(t *testing.T) {
 		t.Errorf("shrink move issued %d mousemove call(s), want 0", len(env.mousemoveCalls())-before)
 	}
 }
+
+// TestInputFailedCallsDoNotEatRateLimitSlots (F-A23W2-18): a call
+// that fails because the screen is locked or the daemon is down
+// performed no input, so it must not consume a per-turn or
+// per-hour slot — otherwise a locked screen or a down daemon
+// burns the whole quota on failures.
+func TestInputFailedCallsDoNotEatRateLimitSlots(t *testing.T) {
+	env := newFakeInputEnv(t)
+	// Screen locked: 20 failures, zero slots consumed.
+	env.locked = true
+	for i := 0; i < 20; i++ {
+		err := env.callErr(t, `{"op": "move", "x": 200, "y": 200}`)
+		if !strings.Contains(err.Error(), "screen is locked") {
+			t.Fatalf("locked call #%d err = %v, want the locked-screen error", i+1, err)
+		}
+	}
+	if env.tool.turnCalls != 0 || len(env.tool.hourCalls) != 0 {
+		t.Errorf("after 20 locked failures: turnCalls = %d, hourCalls = %d, want 0, 0", env.tool.turnCalls, len(env.tool.hourCalls))
+	}
+	// Daemon down: same — the socket is gone, the call fails
+	// before the rate-limit check.
+	env.locked = false
+	sock := env.socketPath
+	env.socketPath = filepath.Join(env.home, "no-such-socket")
+	for i := 0; i < 20; i++ {
+		err := env.callErr(t, `{"op": "move", "x": 200, "y": 200}`)
+		if !strings.Contains(err.Error(), "daemon is not running") {
+			t.Fatalf("daemon-down call #%d err = %v, want the daemon-down error", i+1, err)
+		}
+	}
+	if env.tool.turnCalls != 0 || len(env.tool.hourCalls) != 0 {
+		t.Errorf("after 20 daemon-down failures: turnCalls = %d, hourCalls = %d, want 0, 0", env.tool.turnCalls, len(env.tool.hourCalls))
+	}
+	// The quota is still whole: 15 moves succeed, the 16th is
+	// rate-limited — the 40 failures above bought nothing.
+	env.socketPath = sock
+	for i := 0; i < inputMaxPerTurn; i++ {
+		env.advance()
+		env.call(t, fmt.Sprintf(`{"op": "move", "x": %d, "y": 200}`, 200+i))
+	}
+	env.advance()
+	err := env.callErr(t, `{"op": "move", "x": 300, "y": 300}`)
+	if !strings.Contains(err.Error(), "at most 15 input calls per turn") {
+		t.Errorf("16th move err = %v, want the per-turn limit", err)
+	}
+}

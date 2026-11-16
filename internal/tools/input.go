@@ -488,12 +488,6 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 		return failed("no graphical session available: neither DISPLAY nor WAYLAND_DISPLAY is set")
 	}
 
-	// Rate limits (M1 discipline): min 1s between calls, max 15
-	// per turn, max 120 per hour.
-	if err := t.checkRateLimit(); err != nil {
-		return denied("%v", err)
-	}
-
 	// Screen locked: injecting into a locked screen is
 	// meaningless — refuse, no retry (same seam as screenshot).
 	if locked, _ := t.shot.screenLocked(ctx); locked {
@@ -507,6 +501,18 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 	// daemon itself.
 	if err := t.checkDaemon(); err != nil {
 		return failed("%v", err)
+	}
+
+	// Rate limits (M1 discipline): min 1s between calls, max 15
+	// per turn, max 120 per hour. The check runs AFTER the
+	// screen-locked and daemon checks (F-A23W2-18): a call that
+	// fails there performed no input, so it must not eat a
+	// per-turn or per-hour slot — otherwise a locked screen or
+	// a down daemon burns the whole quota on failures. Argument
+	// errors above never reach this check either, for the same
+	// reason: only a call that is about to act consumes a slot.
+	if err := t.checkRateLimit(); err != nil {
+		return denied("%v", err)
 	}
 
 	var summary inputSummary
