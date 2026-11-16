@@ -1061,7 +1061,16 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 	for _, e := range snap.details {
 		roleSet[e.Role] = true
 	}
-	fresh, _, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements)
+	// The re-check's view is the full screen (F-M2R-21): the
+	// oracle's screen size bounds the off-screen-centre drop,
+	// and a minimized window's elements are dropped — a click
+	// target in a minimized window is not on screen. A missing
+	// screen size disables the centre check (0x0 view).
+	viewW, viewH := 0, 0
+	if cur.Screen != nil {
+		viewW, viewH = cur.Screen.W, cur.Screen.H
+	}
+	fresh, _, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements, 0, 0, viewW, viewH, kwinMinimizedWindowIndexes(tree, cur.Windows))
 	var moved *atspiElement // same role+name, centre elsewhere
 	for i := range fresh {
 		el := &fresh[i]

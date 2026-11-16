@@ -279,6 +279,11 @@ type groundSummary struct {
 	TreeWalkMs       int64 `json:"tree_walk_ms,omitempty"`
 	TreeAgeMs        int64 `json:"tree_age_ms,omitempty"`
 	GeometryVerified bool  `json:"geometry_verified,omitempty"`
+	// ShowingUnknown (F-M2R-21) counts listed elements whose
+	// SHOWING state was never verified — the helper's state query
+	// failed, so the hidden-element filter kept them on a missing
+	// signal. Zero means every element was verified showing.
+	ShowingUnknown int `json:"showing_unknown,omitempty"`
 }
 
 // groundWindowSummary is one window's share of a grounding
@@ -382,6 +387,12 @@ type atspiOutput struct {
 	// per-window node budget (F-A23-W4-1 / F-M2R-12): the
 	// element list is partial and the summary must say so.
 	Truncated bool `json:"truncated,omitempty"`
+	// ShowingUnknown counts elements whose SHOWING state query
+	// failed in the helper (F-M2R-21): the state filter then
+	// silently disables for those elements (nil → keep), so the
+	// summary must say how many elements were kept on a missing
+	// signal instead of a verified one.
+	ShowingUnknown int `json:"showing_unknown,omitempty"`
 }
 
 type atspiWindow struct {
@@ -489,39 +500,76 @@ func matchKWinWindows(tree *atspiOutput, kwin []kwinWindow) map[int][2]int {
 		return offsets
 	}
 	for i, w := range tree.Windows {
-		// A candidate carries its KWin window (for the
-		// Minimized flag) with the shift from whichever
-		// geometry matched (FG first, then CG — F-M2R-9).
-		type kwinCandidate struct {
-			kw    kwinWindow
-			shift [2]int
-		}
-		var candidates []kwinCandidate
-		for _, kw := range kwin {
-			if !kwinClassCompatible(w.App, kw.Class) {
-				continue
-			}
-			if w.W == kw.FG[2] && w.H == kw.FG[3] {
-				candidates = append(candidates, kwinCandidate{kw, [2]int{kw.FG[0] - w.X, kw.FG[1] - w.Y}})
-			} else if w.W == kw.CG[2] && w.H == kw.CG[3] {
-				candidates = append(candidates, kwinCandidate{kw, [2]int{kw.CG[0] - w.X, kw.CG[1] - w.Y}})
-			}
-		}
-		// A minimized duplicate must not veto the visible
-		// window: only visible candidates count. All-minimized
-		// means nothing on screen to correct against.
-		var visible []kwinCandidate
-		for _, m := range candidates {
-			if !m.kw.Minimized {
-				visible = append(visible, m)
-			}
-		}
+		visible := matchKWinVisible(w, kwin)
 		if len(visible) != 1 {
 			continue
 		}
 		offsets[i] = visible[0].shift
 	}
 	return offsets
+}
+
+// kwinCandidate is one KWin window matching an AT-SPI window on
+// class and size, with the shift from whichever geometry matched
+// (FG first, then CG — F-M2R-9). It carries the KWin window
+// itself so callers can apply the Minimized flag.
+type kwinCandidate struct {
+	kw    kwinWindow
+	shift [2]int
+}
+
+// matchKWinCandidates returns every KWin window matching one
+// AT-SPI window on class and size — before any visibility or
+// uniqueness decision. Shared by matchKWinWindows and
+// kwinMinimizedWindowIndexes so the two never drift apart on
+// what "matches" means. Titles are deliberately NOT used
+// (F-M2R-15): the KWin helper reports none.
+func matchKWinCandidates(w atspiWindow, kwin []kwinWindow) []kwinCandidate {
+	var matches []kwinCandidate
+	for _, kw := range kwin {
+		if !kwinClassCompatible(w.App, kw.Class) {
+			continue
+		}
+		if w.W == kw.FG[2] && w.H == kw.FG[3] {
+			matches = append(matches, kwinCandidate{kw, [2]int{kw.FG[0] - w.X, kw.FG[1] - w.Y}})
+		} else if w.W == kw.CG[2] && w.H == kw.CG[3] {
+			matches = append(matches, kwinCandidate{kw, [2]int{kw.CG[0] - w.X, kw.CG[1] - w.Y}})
+		}
+	}
+	return matches
+}
+
+// matchKWinVisible returns the VISIBLE candidates for one AT-SPI
+// window: a minimized duplicate never vetoes the visible
+// window's correction, and an all-minimized set yields none.
+func matchKWinVisible(w atspiWindow, kwin []kwinWindow) []kwinCandidate {
+	var visible []kwinCandidate
+	for _, m := range matchKWinCandidates(w, kwin) {
+		if !m.kw.Minimized {
+			visible = append(visible, m)
+		}
+	}
+	return visible
+}
+
+// kwinMinimizedWindowIndexes returns the AT-SPI window indexes
+// whose KWin counterpart is minimized (F-M2R-21): elements in a
+// minimized window report SHOWING=true but are not clickable, so
+// the filter drops them. A window counts only when exactly one
+// KWin window matches it and that one is minimized — an
+// ambiguous match filters nothing (fail safe, keep the element).
+func kwinMinimizedWindowIndexes(tree *atspiOutput, kwin []kwinWindow) map[int]bool {
+	minimized := map[int]bool{}
+	if tree == nil {
+		return minimized
+	}
+	for i, w := range tree.Windows {
+		matches := matchKWinCandidates(w, kwin)
+		if len(matches) == 1 && matches[0].kw.Minimized {
+			minimized[i] = true
+		}
+	}
+	return minimized
 }
 
 // kwinClassCompatible reports whether an AT-SPI app name and a
@@ -1258,12 +1306,15 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// listTruncated is true when eligible elements were dropped
 	// by the max_elements cap — disclosed in the summary
 	// alongside the helper's own walk truncation, so a partial
-	// list is never silent.
-	elements, walked, listTruncated := filterGroundElements(tree, roleSet, a.Region, maxElements)
+	// list is never silent. Minimized windows (KWin) are dropped
+	// with the hidden elements (F-M2R-21); the grounded view
+	// bounds the off-screen-centre check.
+	elements, walked, listTruncated := filterGroundElements(tree, roleSet, a.Region, maxElements, originX, originY, viewW, viewH, kwinMinimizedWindowIndexes(tree, kwin))
 
 	// Number the elements (ids from 1, in tree order) and compute
 	// centres. Centre_norm is relative to the returned image
-	// (0-1000 over the grounded view).
+	// (0-1000 over the grounded view), clamped to that range
+	// (F-M2R-21).
 	now := t.now()
 	summary := groundSummary{
 		SnapshotID:       newSnapshotID(now),
@@ -1300,6 +1351,9 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		}
 	}
 	if tree != nil {
+		summary.ShowingUnknown = tree.ShowingUnknown
+	}
+	if tree != nil {
 		summary.Coverage = "grounded"
 	} else {
 		summary.Coverage = "vision_only"
@@ -1322,8 +1376,8 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 			Box:    groundBox{X: el.X, Y: el.Y, W: el.W, H: el.H},
 			Centre: groundPoint{X: cx, Y: cy},
 			CentreNorm: groundPoint{
-				X: (cx - originX) * 1000 / viewW,
-				Y: (cy - originY) * 1000 / viewH,
+				X: clampNorm((cx - originX) * 1000 / viewW),
+				Y: clampNorm((cy - originY) * 1000 / viewH),
 			},
 		})
 	}
@@ -1626,7 +1680,22 @@ func (t *groundTool) checkRateLimit() error {
 // share of the list. Elements with no window tag (older helper
 // output) form a single group in tree order, which keeps the
 // old behaviour for untagged trees.
-func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *region, maxElements int) ([]atspiElement, int, bool) {
+//
+// viewX/viewY/viewW/viewH are the grounded view's origin and
+// dimensions in screen pixels, with the view origin at (0,0)
+// for a full-screen capture or the region origin for a zoomed
+// capture: an element whose CENTRE lies outside the view cannot
+// be seen or clicked from it, so it is dropped (F-M2R-21 — the
+// old filter only rejected x<0 || y<0, so off-screen-right
+// elements passed and their centre_norm exceeded 1000). A zero
+// view (0x0) disables the check. minimizedWins is the set of
+// AT-SPI window indexes KWin reports as minimized: their
+// elements report SHOWING=true but are not clickable, so they
+// are dropped too. Occlusion by another window and other
+// virtual desktops still cannot be detected from the signals
+// available here (KWin reports no stacking or desktop per
+// window) — that part of F-M2R-21 stays open.
+func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *region, maxElements int, viewX, viewY, viewW, viewH int, minimizedWins map[int]bool) ([]atspiElement, int, bool) {
 	if tree == nil {
 		return nil, 0, false
 	}
@@ -1650,8 +1719,15 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		// the focused app's elements are reached (live 2026-11-15
 		// 20:26: 60/60 listed were hidden plasmashell elements).
 		// SHOWING separates visible from hidden cleanly (probe
-		// 2026-11-15 20:27: 7/7). A missing signal (nil) is kept.
+		// 2026-11-15 20:27: 7/7). A missing signal (nil) is kept —
+		// but counted in tree.ShowingUnknown (F-M2R-21), so the
+		// summary says how many elements were kept unverified.
 		if el.Showing != nil && !*el.Showing {
+			continue
+		}
+		// Minimized window: not on screen, not clickable, even
+		// though its elements report SHOWING=true (F-M2R-21).
+		if el.Win != nil && minimizedWins[*el.Win] {
 			continue
 		}
 		// Degenerate box: offscreen (-1,-1) or 1x1 placeholders
@@ -1659,10 +1735,17 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		if el.W <= 1 || el.H <= 1 || el.X < 0 || el.Y < 0 {
 			continue
 		}
+		// Centre outside the grounded view: the element is
+		// off-screen (right/bottom edge included — the old
+		// filter only rejected negative coordinates) and its
+		// centre_norm would exceed the documented 0-1000 range.
+		cx, cy := el.X+el.W/2, el.Y+el.H/2
+		if viewW > 0 && viewH > 0 && (cx < viewX || cx >= viewX+viewW || cy < viewY || cy >= viewY+viewH) {
+			continue
+		}
 		// Region zoom: only elements whose centre lies inside
 		// the region are listed.
 		if region != nil {
-			cx, cy := el.X+el.W/2, el.Y+el.H/2
 			if cx < region.X || cx >= region.X+region.Width ||
 				cy < region.Y || cy >= region.Y+region.Height {
 				continue
@@ -1735,6 +1818,20 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		}
 	}
 	return kept, tree.WalkedNodes, eligible > len(kept)
+}
+
+// clampNorm clamps a centre_norm coordinate to the documented
+// 0-1000 range (F-M2R-21): the filter above drops elements whose
+// centre is off-screen, but the clamp is defence in depth — a
+// scaled or cropped view must never emit a norm above 1000.
+func clampNorm(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 1000 {
+		return 1000
+	}
+	return v
 }
 
 // newSnapshotID builds a unique snapshot id like

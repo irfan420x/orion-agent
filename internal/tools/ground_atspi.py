@@ -62,6 +62,7 @@ def extents(acc):
 
 def main():
     Atspi.init()
+    showing_unknown = [0]
     elements = []
 
     def walk(acc, depth, win_idx, budget, count):
@@ -101,6 +102,13 @@ def main():
                     showing = ss.contains(Atspi.StateType.SHOWING)
             except Exception:
                 showing = None
+            if showing is None:
+                # F-M2R-21: the state query failed, so the Go side
+                # keeps this element on a missing signal — count
+                # it, so the summary says how many elements were
+                # kept unverified instead of silently disabling
+                # the filter for them.
+                showing_unknown[0] += 1
             el = {"role": role, "name": name[:60],
                   "x": box[0], "y": box[1],
                   "w": box[2], "h": box[3], "win": win_idx}
@@ -240,7 +248,8 @@ def main():
     print(json.dumps({"windows": windows, "elements": elements,
                       "focused_window": focused,
                       "walked_nodes": walked,
-                      "truncated": truncated}))
+                      "truncated": truncated,
+                      "showing_unknown": showing_unknown[0]}))
 
 
 if __name__ == "__main__":

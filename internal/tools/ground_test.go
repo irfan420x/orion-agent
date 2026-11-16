@@ -1118,6 +1118,91 @@ func TestGroundKWinCorrectionFirefox(t *testing.T) {
 // matched a window but the shift is (0,0) — the coordinates were
 // verified against the compositor, not merely unshifted — so the
 // status is ok with an empty Windows list, not no_match.
+// TestGroundOffscreenRightDropped pins the F-M2R-21 centre
+// check: the old filter only rejected x<0 || y<0, so an element
+// past the right edge passed and its centre_norm exceeded 1000.
+// An element whose centre is outside the captured image is now
+// dropped.
+func TestGroundOffscreenRightDropped(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = `{"windows": [
+		{"title": "Wide — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "button", "name": "Visible", "x": 100, "y": 100, "w": 100, "h": 40, "showing": true},
+		{"role": "button", "name": "Offscreen right", "x": 2000, "y": 100, "w": 100, "h": 40, "showing": true},
+		{"role": "button", "name": "Straddling right edge", "x": 1900, "y": 200, "w": 100, "h": 40, "showing": true},
+		{"role": "button", "name": "Offscreen bottom", "x": 100, "y": 1100, "w": 100, "h": 40, "showing": true}],
+	"focused_window": {"title": "Wide — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 4}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	// Only "Visible" survives: the right/bottom elements' centres
+	// are outside the 1920x1080 capture, including the straddler
+	// (centre x=1950).
+	if len(s.Elements) != 1 || s.Elements[0].Name != "Visible" {
+		t.Fatalf("got %d elements, want only Visible: %+v", len(s.Elements), s.Elements)
+	}
+}
+
+// TestGroundMinimizedWindowElementsDropped pins the F-M2R-21
+// minimized filter: a minimized window's elements report
+// SHOWING=true but are not clickable, so KWin's minimized flag
+// drops them while the visible window's elements stay.
+func TestGroundMinimizedWindowElementsDropped(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	env.kwin = `{"kwin_windows": [
+		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]},
+		{"caption": "Kate — notes.txt", "cls": "kate", "active": false, "minimized": true, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600]}]}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	for _, el := range s.Elements {
+		if el.Name == "Notes field" {
+			t.Errorf("minimized Kate element %q listed, want dropped", el.Name)
+		}
+	}
+	if got := findGroundElement(t, s, "Sign in"); got.Centre.Y != 569 {
+		t.Errorf("Sign in centre = %+v, want corrected (960,569)", got.Centre)
+	}
+}
+
+// TestGroundShowingUnknownReported pins the F-M2R-21 signal: when
+// the helper's SHOWING query fails for some elements, the summary
+// must say how many were kept on a missing signal instead of
+// silently disabling the filter for them.
+func TestGroundShowingUnknownReported(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 993}],
+	"elements": [
+		{"role": "button", "name": "Sign in", "x": 784, "y": 520, "w": 352, "h": 40, "showing": true},
+		{"role": "entry", "name": "Username", "x": 784, "y": 383, "w": 352, "h": 40},
+		{"role": "entry", "name": "Password", "x": 784, "y": 464, "w": 352, "h": 40}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 3, "showing_unknown": 2}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if s.ShowingUnknown != 2 {
+		t.Errorf("showing_unknown = %d, want 2 (the two entries without a showing field)", s.ShowingUnknown)
+	}
+	if len(s.Elements) != 3 {
+		t.Errorf("got %d elements, want 3 (unknown-showing elements are kept, not dropped)", len(s.Elements))
+	}
+}
+
+func TestClampNorm(t *testing.T) {
+	for _, tc := range []struct {
+		in, want int
+	}{
+		{-5, 0}, {0, 0}, {500, 500}, {1000, 1000}, {1041, 1000},
+	} {
+		if got := clampNorm(tc.in); got != tc.want {
+			t.Errorf("clampNorm(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestGroundKWinZeroShift(t *testing.T) {
 	resetGroundSnapshots()
 	env := newFakeGroundEnv(t)
