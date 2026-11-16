@@ -333,6 +333,12 @@ after the flags are joined with spaces into a single prompt.
 		return err
 	}
 	defer a.Close()
+	// F-A23W2-16: LOUD warning when the sandbox opt-out is set —
+	// with the sandbox off, the denylist's documented bypass
+	// classes are uncontained.
+	if w := a.Config.SandboxDisabledWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
+	}
 	out, err := a.Handle(ctx, strings.Join(args, " "))
 	if err != nil {
 		return err
@@ -358,6 +364,12 @@ Type /quit to exit. Takes no arguments.
 		return err
 	}
 	defer a.Close()
+	// F-A23W2-16: LOUD warning when the sandbox opt-out is set —
+	// with the sandbox off, the denylist's documented bypass
+	// classes are uncontained.
+	if w := a.Config.SandboxDisabledWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
+	}
 	fmt.Println("Orion chat — type /quit to exit.")
 	return messaging.RunCLI(ctx, os.Stdin, os.Stdout, func(c context.Context, input string) (string, error) {
 		return a.Handle(c, input)
@@ -887,6 +899,12 @@ func cmdTelegram(ctx context.Context, args []string) error {
 	if w := a.Config.AllowAllTelegramWarning(); w != "" {
 		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
 	}
+	// F-A23W2-16: LOUD warning when the sandbox opt-out is set —
+	// with the sandbox off, the denylist's documented bypass
+	// classes are uncontained.
+	if w := a.Config.SandboxDisabledWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
+	}
 	gw, err := newTelegramGateway(a)
 	if err != nil {
 		return err
@@ -971,6 +989,12 @@ Run Telegram polling until interrupted. Takes no arguments.
 	applyTelegramBaseURL()
 	// P2-O5: LOUD warning when the allow-all opt-in is set.
 	if w := a.Config.AllowAllTelegramWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
+	}
+	// F-A23W2-16: LOUD warning when the sandbox opt-out is set —
+	// with the sandbox off, the denylist's documented bypass
+	// classes are uncontained.
+	if w := a.Config.SandboxDisabledWarning(); w != "" {
 		fmt.Fprintf(os.Stderr, "orion: %s\n", w)
 	}
 	gw, err := newTelegramGateway(a)

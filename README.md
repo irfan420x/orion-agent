@@ -5,9 +5,9 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (1,846 tests total — 1,842 pass, 0 fail, 4 skip;
+> built and tested (1,869 tests total — 1,865 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
-> Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement and the computer-use M3 input tool (2026-11-15) — see CHANGELOG for the rc25 audit fixes).
+> Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool (2026-11-15) and the Audit 23 fix batch (2026-11-16) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -131,9 +131,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 1,846 tests total (1,842 passing, 0 failing, 4 skipped)
+24/24 packages, 1,869 tests total (1,865 passing, 0 failing, 4 skipped)
 (recount in the working tree after the Audit 22 fix batch, the
-provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement and the computer-use M3 input tool, 2026-11-15; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
+provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool, 2026-11-15, and the Audit 23 fix batch, 2026-11-16; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
 `go test ./...` or `make test`.
 
@@ -341,6 +341,24 @@ established on the host, `shell_exec` refuses the command
 `sandbox.allow_unsandboxed_fallback=true` is set explicitly; a
 missing seccomp filter is likewise refused unless
 `sandbox.allow_without_seccomp=true` is set.
+
+With the sandbox **off**, the shell denylist's documented bypass
+classes are open (F-A23W2-16): the denylist is a static, string-level
+check — it cannot see a path that reaches a sensitive file through
+(1) an operand whose variable cannot be resolved statically
+(`cat $X/.orion/config.json` with `$X` unassigned), (2) a symlink
+alias (`ln -s ~/.orion /tmp/l; cat /tmp/l/config.json`), (3) a path
+built by string concatenation inside an interpreter, or (4) a file
+read through an already-open file descriptor (`cat <&3`). The
+sandbox was the only layer containing those four classes; with it
+off, nothing else stops a shell command from reading
+`~/.orion/config.json` (Telegram token, API keys), `~/.ssh`, or
+`~/.gnupg`. An opted-out daemon therefore prints a LOUD startup
+warning naming all four classes, and every unsandboxed `shell_exec`
+is still logged per command. The limits are deliberate and
+documented in `internal/security/security.go` — the fix is the
+warning, not a wider denylist: re-enable the sandbox
+(`sandbox.enabled=true`, remove `ORION_SANDBOX=off`) to close them.
 
 The sandbox needs a host that lets it create Linux user namespaces:
 it works when the agent runs as root, or on a host that allows

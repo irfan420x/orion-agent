@@ -287,6 +287,12 @@ func run(args []string) int {
 	if w := a.Config.AllowAllTelegramWarning(); w != "" {
 		fmt.Fprintf(os.Stderr, "oriond: %s\n", w)
 	}
+	// F-A23W2-16: LOUD warning when the sandbox opt-out is set —
+	// with the sandbox off, the denylist's documented bypass
+	// classes are uncontained.
+	if w := a.Config.SandboxDisabledWarning(); w != "" {
+		fmt.Fprintf(os.Stderr, "oriond: %s\n", w)
+	}
 	gwOpts := []messaging.GatewayOption{
 		messaging.WithAllowedChats(a.Config.TelegramAllowedChats...),
 		// Polling-health notes (transient getUpdates failures and

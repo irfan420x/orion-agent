@@ -437,6 +437,25 @@ func (c *Config) AllowAllTelegramWarning() string {
 		c.AllowAllWindow())
 }
 
+// SandboxDisabledWarning returns the LOUD startup warning for the
+// sandbox opt-out (F-A23W2-16): with the sandbox off, the shell
+// denylist's documented bypass classes are uncontained — the
+// denylist cannot see them, and nothing else contains them. It
+// returns "" when the sandbox is enabled, so callers can print it
+// unconditionally. The daemon startup paths print this to stderr
+// whenever it is non-empty — an operator who opts out of the
+// sandbox must not be able to miss that shell_exec can now read
+// the agent's own config and keys. The warning is a warning, not
+// a Validate error: the opt-out is a deliberate operator choice
+// (the live deployment itself runs sandbox-off), so startup must
+// stay possible while the loss of containment stays loud.
+func (c *Config) SandboxDisabledWarning() string {
+	if c.Sandbox.Enabled {
+		return ""
+	}
+	return "WARNING: sandbox is OFF (sandbox.enabled=false, or ORION_SANDBOX=off) — shell_exec runs unconfined, and the shell denylist's documented bypass classes are now UNCONTAINED: (1) an operand whose variable cannot be resolved statically (cat $X/.orion/config.json with $X unassigned); (2) a symlink alias (ln -s ~/.orion /tmp/l; cat /tmp/l/config.json); (3) a path built by string concatenation inside an interpreter; (4) a file read through an already-open file descriptor (cat <&3). The denylist cannot see any of these, and with the sandbox off nothing else stops them — a shell command can read ~/.orion/config.json (Telegram token, API keys), ~/.ssh, and ~/.gnupg. Re-enable the sandbox (sandbox.enabled=true, remove ORION_SANDBOX=off) to confine shell_exec again. See \"Sandbox (shell_exec)\" in README.md and SECURITY.md."
+}
+
 // DebugPprofPort returns the effective pprof port (F-A3-2): the
 // configured port, or debug.DefaultPprofPort (6060) when the field
 // is unset (0).

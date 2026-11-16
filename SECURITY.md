@@ -59,6 +59,36 @@ Turning it off is an explicit operator opt-out
 opted-out run is logged every time, so the loss of confinement is
 visible per command.
 
+### What the denylist cannot see (open when the sandbox is off)
+
+F-A23W2-16. The denylist is a static, string-level check over the
+command text; it has four documented bypass classes
+(`internal/security/security.go`, "Deliberate limits (documented,
+not oversights)"), and the sandbox is the only layer that contains
+them:
+
+1. **Unresolvable variable** — an operand whose variable cannot be
+   resolved statically (`cat $X/.orion/config.json` with `$X`
+   unassigned); the denylist cannot prove where it points.
+2. **Symlink alias** — symlinks are not resolved
+   (`ln -s ~/.orion /tmp/l; cat /tmp/l/config.json` names no
+   sensitive path literally).
+3. **String concatenation inside an interpreter** — a path built
+   dynamically in Python/Node/etc. never appears as a literal
+   operand.
+4. **File-descriptor read** — a shell that reads the file without
+   naming it (`cat <&3` after an earlier open).
+
+With the sandbox on, the chroot contains all four: the sensitive
+paths are simply not inside it. With the sandbox off, a shell
+command can read `~/.orion/config.json` (Telegram token, API keys),
+`~/.ssh`, and `~/.gnupg` through any of them. The opt-out therefore
+prints a LOUD startup warning naming all four classes
+(`Config.SandboxDisabledWarning`, printed by oriond and by `orion
+daemon`, `orion telegram poll`, `orion run`, and `orion chat`) — the
+warning is deliberate and the limits stay as documented; re-enable
+the sandbox to close the classes.
+
 ### Mechanism (surveyed on this VM, 2026-11-13)
 
 - `bwrap` and `firejail` are **not installed**; `systemd-run

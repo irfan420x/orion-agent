@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +98,59 @@ func TestSandboxEnvOff(t *testing.T) {
 	}
 	if cfg.Sandbox.Enabled {
 		t.Error("ORION_SANDBOX=off must leave the sandbox disabled")
+	}
+}
+
+// TestSandboxDisabledWarning (F-A23W2-16): the warning is empty
+// when the sandbox is on and LOUD when it is off — naming all four
+// documented denylist bypass classes that are uncontained without
+// the sandbox, the sensitive paths they expose, and the fix. The
+// warning is a warning, not a Validate error: the opt-out is a
+// deliberate operator choice, so Validate must still pass it.
+func TestSandboxDisabledWarning(t *testing.T) {
+	cfg := Default()
+	if w := cfg.SandboxDisabledWarning(); w != "" {
+		t.Errorf("SandboxDisabledWarning with sandbox on = %q, want empty", w)
+	}
+	cfg.Sandbox.Enabled = false
+	w := cfg.SandboxDisabledWarning()
+	for _, want := range []string{
+		"WARNING",
+		"sandbox.enabled=false",
+		"ORION_SANDBOX=off",
+		// The four bypass classes (security.go "Deliberate limits").
+		"variable cannot be resolved",
+		"symlink",
+		"string concatenation",
+		"file descriptor",
+		// What they expose, and the fix.
+		".orion/config.json",
+		".ssh",
+		".gnupg",
+		"sandbox.enabled=true",
+		"README.md",
+		"SECURITY.md",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("sandbox-disabled warning %q does not mention %q", w, want)
+		}
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate with sandbox off = %v, want nil (opt-out warns, it does not fail startup)", err)
+	}
+}
+
+// TestSandboxDisabledWarningFromEnvOff: an ORION_SANDBOX=off load
+// produces the warning — the env opt-out is the same opt-out as
+// the file one, so it must warn the same way.
+func TestSandboxDisabledWarningFromEnvOff(t *testing.T) {
+	t.Setenv("ORION_SANDBOX", "off")
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.json"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if w := cfg.SandboxDisabledWarning(); w == "" {
+		t.Error("SandboxDisabledWarning with ORION_SANDBOX=off = empty, want the LOUD opt-out warning")
 	}
 }
 
