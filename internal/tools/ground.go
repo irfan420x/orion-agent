@@ -1772,6 +1772,26 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		if runes := []rune(el.Name); len(runes) > groundMaxNameRunes {
 			el.Name = string(runes[:groundMaxNameRunes-1]) + "…"
 		}
+		// Duplicate listing (F-M2R-36): the same control can be
+		// reported twice (frame double-report — e.g. CSD buttons
+		// at y≈20 and y≈29, or a launcher listed twice with the
+		// same box). Same role+name with heavily overlapping
+		// boxes is one element, not two: keep the larger box
+		// (the visible control; the frame sliver is the smaller
+		// slice). The check runs against the element's own
+		// window group, before the round-robin pick, so a
+		// duplicate takes neither a list slot nor a count
+		// toward total_matched.
+		winIdx := -1
+		if el.Win != nil {
+			winIdx = *el.Win
+		}
+		if dup := findGroundDuplicate(groups[winIdx], el); dup >= 0 {
+			if el.W*el.H > groups[winIdx][dup].W*groups[winIdx][dup].H {
+				groups[winIdx][dup] = el
+			}
+			continue
+		}
 		if el.Win == nil {
 			add(-1, el)
 			continue
@@ -1830,6 +1850,32 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		}
 	}
 	return kept, tree.WalkedNodes, eligible, eligible > len(kept)
+}
+
+// findGroundDuplicate returns the index in kept of an element
+// that is the same control as el — same role and name, with boxes
+// overlapping by at least half the smaller box's area — or -1.
+// Adjacent distinct controls do not overlap at all, so the
+// threshold only fires on double-reports of one control.
+func findGroundDuplicate(kept []atspiElement, el atspiElement) int {
+	for i, k := range kept {
+		if k.Role != el.Role || k.Name != el.Name {
+			continue
+		}
+		ix0 := max(k.X, el.X)
+		iy0 := max(k.Y, el.Y)
+		ix1 := min(k.X+k.W, el.X+el.W)
+		iy1 := min(k.Y+k.H, el.Y+el.H)
+		if ix1 <= ix0 || iy1 <= iy0 {
+			continue
+		}
+		inter := (ix1 - ix0) * (iy1 - iy0)
+		smaller := min(k.W*k.H, el.W*el.H)
+		if smaller > 0 && inter*2 >= smaller {
+			return i
+		}
+	}
+	return -1
 }
 
 // clampNorm clamps a centre_norm coordinate to the documented

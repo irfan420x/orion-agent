@@ -1138,6 +1138,48 @@ func TestGroundKWinCorrectionFirefox(t *testing.T) {
 // past the right edge passed and its centre_norm exceeded 1000.
 // An element whose centre is outside the captured image is now
 // dropped.
+// TestGroundDuplicateElementsDeduped pins F-M2R-36: the same
+// control reported twice (frame double-report) must be listed
+// once. The CSD case keeps the larger box (the visible button,
+// y≈29 h44) over the frame sliver (y≈20 h18); an identical-box
+// repeat collapses to one entry.
+func TestGroundDuplicateElementsDeduped(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = `{"windows": [
+		{"title": "Desktop — Plasma", "app": "plasmashell", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "button", "name": "Application Launcher", "x": 10, "y": 10, "w": 40, "h": 40, "showing": true},
+		{"role": "button", "name": "Application Launcher", "x": 10, "y": 10, "w": 40, "h": 40, "showing": true},
+		{"role": "button", "name": "Minimize", "x": 1800, "y": 20, "w": 30, "h": 18, "showing": true},
+		{"role": "button", "name": "Minimize", "x": 1800, "y": 29, "w": 30, "h": 44, "showing": true},
+		{"role": "button", "name": "Close", "x": 1870, "y": 29, "w": 30, "h": 44, "showing": true},
+		{"role": "button", "name": "Close", "x": 1870, "y": 29, "w": 30, "h": 44, "showing": true}],
+	"focused_window": {"title": "Desktop — Plasma", "app": "plasmashell"},
+	"walked_nodes": 6}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if len(s.Elements) != 3 {
+		t.Fatalf("got %d elements, want 3 (Launcher, Minimize, Close): %+v", len(s.Elements), s.Elements)
+	}
+	byName := make(map[string]groundElement, len(s.Elements))
+	for _, el := range s.Elements {
+		byName[el.Name] = el
+	}
+	min := byName["Minimize"]
+	if min.Box != (groundBox{X: 1800, Y: 29, W: 30, H: 44}) {
+		t.Errorf("Minimize box = %+v, want the larger visible box {1800 29 30 44}", min.Box)
+	}
+	if min.Centre != (groundPoint{X: 1815, Y: 51}) {
+		t.Errorf("Minimize centre = %+v, want {1815 51} (the visible button)", min.Centre)
+	}
+	if s.TotalMatched != 3 {
+		t.Errorf("total_matched = %d, want 3 (duplicates are not distinct matches)", s.TotalMatched)
+	}
+	if s.Truncated {
+		t.Errorf("truncated = true, want false")
+	}
+}
+
 func TestGroundOffscreenRightDropped(t *testing.T) {
 	resetGroundSnapshots()
 	env := newFakeGroundEnv(t)
