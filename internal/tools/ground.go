@@ -987,6 +987,29 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		return denied("%v", err)
 	}
 
+	// KWin geometry query FIRST (F-M2R-30): the compositor's window
+	// list is a cheap sensitive source, and the sensitive-window
+	// check runs on it BEFORE the AT-SPI walk. The old order walked
+	// the whole tree (and queried KWin) before refusing, so a
+	// refusal still enumerated every window. The KWin list sees
+	// the same windows the walk would; when KWin is unavailable
+	// the walk still happens and the AT-SPI title check below
+	// refuses instead — the KWin pre-check is an early refusal,
+	// never the only check. The check reads only the Sens flag:
+	// the KWin script matches titles itself and reports only the
+	// matched pattern, never the title (F-M2R-15) — no KWin
+	// caption ever reaches Go. The raw KWin output is kept for
+	// the correction step after the walk, so the helper still
+	// runs once.
+	kwin, _ := t.kwinWindows(ctx)
+	if kwin != nil {
+		for _, w := range kwin {
+			if w.Sens != "" {
+				return denied("this screen shows a %s: I will not capture, ground or describe it", SensitiveTitleCategory(w.Sens))
+			}
+		}
+	}
+
 	// AT-SPI backend probe at Execute start, never cached: python3
 	// present + gi.Atspi importable. A missing backend (or any
 	// helper failure) is not an error — grounding degrades to
@@ -1012,17 +1035,8 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// returns, with no correction field, rather than failing or
 	// faking coordinates.
 	var correction *groundCorrection
-	var kwinOut *kwinOutput
-	if kwinPath, werr := t.writeKWinHelper(); werr == nil {
-		if raw, rerr := t.runKWinHelper(ctx, kwinPath); rerr == nil {
-			var kout kwinOutput
-			if jerr := json.Unmarshal(raw, &kout); jerr == nil {
-				kwinOut = &kout
-			}
-		}
-	}
-	if tree != nil && kwinOut != nil {
-		offsets := matchKWinWindows(tree, kwinOut.Windows)
+	if tree != nil && kwin != nil {
+		offsets := matchKWinWindows(tree, kwin)
 		if len(offsets) > 0 {
 			correction = &groundCorrection{Source: "kwin", Windows: []groundWindowShift{}}
 			for i := range tree.Windows {
@@ -1044,7 +1058,9 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// tree cannot (F-M2R-4). The KWin script matches titles
 	// itself and reports only the matched pattern, never the
 	// title (F-M2R-15). The refusal names the category only,
-	// never the title.
+	// never the title. This check stays even though KWin's Sens
+	// flag was checked above: KWin may be unavailable, and a
+	// title AT-SPI sees but KWin missed must still refuse.
 	if tree != nil {
 		titles := make([]string, 0, len(tree.Windows))
 		for _, w := range tree.Windows {
@@ -1054,8 +1070,8 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 			return denied("this screen shows a %s: I will not capture, ground or describe it", SensitiveTitleCategory(hit))
 		}
 	}
-	if kwinOut != nil {
-		for _, kw := range kwinOut.Windows {
+	if kwin != nil {
+		for _, kw := range kwin {
 			if kw.Sens != "" {
 				return denied("this screen shows a %s: I will not capture, ground or describe it", SensitiveTitleCategory(kw.Sens))
 			}
@@ -1067,7 +1083,7 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// at all could be on screen unseen. The capture does NOT
 	// proceed on an unverified screen; the caller must fix the
 	// backend (AT-SPI or KWin) and ground again.
-	if tree == nil && kwinOut == nil {
+	if tree == nil && kwin == nil {
 		return denied("cannot verify no sensitive window is visible (no accessibility tree and no KWin window list): I will not capture blind")
 	}
 
@@ -1111,12 +1127,12 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// grounding proceeds with geometry_verified false (the
 	// reported tree age is then the honest bound).
 	geometryVerified := false
-	if kwinOut != nil {
+	if kwin != nil {
 		if kwinPath2, werr := t.writeKWinHelper(); werr == nil {
 			if raw2, rerr := t.runKWinHelper(ctx, kwinPath2); rerr == nil {
 				var kout2 kwinOutput
 				if jerr := json.Unmarshal(raw2, &kout2); jerr == nil {
-					if sameKWinGeometry(kwinOut.Windows, kout2.Windows) {
+					if sameKWinGeometry(kwin, kout2.Windows) {
 						geometryVerified = true
 					} else {
 						return failed("the screen moved during grounding (a window changed geometry between the tree walk and the capture): ground again for fresh markers")
@@ -1419,6 +1435,26 @@ func sameKWinGeometry(a, b []kwinWindow) bool {
 		}
 	}
 	return true
+}
+
+// kwinWindows runs the KWin helper once and returns the parsed
+// window list. (nil, err) on any failure (write, run, parse) —
+// the caller grounds uncorrected, and a nil list skips the
+// title-only pre-check (F-M2R-30) without failing the grounding.
+func (t *groundTool) kwinWindows(ctx context.Context) ([]kwinWindow, error) {
+	kwinPath, err := t.writeKWinHelper()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := t.runKWinHelper(ctx, kwinPath)
+	if err != nil {
+		return nil, err
+	}
+	var out kwinOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("KWin helper output does not parse: %v", err)
+	}
+	return out.Windows, nil
 }
 
 // defaultRunHelper runs the helper with the depth/node caps and

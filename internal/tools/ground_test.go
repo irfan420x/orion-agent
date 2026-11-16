@@ -35,6 +35,7 @@ type fakeGroundEnv struct {
 	captures int
 	helperOK bool   // runHelper succeeds
 	helper   string // canned helper JSON ("" = default tree)
+	helperCalled bool // runHelper was invoked (F-M2R-30 ordering)
 	kwinOK   bool   // runKWinHelper succeeds
 	kwin     string // canned KWin JSON
 }
@@ -81,6 +82,7 @@ func newFakeGroundEnv(t *testing.T) *fakeGroundEnv {
 		return "", nil
 	}
 	tool.runHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		env.helperCalled = true
 		if !env.helperOK {
 			return nil, errors.New("fake helper failure")
 		}
@@ -645,6 +647,39 @@ func TestGroundSensitiveRefusal(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "Bitwarden") {
 		t.Errorf("refusal names the window title %q — titles can carry secrets", err.Error())
+	}
+	if env.captures != 0 {
+		t.Errorf("sensitive refusal still captured %d screenshot(s)", env.captures)
+	}
+}
+
+// TestGroundKWinTitlePrecheckRefusesBeforeWalk pins F-M2R-30:
+// when the KWin window list already flags a sensitive window, the
+// refusal must happen BEFORE the AT-SPI walk — no enumeration, no
+// capture. The KWin signal is the Sens flag the helper script sets
+// by matching the caption itself (F-M2R-15: no KWin caption ever
+// reaches Go); the AT-SPI title check stays as the fallback when
+// KWin is unavailable.
+func TestGroundKWinTitlePrecheckRefusesBeforeWalk(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.kwinOK = true
+	env.kwin = `{"kwin_windows": [{"cls": "bitwarden", "active": true, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600], "sens": "bitwarden"}]}`
+	// The AT-SPI tree would also refuse — the point is it is
+	// never walked.
+	env.helper = `{"windows": [
+		{"title": "Bitwarden — Vault", "app": "Bitwarden", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 800, "h": 600}],
+	"elements": [], "focused_window": {"title": "Bitwarden — Vault", "app": "Bitwarden"}, "walked_nodes": 3}`
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("sensitive window should refuse grounding")
+	}
+	var terr *ToolError
+	if !errors.As(err, &terr) || terr.Kind != "denied" {
+		t.Errorf("error = %v, want denied ToolError", err)
+	}
+	if env.helperCalled {
+		t.Errorf("KWin pre-check refusal still ran the AT-SPI walk — enumeration must happen after the check")
 	}
 	if env.captures != 0 {
 		t.Errorf("sensitive refusal still captured %d screenshot(s)", env.captures)
