@@ -113,7 +113,7 @@ func TestVisionInfoContext(t *testing.T) {
 		{"openai", "gpt-4o", true},
 		{"openai", "gpt-3.5-turbo", false},
 		{"ollama", "llama3.1", false},
-		{"anthropic", "claude-sonnet-4-5", false},
+		{"anthropic", "claude-sonnet-4-5", true}, // F-M2R-31: Claude 4.5 renders image blocks, so it is vision-capable
 		{"unknown-provider", "whatever", false},
 	}
 	for _, c := range cases {
