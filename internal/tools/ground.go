@@ -509,8 +509,12 @@ type WindowGeometry struct {
 // same-second id collision could click the wrong chat's element),
 // the window geometry each element was grounded in (the geometry
 // binding — a click refuses when that window has moved or
-// resized since the grounding), and the sequence number that
-// decides supersession (only the newest snapshot is live).
+// resized since the grounding), details carries the full element
+// (role, name, box) alongside the centre: the input tool's
+// pre-click re-check (F-A23W2-1) matches a fresh AT-SPI read
+// against the grounded element's identity, not just its id,
+// and the sequence number that decides supersession (only the
+// newest snapshot is live).
 type groundSnapshot struct {
 	id             string
 	chatID         int64 // 0 when the grounding ran with no chat in context (CLI, tests)
@@ -518,6 +522,7 @@ type groundSnapshot struct {
 	elements       map[int]bool
 	centres        map[int]groundPoint
 	elementWindows map[int]WindowGeometry
+	details        map[int]groundElement
 	seq            int64
 }
 
@@ -557,18 +562,26 @@ var groundSnapshots = newGroundSnapshotRegistry()
 // element id to the geometry of the window that held it at
 // ground time (nil when the grounding recorded none — e.g. an
 // untagged element — in which case that element has no geometry
-// binding and only the TTL/supersession checks apply).
+// binding and only the TTL/supersession checks apply). The full element is
+// stored too, with an empty name normalised to the role exactly
+// as the grounding summary does, so the pre-click re-check can
+// match a fresh tree read against the grounded identity.
 func (r *groundSnapshotRegistry) register(id string, chatID int64, takenAt time.Time, elements []groundElement, windows map[int]WindowGeometry) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seq++
 	els := make(map[int]bool, len(elements))
 	cen := make(map[int]groundPoint, len(elements))
+	det := make(map[int]groundElement, len(elements))
 	for _, e := range elements {
 		els[e.ID] = true
 		cen[e.ID] = e.Centre
+		if strings.TrimSpace(e.Name) == "" {
+			e.Name = e.Role
+		}
+		det[e.ID] = e
 	}
-	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, chatID: chatID, takenAt: takenAt, elements: els, centres: cen, elementWindows: windows, seq: r.seq})
+	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, chatID: chatID, takenAt: takenAt, elements: els, centres: cen, elementWindows: windows, details: det, seq: r.seq})
 	for len(r.snapshots) > groundMaxSnapshots {
 		r.snapshots = r.snapshots[1:]
 	}

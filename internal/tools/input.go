@@ -820,18 +820,18 @@ func (t *inputTool) doMove(ctx context.Context, x, y int) (cursorPos, int, error
 
 // doClick moves to the target (closed-loop — a failed move
 // aborts before any click, so a click never lands in the wrong
-// place) and then clicks. For a snapshot click the snapshot is
-// re-validated immediately before the click: the element could
-// have gone stale during the sensitive check and the move, and
-// a stale element must never be clicked.
+// place) and then clicks. For a snapshot click the element is
+// re-validated fresh immediately before the click: the registry
+// check alone (TTL/id) cannot see that the element moved since
+// grounding, and a stale centre can land on a different control.
 func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snapshotID string, elementID *int, target cursorPos) (cursorPos, int, error) {
 	final, iters, err := t.doMove(ctx, target.X, target.Y)
 	if err != nil {
 		return cursorPos{}, iters, err
 	}
 	if snapshotID != "" && elementID != nil {
-		if _, err := GroundSnapshotElementCentre(ctx, snapshotID, *elementID); err != nil {
-			return cursorPos{}, iters, fmt.Errorf("snapshot went stale before the click: %v (ground again)", err)
+		if err := t.revalidateSnapshotElement(ctx, snapshotID, *elementID, final); err != nil {
+			return cursorPos{}, iters, err
 		}
 	}
 	code := inputClickCodes[button]
@@ -839,6 +839,72 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 		return cursorPos{}, iters, fmt.Errorf("ydotool click failed: %v", err)
 	}
 	return final, iters, nil
+}
+
+// revalidateSnapshotElement re-reads the live accessibility tree
+// right before a snapshot click and checks the element is still
+// at the cursor: an element with the grounded role and name must
+// be present with its centre within tolerance of the
+// oracle-confirmed cursor position (the position the click is
+// about to land on). The check runs after the move, so it covers
+// the whole gap since grounding — the page scrolling, loading or
+// reflowing, or the window moving, in between. A moved, vanished
+// or unverifiable element refuses the click: the provider must
+// ground again. The fresh boxes get the same KWin correction the
+// grounding applied, or a ~29 px Wayland shift would refuse
+// every click; a KWin failure therefore refuses too, rather than
+// comparing uncorrected boxes against corrected centres.
+//
+// Cost, stated plainly: one more AT-SPI walk (~5 s on a heavy
+// page) per snapshot click, on top of the sensitive check's
+// walk. That is the price of clicking a live element instead of
+// a remembered coordinate.
+func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID string, elementID int, cursor cursorPos) error {
+	snap, err := groundSnapshots.lookup(snapshotID, chatIDFromContext(ctx), elementID, time.Now())
+	if err != nil {
+		return fmt.Errorf("snapshot went stale before the click: %v (ground again)", err)
+	}
+	want := snap.details[elementID]
+	tree, err := t.ground.atspiTree(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: the accessibility tree failed (%v) — ground again", elementID, want.Role, want.Name, err)
+	}
+	if tree == nil {
+		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: no accessibility tree — ground again", elementID, want.Role, want.Name)
+	}
+	cur, err := t.readCursor(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: the KWin oracle failed (%v) — ground again", elementID, want.Role, want.Name, err)
+	}
+	if len(cur.Windows) > 0 {
+		applyWindowOffsets(tree, matchKWinWindows(tree, cur.Windows))
+	}
+	// The role set is the snapshot's own roles: the grounding
+	// may have used a custom roles filter, and the fresh walk
+	// must see the same elements it saw.
+	roleSet := make(map[string]bool, len(snap.details))
+	for _, e := range snap.details {
+		roleSet[e.Role] = true
+	}
+	fresh, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements)
+	var moved *atspiElement // same role+name, centre elsewhere
+	for i := range fresh {
+		el := &fresh[i]
+		if el.Role != want.Role || el.Name != want.Name {
+			continue
+		}
+		cx, cy := el.X+el.W/2, el.Y+el.H/2
+		if withinTolerance(cursorPos{X: cx, Y: cy}, cursor.X, cursor.Y) {
+			return nil // still at the cursor: click
+		}
+		if moved == nil {
+			moved = el
+		}
+	}
+	if moved != nil {
+		return fmt.Errorf("element %d (%s %q) has moved since grounding: it was at (%d, %d), now at (%d, %d) — the click target is stale: ground again", elementID, want.Role, want.Name, want.Centre.X, want.Centre.Y, moved.X+moved.W/2, moved.Y+moved.H/2)
+	}
+	return fmt.Errorf("element %d (%s %q) is no longer on screen — ground again and pick an element from the new list", elementID, want.Role, want.Name)
 }
 
 // windowInfo enumerates the visible windows for the sensitive

@@ -365,17 +365,12 @@ func TestInputClickButtonsAndDouble(t *testing.T) {
 
 func TestInputClickBySnapshot(t *testing.T) {
 	resetGroundSnapshots()
-	// Both elements are bound to the Firefox window exactly as
-	// the benign fake tree reports it (0,0,1920,1080): the
-	// geometry binding holds, so the click proceeds.
-	groundSnapshots.register("g-test-1", 0, time.Now(), []groundElement{
-		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
-		{ID: 2, Centre: groundPoint{X: 960, Y: 484}},
-	}, map[int]WindowGeometry{
-		1: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},
-		2: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},
-	})
+	registerSignInSnapshot()
 	env := newFakeInputEnv(t)
+	env.kwinWindows = firefoxKWinWindow(0)
+	// The fresh tree still shows the button at its grounded
+	// centre: the pre-click re-check passes and the click lands.
+	env.tree = treeWithButtonJSON(910, 378, 100, 50)
 	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
 	s := parseInputSummary(t, res)
 	if !s.Reached || s.Target == nil || *s.Target != (cursorPos{X: 960, Y: 403}) {
@@ -977,5 +972,125 @@ func TestInputClickBySnapshotMovedWindow(t *testing.T) {
 	}
 	if len(env.ydotoolCalls) != 0 {
 		t.Errorf("got %d ydotool calls, want 0 (refused before touching the desktop)", len(env.ydotoolCalls))
+	}
+}
+
+// --- F-A23W2-1 (stale-centre click): the element must be
+// re-read fresh right before the click. ---
+
+// treeWithButtonJSON builds a canned AT-SPI tree whose only
+// element is one "Sign in" button at (x, y, w, h) in the
+// Firefox window, so a test can move the button between the
+// grounding and the click.
+func treeWithButtonJSON(x, y, w, h int) string {
+	return fmt.Sprintf(`{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "button", "name": "Sign in", "x": %d, "y": %d, "w": %d, "h": %d, "win": 0}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 140}`, x, y, w, h)
+}
+
+// firefoxKWinWindow is the KWin window matching the Firefox
+// window in treeWithButtonJSON: same title, class and size, so
+// the correction is (dx, dy) — (0, 0) unless dy is given.
+func firefoxKWinWindow(dy int) []kwinWindow {
+	return []kwinWindow{{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", FG: [4]int{0, dy, 1920, 1080}, CG: [4]int{0, dy, 1920, 1080}}}
+}
+
+func registerSignInSnapshot() {
+	groundSnapshots.register("g-test-1", 0, time.Now(), []groundElement{
+		{ID: 1, Role: "button", Name: "Sign in", Box: groundBox{X: 910, Y: 378, W: 100, H: 50}, Centre: groundPoint{X: 960, Y: 403}},
+	}, map[int]WindowGeometry{
+		1: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},
+	})
+}
+
+func TestInputClickRefusesMovedElement(t *testing.T) {
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = firefoxKWinWindow(0)
+	// The page scrolled after grounding: the same button is now
+	// 197 px lower. The snapshot is still fresh (TTL/id pass),
+	// so only a fresh re-read can catch this.
+	env.tree = treeWithButtonJSON(910, 575, 100, 50)
+	err := env.callErr(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	if !strings.Contains(err.Error(), "moved") || !strings.Contains(err.Error(), "ground again") {
+		t.Errorf("moved-element click err = %v, want the 'has moved, ground again' refusal", err)
+	}
+	if got := len(env.clickCalls()); got != 0 {
+		t.Errorf("got %d click calls, want 0 (a moved element must never be clicked)", got)
+	}
+}
+
+func TestInputClickRefusesVanishedElement(t *testing.T) {
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = firefoxKWinWindow(0)
+	// The button is gone from the fresh tree (dialog closed).
+	env.tree = benignInputTreeJSON()
+	err := env.callErr(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	if !strings.Contains(err.Error(), "no longer on screen") || !strings.Contains(err.Error(), "ground again") {
+		t.Errorf("vanished-element click err = %v, want the 'no longer on screen, ground again' refusal", err)
+	}
+	if got := len(env.clickCalls()); got != 0 {
+		t.Errorf("got %d click calls, want 0", got)
+	}
+}
+
+func TestInputClickRefusesWhenElementCannotBeRechecked(t *testing.T) {
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	// The accessibility tree is gone at click time: the element
+	// cannot be re-checked, so the click is refused rather than
+	// trusted on the stale centre (fail closed).
+	env.treeErr = true
+	env.xdotoolTitles = []string{"Sign in to GitHub · GitHub — Mozilla Firefox"}
+	err := env.callErr(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	if !strings.Contains(err.Error(), "cannot re-check") {
+		t.Errorf("unverifiable-element click err = %v, want the fail-closed 'cannot re-check' refusal", err)
+	}
+	if got := len(env.clickCalls()); got != 0 {
+		t.Errorf("got %d click calls, want 0", got)
+	}
+}
+
+func TestInputClickProceedsWhenElementStillThere(t *testing.T) {
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = firefoxKWinWindow(0)
+	// The fresh tree still shows the button at its grounded
+	// centre: the click proceeds.
+	env.tree = treeWithButtonJSON(910, 378, 100, 50)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	if s := parseInputSummary(t, res); !s.Reached {
+		t.Errorf("summary = %+v, want reached (element confirmed at its centre)", s)
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputClickRecheckAppliesKWinCorrection(t *testing.T) {
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	// KWin places the Firefox window 29 px lower than AT-SPI
+	// reports (the M2 F2 shift): the raw tree button at y=349
+	// (centre 374) corrects to the grounded centre (960, 403).
+	// Without the correction the re-check would refuse every
+	// click on a Wayland window.
+	env.kwinWindows = firefoxKWinWindow(29)
+	env.tree = treeWithButtonJSON(910, 349, 100, 50)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	if s := parseInputSummary(t, res); !s.Reached {
+		t.Errorf("summary = %+v, want reached (KWin-corrected centre matches)", s)
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
 	}
 }
