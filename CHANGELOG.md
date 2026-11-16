@@ -6,6 +6,45 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Audit 23 fix batch (2026-11-16)
+
+Thirteen Audit 23 / MEDIA-review findings fixed, one commit per
+finding, all verified by Muse #1 in fresh clones (package tests +
+full suite). Suite: **1,869 tests total (1,865 pass, 0 fail, 4 skip),
+24/24 packages**, plain AND `-race`, 0 data races.
+
+- **F-A23-2 (P1):** child agents no longer run destructive tools
+  ungated — `input`/`ground`/`screenshot` removed from the child
+  registry, plus a non-interactive deny-by-default child gate.
+- **F-M1 (P1) + F-A23W2-6 (P1):** MEDIA refuses `/proc`, `/sys`,
+  `/dev` and any file with more than one hard link (config-exfil
+  paths closed).
+- **F-A23W2-12 (P2) + F-A23W2-24 (P3):** MEDIA upload now
+  re-verifies the opened fd (O_NOFOLLOW + `/proc/self/fd`) and
+  enforces the size cap while streaming.
+- **F-A23W3-2 (P1):** system prompt splits denied vs failed — a
+  denial is stop-and-report, never a route-around; "installing the
+  missing tool" removed.
+- **F-A23W3-13 (P2):** external tool results are delimited as
+  untrusted data at the registry choke point.
+- **F-A23W2-25 (P3):** `validateArgs` rejects unknown parameters.
+- **F-A23W2-15 (P2):** `cron_schedule` is now ClassNetwork
+  (prompted) — no more approval-free persistent jobs.
+- **F-A23-POLL (P2):** poll multi-log fixed — each update id is
+  logged once per PollStream (was 243x for one update).
+- **F-A23W3-12 (P2):** leftover-turn interrupt now cancels the
+  live turn; the redirect ack is sent only when a live turn was
+  actually cancelled.
+- **F-A23W3-18 (P2):** unattended computer-use refusal honours
+  either ctx marker (tools or permissions).
+- **F-A23W2-16 (P2):** LOUD startup warning when the sandbox is
+  off, naming the four denylist bypass classes.
+
+Noted, not fixed: F-A23-W4-3 (screenshot staging needs the user's
+design decision), F-M3 (denylist-only residual surface — user's
+ordered behaviour), F-M2R-2 (investigated: NOT a bug — session-wide
+AT-SPI bus from login explains desktop Firefox visibility).
+
 ### Computer-use M3 — input (`input`, pin 31, Destructive)
 
 Third computer-use tool (`input`, pin 31 — pins 26–29 reserved
