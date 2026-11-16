@@ -38,8 +38,11 @@
 //     everyone (fail closed). cron_list stays readable by any
 //     allowlisted member: it is read-only, and the ids it
 //     reveals cannot cancel anything without the owner check.
-//   - Approval: the MANAGEMENT tools are Safe — they only write
-//     Orion's own job files. The scheduled TURN is a normal agent
+//   - Approval: cron_schedule is ClassNetwork (prompted, Audit 23
+//     F-A23W2-15) — a scheduled job is a persistent recurring
+//     agent turn, so creating one needs the user's approval.
+//     cron_list, cron_cancel and cron_enable stay Safe — they only
+//     read or stop Orion's own job files. The scheduled TURN is a normal agent
 //     turn on the chat's agent, through the same gate machinery
 //     as an interactive turn (the daemon's runner sets the
 //     approval context to the job's chat and requester, and the
@@ -1282,13 +1285,19 @@ func (t *cronScheduleTool) Definition() model.ToolDefinition {
 	}
 }
 
-// RiskClass declares the tool safe: it persists only Orion's own
-// 0600 per-chat job file (cron.json, paths derived from config
-// and context — never a user-supplied path), never user files,
-// never the shell, never the network. The scheduled turn's own
-// actions are gated separately by the turn machinery, not by
-// this tool's class.
-func (t *cronScheduleTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+// RiskClass declares the tool ClassNetwork (prompted, Audit 23
+// F-A23W2-15): scheduling creates a persistent recurring job — a
+// prompt the agent runs as unattended turns in the future — so
+// the model must not create one without the user's approval. It
+// persists only Orion's own 0600 per-chat job file (cron.json,
+// paths derived from config and context — never a user-supplied
+// path), never user files, never the shell, never the network;
+// the class is about the persistence, not the write. The
+// scheduled turn's own actions are gated separately by the turn
+// machinery, not by this tool's class. cron_list, cron_cancel
+// and cron_enable stay Safe: they only read or stop Orion's own
+// jobs.
+func (t *cronScheduleTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
 
 type cronScheduleArgs struct {
 	Expression string `json:"expression"`

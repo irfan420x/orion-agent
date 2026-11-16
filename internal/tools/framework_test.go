@@ -415,7 +415,9 @@ func TestKnownBuiltInToolsMatchesFactorySet(t *testing.T) {
 // over every built-in tool name, the Destructive set must be
 // exactly {shell_exec, file_write, file_edit, subagent_spawn,
 // input} and
-// the Network set exactly {web_fetch, web_search}; every built-in
+// the Network set exactly {web_fetch, web_search, cron_schedule}
+// (cron_schedule: Audit 23 F-A23W2-15 — a persistent recurring
+// job needs approval); every built-in
 // name must be EXPLICITLY classified (ClassifyKnown), so a Safe
 // tool is Safe because it is listed in the safe map, never because
 // Classify defaulted it; and the classified-name set
@@ -423,7 +425,7 @@ func TestKnownBuiltInToolsMatchesFactorySet(t *testing.T) {
 // for a tool that no longer exists fails loudly here too.
 func TestClassifyMapsMatchFactorySet(t *testing.T) {
 	wantDestructive := map[string]bool{"shell_exec": true, "file_write": true, "file_edit": true, "subagent_spawn": true, "input": true}
-	wantNetwork := map[string]bool{"web_fetch": true, "web_search": true}
+	wantNetwork := map[string]bool{"cron_schedule": true, "web_fetch": true, "web_search": true}
 	gotDestructive := map[string]bool{}
 	gotNetwork := map[string]bool{}
 	for _, name := range fullBuiltInToolNames(t) {

@@ -947,7 +947,14 @@ func TestCronRegistryWiring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultRegistry: %v", err)
 	}
-	for _, name := range []string{"cron_schedule", "cron_list", "cron_cancel"} {
+	for name, want := range map[string]permissions.Class{
+		// Audit 23 F-A23W2-15: cron_schedule is ClassNetwork
+		// (prompted) — a persistent recurring job needs
+		// approval. cron_list and cron_cancel stay Safe.
+		"cron_schedule": permissions.ClassNetwork,
+		"cron_list":     permissions.ClassSafe,
+		"cron_cancel":   permissions.ClassSafe,
+	} {
 		tool, ok := reg.Get(name)
 		if !ok {
 			t.Fatalf("registry has no %q", name)
@@ -956,11 +963,11 @@ func TestCronRegistryWiring(t *testing.T) {
 		if !ok {
 			t.Fatalf("%q does not implement RiskClasser", name)
 		}
-		if rc.RiskClass() != permissions.ClassSafe {
-			t.Fatalf("%q risk class = %v, want safe", name, rc.RiskClass())
+		if rc.RiskClass() != want {
+			t.Fatalf("%q risk class = %v, want %v", name, rc.RiskClass(), want)
 		}
-		if permissions.Classify(name) != permissions.ClassSafe {
-			t.Fatalf("gate classifies %q as %v, want safe", name, permissions.Classify(name))
+		if permissions.Classify(name) != want {
+			t.Fatalf("gate classifies %q as %v, want %v", name, permissions.Classify(name), want)
 		}
 		if _, known := permissions.ClassifyKnown(name); !known {
 			t.Fatalf("%q is not explicitly classified", name)
