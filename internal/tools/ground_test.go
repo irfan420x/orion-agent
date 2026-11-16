@@ -1316,3 +1316,143 @@ func TestGroundTimeBudget(t *testing.T) {
 		t.Errorf("over-budget grounding still captured %d screenshot(s)", env.captures)
 	}
 }
+
+// --- F-M2R-11: markers from a stale tree ---
+
+// TestGroundStalenessReported pins the honest staleness
+// accounting: the summary reports the real walk duration and
+// tree age instead of the old "~0.4 s" claim, and
+// geometry_verified says whether the post-capture KWin
+// re-check ran and matched.
+func TestGroundStalenessReported(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.tool.runHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		time.Sleep(60 * time.Millisecond)
+		return []byte(groundTreeJSON()), nil
+	}
+	// KWin available and unchanged: the re-check verifies.
+	env.kwinOK = true
+	env.kwin = kwinFirefoxJSON()
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if s.TreeWalkMs < 40 {
+		t.Errorf("tree_walk_ms = %d, want >= 40 (60 ms walk)", s.TreeWalkMs)
+	}
+	if s.TreeAgeMs < 0 {
+		t.Errorf("tree_age_ms = %d, want >= 0", s.TreeAgeMs)
+	}
+	if !s.GeometryVerified {
+		t.Errorf("geometry_verified = false, want true (KWin matched before and after)")
+	}
+	// KWin unavailable: no re-check, verified stays false —
+	// and the walk duration is still reported honestly.
+	env2 := newFakeGroundEnv(t)
+	env2.tool.runHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		time.Sleep(60 * time.Millisecond)
+		return []byte(groundTreeJSON()), nil
+	}
+	env2.advance()
+	s2 := parseGroundSummary(t, env2.call(t, `{}`))
+	if s2.TreeWalkMs < 40 {
+		t.Errorf("tree_walk_ms = %d, want >= 40 (60 ms walk, no KWin)", s2.TreeWalkMs)
+	}
+	if s2.GeometryVerified {
+		t.Errorf("geometry_verified = true, want false (no KWin re-check ran)")
+	}
+}
+
+// TestGroundScreenMovedRefuses pins the post-capture movement
+// re-check: a window that moved between the tree walk and the
+// capture refuses the grounding — the markers would land on the
+// window's old position, so no image is returned.
+func TestGroundScreenMovedRefuses(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	calls := 0
+	env.tool.runKWinHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte(kwinFirefoxJSON()), nil
+		}
+		// Second call (post-capture): Firefox moved 100 px right.
+		return []byte(`{"kwin_windows": [
+			{"cls": "firefox-esr", "active": true, "minimized": false, "fg": [100, 29, 1920, 993], "cg": [100, 29, 1920, 993], "sens": ""},
+			{"cls": "kate", "active": false, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600], "sens": ""}]}`), nil
+	}
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("moved-window grounding = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "moved") || !strings.Contains(err.Error(), "ground again") {
+		t.Errorf("moved-window grounding err = %v, want the screen-moved refusal", err)
+	}
+	if calls != 2 {
+		t.Errorf("KWin helper ran %d time(s), want 2 (pre + post capture)", calls)
+	}
+}
+
+// TestGroundScreenMovedKWinFailureProceeds pins the re-check's
+// failure mode: when the post-capture KWin run fails, movement
+// cannot be proven either way, so the grounding proceeds —
+// with geometry_verified false, so the model sees the bound.
+func TestGroundScreenMovedKWinFailureProceeds(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	calls := 0
+	env.tool.runKWinHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte(kwinFirefoxJSON()), nil
+		}
+		return nil, errors.New("fake post-capture KWin failure")
+	}
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if s.GeometryVerified {
+		t.Errorf("geometry_verified = true, want false (post-capture KWin failed)")
+	}
+	if s.Coverage != "grounded" {
+		t.Errorf("coverage = %q, want grounded (re-check failure degrades, never fails)", s.Coverage)
+	}
+}
+
+func TestSameKWinGeometry(t *testing.T) {
+	a := []kwinWindow{
+		{Class: "firefox-esr", FG: [4]int{0, 29, 1920, 993}, CG: [4]int{0, 29, 1920, 993}},
+		{Class: "kate", FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
+	}
+	// Identical (order swapped): same.
+	b := []kwinWindow{a[1], a[0]}
+	if !sameKWinGeometry(a, b) {
+		t.Errorf("identical lists (reordered) compare different")
+	}
+	// Active flag flips without movement: same.
+	c := []kwinWindow{a[0], a[1]}
+	c[0].Active = true
+	if !sameKWinGeometry(a, c) {
+		t.Errorf("active-only change compares different")
+	}
+	// Moved window: different.
+	d := []kwinWindow{a[0], a[1]}
+	d[0].FG[0] = 100
+	if sameKWinGeometry(a, d) {
+		t.Errorf("moved window compares same")
+	}
+	// Resized window: different.
+	e := []kwinWindow{a[0], a[1]}
+	e[1].CG[3] = 500
+	if sameKWinGeometry(a, e) {
+		t.Errorf("resized window compares same")
+	}
+	// Minimized toggled: different (the window left the screen).
+	f := []kwinWindow{a[0], a[1]}
+	f[1].Minimized = true
+	if sameKWinGeometry(a, f) {
+		t.Errorf("minimized window compares same")
+	}
+	// Window closed / opened: different.
+	if sameKWinGeometry(a, a[:1]) || sameKWinGeometry(a, append(append([]kwinWindow{}, a...), kwinWindow{Class: "new"})) {
+		t.Errorf("changed window count compares same")
+	}
+}

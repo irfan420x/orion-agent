@@ -33,10 +33,16 @@
 //
 // Timing note: the tree is walked BEFORE the screenshot (the
 // sensitive-window check must refuse before anything is captured),
-// so image and tree are ~0.4 s apart (probe: 140 nodes / 0.38 s),
-// not the same millisecond. A window that moves in that gap
-// misaligns its marker by that movement; the snapshot registry
-// (§5 stale-refusal) bounds the damage to one grounding.
+// so the tree is NOT the same instant as the image. The old
+// comment claimed "~0.4 s apart" — that was measured on a
+// 140-node tree (0.38 s); on a real 942-node tree the walk alone
+// takes ~5.4 s (D-Bus round-trip bound), so the markers come
+// from a tree up to ~6 s old. The summary now reports the real
+// numbers (tree_walk_ms, tree_age_ms) instead of the stale
+// claim, and a post-capture KWin re-check refuses the grounding
+// when a window moved between the walk and the capture —
+// in-page movement (scrolling, typing) is still invisible to
+// that check, and the reported ages are the honest bound on it.
 //
 // Safety (design §4.3, enforced in code):
 //   - interactive roles only (default set below); degenerate
@@ -222,6 +228,16 @@ type groundSummary struct {
 	Coverage      string            `json:"coverage"` // grounded | vision_only
 	WalkedNodes   int               `json:"walked_nodes,omitempty"`
 	Correction    *groundCorrection `json:"correction,omitempty"`
+	// TreeWalkMs is how long the AT-SPI probe + walk took, and
+	// TreeAgeMs how long from the end of that walk to the
+	// capture (F-M2R-11): the markers are that old, never the
+	// "~0.4 s" the old comment claimed. GeometryVerified is
+	// true only when the post-capture KWin re-check ran and the
+	// window geometries still matched — false when KWin was
+	// unavailable for either check.
+	TreeWalkMs       int64 `json:"tree_walk_ms,omitempty"`
+	TreeAgeMs        int64 `json:"tree_age_ms,omitempty"`
+	GeometryVerified bool  `json:"geometry_verified,omitempty"`
 }
 
 // groundCorrection records the KWin-measured per-window
@@ -884,8 +900,10 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// helper failure) is not an error — grounding degrades to
 	// vision_only below — UNLESS the budget killed the walk, in
 	// which case the degrade would hide the timeout: that is a
-	// budget failure, reported as one.
-	tree, _ := t.atspiTree(ctx)
+	// budget failure, reported as one. walkTime is the real
+	// probe + walk duration (F-M2R-11): the markers are that old.
+	tree, walkTime, _ := t.atspiTree(ctx)
+	walkEnd := time.Now()
 	if tree == nil && ctx.Err() == context.DeadlineExceeded {
 		return failed("ground time budget of %v exceeded during the accessibility walk", groundTimeBudget)
 	}
@@ -988,6 +1006,33 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		}
 		return ToolResult{}, err
 	}
+	// Tree age (F-M2R-11): from the end of the walk to the end
+	// of the capture — the bound on how stale the markers are.
+	treeAge := time.Since(walkEnd)
+	// Post-capture movement re-check (F-M2R-11): the walk is
+	// seconds old, so a window that moved between the walk and
+	// the capture misaligns every marker in it. KWin answers in
+	// ~0.1 s, so re-read the window geometries now and refuse
+	// the grounding when they differ from the pre-capture list
+	// — the provider must ground again for fresh markers. A
+	// KWin failure here cannot prove movement either way, so the
+	// grounding proceeds with geometry_verified false (the
+	// reported tree age is then the honest bound).
+	geometryVerified := false
+	if kwinOut != nil {
+		if kwinPath2, werr := t.writeKWinHelper(); werr == nil {
+			if raw2, rerr := t.runKWinHelper(ctx, kwinPath2); rerr == nil {
+				var kout2 kwinOutput
+				if jerr := json.Unmarshal(raw2, &kout2); jerr == nil {
+					if sameKWinGeometry(kwinOut.Windows, kout2.Windows) {
+						geometryVerified = true
+					} else {
+						return failed("the screen moved during grounding (a window changed geometry between the tree walk and the capture): ground again for fresh markers")
+					}
+				}
+			}
+		}
+	}
 	if len(shotRes.Images) != 1 {
 		return failed("screenshot returned %d images, want 1", len(shotRes.Images))
 	}
@@ -1024,13 +1069,16 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// (0-1000 over the grounded view).
 	now := t.now()
 	summary := groundSummary{
-		SnapshotID:  newSnapshotID(now),
-		TakenAt:     now.Format(time.RFC3339),
-		Screen:      groundScreen{Width: imgW, Height: imgH, Scale: scale},
-		Region:      a.Region,
-		Elements:    []groundElement{},
-		WalkedNodes: walked,
-		Correction:  correction,
+		SnapshotID:       newSnapshotID(now),
+		TakenAt:          now.Format(time.RFC3339),
+		Screen:           groundScreen{Width: imgW, Height: imgH, Scale: scale},
+		Region:           a.Region,
+		Elements:         []groundElement{},
+		WalkedNodes:      walked,
+		Correction:       correction,
+		TreeWalkMs:       walkTime.Milliseconds(),
+		TreeAgeMs:        treeAge.Milliseconds(),
+		GeometryVerified: geometryVerified,
 	}
 	if tree != nil {
 		summary.Coverage = "grounded"
@@ -1198,29 +1246,61 @@ func installEmbeddedHelper(homeDir func() (string, error), file, source string) 
 }
 
 // atspiTree probes the AT-SPI backend and runs the helper,
-// returning the parsed tree. (nil, nil) when the backend is
-// missing — the caller degrades (ground: vision_only; input:
-// xdotool fallback). Any helper failure (write, run, parse) is
-// an error. Extracted from ExecuteResult so the input tool's
+// returning the parsed tree and how long the probe + walk took
+// (real wall clock — the tree's age is a staleness fact, never a
+// fake-clock value). (nil, 0, nil) when the backend is missing —
+// the caller degrades (ground: vision_only; input: xdotool
+// fallback). Any helper failure (write, run, parse) is an error.
+// Extracted from ExecuteResult so the input tool's
 // sensitive-window check runs the same tree walk instead of a
 // second, drifting copy of it.
-func (t *groundTool) atspiTree(ctx context.Context) (*atspiOutput, error) {
+func (t *groundTool) atspiTree(ctx context.Context) (*atspiOutput, time.Duration, error) {
+	start := time.Now()
 	if !t.probeHelper(ctx) {
-		return nil, nil
+		return nil, time.Since(start), nil
 	}
 	helperPath, err := t.writeHelper()
 	if err != nil {
-		return nil, err
+		return nil, time.Since(start), err
 	}
 	raw, err := t.runHelper(ctx, helperPath)
 	if err != nil {
-		return nil, err
+		return nil, time.Since(start), err
 	}
 	var out atspiOutput
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("AT-SPI helper output does not parse: %v", err)
+		return nil, time.Since(start), fmt.Errorf("AT-SPI helper output does not parse: %v", err)
 	}
-	return &out, nil
+	return &out, time.Since(start), nil
+}
+
+// sameKWinGeometry reports whether two KWin window lists describe
+// the same windows at the same geometries: the same multiset of
+// (app class, frame geometry, client geometry, minimized). The
+// active flag and the sensitive flag are excluded — either can
+// change without anything moving. Used by the post-capture
+// movement re-check (F-M2R-11): a window that moved, resized,
+// opened, closed, minimized or restored between the walk and
+// the capture makes the lists differ.
+func sameKWinGeometry(a, b []kwinWindow) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(w kwinWindow) string {
+		return fmt.Sprintf("%s|%v|%v|%v", w.Class, w.FG, w.CG, w.Minimized)
+	}
+	counts := make(map[string]int, len(a))
+	for _, w := range a {
+		counts[key(w)]++
+	}
+	for _, w := range b {
+		k := key(w)
+		counts[k]--
+		if counts[k] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // defaultRunHelper runs the helper with the depth/node caps and

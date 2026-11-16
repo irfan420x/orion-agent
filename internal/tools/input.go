@@ -857,7 +857,7 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 // already returns captions), which is ~0.1 s — flagged for M4,
 // not done here, because the brief pins the AT-SPI check.
 func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
-	tree, _ := t.ground.atspiTree(ctx)
+	tree, _, _ := t.ground.atspiTree(ctx)
 	if tree == nil {
 		titles, err := t.shot.windowTitles(ctx)
 		if err != nil {
