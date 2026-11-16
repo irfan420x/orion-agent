@@ -3,7 +3,7 @@
 
 Walks the AT-SPI desktop tree and prints one JSON document:
 {"windows": [...], "elements": [...], "focused_window": {...},
- "walked_nodes": N}.
+ "walked_nodes": N, "truncated": bool}.
 
 Reads ONLY name / role / screen extents. It NEVER reads text
 content or values — there is no get_text_iface anywhere in this
@@ -17,6 +17,21 @@ heavy app (big page, IDE) cannot hang the walk. On ANY failure the
 helper exits non-zero with the error on stderr and NO JSON on
 stdout, so the Go caller degrades cleanly to vision_only instead
 of grounding on partial data.
+
+Walk budget (F-A23-W4-1 / F-M2R-12, Audit 23): the old walk spent
+one GLOBAL node budget in desktop order, so plasmashell+KRunner
+(~839 nodes on the live desktop) ate the 1,000-node cap before
+the second Firefox window was ever walked — its content was
+structurally invisible to ground. Now the windows are enumerated
+FIRST, then walked in priority order (focused window first) with
+a PER-WINDOW node budget: the focused window gets a double share
+(it is usually the target), every other window one share, and the
+shares always sum to exactly MAX_NODES, so the total bound is
+unchanged. A window that hits its share stops early and reports
+"truncated": true (per window and top-level), so the caller can
+disclose the truncation instead of silently listing a partial
+desktop. Depth pruning (depth > MAX_DEPTH) is NOT truncation —
+it is the design's depth bound, and is not reported as such.
 
 Model: ~/workspace/orion-verification/computer-use-m2/design/
 probe-firefox.py (bounded walk, name/role/extents only), generalised
@@ -47,14 +62,18 @@ def extents(acc):
 
 def main():
     Atspi.init()
-    nodes = [0]
-    windows = []
     elements = []
 
-    def walk(acc, depth, win_idx):
-        if nodes[0] >= MAX_NODES or depth > MAX_DEPTH:
-            return
-        nodes[0] += 1
+    def walk(acc, depth, win_idx, budget, count):
+        """Walk one window's subtree. count is a one-element list
+        holding the nodes walked in THIS window. Returns True when
+        the walk stopped early because this window's node budget
+        ran out (truncation); depth pruning returns False."""
+        if count[0] >= budget:
+            return True
+        if depth > MAX_DEPTH:
+            return False
+        count[0] += 1
         try:
             name = acc.get_name() or ""
         except Exception:
@@ -93,22 +112,34 @@ def main():
         try:
             n = acc.get_child_count()
         except Exception:
-            return
+            return False
+        hit = False
         for i in range(n):
             try:
                 child = acc.get_child_at_index(i)
             except Exception:
                 continue
-            if child is not None:
-                walk(child, depth + 1, win_idx)
+            if child is not None and walk(child, depth + 1, win_idx,
+                                         budget, count):
+                hit = True
+                if count[0] >= budget:
+                    break
+        return hit
 
-    # win_idx is the index into the "windows" array below: every
-    # element carries the window it was walked from, so the Go side
-    # can apply a per-window coordinate correction (F2: a Wayland
-    # client reports window-relative coords, and only KWin knows the
-    # window's true screen position — the offset differs per
-    # window, so elements must be tagged, never blanket-shifted).
-    win_idx = -1
+    # Enumerate the windows FIRST, without walking any subtree:
+    # the per-window budget split needs the window count, and the
+    # walk order (focused first) needs to know which window is
+    # focused before any node is spent. win_idx is the index into
+    # the "windows" array below: every element carries the window
+    # it was walked from, so the Go side can apply a per-window
+    # coordinate correction (F2: a Wayland client reports
+    # window-relative coords, and only KWin knows the window's
+    # true screen position — the offset differs per window, so
+    # elements must be tagged, never blanket-shifted). The
+    # windows array itself stays in desktop order; only the WALK
+    # order is prioritised.
+    windows = []
+    win_accs = []
     for d in range(Atspi.get_desktop_count()):
         desk = Atspi.get_desktop(d)
         for i in range(desk.get_child_count()):
@@ -148,14 +179,58 @@ def main():
                 except Exception:
                     pass
                 box = extents(win)
-                win_idx += 1
                 windows.append({
                     "title": title[:200], "app": app_name, "role": wrole,
                     "focused": focused,
                     "x": box[0] if box else -1, "y": box[1] if box else -1,
                     "w": box[2] if box else -1, "h": box[3] if box else -1,
+                    "nodes": 0, "truncated": False,
                 })
-                walk(win, 0, win_idx)
+                win_accs.append(win)
+
+    # Per-window budgets: one share per window, a double share for
+    # the focused window (usually the target), shares summing to
+    # exactly MAX_NODES so the total bound is unchanged. With no
+    # windows there is nothing to walk.
+    nwin = len(windows)
+    if nwin > 0:
+        # units: one per window plus one extra for the focused
+        # window's double share.
+        units = nwin + 1
+        base = MAX_NODES // units
+        if base < 1:
+            base = 1
+        focused_idx = None
+        for idx, w in enumerate(windows):
+            if w["focused"]:
+                focused_idx = idx
+                break
+        budgets = [base] * nwin
+        if focused_idx is not None:
+            # Focused window gets the remainder, so the shares
+            # sum to exactly MAX_NODES (floored at 1: with more
+            # windows than nodes the shares cannot all be >= 1).
+            budgets[focused_idx] = max(1, MAX_NODES - base * (nwin - 1))
+        else:
+            budgets[0] += MAX_NODES - base * nwin
+        # Walk order: focused window first, then the rest in
+        # desktop order — so the target window's elements head
+        # the list even when the element cap bites.
+        order = sorted(range(nwin),
+                       key=lambda i: (i != focused_idx, i))
+        truncated = False
+        walked = 0
+        for idx in order:
+            count = [0]
+            hit = walk(win_accs[idx], 0, idx, budgets[idx], count)
+            windows[idx]["nodes"] = count[0]
+            windows[idx]["truncated"] = hit
+            walked += count[0]
+            if hit:
+                truncated = True
+    else:
+        walked = 0
+        truncated = False
 
     focused = None
     for w in windows:
@@ -164,7 +239,8 @@ def main():
             break
     print(json.dumps({"windows": windows, "elements": elements,
                       "focused_window": focused,
-                      "walked_nodes": nodes[0]}))
+                      "walked_nodes": walked,
+                      "truncated": truncated}))
 
 
 if __name__ == "__main__":

@@ -1003,7 +1003,7 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 	for _, e := range snap.details {
 		roleSet[e.Role] = true
 	}
-	fresh, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements)
+	fresh, _, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements)
 	var moved *atspiElement // same role+name, centre elsewhere
 	for i := range fresh {
 		el := &fresh[i]

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"os"
@@ -252,6 +253,117 @@ func TestGroundElementFiltering(t *testing.T) {
 		if el.CentreNorm.X < 0 || el.CentreNorm.X > 1000 || el.CentreNorm.Y < 0 || el.CentreNorm.Y > 1000 {
 			t.Errorf("centre_norm %+v outside 0-1000", el.CentreNorm)
 		}
+	}
+}
+
+// TestGroundWalkFairAcrossWindows pins F-A23-W4-1 / F-M2R-12
+// (Audit 23, live): the old walk spent one global 1,000-node
+// budget in desktop order, so plasmashell+KRunner (~839 nodes)
+// ate the cap before the second Firefox window was walked — a
+// default ground run listed 61 elements, all from the first
+// (Groq) window, and GitHub's "Sign in" was structurally
+// invisible. The element list must now be shared fairly across
+// windows: with the first window flooding 70 eligible elements
+// and the second holding "Sign in", the second window's elements
+// must appear in a default (60-element) grounding, and the
+// summary must disclose that the list was truncated by the cap.
+func TestGroundWalkFairAcrossWindows(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	var els []string
+	for i := 0; i < 70; i++ {
+		els = append(els, fmt.Sprintf(`{"role": "button", "name": "Groq button %d", "x": 100, "y": %d, "w": 120, "h": 30, "win": 0}`, i, 100+i*5))
+	}
+	els = append(els,
+		`{"role": "entry", "name": "Username or email address", "x": 784, "y": 383, "w": 352, "h": 40, "win": 1}`,
+		`{"role": "password text", "name": "Password", "x": 784, "y": 464, "w": 352, "h": 40, "win": 1}`,
+		`{"role": "button", "name": "Sign in", "x": 784, "y": 520, "w": 352, "h": 40, "win": 1}`,
+	)
+	env.helper = `{"windows": [
+		{"title": "GroqCloud — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": false, "x": 0, "y": 0, "w": 1920, "h": 1080, "nodes": 161},
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080, "nodes": 161}],
+	"elements": [` + strings.Join(els, ",") + `],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 1221, "truncated": false}`
+	res := env.call(t, `{}`)
+	s := parseGroundSummary(t, res)
+	if len(s.Elements) != 60 {
+		t.Fatalf("got %d elements, want 60 (the default cap)", len(s.Elements))
+	}
+	byName := make(map[string]groundElement, len(s.Elements))
+	for _, el := range s.Elements {
+		byName[el.Name] = el
+	}
+	// The second window's content must survive the first
+	// window's flood — the live failure was exactly this
+	// element missing from the list.
+	for _, name := range []string{"Sign in", "Username or email address", "Password"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("second-window element %q missing from the list (walk-cap starvation)", name)
+		}
+	}
+	// Focused window first: element 1 is the focused window's
+	// first element, not the flooding window's.
+	if s.Elements[0].Name != "Username or email address" {
+		t.Errorf("element 1 = %q, want the focused window's first element", s.Elements[0].Name)
+	}
+	// The truncation is disclosed, not silent: 73 eligible
+	// elements, 60 listed.
+	if !s.Truncated {
+		t.Errorf("truncated = false, want true (73 eligible, 60 listed)")
+	}
+	// The per-window table names both windows and their shares.
+	if len(s.Windows) != 2 {
+		t.Fatalf("got %d window summaries, want 2: %+v", len(s.Windows), s.Windows)
+	}
+	if s.Windows[0].Elements != 57 || s.Windows[1].Elements != 3 {
+		t.Errorf("window element counts = %d/%d, want 57/3", s.Windows[0].Elements, s.Windows[1].Elements)
+	}
+	if s.Windows[0].Title != "GroqCloud — Mozilla Firefox" || s.Windows[1].App != "Firefox" {
+		t.Errorf("window summaries = %+v, want both windows named", s.Windows)
+	}
+}
+
+// TestGroundWalkTruncationDisclosed pins the disclosure half of
+// F-A23-W4-1: when the helper itself reports a window cut short
+// by its node budget, the summary says so — truncated true and
+// the window's table row flagged — even when the element list
+// itself fits under the cap.
+func TestGroundWalkTruncationDisclosed(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = `{"windows": [
+		{"title": "Desktop — Plasma", "app": "plasmashell", "role": "frame", "focused": false, "x": 0, "y": 0, "w": 1920, "h": 1080, "nodes": 200, "truncated": true},
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080, "nodes": 161}],
+	"elements": [
+		{"role": "button", "name": "Sign in", "x": 784, "y": 520, "w": 352, "h": 40, "win": 1},
+		{"role": "entry", "name": "Username or email address", "x": 784, "y": 383, "w": 352, "h": 40, "win": 1}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 361, "truncated": true}`
+	res := env.call(t, `{"max_elements": 200}`)
+	s := parseGroundSummary(t, res)
+	if len(s.Elements) != 2 {
+		t.Fatalf("got %d elements, want 2", len(s.Elements))
+	}
+	if !s.Truncated {
+		t.Errorf("truncated = false, want true (helper reported a cut-short window)")
+	}
+	if len(s.Windows) != 2 {
+		t.Fatalf("got %d window summaries, want 2", len(s.Windows))
+	}
+	if !s.Windows[0].Truncated || s.Windows[0].WalkedNodes != 200 {
+		t.Errorf("plasmashell row = %+v, want truncated with 200 walked nodes", s.Windows[0])
+	}
+	if s.Windows[1].Truncated || s.Windows[1].Elements != 2 {
+		t.Errorf("firefox row = %+v, want untruncated with 2 elements", s.Windows[1])
+	}
+	// And the no-truncation case stays quiet: a full walk with
+	// room in the list reports truncated false.
+	env2 := newFakeGroundEnv(t)
+	res = env2.call(t, `{}`)
+	s = parseGroundSummary(t, res)
+	if s.Truncated {
+		t.Errorf("truncated = true on the untagged full fixture, want false")
 	}
 }
 

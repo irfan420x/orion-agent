@@ -140,6 +140,16 @@ func init() {
 
 // Grounding bounds (design §2.1 — see the package comment for the
 // depth-cap rationale).
+//
+// groundMaxNodes is the TOTAL node budget for one walk — and,
+// since F-A23-W4-1 / F-M2R-12, the helper splits it into
+// per-window shares (focused window double, the rest single,
+// shares summing to exactly this number) instead of spending it
+// in desktop order. The old global spend let plasmashell+KRunner
+// (~839 nodes live) eat the whole 1,000 before a second window
+// was ever walked, so that window's content was structurally
+// invisible; the split guarantees every window is visited, and
+// any window cut short by its share is disclosed (truncated).
 const (
 	groundMaxDepth = 12
 	groundMaxNodes = 1000
@@ -234,15 +244,17 @@ type groundArgs struct {
 
 // groundSummary is the JSON text returned with the marked image.
 type groundSummary struct {
-	SnapshotID    string            `json:"snapshot_id"`
-	TakenAt       string            `json:"taken_at"`
-	Screen        groundScreen      `json:"screen"`
-	Region        *region           `json:"region,omitempty"`
-	FocusedWindow *groundWindowRef  `json:"focused_window,omitempty"`
-	Elements      []groundElement   `json:"elements"`
-	Coverage      string            `json:"coverage"` // grounded | vision_only
-	WalkedNodes   int               `json:"walked_nodes,omitempty"`
-	Correction    *groundCorrection `json:"correction,omitempty"`
+	SnapshotID    string                `json:"snapshot_id"`
+	TakenAt       string                `json:"taken_at"`
+	Screen        groundScreen          `json:"screen"`
+	Region        *region               `json:"region,omitempty"`
+	FocusedWindow *groundWindowRef      `json:"focused_window,omitempty"`
+	Elements      []groundElement       `json:"elements"`
+	Coverage      string                `json:"coverage"` // grounded | vision_only
+	WalkedNodes   int                   `json:"walked_nodes,omitempty"`
+	Truncated     bool                  `json:"truncated,omitempty"`
+	Windows       []groundWindowSummary `json:"windows,omitempty"`
+	Correction    *groundCorrection     `json:"correction,omitempty"`
 	// TreeWalkMs is how long the AT-SPI probe + walk took, and
 	// TreeAgeMs how long from the end of that walk to the
 	// capture (F-M2R-11): the markers are that old, never the
@@ -253,6 +265,22 @@ type groundSummary struct {
 	TreeWalkMs       int64 `json:"tree_walk_ms,omitempty"`
 	TreeAgeMs        int64 `json:"tree_age_ms,omitempty"`
 	GeometryVerified bool  `json:"geometry_verified,omitempty"`
+}
+
+// groundWindowSummary is one window's share of a grounding
+// (F-A23-W4-1 / F-M2R-12): how many of its nodes the walk
+// reached, how many of its elements made the list, and whether
+// its walk was cut short by its node budget. A window with
+// Elements 0 and Truncated true is the disclosure the audit
+// asked for — the provider can see the window exists but its
+// content was not reached, and re-ground with a region zoom on
+// it, instead of assuming the desktop has only one window.
+type groundWindowSummary struct {
+	Title       string `json:"title"`
+	App         string `json:"app"`
+	Elements    int    `json:"elements"`
+	WalkedNodes int    `json:"walked_nodes"`
+	Truncated   bool   `json:"truncated,omitempty"`
 }
 
 // groundCorrection records the KWin-measured per-window
@@ -325,6 +353,10 @@ type atspiOutput struct {
 	Elements      []atspiElement  `json:"elements"`
 	FocusedWindow *atspiWindowRef `json:"focused_window"`
 	WalkedNodes   int             `json:"walked_nodes"`
+	// Truncated is true when any window's walk hit its
+	// per-window node budget (F-A23-W4-1 / F-M2R-12): the
+	// element list is partial and the summary must say so.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type atspiWindow struct {
@@ -336,6 +368,11 @@ type atspiWindow struct {
 	Y       int    `json:"y"`
 	W       int    `json:"w"`
 	H       int    `json:"h"`
+	// Walked is the nodes the helper walked in this window;
+	// Truncated is true when the window's own node budget ran
+	// out before its subtree was fully walked.
+	Walked    int  `json:"nodes,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type atspiWindowRef struct {
@@ -795,7 +832,7 @@ func newGroundToolWithBudget(budget *CaptureBudget, owner bool) *groundTool {
 func (t *groundTool) Name() string { return "ground" }
 
 func (t *groundTool) Description() string {
-	return "Ground the screen: capture a screenshot with numbered markers and return the exact name, role and bounding box of every interactive element on screen, so a click can target an element number instead of a guessed coordinate. Read-only on the desktop: it takes no input from the screen and changes nothing. DISCLOSURE: the captured image is sent to the model provider (data leaves this machine) — this call is gated and needs approval. Returns a snapshot_id plus the element list; a later click must quote that snapshot_id and an element id from it (stale snapshots are refused). When no accessibility tree is available the screenshot is still returned with an empty element list and coverage \"vision_only\" — never faked elements. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns."
+	return "Ground the screen: capture a screenshot with numbered markers and return the exact name, role and bounding box of every interactive element on screen, so a click can target an element number instead of a guessed coordinate. Read-only on the desktop: it takes no input from the screen and changes nothing. DISCLOSURE: the captured image is sent to the model provider (data leaves this machine) — this call is gated and needs approval. Returns a snapshot_id plus the element list; a later click must quote that snapshot_id and an element id from it (stale snapshots are refused). When no accessibility tree is available the screenshot is still returned with an empty element list and coverage \"vision_only\" — never faked elements. The walk visits every window (focused window first, each with its own node budget), the element list is shared fairly across windows, and when the walk or the list is truncated the summary says so (truncated plus per-window counts) — a window with 0 listed elements was not reached, so re-ground with a region zoom on it. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns."
 }
 
 func (t *groundTool) Definition() model.ToolDefinition {
@@ -1103,7 +1140,11 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	scale := math.Min(scaleX, scaleY)
 
 	// Filter the tree into the element list (design §4.3).
-	elements, walked := filterGroundElements(tree, roleSet, a.Region, maxElements)
+	// listTruncated is true when eligible elements were dropped
+	// by the max_elements cap — disclosed in the summary
+	// alongside the helper's own walk truncation, so a partial
+	// list is never silent.
+	elements, walked, listTruncated := filterGroundElements(tree, roleSet, a.Region, maxElements)
 
 	// Number the elements (ids from 1, in tree order) and compute
 	// centres. Centre_norm is relative to the returned image
@@ -1120,6 +1161,28 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		TreeWalkMs:       walkTime.Milliseconds(),
 		TreeAgeMs:        treeAge.Milliseconds(),
 		GeometryVerified: geometryVerified,
+	}
+	if tree != nil {
+		// Walk truncation (any window's node budget ran out)
+		// or list truncation (the element cap dropped eligible
+		// elements): either way the provider must be told the
+		// list is partial. The per-window table below names
+		// which window was cut short.
+		summary.Truncated = tree.Truncated || listTruncated
+		if len(tree.Windows) > 0 {
+			perWin := make([]int, len(tree.Windows))
+			for _, el := range elements {
+				if el.Win != nil && *el.Win >= 0 && *el.Win < len(perWin) {
+					perWin[*el.Win]++
+				}
+			}
+			for i, w := range tree.Windows {
+				summary.Windows = append(summary.Windows, groundWindowSummary{
+					Title: w.Title, App: w.App, Elements: perWin[i],
+					WalkedNodes: w.Walked, Truncated: w.Truncated,
+				})
+			}
+		}
 	}
 	if tree != nil {
 		summary.Coverage = "grounded"
@@ -1411,18 +1474,38 @@ func (t *groundTool) checkRateLimit() error {
 }
 
 // filterGroundElements applies the design §4.3 filters to the
-// tree, in tree order, capped at maxElements. A nil tree yields no
-// elements (vision_only). Returns the kept elements and the walked
-// node count (0 without a tree).
-func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *region, maxElements int) ([]atspiElement, int) {
+// tree, capped at maxElements. A nil tree yields no elements
+// (vision_only). Returns the kept elements, the walked node
+// count, and whether the element list itself was truncated by
+// the maxElements cap (eligible elements dropped — a second
+// truncation source beside the helper's node budget, disclosed
+// the same way by the caller).
+//
+// Selection is window-fair (F-A23-W4-1 / F-M2R-12): the old code
+// took the first maxElements in tree order, so one window's
+// flood starved every later window out of the list — live, the
+// first Firefox window's 61 elements filled the list and the
+// second window's "Sign in" never appeared. Eligible elements
+// are now grouped by window and picked round-robin, starting
+// with the focused window's group, so every window gets a
+// share of the list. Elements with no window tag (older helper
+// output) form a single group in tree order, which keeps the
+// old behaviour for untagged trees.
+func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *region, maxElements int) ([]atspiElement, int, bool) {
 	if tree == nil {
-		return nil, 0
+		return nil, 0, false
 	}
-	kept := []atspiElement{}
-	for _, el := range tree.Elements {
-		if len(kept) >= maxElements {
-			break
+	// Filter first, preserving tree order, grouped by window.
+	// Group key -1 is the untagged group (older helper output).
+	groups := map[int][]atspiElement{}
+	var groupOrder []int // window indices in first-appearance order
+	add := func(win int, el atspiElement) {
+		if _, ok := groups[win]; !ok {
+			groupOrder = append(groupOrder, win)
 		}
+		groups[win] = append(groups[win], el)
+	}
+	for _, el := range tree.Elements {
 		if !roleSet[el.Role] {
 			continue
 		}
@@ -1461,9 +1544,62 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		if runes := []rune(el.Name); len(runes) > groundMaxNameRunes {
 			el.Name = string(runes[:groundMaxNameRunes-1]) + "…"
 		}
-		kept = append(kept, el)
+		if el.Win == nil {
+			add(-1, el)
+			continue
+		}
+		add(*el.Win, el)
 	}
-	return kept, tree.WalkedNodes
+	// Group order: the focused window's group first, then the
+	// rest in first-appearance order, the untagged group last.
+	// The focused flag is a best-effort hint (live it once
+	// reported false for the active window), so a missing flag
+	// just falls back to appearance order.
+	focusedIdx := -2 // -1 is the untagged group; -2 means none
+	for i, w := range tree.Windows {
+		if w.Focused {
+			focusedIdx = i
+			break
+		}
+	}
+	ordered := []int{}
+	if _, ok := groups[focusedIdx]; ok {
+		ordered = append(ordered, focusedIdx)
+	}
+	for _, g := range groupOrder {
+		if g != focusedIdx && g != -1 {
+			ordered = append(ordered, g)
+		}
+	}
+	if _, ok := groups[-1]; ok {
+		ordered = append(ordered, -1)
+	}
+	eligible := 0
+	for _, g := range ordered {
+		eligible += len(groups[g])
+	}
+	// Round-robin: one element per group per pass, until the
+	// cap or the eligible pool runs out.
+	kept := []atspiElement{}
+	pos := make(map[int]int, len(ordered))
+	for len(kept) < maxElements && len(kept) < eligible {
+		progressed := false
+		for _, g := range ordered {
+			if len(kept) >= maxElements {
+				break
+			}
+			list := groups[g]
+			if pos[g] < len(list) {
+				kept = append(kept, list[pos[g]])
+				pos[g]++
+				progressed = true
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	return kept, tree.WalkedNodes, eligible > len(kept)
 }
 
 // newSnapshotID builds a unique snapshot id like
