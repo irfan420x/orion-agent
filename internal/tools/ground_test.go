@@ -999,6 +999,31 @@ func TestGroundKWinHelperFile(t *testing.T) {
 	}
 }
 
+func TestGroundKWinHelperMarkerEntropy(t *testing.T) {
+	// F-A23W2-11: same 16-bit marker as the input cursor
+	// helper (and a pid-only script name) — a stale journal
+	// line could return the wrong geometries as grounding
+	// truth. Same fix: 64-bit+ secrets randomness + timestamp,
+	// nonce echoed in the payload and checked on receipt.
+	if strings.Contains(kwinHelperSource, "randrange(0x10000)") {
+		t.Errorf("ground KWin helper still uses the 16-bit marker")
+	}
+	if strings.Contains(kwinHelperSource, `"orion-kwin-geom-%d" % os.getpid()`) {
+		t.Errorf("ground KWin helper still uses a pid-only script name")
+	}
+	for _, want := range []string{
+		"secrets.token_hex(8)", // 64-bit randomness
+		"time.time_ns()",       // timestamp/nonce
+		`{nonce: "%s"`,         // nonce echoed in the payload
+		"nonce mismatch",       // stale line refused, not used
+		"def new_marker",
+	} {
+		if !strings.Contains(kwinHelperSource, want) {
+			t.Errorf("ground KWin helper source lacks %q", want)
+		}
+	}
+}
+
 func TestMatchKWinWindows(t *testing.T) {
 	tree := &atspiOutput{
 		Windows: []atspiWindow{

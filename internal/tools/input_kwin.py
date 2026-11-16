@@ -39,6 +39,15 @@ sequencing. Note: start() starts ALL loaded scripts (that is
 the KWin API); other scripts' start is idempotent for
 well-behaved scripts.
 
+Marker (F-A23W2-11): pid + 64-bit secrets randomness +
+nanosecond timestamp, echoed as "nonce" in the JSON payload and
+checked on receipt. The old marker was 16-bit random only: two
+calls from the same pid collided after ~100 calls (birthday
+paradox), and a stale journal line would return the wrong cursor
+as closed-loop truth. A stale line can no longer match: the
+marker is unique per call, and even a line that contained it
+would fail the payload-nonce check.
+
 Reads ONLY cursor position, screen geometry and window
 geometries (captions are window titles, already visible on
 screen). On ANY failure this helper exits non-zero with the
@@ -47,7 +56,7 @@ the move instead of moving on partial or faked geometry.
 """
 import json
 import os
-import random
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -71,7 +80,7 @@ for (var i = 0; i < wins.length; i++) {
     var cg = w.clientGeometry;
     out.push({caption: w.caption, cls: w.resourceClass, active: w.active, minimized: w.minimized, fg: [fg.x, fg.y, fg.width, fg.height], cg: [cg.x, cg.y, cg.width, cg.height]});
 }
-print("%s" + JSON.stringify({cursor: {x: cp.x, y: cp.y}, screen: g, kwin_windows: out}));
+print("%s" + JSON.stringify({nonce: "%s", cursor: {x: cp.x, y: cp.y}, screen: g, kwin_windows: out}));
 """
 
 POLL_TRIES = 6
@@ -99,9 +108,18 @@ def journal_grep(marker):
     return None
 
 
+def new_marker(prefix):
+    """A fresh oracle marker and its nonce: pid + 64-bit secrets
+    randomness + nanosecond timestamp. The nonce is echoed in
+    the payload so a stale journal line can never pass as this
+    call's output (F-A23W2-11)."""
+    nonce = "%d-%s-%d" % (os.getpid(), secrets.token_hex(8), time.time_ns())
+    return "%s-%s:" % (prefix, nonce), nonce
+
+
 def main():
-    marker = "ORION-INPUT-CURSOR-%d-%04x:" % (os.getpid(), random.randrange(0x10000))
-    js = JS_TEMPLATE % marker
+    marker, nonce = new_marker("ORION-INPUT-CURSOR")
+    js = JS_TEMPLATE % (marker, nonce)
     fd, js_path = tempfile.mkstemp(prefix="orion-input-cursor-", suffix=".js")
     try:
         os.write(fd, js.encode())
@@ -110,7 +128,7 @@ def main():
         # failed would leave a stale script behind, and loadScript
         # with a duplicate name would return the stale one instead
         # of loading this call's script.
-        name = "orion-input-cursor-%d-%04x" % (os.getpid(), random.randrange(0x10000))
+        name = "orion-input-cursor-%s" % nonce
         try:
             proxy = Gio.DBusProxy.new_for_bus_sync(
                 Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
@@ -141,6 +159,8 @@ def main():
             fail("cannot parse KWin cursor output: %s" % e)
         if not isinstance(data, dict) or "cursor" not in data:
             fail("KWin cursor output has no cursor")
+        if data.get("nonce") != nonce:
+            fail("KWin cursor output nonce mismatch: stale journal line, not this call's output")
         print(json.dumps(data))
     finally:
         try:

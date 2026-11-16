@@ -38,6 +38,14 @@ markers + proper load/start/unload sequencing). Note: start()
 starts ALL loaded scripts (that is the KWin API); other scripts'
 start is idempotent for well-behaved scripts.
 
+Marker (F-A23W2-11): pid + 64-bit secrets randomness +
+nanosecond timestamp, echoed as "nonce" in the JSON payload and
+checked on receipt — the same fix as the input cursor helper.
+The old marker was 16-bit random only, and the script name was
+pid-only: two calls from the same pid collided after ~100 calls
+(birthday paradox), and a stale journal line would return the
+wrong geometries as grounding truth.
+
 Reads ONLY window geometries (captions are compared inside the
 script for the sensitive flag and never printed). On ANY failure
 this helper exits non-zero with the error on stderr and NO JSON
@@ -46,7 +54,7 @@ grounding on partial or faked geometry.
 """
 import json
 import os
-import random
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -77,7 +85,7 @@ for (var i = 0; i < wins.length; i++) {
     }
     out.push({cls: w.resourceClass, active: w.active, minimized: w.minimized, fg: [fg.x, fg.y, fg.width, fg.height], cg: [cg.x, cg.y, cg.width, cg.height], sens: sens});
 }
-print("%s" + JSON.stringify(out));
+print("%s" + JSON.stringify({nonce: "%s", kwin_windows: out}));
 """
 
 POLL_TRIES = 6
@@ -105,14 +113,23 @@ def journal_grep(marker):
     return None
 
 
+def new_marker(prefix):
+    """A fresh oracle marker and its nonce: pid + 64-bit secrets
+    randomness + nanosecond timestamp. The nonce is echoed in
+    the payload so a stale journal line can never pass as this
+    call's output (F-A23W2-11)."""
+    nonce = "%d-%s-%d" % (os.getpid(), secrets.token_hex(8), time.time_ns())
+    return "%s-%s:" % (prefix, nonce), nonce
+
+
 def main():
-    marker = "ORION-KWIN-GEOM-%d-%04x:" % (os.getpid(), random.randrange(0x10000))
-    js = JS_TEMPLATE % (json.dumps(SENSITIVE_PATTERNS), marker)
+    marker, nonce = new_marker("ORION-KWIN-GEOM")
+    js = JS_TEMPLATE % (json.dumps(SENSITIVE_PATTERNS), marker, nonce)
     fd, js_path = tempfile.mkstemp(prefix="orion-kwin-geom-", suffix=".js")
     try:
         os.write(fd, js.encode())
         os.close(fd)
-        name = "orion-kwin-geom-%d" % os.getpid()
+        name = "orion-kwin-geom-%s" % nonce
         try:
             proxy = Gio.DBusProxy.new_for_bus_sync(
                 Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
@@ -138,9 +155,14 @@ def main():
             fail("no KWin geometry output in the journal for %s" % marker)
         try:
             payload = line.split(marker, 1)[1].strip()
-            wins = json.loads(payload)
+            data = json.loads(payload)
         except Exception as e:
             fail("cannot parse KWin geometry output: %s" % e)
+        if not isinstance(data, dict) or "kwin_windows" not in data:
+            fail("KWin geometry output has no kwin_windows")
+        if data.get("nonce") != nonce:
+            fail("KWin geometry output nonce mismatch: stale journal line, not this call's output")
+        wins = data["kwin_windows"]
         if not isinstance(wins, list):
             fail("KWin geometry output is not a list")
         print(json.dumps({"kwin_windows": wins}))

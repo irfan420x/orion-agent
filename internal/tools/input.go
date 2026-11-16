@@ -271,15 +271,19 @@ type inputScreen struct {
 // (AT-SPI first, xdotool fallback), window boxes when the
 // AT-SPI tree was available, and whether every sensitive
 // window's box is KWin-corrected (the precise-click condition).
-// activeTitle is the focused window's title at enumeration time
+// focus is the focused window's identity at enumeration time
 // (KWin active window first, AT-SPI focused window second):
 // the type/key TOCTOU guard re-checks it right before typing.
+// The identity never carries a title out of KWin (F-M2R-15) —
+// it is class + frame geometry + the sensitive pattern KWin
+// itself matched — and the AT-SPI fallback title inside it is
+// compare-only, never logged.
 type inputWindowInfo struct {
 	available        bool
 	titles           []string
 	windows          []atspiWindow // AT-SPI boxes, KWin-corrected where matched
 	sensitivePrecise bool          // every sensitive window has a corrected box
-	activeTitle      string        // focused window when enumerated, "" when unknown
+	focus            focusIdentity // focused window when enumerated, unknown when neither authority could name it
 }
 
 type inputTool struct {
@@ -631,7 +635,7 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 		}
 		// The focus must be the window just checked: re-check
 		// it right before the keystrokes (F-A23W2-10).
-		if err := t.recheckFocus(ctx, info.activeTitle); err != nil {
+		if err := t.recheckFocus(ctx, info.focus); err != nil {
 			return denied("%v", err)
 		}
 		// Type via stdin (ydotool type --file -): the text
@@ -646,7 +650,7 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 		if err != nil {
 			return denied("%v", err)
 		}
-		if err := t.recheckFocus(ctx, info.activeTitle); err != nil {
+		if err := t.recheckFocus(ctx, info.focus); err != nil {
 			return denied("%v", err)
 		}
 		code := strconv.Itoa(keyCode)
@@ -1031,10 +1035,11 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 // Cost, stated plainly: the AT-SPI walk is D-Bus round-trip
 // bound (~5 s on a heavy page), so a guarded type/key/click
 // pays a tree walk before it acts. That is the price of the
-// full-coverage check; a future optimisation could read the
-// window titles from the KWin list alone (the cursor helper
-// already returns captions), which is ~0.1 s — flagged for M4,
-// not done here, because the brief pins the AT-SPI check.
+// full-coverage check; the KWin list alone cannot replace it
+// for titles — the cursor helper returns class, geometry and
+// the sensitive flag only, never captions (F-M2R-15) — but the
+// cheap KWin query does supply the focus identity for the
+// type/key re-check, so that re-check costs no second walk.
 func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 	tree, _, _ := t.ground.atspiTree(ctx)
 	if tree == nil {
@@ -1045,10 +1050,12 @@ func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 		info := inputWindowInfo{available: true, titles: titles}
 		// Best effort: the KWin active window is the focus the
 		// type/key re-check compares against. Unavailable here
-		// leaves activeTitle empty — the re-check then only
+		// leaves focus unknown — the re-check then only
 		// verifies the current focus is known and non-sensitive.
 		if cur, err := t.readCursor(ctx); err == nil {
-			info.activeTitle = kwinActiveCaption(cur.Windows)
+			if w := kwinActiveWindow(cur.Windows); w != nil {
+				info.focus = kwinFocusIdentity(*w)
+			}
 		}
 		return info
 	}
@@ -1058,7 +1065,7 @@ func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 	}
 	info.windows = tree.Windows
 	if tree.FocusedWindow != nil {
-		info.activeTitle = tree.FocusedWindow.Title
+		info.focus = focusIdentity{known: true, title: tree.FocusedWindow.Title}
 	}
 	// Correct the AT-SPI boxes with KWin's true geometries, so
 	// the click point-in-box check is on compositor truth, not
@@ -1076,8 +1083,8 @@ func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 		// focus: prefer it over the AT-SPI focused window
 		// (which has reported focused=false for the active
 		// window live).
-		if cap := kwinActiveCaption(cur.Windows); cap != "" {
-			info.activeTitle = cap
+		if w := kwinActiveWindow(cur.Windows); w != nil {
+			info.focus = kwinFocusIdentity(*w)
 		}
 		precise := true
 		for i, w := range tree.Windows {
@@ -1094,53 +1101,99 @@ func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 	return info
 }
 
-// kwinActiveCaption returns the caption of the active window in
-// a KWin window list, or "" when none is marked active.
-func kwinActiveCaption(wins []kwinWindow) string {
-	for _, w := range wins {
-		if w.Active {
-			return w.Caption
-		}
-	}
-	return ""
+// focusIdentity identifies the focused window for the type/key
+// TOCTOU guard without ever naming it in output. The KWin form
+// is the active window's app class + frame geometry + the
+// sensitive pattern KWin itself matched ("" when none): KWin
+// reports no titles (F-M2R-15), so class+geometry is the
+// identity a focus move can change, and Sens is the
+// sensitive-takeover signal. The AT-SPI form is the focused
+// window's title, used only when KWin names no active window:
+// it is compared, never logged anywhere — no title in the
+// journal, no title in tool output.
+type focusIdentity struct {
+	known bool
+	kwin  bool   // true: class+fg identity; false: AT-SPI title fallback
+	class string // KWin active window class
+	fg    [4]int // KWin active window frame geometry [x, y, w, h]
+	sens  string // sensitive pattern KWin matched, "" when none
+	title string // AT-SPI focused title, compare-only
 }
 
-// focusTitle returns the currently focused window's title: the
-// KWin active window first (compositor truth, one cheap query),
-// the AT-SPI focused window as fallback. An error means neither
-// could name the focused window.
-func (t *inputTool) focusTitle(ctx context.Context) (string, error) {
-	if cur, err := t.readCursor(ctx); err == nil {
-		if cap := kwinActiveCaption(cur.Windows); cap != "" {
-			return cap, nil
+// kwinFocusIdentity builds the KWin form of a focus identity
+// from one active KWin window.
+func kwinFocusIdentity(w kwinWindow) focusIdentity {
+	return focusIdentity{known: true, kwin: true, class: w.Class, fg: w.FG, sens: w.Sens}
+}
+
+// equal reports whether two focus identities name the same
+// focused window. Identities from different authorities never
+// match: a focus that can only be confirmed by a different
+// source than the one that checked it is treated as changed
+// (fail closed — typing blind is the highest-risk op).
+func (f focusIdentity) equal(o focusIdentity) bool {
+	if !f.known || !o.known || f.kwin != o.kwin {
+		return false
+	}
+	if f.kwin {
+		return f.class == o.class && f.fg == o.fg
+	}
+	return f.title == o.title
+}
+
+// kwinActiveWindow returns the active window in a KWin window
+// list, or nil when none is marked active.
+func kwinActiveWindow(wins []kwinWindow) *kwinWindow {
+	for i := range wins {
+		if wins[i].Active {
+			return &wins[i]
 		}
 	}
-	tree, err := t.ground.atspiTree(ctx)
-	if err != nil || tree == nil || tree.FocusedWindow == nil || tree.FocusedWindow.Title == "" {
-		return "", fmt.Errorf("KWin oracle unavailable and no accessibility tree names a focused window")
+	return nil
+}
+
+// focusIdentity returns the currently focused window's identity:
+// the KWin active window first (compositor truth, one cheap
+// query), the AT-SPI focused window as fallback. An error means
+// neither could identify the focused window.
+func (t *inputTool) focusIdentity(ctx context.Context) (focusIdentity, error) {
+	if cur, err := t.readCursor(ctx); err == nil {
+		if w := kwinActiveWindow(cur.Windows); w != nil {
+			return kwinFocusIdentity(*w), nil
+		}
 	}
-	return tree.FocusedWindow.Title, nil
+	tree, _, err := t.ground.atspiTree(ctx)
+	if err != nil || tree == nil || tree.FocusedWindow == nil || tree.FocusedWindow.Title == "" {
+		return focusIdentity{}, fmt.Errorf("KWin oracle unavailable and no accessibility tree names a focused window")
+	}
+	return focusIdentity{known: true, title: tree.FocusedWindow.Title}, nil
 }
 
 // recheckFocus is the F-A23W2-10 TOCTOU guard: right before
 // typing or pressing a key, re-read the focused window and
-// compare it with the one the safety check saw. The check and
-// the keystrokes are seconds apart (the AT-SPI walk alone is
-// ~5 s), and in between the focus can move — a popup, a
-// notification, the user Alt-Tabbing — sending the text into
+// compare its identity with the one the safety check saw. The
+// check and the keystrokes are seconds apart (the AT-SPI walk
+// alone is ~5 s), and in between the focus can move — a popup,
+// a notification, the user Alt-Tabbing — sending the text into
 // the wrong field. The re-read is a cheap KWin query, with the
 // AT-SPI focused window as fallback. A changed focus, a newly
 // sensitive focused window, or an undeterminable focus all
-// refuse: typing blind is the highest-risk op.
-func (t *inputTool) recheckFocus(ctx context.Context, before string) error {
-	after, err := t.focusTitle(ctx)
+// refuse: typing blind is the highest-risk op. No refusal ever
+// names a window title — a sensitive takeover names the
+// category only.
+func (t *inputTool) recheckFocus(ctx context.Context, before focusIdentity) error {
+	after, err := t.focusIdentity(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot confirm which window is focused (%v): I will not type or press keys blind", err)
 	}
-	if hit := FindSensitiveTitle([]string{after}); hit != "" {
+	if after.kwin {
+		if after.sens != "" {
+			return fmt.Errorf("the focused window is now a %s: I will not type or press keys into it", SensitiveTitleCategory(after.sens))
+		}
+	} else if hit := FindSensitiveTitle([]string{after.title}); hit != "" {
 		return fmt.Errorf("the focused window is now a %s: I will not type or press keys into it", SensitiveTitleCategory(hit))
 	}
-	if before != "" && after != before {
+	if before.known && !before.equal(after) {
 		return fmt.Errorf("the focused window changed since the safety check: I will not type or press keys into a window I have not checked — look at the screen and retry")
 	}
 	return nil
@@ -1159,6 +1212,13 @@ func (t *inputTool) checkTypeSensitive(ctx context.Context) (inputWindowInfo, er
 	}
 	if hit := FindSensitiveTitle(info.titles); hit != "" {
 		return info, fmt.Errorf("this screen shows a %s: I will not type or press keys into it", SensitiveTitleCategory(hit))
+	}
+	// The KWin active window's own sensitive flag catches a
+	// focused sensitive window the AT-SPI enumeration cannot
+	// see (the same signal the focus re-check uses): the
+	// refusal names the category only, never the title.
+	if info.focus.kwin && info.focus.sens != "" {
+		return info, fmt.Errorf("the focused window is a %s: I will not type or press keys into it", SensitiveTitleCategory(info.focus.sens))
 	}
 	return info, nil
 }

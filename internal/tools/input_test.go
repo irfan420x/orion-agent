@@ -58,7 +58,7 @@ type fakeInputEnv struct {
 	socketPath   string
 	ydotoolCalls []fakeYdotoolCall
 	kwinCalls    int
-	kwinFlipTo   string // F-A23W2-10: from the 2nd KWin call on, this caption is the active window (simulates a focus change mid-call)
+	kwinFlipTo   string // F-A23W2-10: from the 2nd KWin call on, this class is the active window (simulates a focus change mid-call)
 }
 
 func benignInputTreeJSON() string {
@@ -141,7 +141,7 @@ func newFakeInputEnv(t *testing.T) *fakeInputEnv {
 			flipped := make([]kwinWindow, len(wins))
 			copy(flipped, wins)
 			for i := range flipped {
-				flipped[i].Active = flipped[i].Caption == env.kwinFlipTo
+				flipped[i].Active = flipped[i].Class == env.kwinFlipTo
 			}
 			wins = flipped
 		}
@@ -814,6 +814,29 @@ func TestInputKWinHelperFile(t *testing.T) {
 	}
 }
 
+func TestInputKWinHelperMarkerEntropy(t *testing.T) {
+	// F-A23W2-11: the oracle marker was 16-bit random only —
+	// two calls from the same pid collided after ~100 calls,
+	// and a stale journal line could return the wrong cursor
+	// as closed-loop truth. The marker must carry 64-bit+
+	// secrets randomness plus a timestamp, with the nonce
+	// echoed in the payload and checked on receipt.
+	if strings.Contains(inputKWinHelperSource, "randrange(0x10000)") {
+		t.Errorf("input KWin helper still uses the 16-bit marker")
+	}
+	for _, want := range []string{
+		"secrets.token_hex(8)", // 64-bit randomness
+		"time.time_ns()",       // timestamp/nonce
+		`{nonce: "%s"`,         // nonce echoed in the payload
+		"nonce mismatch",       // stale line refused, not used
+		"def new_marker",
+	} {
+		if !strings.Contains(inputKWinHelperSource, want) {
+			t.Errorf("input KWin helper source lacks %q", want)
+		}
+	}
+}
+
 func TestInputFrameworkIntegration(t *testing.T) {
 	reg, err := DefaultRegistry()
 	if err != nil {
@@ -1030,9 +1053,9 @@ func registerSignInSnapshot() {
 // tests that click by coordinates (F-A23W2-8): a coordinate
 // click needs a grounding from the last 60 s.
 func registerFreshGrounding() {
-	groundSnapshots.register("g-fake-fresh", time.Now(), []groundElement{
+	groundSnapshots.register("g-fake-fresh", 0, time.Now(), []groundElement{
 		{ID: 1, Role: "button", Name: "Sign in", Centre: groundPoint{X: 960, Y: 403}},
-	})
+	}, nil)
 }
 
 func TestInputClickRefusesMovedElement(t *testing.T) {
@@ -1142,9 +1165,9 @@ func TestInputCoordClickRefusedWithoutGrounding(t *testing.T) {
 func TestInputCoordClickRefusedWhenGroundingStale(t *testing.T) {
 	env := newFakeInputEnv(t)
 	resetGroundSnapshots()
-	groundSnapshots.register("g-old", time.Now().Add(-61*time.Second), []groundElement{
+	groundSnapshots.register("g-old", 0, time.Now().Add(-61*time.Second), []groundElement{
 		{ID: 1, Role: "button", Name: "Sign in", Centre: groundPoint{X: 960, Y: 403}},
-	})
+	}, nil)
 	err := env.callErr(t, `{"op": "click", "x": 500, "y": 300}`)
 	if !strings.Contains(err.Error(), "ground first") {
 		t.Errorf("coord click with a stale grounding err = %v, want the 'ground first' refusal", err)
@@ -1242,12 +1265,12 @@ func TestInputClickDeliveredButUnverifiedWhenOracleFails(t *testing.T) {
 func TestInputTypeRefusedWhenFocusChanges(t *testing.T) {
 	env := newFakeInputEnv(t)
 	env.kwinWindows = []kwinWindow{
-		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
-		{Caption: "Kate — notes.txt", Class: "kate", Active: false, FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
+		{Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Class: "kate", Active: false, FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
 	}
 	// Between the safety check and the keystrokes the user
 	// Alt-Tabs to Kate: the text must not go there.
-	env.kwinFlipTo = "Kate — notes.txt"
+	env.kwinFlipTo = "kate"
 	err := env.callErr(t, `{"op": "type", "text": "secret"}`)
 	if !strings.Contains(err.Error(), "focused window changed") {
 		t.Errorf("type after a focus change err = %v, want the 'focused window changed' refusal", err)
@@ -1260,10 +1283,10 @@ func TestInputTypeRefusedWhenFocusChanges(t *testing.T) {
 func TestInputKeyRefusedWhenFocusChanges(t *testing.T) {
 	env := newFakeInputEnv(t)
 	env.kwinWindows = []kwinWindow{
-		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
-		{Caption: "Kate — notes.txt", Class: "kate", Active: false, FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
+		{Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Class: "kate", Active: false, FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
 	}
-	env.kwinFlipTo = "Kate — notes.txt"
+	env.kwinFlipTo = "kate"
 	err := env.callErr(t, `{"op": "key", "key": "Return"}`)
 	if !strings.Contains(err.Error(), "focused window changed") {
 		t.Errorf("key after a focus change err = %v, want the 'focused window changed' refusal", err)
@@ -1276,14 +1299,17 @@ func TestInputKeyRefusedWhenFocusChanges(t *testing.T) {
 func TestInputTypeRefusedWhenSensitiveWindowTakesFocus(t *testing.T) {
 	env := newFakeInputEnv(t)
 	env.kwinWindows = []kwinWindow{
-		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
-		{Caption: "KeePassXC — passwords.kdbx", Class: "keepassxc", Active: false, FG: [4]int{100, 100, 800, 600}, CG: [4]int{100, 100, 800, 600}},
+		{Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		// Sens is the pattern the KWin script itself matched
+		// against this window's caption ("keepass"): the
+		// takeover is refused on the flag, never on a title.
+		{Class: "keepassxc", Active: false, FG: [4]int{100, 100, 800, 600}, CG: [4]int{100, 100, 800, 600}, Sens: "keepass"},
 	}
 	// A password-manager popup takes focus after the safety
 	// check (which saw only Firefox): typing into it is refused.
 	// The AT-SPI titles do not list KeePassXC — only the KWin
 	// focus re-check can catch this.
-	env.kwinFlipTo = "KeePassXC — passwords.kdbx"
+	env.kwinFlipTo = "keepassxc"
 	err := env.callErr(t, `{"op": "type", "text": "secret"}`)
 	if !strings.Contains(err.Error(), "password manager") {
 		t.Errorf("type after a sensitive window took focus err = %v, want the password-manager refusal", err)
@@ -1295,7 +1321,7 @@ func TestInputTypeRefusedWhenSensitiveWindowTakesFocus(t *testing.T) {
 
 func TestInputTypeRefusedWhenFocusCannotBeConfirmed(t *testing.T) {
 	env := newFakeInputEnv(t)
-	env.treeErr = true  // no AT-SPI tree for the fallback either
+	env.treeErr = true   // no AT-SPI tree for the fallback either
 	env.oracleErr = true // KWin oracle down at re-check time
 	err := env.callErr(t, `{"op": "type", "text": "secret"}`)
 	if !strings.Contains(err.Error(), "cannot confirm which window is focused") {
