@@ -42,6 +42,9 @@ import (
 // no constraint beyond the top-level object check: a tool that
 // publishes no schema cannot have its arguments second-guessed here,
 // and a malformed schema must never turn a valid call into an error.
+// A parameter the schema does not declare is rejected (Audit 23
+// F-A23W2-25): silently ignoring it let a model typo use the
+// default instead of failing loudly.
 //
 // The returned error is always a *ToolError with Kind "invalid_args"
 // (or nil when the call is valid).
@@ -117,10 +120,21 @@ func validateObject(tool, name string, obj map[string]any, schema map[string]any
 		}
 		prop, ok := props[propName]
 		if !ok {
-			// Unknown parameters are ignored: providers add
-			// extra fields, and rejecting them would break
-			// calls that are otherwise valid.
-			continue
+			// Unknown parameters are rejected (Audit 23
+			// F-A23W2-25): the old code ignored them, so a
+			// model typo — e.g. max_element for max_elements
+			// — silently used the default instead of failing
+			// loudly, and the model never learned it
+			// misspelled the parameter. A schema with no
+			// usable "properties" cannot second-guess
+			// arguments, and an explicit
+			// additionalProperties:true opts out — both keep
+			// ignoring unknown fields rather than failing a
+			// call the schema cannot judge.
+			if len(props) == 0 || schema["additionalProperties"] == true {
+				continue
+			}
+			return invalid("unknown parameter %q", joinName(name, propName))
 		}
 		propSchema, ok := prop.(map[string]any)
 		if !ok {

@@ -40,6 +40,7 @@ func (t *validatingStubTool) Definition() model.ToolDefinition {
 				"ratio": map[string]any{"type": "number"},
 				"flag":  map[string]any{"type": "boolean"},
 				"opts":  map[string]any{"type": "object"},
+				"meta":  map[string]any{"type": "object", "properties": map[string]any{"a": map[string]any{"type": "string"}}},
 				"tags":  map[string]any{"type": "array"},
 				"mode":  map[string]any{"type": "string", "enum": []any{"a", "b"}},
 			},
@@ -149,7 +150,6 @@ func TestValidateAcceptsValidCalls(t *testing.T) {
 		`{"name":"x","count":2,"tags":["a"]}`,
 		`{"name":"x","count":2,"mode":"a"}`,
 		`{"name":"x","count":2,"ratio":null}`, // null optional = absent
-		`{"name":"x","count":2,"extra":123}`,  // unknown fields ignored
 	}
 	for _, args := range valid {
 		if _, err := r.Execute(ctx, "calculator", json.RawMessage(args)); err != nil {
@@ -158,6 +158,43 @@ func TestValidateAcceptsValidCalls(t *testing.T) {
 	}
 	if *ran != len(valid) {
 		t.Fatalf("tool ran %d time(s), want %d", *ran, len(valid))
+	}
+}
+
+// TestValidateRejectsUnknownParameters pins Audit 23 F-A23W2-25:
+// a parameter the schema does not declare is an invalid_args
+// error, never a silent default. The audit's example is a model
+// typo — max_element for max_elements — which used to run with
+// the default and never tell the model it misspelled the name.
+// The tool never runs on a rejected call, and the error names
+// the unknown parameter (with its dotted path when nested).
+func TestValidateRejectsUnknownParameters(t *testing.T) {
+	r, ran := newValidatingRegistry(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		args string
+		want string
+	}{
+		{"unknown top-level parameter", `{"name":"x","count":2,"extra":123}`, `unknown parameter "extra"`},
+		{"near-miss typo of a real parameter", `{"name":"x","count":2,"nam":"y"}`, `unknown parameter "nam"`},
+		{"unknown nested parameter", `{"name":"x","count":2,"meta":{"b":1}}`, `unknown parameter "meta.b"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := r.Execute(ctx, "calculator", json.RawMessage(tc.args))
+			assertInvalidArgs(t, err, tc.want)
+			if *ran != 0 {
+				t.Fatalf("tool ran despite unknown parameter in %s", tc.args)
+			}
+		})
+	}
+	// A nested object whose schema declares no properties cannot
+	// be second-guessed: its unknown fields are still ignored,
+	// so a free-form object stays callable.
+	if _, err := r.Execute(ctx, "calculator", json.RawMessage(`{"name":"x","count":2,"opts":{"k":1}}`)); err != nil {
+		t.Fatalf("Execute with free-form nested object: expected success, got %v", err)
 	}
 }
 
