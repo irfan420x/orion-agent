@@ -563,6 +563,18 @@ func matchKWinVisible(w atspiWindow, kwin []kwinWindow) []kwinCandidate {
 	return visible
 }
 
+// kwinActiveWindow returns the first active KWin window, or nil
+// when none is active (F-M2R-37): KWin knows which window is
+// active even when AT-SPI never sets FOCUSED.
+func kwinActiveWindow(kwin []kwinWindow) *kwinWindow {
+	for i := range kwin {
+		if kwin[i].Active {
+			return &kwin[i]
+		}
+	}
+	return nil
+}
+
 // kwinMinimizedWindowIndexes returns the AT-SPI window indexes
 // whose KWin counterpart is minimized (F-M2R-21): elements in a
 // minimized window report SHOWING=true but are not clickable, so
@@ -1356,10 +1368,14 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	now := t.now()
 	summary := buildGroundSummary(tree, elements, walked, totalMatched, listTruncated, correction, a.Region, originX, originY, viewW, viewH, imgW, imgH, scale, now, walkTime, treeAge, geometryVerified)
 	// Focused window: the AT-SPI tree's focused window first
-	// (it sees native Wayland windows); fall back to the
-	// screenshot tool's xdotool value.
+	// (it sees native Wayland windows); then the KWin active
+	// window (F-M2R-37 — AT-SPI never sets FOCUSED live, so every
+	// summary showed focused_window null even with Firefox
+	// active); fall back to the screenshot tool's xdotool value.
 	if tree != nil && tree.FocusedWindow != nil && tree.FocusedWindow.Title != "" {
 		summary.FocusedWindow = &groundWindowRef{Title: tree.FocusedWindow.Title, App: tree.FocusedWindow.App}
+	} else if active := kwinActiveWindow(kwin); active != nil {
+		summary.FocusedWindow = &groundWindowRef{Title: active.Caption, App: active.Class}
 	} else if shotSummary.FocusedWindow != "" {
 		summary.FocusedWindow = &groundWindowRef{Title: shotSummary.FocusedWindow}
 	}

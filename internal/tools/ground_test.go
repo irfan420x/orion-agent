@@ -1388,6 +1388,52 @@ func TestGroundKWinSkippedOnX11(t *testing.T) {
 	}
 }
 
+// TestGroundFocusedWindowFromKWinActive pins F-M2R-37: live,
+// AT-SPI never sets FOCUSED, so every summary showed
+// focused_window null even with Firefox active. The KWin active
+// window now fills it when the tree has no focused window.
+func TestGroundFocusedWindowFromKWinActive(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	// No focused window in the AT-SPI tree at all.
+	env.helper = `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": false, "x": 0, "y": 0, "w": 1920, "h": 993}],
+	"elements": [
+		{"role": "button", "name": "Sign in", "x": 784, "y": 520, "w": 352, "h": 40, "win": 0, "showing": true}],
+	"focused_window": null,
+	"walked_nodes": 2}`
+	env.kwinOK = true
+	env.kwin = kwinFirefoxJSON()
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if s.FocusedWindow == nil {
+		t.Fatal("focused_window is nil, want the KWin active window")
+	}
+	if s.FocusedWindow.Title != "Sign in to GitHub · GitHub — Mozilla Firefox" {
+		t.Errorf("focused_window title = %q, want the Firefox title", s.FocusedWindow.Title)
+	}
+	if s.FocusedWindow.App != "firefox-esr" {
+		t.Errorf("focused_window app = %q, want the KWin class firefox-esr", s.FocusedWindow.App)
+	}
+}
+
+// TestGroundFocusedWindowPrefersAtspi pins the precedence: when
+// the AT-SPI tree DOES name a focused window, it wins over the
+// KWin active window.
+func TestGroundFocusedWindowPrefersAtspi(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	// KWin says Kate is active; the tree says Firefox is focused.
+	env.kwin = `{"kwin_windows": [
+		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": false, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]},
+		{"caption": "Kate — notes.txt", "cls": "kate", "active": true, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600]}]}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if s.FocusedWindow == nil || s.FocusedWindow.Title != "Sign in to GitHub · GitHub — Mozilla Firefox" || s.FocusedWindow.App != "Firefox" {
+		t.Errorf("focused_window = %+v, want the AT-SPI focused window (Firefox)", s.FocusedWindow)
+	}
+}
+
 func TestGroundKWinZeroShift(t *testing.T) {
 	resetGroundSnapshots()
 	env := newFakeGroundEnv(t)
