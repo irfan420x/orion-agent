@@ -45,8 +45,9 @@
 //     never in results or logs (the helper cannot read values);
 //   - sensitive-window refusal BEFORE grounding, using the AT-SPI
 //     window titles (which see native Wayland windows xdotool
-//     cannot) and falling back to the screenshot tool's xdotool
-//     check when there is no tree;
+//     cannot) plus the KWin sensitive flag (which sees the Qt
+//     windows the tree cannot); with neither source available
+//     the grounding is refused, never captured blind (F-M2R-4/5);
 //   - empty name -> the role is the name, never a guessed name.
 //   - read-only, RiskClass Network (the image leaves the machine
 //     to the model provider — F-M2R-6); refused in unattended turns.
@@ -223,9 +224,9 @@ type groundCorrection struct {
 }
 
 type groundWindowShift struct {
-	Title string `json:"title"`
-	DX    int    `json:"dx"`
-	DY    int    `json:"dy"`
+	App string `json:"app"`
+	DX  int    `json:"dx"`
+	DY  int    `json:"dy"`
 }
 
 // groundScreen is the grounded view: the returned image's
@@ -323,15 +324,21 @@ type atspiElement struct {
 // kwinWindow is one window's true screen geometry from the KWin
 // compositor (frameGeometry is the outer frame; clientGeometry
 // the content area — identical for Wayland apps without
-// decorations). Caption is the window title, Class the app class
-// (e.g. "firefox-esr").
+// decorations). Class is the app class (e.g. "firefox-esr").
+// There is deliberately NO caption/title field (F-M2R-15): the
+// helper's output passes through the systemd journal, and titles
+// can carry sensitive text — so the helper never prints them.
+// Sens is the sensitive pattern the KWin script itself matched
+// against the window's caption ("" when none matched): the
+// sensitive check runs inside KWin, where the title is visible,
+// and only the matched pattern leaves it.
 type kwinWindow struct {
-	Caption   string `json:"caption"`
 	Class     string `json:"cls"`
 	Active    bool   `json:"active"`
 	Minimized bool   `json:"minimized"`
 	FG        [4]int `json:"fg"` // [x, y, w, h] frame geometry
 	CG        [4]int `json:"cg"` // [x, y, w, h] client geometry
+	Sens      string `json:"sens,omitempty"`
 }
 
 type kwinOutput struct {
@@ -339,15 +346,25 @@ type kwinOutput struct {
 }
 
 // matchKWinWindows matches KWin's true geometries to the AT-SPI
-// windows and returns the per-window coordinate shift (KWin frame
-// minus AT-SPI box) for each matched window, keyed by the AT-SPI
-// window index. A window matches when exactly one KWin window has
-// the same title, a compatible app class, and the same size; the
-// shift is then a pure translation (the app reports
-// window-relative coordinates — Firefox's window at (0,0) while
-// KWin places it at (0,29)). Anything ambiguous or unmatched gets
-// no shift: an uncorrected element is never worse than a
-// wrongly-shifted one.
+// windows and returns the per-window coordinate shift (KWin
+// geometry minus AT-SPI box) for each matched window, keyed by the
+// AT-SPI window index. A window matches when exactly one KWin
+// window has a compatible app class and the same size; the shift
+// is then a pure translation (the app reports window-relative
+// coordinates — Firefox's window at (0,0) while KWin places it
+// at (0,29)). Anything ambiguous or unmatched gets no shift: an
+// uncorrected element is never worse than a wrongly-shifted one.
+//
+// The size match tries the frame geometry first, then the client
+// geometry (F-M2R-9: CG was collected but never used). A decorated
+// window's frame is bigger than the area AT-SPI reports, so the
+// FG size never matches — but the client area does, and the
+// offset then comes from the client origin. The offset is taken
+// from whichever geometry matched.
+//
+// Titles are deliberately NOT used for matching (F-M2R-15): the
+// KWin helper no longer reports them, so two same-app, same-size
+// windows are ambiguous and stay uncorrected rather than guessed.
 //
 // The focused/active flags are deliberately NOT used for
 // matching: AT-SPI reported focused=false for the active Firefox
@@ -358,24 +375,21 @@ func matchKWinWindows(tree *atspiOutput, kwin []kwinWindow) map[int][2]int {
 		return offsets
 	}
 	for i, w := range tree.Windows {
-		var matches []kwinWindow
+		var matches [][2]int
 		for _, kw := range kwin {
-			if w.Title != kw.Caption {
-				continue
-			}
 			if !kwinClassCompatible(w.App, kw.Class) {
 				continue
 			}
-			if w.W != kw.FG[2] || w.H != kw.FG[3] {
-				continue
+			if w.W == kw.FG[2] && w.H == kw.FG[3] {
+				matches = append(matches, [2]int{kw.FG[0] - w.X, kw.FG[1] - w.Y})
+			} else if w.W == kw.CG[2] && w.H == kw.CG[3] {
+				matches = append(matches, [2]int{kw.CG[0] - w.X, kw.CG[1] - w.Y})
 			}
-			matches = append(matches, kw)
 		}
 		if len(matches) != 1 {
 			continue
 		}
-		dx, dy := matches[0].FG[0]-w.X, matches[0].FG[1]-w.Y
-		offsets[i] = [2]int{dx, dy}
+		offsets[i] = matches[0]
 	}
 	return offsets
 }
@@ -801,46 +815,51 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// vision_only below.
 	tree, _ := t.atspiTree(ctx)
 
-	// KWin geometry correction (F2): the compositor knows each
-	// window's true screen position; a Wayland client reports
-	// window-relative coordinates instead (Firefox's window at
-	// (0,0) while KWin places it at (0,29)), so the AT-SPI boxes
-	// sit ~29 px above the visible elements. The correction is
-	// measured fresh here, per window, from KWin's frameGeometry
-	// — never a hardcoded offset. A KWin failure (no KWin, no
-	// journal, timeout) leaves the tree uncorrected: the grounding
-	// still returns, with no correction field, rather than failing
-	// or faking coordinates.
+	// KWin geometry correction (F2) + the KWin sensitive source
+	// (F-M2R-4): the compositor knows each window's true screen
+	// position AND sees every window — including Qt apps with no
+	// accessibility bridge, which are invisible to both the
+	// AT-SPI tree and xdotool. The KWin query therefore runs on
+	// EVERY grounding, not only when there is a tree: it is the
+	// sensitive check's second source, and the only one that
+	// sees Qt windows. A KWin failure (no KWin, no journal,
+	// timeout) leaves the tree uncorrected: the grounding still
+	// returns, with no correction field, rather than failing or
+	// faking coordinates.
 	var correction *groundCorrection
-	if tree != nil {
-		if kwinPath, werr := t.writeKWinHelper(); werr == nil {
-			if raw, rerr := t.runKWinHelper(ctx, kwinPath); rerr == nil {
-				var kout kwinOutput
-				if jerr := json.Unmarshal(raw, &kout); jerr == nil {
-					offsets := matchKWinWindows(tree, kout.Windows)
-					if len(offsets) > 0 {
-						correction = &groundCorrection{Source: "kwin", Windows: []groundWindowShift{}}
-						for i := range tree.Windows {
-							if off, ok := offsets[i]; ok && (off[0] != 0 || off[1] != 0) {
-								correction.Windows = append(correction.Windows, groundWindowShift{
-									Title: tree.Windows[i].Title, DX: off[0], DY: off[1],
-								})
-							}
-						}
-						applyWindowOffsets(tree, offsets)
-					}
+	var kwinOut *kwinOutput
+	if kwinPath, werr := t.writeKWinHelper(); werr == nil {
+		if raw, rerr := t.runKWinHelper(ctx, kwinPath); rerr == nil {
+			var kout kwinOutput
+			if jerr := json.Unmarshal(raw, &kout); jerr == nil {
+				kwinOut = &kout
+			}
+		}
+	}
+	if tree != nil && kwinOut != nil {
+		offsets := matchKWinWindows(tree, kwinOut.Windows)
+		if len(offsets) > 0 {
+			correction = &groundCorrection{Source: "kwin", Windows: []groundWindowShift{}}
+			for i := range tree.Windows {
+				if off, ok := offsets[i]; ok && (off[0] != 0 || off[1] != 0) {
+					correction.Windows = append(correction.Windows, groundWindowShift{
+						App: tree.Windows[i].App, DX: off[0], DY: off[1],
+					})
 				}
 			}
+			applyWindowOffsets(tree, offsets)
 		}
 	}
 
 	// Sensitive-window refusal BEFORE grounding, on the AT-SPI
 	// window titles when there is a tree — AT-SPI sees native
 	// Wayland windows, which closes the xdotool gap the M1
-	// screenshot tool reports as "partial"/"unavailable". With no
-	// tree the screenshot tool's own check (inside ExecuteResult
-	// below) still refuses on what xdotool can see. The refusal
-	// names the category only, never the title.
+	// screenshot tool reports as "partial"/"unavailable" — plus
+	// the KWin sensitive flag, which sees the Qt windows the
+	// tree cannot (F-M2R-4). The KWin script matches titles
+	// itself and reports only the matched pattern, never the
+	// title (F-M2R-15). The refusal names the category only,
+	// never the title.
 	if tree != nil {
 		titles := make([]string, 0, len(tree.Windows))
 		for _, w := range tree.Windows {
@@ -850,6 +869,22 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 			return denied("this screen shows a %s: I will not capture, ground or describe it", SensitiveTitleCategory(hit))
 		}
 	}
+	if kwinOut != nil {
+		for _, kw := range kwinOut.Windows {
+			if kw.Sens != "" {
+				return denied("this screen shows a %s: I will not capture, ground or describe it", SensitiveTitleCategory(kw.Sens))
+			}
+		}
+	}
+	// Fail closed (F-M2R-5): with no AT-SPI tree AND no KWin
+	// list, no source can say whether a sensitive window is
+	// visible — a Qt window, a native Wayland window, any window
+	// at all could be on screen unseen. The capture does NOT
+	// proceed on an unverified screen; the caller must fix the
+	// backend (AT-SPI or KWin) and ground again.
+	if tree == nil && kwinOut == nil {
+		return denied("cannot verify no sensitive window is visible (no accessibility tree and no KWin window list): I will not capture blind")
+	}
 
 	// Capture with the M1 screenshot tool at full resolution
 	// (max_width 1920, scale 1.0): image pixels must BE screen
@@ -857,14 +892,21 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// screenshot tool still enforces its own sensitive check on
 	// top — but the capture is NOT charged to the shared budget
 	// again: this grounding already charged it once above, and
-	// one grounding is one capture (F-A23W2-14).
+	// one grounding is one capture (F-A23W2-14). The sensitive
+	// check is already done above, on strictly better sources
+	// (AT-SPI + KWin) than the screenshot tool's xdotool list —
+	// so the run context carries the verified mark and the
+	// screenshot tool skips its own check instead of refusing
+	// on a pure-Wayland session where xdotool sees nothing (its
+	// fail-closed "unavailable" refusal is for standalone
+	// captures with no verification at all).
 	shotArgs, _ := json.Marshal(map[string]any{
 		"format":    "jpeg",
 		"scale":     1.0,
 		"max_width": 1920,
 		"region":    a.Region,
 	})
-	shotRes, err := t.shot.executeResult(ctx, shotArgs, false)
+	shotRes, err := t.shot.executeResult(WithSensitiveVerified(ctx), shotArgs, false)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -1107,11 +1149,15 @@ func (t *groundTool) defaultRunHelper(ctx context.Context, helperPath string) ([
 
 // defaultRunKWinHelper runs the KWin helper with the KWin timeout
 // and returns its stdout. Any failure (exit code, timeout, empty
-// output) is an error — the caller grounds uncorrected.
+// output) is an error — the caller grounds uncorrected. The
+// sensitive substrings travel as argv so the helper's KWin script
+// can run the sensitive check itself (F-M2R-15: titles never
+// leave KWin — only the matched pattern does).
 func (t *groundTool) defaultRunKWinHelper(ctx context.Context, helperPath string) ([]byte, error) {
 	hctx, cancel := context.WithTimeout(ctx, groundKWinTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(hctx, "python3", helperPath)
+	args := append([]string{helperPath}, sensitiveWindowTitles...)
+	cmd := exec.CommandContext(hctx, "python3", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

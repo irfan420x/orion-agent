@@ -680,7 +680,7 @@ func TestInputClickSensitivePreciseBox(t *testing.T) {
 	// because the correction is applied; a click at (500,200)
 	// is inside the corrected box — refused.
 	env.kwinWindows = []kwinWindow{
-		{Caption: "KeePassXC — passwords.kdbx", Class: "keepassxc", FG: [4]int{100, 129, 800, 600}, CG: [4]int{100, 129, 800, 600}},
+		{Class: "keepassxc", FG: [4]int{100, 129, 800, 600}, CG: [4]int{100, 129, 800, 600}},
 	}
 	res := env.call(t, `{"op": "click", "x": 500, "y": 110}`)
 	if s := parseInputSummary(t, res); !s.Reached {

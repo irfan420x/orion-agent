@@ -437,8 +437,13 @@ func TestGroundHiddenElementsExcluded(t *testing.T) {
 func TestGroundVisionOnly(t *testing.T) {
 	resetGroundSnapshots()
 	// Helper run fails: screenshot still returned, empty list.
+	// Fail-closed (F-M2R-5) still applies with no tree: the
+	// grounding proceeds only because KWin verified the screen
+	// (empty window list, nothing sensitive).
 	env := newFakeGroundEnv(t)
 	env.helperOK = false
+	env.kwinOK = true
+	env.kwin = `{"kwin_windows": []}`
 	res := env.call(t, `{}`)
 	s := parseGroundSummary(t, res)
 	if s.Coverage != "vision_only" {
@@ -453,6 +458,8 @@ func TestGroundVisionOnly(t *testing.T) {
 	// Helper JSON unparseable: same clean degrade.
 	env2 := newFakeGroundEnv(t)
 	env2.helper = `{"windows": [ broken`
+	env2.kwinOK = true
+	env2.kwin = `{"kwin_windows": []}`
 	res = env2.call(t, `{}`)
 	if s := parseGroundSummary(t, res); s.Coverage != "vision_only" || len(s.Elements) != 0 {
 		t.Errorf("bad helper JSON gave coverage %q with %d elements, want vision_only/0", s.Coverage, len(s.Elements))
@@ -460,6 +467,8 @@ func TestGroundVisionOnly(t *testing.T) {
 	// python3 missing entirely: same degrade, no error.
 	env3 := newFakeGroundEnv(t)
 	env3.tool.lookPath = func(name string) (string, error) { return "", errFakeLookPath }
+	env3.kwinOK = true
+	env3.kwin = `{"kwin_windows": []}`
 	res = env3.call(t, `{}`)
 	if s := parseGroundSummary(t, res); s.Coverage != "vision_only" {
 		t.Errorf("no python3 gave coverage %q, want vision_only", s.Coverage)
@@ -835,8 +844,8 @@ func groundTreeWithWinJSON() string {
 // y=29, Kate's at y=0.
 func kwinFirefoxJSON() string {
 	return `{"kwin_windows": [
-		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]},
-		{"caption": "Kate — notes.txt", "cls": "kate", "active": false, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600]}]}`
+		{"cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993], "sens": ""},
+		{"cls": "kate", "active": false, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600], "sens": ""}]}`
 }
 
 func findGroundElement(t *testing.T, s groundSummary, name string) groundElement {
@@ -880,7 +889,7 @@ func TestGroundKWinCorrectionFirefox(t *testing.T) {
 		t.Fatalf("correction windows = %+v, want one Firefox entry", s.Correction.Windows)
 	}
 	w := s.Correction.Windows[0]
-	if w.Title != "Sign in to GitHub · GitHub — Mozilla Firefox" || w.DX != 0 || w.DY != 29 {
+	if w.App != "Firefox" || w.DX != 0 || w.DY != 29 {
 		t.Errorf("correction window = %+v, want Firefox (0,29)", w)
 	}
 }
@@ -890,8 +899,11 @@ func TestGroundKWinNoMatch(t *testing.T) {
 	env := newFakeGroundEnv(t)
 	env.helper = groundTreeWithWinJSON()
 	env.kwinOK = true
-	// No KWin window carries the Firefox title: no correction.
-	env.kwin = `{"kwin_windows": [{"caption": "Some other window", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
+	// Same app class and origin, different size (neither FG nor
+	// CG matches the AT-SPI window): no correction. Titles are
+	// no longer part of the match (F-M2R-15 — the helper never
+	// reports them), so size is what distinguishes windows here.
+	env.kwin = `{"kwin_windows": [{"cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 1050], "cg": [0, 29, 1920, 1050]}]}`
 	s := parseGroundSummary(t, env.call(t, `{}`))
 	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
 		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
@@ -906,11 +918,11 @@ func TestGroundKWinAmbiguous(t *testing.T) {
 	env := newFakeGroundEnv(t)
 	env.helper = groundTreeWithWinJSON()
 	env.kwinOK = true
-	// Two KWin windows match the Firefox title+class+size: fail
+	// Two KWin windows match the Firefox class+size: fail
 	// safe — no correction rather than a guessed one.
 	env.kwin = `{"kwin_windows": [
-		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]},
-		{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": false, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
+		{"cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]},
+		{"cls": "firefox-esr", "active": false, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
 	s := parseGroundSummary(t, env.call(t, `{}`))
 	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
 		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
@@ -925,8 +937,8 @@ func TestGroundKWinClassMismatch(t *testing.T) {
 	env := newFakeGroundEnv(t)
 	env.helper = groundTreeWithWinJSON()
 	env.kwinOK = true
-	// Same title and size, different app class: no correction.
-	env.kwin = `{"kwin_windows": [{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "chromium", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
+	// Same size, different app class: no correction.
+	env.kwin = `{"kwin_windows": [{"cls": "chromium", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]}`
 	s := parseGroundSummary(t, env.call(t, `{}`))
 	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
 		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
@@ -993,12 +1005,16 @@ func TestMatchKWinWindows(t *testing.T) {
 			{Title: "Sign in to GitHub · GitHub — Mozilla Firefox", App: "Firefox", X: 0, Y: 0, W: 1920, H: 993},
 			{Title: "Kate — notes.txt", App: "Kate", X: 0, Y: 0, W: 800, H: 600},
 			{Title: "Hidden panel", App: "plasmashell", X: 0, Y: 0, W: 1920, H: 45},
+			// Decorated window: AT-SPI reports the client area
+			// (800x570 at y=30); the frame is taller (800x600).
+			{Title: "Decorated app", App: "decorated", X: 100, Y: 30, W: 800, H: 570},
 		},
 	}
 	kwin := []kwinWindow{
-		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", FG: [4]int{0, 29, 1920, 993}},
-		{Caption: "Kate — notes.txt", Class: "kate", FG: [4]int{0, 0, 800, 600}},
-		{Caption: "Hidden panel", Class: "plasmashell", FG: [4]int{0, 0, 1920, 45}},
+		{Class: "firefox-esr", FG: [4]int{0, 29, 1920, 993}},
+		{Class: "kate", FG: [4]int{0, 0, 800, 600}},
+		{Class: "plasmashell", FG: [4]int{0, 0, 1920, 45}},
+		{Class: "decorated", FG: [4]int{100, 0, 800, 600}, CG: [4]int{100, 30, 800, 570}},
 	}
 	offsets := matchKWinWindows(tree, kwin)
 	if got, want := offsets[0], [2]int{0, 29}; got != want {
@@ -1010,10 +1026,29 @@ func TestMatchKWinWindows(t *testing.T) {
 	if got, want := offsets[2], [2]int{0, 0}; got != want {
 		t.Errorf("plasmashell offset = %v, want %v", got, want)
 	}
-	// Size mismatch: same title and class, different height.
+	// F-M2R-9: the decorated window matches on CG, not FG — the
+	// frame (800x600) never matches the AT-SPI box (800x570),
+	// but the client area does, and the offset comes from the
+	// client origin (100,30) - (100,30) = (0,0).
+	if got, want := offsets[3], [2]int{0, 0}; got != want {
+		t.Errorf("decorated-window offset = %v, want %v (CG match)", got, want)
+	}
+	// Size mismatch: same class, neither FG nor CG fits.
 	kwin[0].FG = [4]int{0, 29, 1920, 1050}
-	if offsets := matchKWinWindows(tree, kwin); len(offsets) != 2 {
+	kwin[0].CG = [4]int{0, 29, 1920, 1050}
+	if offsets := matchKWinWindows(tree, kwin); len(offsets) != 3 {
 		t.Errorf("size mismatch still matched: %v", offsets)
+	}
+	// CG origin shift: a decorated window whose client area sits
+	// below the frame origin gets the CG offset.
+	tree2 := &atspiOutput{Windows: []atspiWindow{
+		{Title: "Decorated app", App: "decorated", X: 100, Y: 0, W: 800, H: 570},
+	}}
+	kwin2 := []kwinWindow{
+		{Class: "decorated", FG: [4]int{100, 0, 800, 600}, CG: [4]int{100, 30, 800, 570}},
+	}
+	if offsets := matchKWinWindows(tree2, kwin2); offsets[0] != [2]int{0, 30} {
+		t.Errorf("CG-origin offset = %v, want {0 30}", offsets[0])
 	}
 }
 
@@ -1075,5 +1110,77 @@ func TestApplyWindowOffsets(t *testing.T) {
 	applyWindowOffsets(tree, map[int][2]int{0: {0, 29}})
 	if tree.Elements[0].Y != 129 {
 		t.Errorf("out-of-range win element Y = %d, want 129", tree.Elements[0].Y)
+	}
+}
+
+// --- F-M2R-4/5: sensitive-window guard fail-open ---
+
+// TestGroundNoTreeNoKWinRefuses pins F-M2R-5 (fail closed): with
+// no AT-SPI tree AND no KWin list, no source can say whether a
+// sensitive window is visible, so the capture must NOT proceed
+// on an unverified screen — not even as vision_only.
+func TestGroundNoTreeNoKWinRefuses(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helperOK = false // no tree
+	// kwinOK stays false: no KWin list either.
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("ground with no tree and no KWin = nil, want a denial")
+	}
+	var terr *ToolError
+	if !errors.As(err, &terr) || terr.Kind != "denied" {
+		t.Errorf("error = %v, want denied ToolError", err)
+	}
+	if !strings.Contains(err.Error(), "cannot verify") {
+		t.Errorf("refusal = %q, want the cannot-verify explanation", err.Error())
+	}
+	if env.captures != 0 {
+		t.Errorf("fail-closed refusal still captured %d screenshot(s)", env.captures)
+	}
+}
+
+// TestGroundKWinSensitiveRefusal pins F-M2R-4: a Qt-style window
+// the AT-SPI tree cannot see (no title match in the tree) is
+// still caught by the KWin sensitive flag — the KWin script
+// matched the caption itself and reported only the pattern.
+func TestGroundKWinSensitiveRefusal(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.kwinOK = true
+	env.kwin = `{"kwin_windows": [{"cls": "keepassxc", "active": true, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600], "sens": "keepass"}]}`
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("KWin-flagged sensitive window = nil, want a denial")
+	}
+	var terr *ToolError
+	if !errors.As(err, &terr) || terr.Kind != "denied" {
+		t.Errorf("error = %v, want denied ToolError", err)
+	}
+	if !strings.Contains(err.Error(), "password manager") {
+		t.Errorf("refusal = %q, want the category (never the title)", err.Error())
+	}
+	if strings.Contains(err.Error(), "KeePass") || strings.Contains(err.Error(), "keepassxc") {
+		t.Errorf("refusal leaks window identity %q", err.Error())
+	}
+	if env.captures != 0 {
+		t.Errorf("KWin sensitive refusal still captured %d screenshot(s)", env.captures)
+	}
+}
+
+// TestGroundKWinHelperNoTitles pins F-M2R-15: the KWin helper's
+// output passes through the systemd journal, so it must never
+// carry a window caption — only geometries, the app class and
+// the matched sensitive pattern.
+func TestGroundKWinHelperNoTitles(t *testing.T) {
+	if strings.Contains(kwinHelperSource, `"caption"`) || strings.Contains(kwinHelperSource, "caption:") {
+		t.Errorf("KWin helper source prints a caption — titles must never reach the journal (F-M2R-15)")
+	}
+	if !strings.Contains(kwinHelperSource, "sens") {
+		t.Errorf("KWin helper source has no sensitive flag — the check must run inside KWin")
+	}
+	// The script reads the caption only to match it locally.
+	if !strings.Contains(kwinHelperSource, "w.caption") {
+		t.Errorf("KWin helper source does not read w.caption for the in-script sensitive match")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/png"
 	"os"
@@ -99,6 +100,17 @@ func (e *fakeScreenshotEnv) call(t *testing.T, args string) ToolResult {
 	res, err := e.tool.ExecuteResult(context.Background(), json.RawMessage(args))
 	if err != nil {
 		t.Fatalf("ExecuteResult(%s) = %v, want nil", args, err)
+	}
+	return res
+}
+
+// callVerified is call with ground's sensitive-verified mark on
+// the context (the hand-off ground uses after its own check).
+func (e *fakeScreenshotEnv) callVerified(t *testing.T, args string) ToolResult {
+	t.Helper()
+	res, err := e.tool.ExecuteResult(WithSensitiveVerified(context.Background()), json.RawMessage(args))
+	if err != nil {
+		t.Fatalf("ExecuteResult(verified, %s) = %v, want nil", args, err)
 	}
 	return res
 }
@@ -411,15 +423,40 @@ func TestScreenshotExecuteReturnsText(t *testing.T) {
 }
 
 func TestScreenshotSensitiveCheckUnavailable(t *testing.T) {
-	// xdotool missing entirely: the capture proceeds, but the
-	// summary says the check could not run — the gap is visible,
-	// never silent.
+	// xdotool missing entirely: fail closed (F-M2R-5) — the
+	// capture is refused, because no window title can be read
+	// and a sensitive window could be on screen unseen. The old
+	// behaviour (capture anyway, summary says "unavailable")
+	// was the fail-open hole.
 	env := newFakeScreenshotEnv(t)
 	env.tool.windowTitles = func(ctx context.Context) ([]string, error) { return nil, os.ErrNotExist }
 	env.tool.activeWindow = func(ctx context.Context) (string, error) { return "", os.ErrNotExist }
-	res := env.call(t, `{}`)
-	if s := parseSummary(t, res); s.SensitiveCheck != "unavailable" {
-		t.Errorf("sensitive_check = %q, want unavailable", s.SensitiveCheck)
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("screenshot with no window list = nil, want a denial")
+	}
+	var terr *ToolError
+	if !errors.As(err, &terr) || terr.Kind != "denied" {
+		t.Errorf("error = %v, want denied ToolError", err)
+	}
+	if env.captures != 0 {
+		t.Errorf("fail-closed refusal still captured %d time(s)", env.captures)
+	}
+}
+
+// TestScreenshotSensitiveVerifiedSkipsCheck pins the ground
+// hand-off: when ground already verified the screen on better
+// sources (AT-SPI + KWin) and marks the context, the screenshot
+// tool skips its own xdotool check — a verified capture on a
+// pure-Wayland session (no xdotool at all) must not be refused
+// for the missing list.
+func TestScreenshotSensitiveVerifiedSkipsCheck(t *testing.T) {
+	env := newFakeScreenshotEnv(t)
+	env.tool.windowTitles = func(ctx context.Context) ([]string, error) { return nil, os.ErrNotExist }
+	env.tool.activeWindow = func(ctx context.Context) (string, error) { return "", os.ErrNotExist }
+	res := env.callVerified(t, `{}`)
+	if s := parseSummary(t, res); s.SensitiveCheck != "ok" {
+		t.Errorf("sensitive_check = %q, want ok (ground-verified)", s.SensitiveCheck)
 	}
 }
 

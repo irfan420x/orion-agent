@@ -367,12 +367,29 @@ func (t *screenshotTool) executeResult(ctx context.Context, args json.RawMessage
 
 	// Sensitive-window check BEFORE capturing anything (plan
 	// §5.3): a password manager / bank / OTP window focused or
-	// visible refuses the capture outright.
-	sensitiveCheck, sensitiveErr := t.checkSensitive(ctx)
-	if sensitiveErr != "" {
-		// The refusal names the category only — never the window
-		// title, which could itself carry sensitive text.
-		return denied("this screen shows a %s: I will not capture or describe it", sensitiveErr)
+	// visible refuses the capture outright. Fail closed
+	// (F-M2R-5): when no window title can be read at all
+	// ("unavailable" — xdotool missing, no XWayland), the capture
+	// does NOT proceed on an unverified screen. The one exception
+	// is a capture ground already verified on better sources
+	// (AT-SPI tree + KWin list): ground marks that context, and
+	// the check is skipped — verifying twice would refuse a
+	// verified capture on a pure-Wayland session where xdotool
+	// sees nothing.
+	var sensitiveCheck string
+	if SensitiveVerifiedFromContext(ctx) {
+		sensitiveCheck = "ok"
+	} else {
+		var sensitiveErr string
+		sensitiveCheck, sensitiveErr = t.checkSensitive(ctx)
+		if sensitiveCheck == "unavailable" {
+			return denied("cannot determine the visible windows (no window list available): I will not capture blind")
+		}
+		if sensitiveErr != "" {
+			// The refusal names the category only — never the window
+			// title, which could itself carry sensitive text.
+			return denied("this screen shows a %s: I will not capture or describe it", sensitiveErr)
+		}
 	}
 
 	// Screen locked / display off: error, no retry (plan §4.1).
@@ -533,9 +550,11 @@ func (t *screenshotTool) checkRateLimit(charge bool) error {
 // means the full window list could not be enumerated and only the
 // active window was checked; "unavailable" means no title could be
 // read at all (xdotool missing — e.g. a session with no XWayland),
-// in which case the capture proceeds and the summary says so. An
-// enumeration that succeeds but finds no titled windows is "ok",
-// not "unavailable" — empty titles are a result, not a failure.
+// in which case the CALLER must refuse the capture (F-M2R-5: an
+// unverified screen is never captured) — the summary field alone
+// is not a substitute for refusing. An enumeration that succeeds
+// but finds no titled windows is "ok", not "unavailable" — empty
+// titles are a result, not a failure.
 func (t *screenshotTool) checkSensitive(ctx context.Context) (string, string) {
 	titles, err := t.windowTitles(ctx)
 	if err != nil {

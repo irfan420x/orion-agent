@@ -159,6 +159,38 @@ func visionGateError(ctx context.Context, tool string) error {
 	return fmt.Errorf("the current model %s/%s cannot see images (no vision support): %s refused — switch to a vision-capable model (e.g. deepseek-flash) to capture the screen", provider, modelName, tool)
 }
 
+// --- sensitive-verified marker (F-M2R-5) ---
+//
+// Ground verifies the screen itself, on strictly better sources
+// than the screenshot tool's xdotool list (AT-SPI tree + KWin
+// list), before it asks the screenshot tool to capture. It marks
+// the context it passes down, so the screenshot tool skips its
+// own check instead of refusing a verified capture on a
+// pure-Wayland session where xdotool sees nothing. The mark is
+// set ONLY by ground, after its own check passed — never by a
+// caller that did not verify anything.
+
+type sensitiveVerifiedContextKey struct{}
+
+// WithSensitiveVerified returns ctx marked as sensitive-verified
+// by ground's AT-SPI + KWin check.
+func WithSensitiveVerified(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sensitiveVerifiedContextKey{}, true)
+}
+
+// SensitiveVerifiedFromContext reports whether ctx carries
+// ground's sensitive-verified mark.
+func SensitiveVerifiedFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(sensitiveVerifiedContextKey{}).(bool)
+	return v
+}
+
 // sensitiveWindowTitles are case-insensitive substrings of window
 // titles that mark a window as sensitive: password managers,
 // banks/payment/crypto apps, vaults and OTP/2FA dialogs. The list
@@ -167,6 +199,8 @@ func visionGateError(ctx context.Context, tool string) error {
 // data, not a prompt hint: the screenshot tool checks it before
 // capturing anything. Titles the platform cannot see (native
 // Wayland windows under xdotool) are a known gap, not a pass.
+// The same list is passed to the KWin helper, which matches
+// captions inside KWin and reports only the matched pattern.
 var sensitiveWindowTitles = []string{
 	// Password managers / vaults.
 	"keepass", "bitwarden", "1password", "lastpass", "dashlane",

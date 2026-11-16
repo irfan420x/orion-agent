@@ -3,9 +3,9 @@
 
 Queries KWin (the Wayland compositor) for every window's TRUE
 screen geometry via its scripting API, and prints one JSON
-document: {"kwin_windows": [{"caption": ..., "cls": ...,
-"active": ..., "minimized": ..., "fg": [x, y, w, h],
-"cg": [x, y, w, h]}]}.
+document: {"kwin_windows": [{"cls": ..., "active": ...,
+"minimized": ..., "fg": [x, y, w, h], "cg": [x, y, w, h],
+"sens": "<matched sensitive pattern or ''>"}]}.
 
 Why: on Wayland a client does not know its own absolute position
 (the compositor decides it), so Firefox's accessibility tree
@@ -13,9 +13,20 @@ reports window-relative coordinates — its window at (0,0) while
 KWin places it at (0,29). The AT-SPI boxes are therefore ~29 px
 above the visible elements (F2). KWin's frameGeometry is the
 compositor's truth; the Go caller matches KWin windows to AT-SPI
-windows (exact title + compatible app class + same size) and
-applies the per-window translation. NEVER a hardcoded offset:
-the correction is measured fresh on every grounding.
+windows (compatible app class + same size) and applies the
+per-window translation. NEVER a hardcoded offset: the correction
+is measured fresh on every grounding.
+
+Titles NEVER leave KWin (F-M2R-15): the script's print() output
+lands in the systemd journal, and window titles can carry
+sensitive text (document names, account numbers, message
+subjects) — so the JSON carries NO caption at all. The
+sensitive-window check runs INSIDE the script instead: the
+caller passes the sensitive substrings as argv, the script
+matches each window's caption against them (case-insensitive
+substring, same rule as the Go side) and reports only the
+matched pattern ("sens"), never the title. A journal reader sees
+geometries and a pattern word, never a title.
 
 Mechanism: load a tiny JS script via org.kde.KWin /Scripting
 (loadScript + start), which prints the geometries with a unique
@@ -27,11 +38,11 @@ markers + proper load/start/unload sequencing). Note: start()
 starts ALL loaded scripts (that is the KWin API); other scripts'
 start is idempotent for well-behaved scripts.
 
-Reads ONLY window geometries (captions are window titles, already
-visible on screen). On ANY failure this helper exits non-zero
-with the error on stderr and NO JSON on stdout, so the Go caller
-grounds uncorrected instead of grounding on partial or faked
-geometry.
+Reads ONLY window geometries (captions are compared inside the
+script for the sensitive flag and never printed). On ANY failure
+this helper exits non-zero with the error on stderr and NO JSON
+on stdout, so the Go caller grounds uncorrected instead of
+grounding on partial or faked geometry.
 """
 import json
 import os
@@ -45,13 +56,26 @@ import gi
 gi.require_version('Gio', '2.0')
 from gi.repository import Gio, GLib
 
-JS_TEMPLATE = """var wins = workspace.windowList();
+# Sensitive substrings, passed by the Go caller as argv[1:]
+# (same list as sensitiveWindowTitles in internal/tools/
+# computeruse.go — the Go side is authoritative; the helper takes
+# them as input so the two can never drift). The script matches
+# each caption against them and reports only the matched pattern.
+SENSITIVE_PATTERNS = sys.argv[1:]
+
+JS_TEMPLATE = """var pats = %s;
+var wins = workspace.windowList();
 var out = [];
 for (var i = 0; i < wins.length; i++) {
     var w = wins[i];
     var fg = w.frameGeometry;
     var cg = w.clientGeometry;
-    out.push({caption: w.caption, cls: w.resourceClass, active: w.active, minimized: w.minimized, fg: [fg.x, fg.y, fg.width, fg.height], cg: [cg.x, cg.y, cg.width, cg.height]});
+    var sens = "";
+    var cap = (w.caption || "").toLowerCase();
+    for (var k = 0; k < pats.length; k++) {
+        if (cap.indexOf(pats[k]) >= 0) { sens = pats[k]; break; }
+    }
+    out.push({cls: w.resourceClass, active: w.active, minimized: w.minimized, fg: [fg.x, fg.y, fg.width, fg.height], cg: [cg.x, cg.y, cg.width, cg.height], sens: sens});
 }
 print("%s" + JSON.stringify(out));
 """
@@ -83,7 +107,7 @@ def journal_grep(marker):
 
 def main():
     marker = "ORION-KWIN-GEOM-%d-%04x:" % (os.getpid(), random.randrange(0x10000))
-    js = JS_TEMPLATE % marker
+    js = JS_TEMPLATE % (json.dumps(SENSITIVE_PATTERNS), marker)
     fd, js_path = tempfile.mkstemp(prefix="orion-kwin-geom-", suffix=".js")
     try:
         os.write(fd, js.encode())
