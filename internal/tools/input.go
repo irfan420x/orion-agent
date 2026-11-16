@@ -292,7 +292,7 @@ type inputTool struct {
 	// cause a wrong move — only a fail-fast rejection while the
 	// cache is fresh.
 	screenW, screenH int
-	screenCachedAt time.Time
+	screenCachedAt   time.Time
 
 	// ground supplies the AT-SPI tree for the sensitive-window
 	// check (the M2 safety layer); shot supplies the xdotool
