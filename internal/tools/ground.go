@@ -143,17 +143,14 @@ const (
 	// (D-Bus round-trip bound, ~5.8 ms/node on a 942-node tree),
 	// spectacle ~1.0 s, probe 0.36 s, KWin query ~0.1-0.5 s.
 	// Depth caps cannot help — the tree is wide, not deep. The
-	// budget is a design target, not an enforced timeout: the
-	// enforced bounds are groundHelperTimeout (10 s), the KWin
-	// helper timeout (half the budget, below), and the agent's
+	// budget is ENFORCED (F-M2R-10): ExecuteResult runs under one
+	// context deadline for the whole grounding (probe + walk +
+	// KWin + capture), so the worst case is the budget, not the
+	// ~25 s+ the sequential per-step timeouts allowed. The
+	// enforced bounds inside it are groundHelperTimeout (10 s),
+	// the KWin helper timeout (half the budget), and the agent's
 	// 120 s step timeout. Grounding is a deliberate
 	// once-per-decision action, not a hot path.
-	groundTimeBudget = 10 * time.Second
-	// KWin helper timeout: half the ground time budget, so a KWin
-	// failure (no KWin, no journal, hung script) can never eat
-	// the whole budget — the grounding degrades to uncorrected
-	// instead. The query itself measured ~0.1 s (10/10 trials).
-	groundKWinTimeout        = groundTimeBudget / 2
 	groundDefaultMaxElements = 60
 	groundMaxMaxElements     = 200
 	groundSnapshotTTL        = 60 * time.Second
@@ -161,6 +158,19 @@ const (
 	groundHelperFile         = "ground-atspi-helper.py"
 	groundKWinHelperFile     = "ground-kwin-helper.py"
 )
+
+// groundTimeBudget is the enforced whole-grounding deadline
+// (F-M2R-10). It is a var, not a const, so tests can shrink it to
+// prove the deadline fires (see TestGroundTimeBudget).
+var groundTimeBudget = 10 * time.Second
+
+// groundKWinTimeout bounds one KWin helper run: half the ground
+// time budget, so a KWin failure (no KWin, no journal, hung
+// script) can never eat the whole budget — the grounding degrades
+// to uncorrected instead. The query itself measured ~0.1 s
+// (10/10 trials). Computed from the budget, not a const, so a
+// test-shrunk budget shrinks it too.
+func groundKWinTimeout() time.Duration { return groundTimeBudget / 2 }
 
 // Ground rate limits (M1 screenshot discipline, plan §4.1).
 // The per-turn/hour numbers alias the shared capture budget's
@@ -803,6 +813,15 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		return ToolResult{}, &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf(format, v...)}
 	}
 
+	// Time budget (F-M2R-10): the whole grounding — probe, tree
+	// walk, KWin query, capture, markers — runs under one
+	// deadline, so the worst case is the budget, not the ~25 s+
+	// the sequential per-step timeouts allowed. Every subcall
+	// below takes this ctx, so a hung helper or a slow capture
+	// is cut off at the deadline instead of stacking timeouts.
+	ctx, cancel := context.WithTimeout(ctx, groundTimeBudget)
+	defer cancel()
+
 	// Computer-use is OFF in unattended turns, no exceptions
 	// (plan §11.3) — refused before anything else happens.
 	if UnattendedTurnFromContext(ctx) {
@@ -863,8 +882,13 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// AT-SPI backend probe at Execute start, never cached: python3
 	// present + gi.Atspi importable. A missing backend (or any
 	// helper failure) is not an error — grounding degrades to
-	// vision_only below.
+	// vision_only below — UNLESS the budget killed the walk, in
+	// which case the degrade would hide the timeout: that is a
+	// budget failure, reported as one.
 	tree, _ := t.atspiTree(ctx)
+	if tree == nil && ctx.Err() == context.DeadlineExceeded {
+		return failed("ground time budget of %v exceeded during the accessibility walk", groundTimeBudget)
+	}
 
 	// KWin geometry correction (F2) + the KWin sensitive source
 	// (F-M2R-4): the compositor knows each window's true screen
@@ -959,6 +983,9 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	})
 	shotRes, err := t.shot.executeResult(WithSensitiveVerified(ctx), shotArgs, false)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return failed("ground time budget of %v exceeded during capture", groundTimeBudget)
+		}
 		return ToolResult{}, err
 	}
 	if len(shotRes.Images) != 1 {
@@ -1224,7 +1251,7 @@ func (t *groundTool) defaultRunHelper(ctx context.Context, helperPath string) ([
 // can run the sensitive check itself (F-M2R-15: titles never
 // leave KWin — only the matched pattern does).
 func (t *groundTool) defaultRunKWinHelper(ctx context.Context, helperPath string) ([]byte, error) {
-	hctx, cancel := context.WithTimeout(ctx, groundKWinTimeout)
+	hctx, cancel := context.WithTimeout(ctx, groundKWinTimeout())
 	defer cancel()
 	args := append([]string{helperPath}, sensitiveWindowTitles...)
 	cmd := exec.CommandContext(hctx, "python3", args...)

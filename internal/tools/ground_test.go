@@ -1281,3 +1281,38 @@ func TestGroundRegistersWindowGeometry(t *testing.T) {
 		t.Errorf("raw-geometry check = %v, want the moved-or-resized refusal", err)
 	}
 }
+
+// TestGroundTimeBudget pins F-M2R-10: the 10 s budget is an
+// enforced deadline, not a design target. With the budget shrunk
+// to 150 ms and a helper that blocks until its context dies, the
+// grounding must fail with the budget error within ~1 s — not
+// run on until the helper's own 10 s timeout (or the ~25 s the
+// old sequential timeouts allowed).
+func TestGroundTimeBudget(t *testing.T) {
+	resetGroundSnapshots()
+	oldBudget := groundTimeBudget
+	groundTimeBudget = 150 * time.Millisecond
+	defer func() { groundTimeBudget = oldBudget }()
+	env := newFakeGroundEnv(t)
+	env.tool.runHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	// KWin must not mask the budget: fail it fast.
+	env.kwinOK = false
+	start := time.Now()
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("over-budget grounding = nil, want a budget failure")
+	}
+	if !strings.Contains(err.Error(), "time budget") {
+		t.Errorf("over-budget grounding err = %v, want the time-budget failure", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("over-budget grounding took %v, want it cut off at the budget", elapsed)
+	}
+	if env.captures != 0 {
+		t.Errorf("over-budget grounding still captured %d screenshot(s)", env.captures)
+	}
+}
