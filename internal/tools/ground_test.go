@@ -680,6 +680,75 @@ func TestGroundSensitiveRefusal(t *testing.T) {
 // TestGroundRefusesLockedScreen pins F-M2R-34: ground checks
 // the screen lock itself, before the KWin query and the AT-SPI
 // walk — a locked screen must not pay for a window enumeration.
+// TestGroundSpectacleFailureKeepsTree pins F-M2R-29: when the
+// inner screenshot fails (spectacle missing or broken) the good
+// tree is returned as a tree-only partial result — elements plus
+// coverage "grounded" and a screenshot_error naming the failure,
+// no image — instead of erroring the tree away. The snapshot is
+// registered, so the elements stay clickable.
+func TestGroundSpectacleFailureKeepsTree(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.tool.shot.execCmd = func(ctx context.Context, name string, args ...string) (string, error) {
+		if name == "spectacle" && len(args) == 1 && args[0] == "--version" {
+			return "spectacle 6.6.5\n", nil
+		}
+		if name == "spectacle" {
+			return "", errors.New("spectacle: cannot open display")
+		}
+		t.Errorf("unexpected shot exec: %s %v", name, args)
+		return "", nil
+	}
+	res, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("spectacle failure err = %v, want a tree-only partial result", err)
+	}
+	if len(res.Images) != 0 {
+		t.Errorf("partial result gave %d images, want 0", len(res.Images))
+	}
+	s := parseGroundSummary(t, res)
+	if s.Coverage != "grounded" {
+		t.Errorf("coverage = %q, want grounded (the tree survived)", s.Coverage)
+	}
+	if len(s.Elements) != 6 {
+		t.Fatalf("got %d elements, want 6: %+v", len(s.Elements), s.Elements)
+	}
+	if s.ScreenshotError == "" {
+		t.Errorf("screenshot_error is empty, want the spectacle failure named")
+	}
+	if !strings.Contains(s.ScreenshotError, "spectacle") {
+		t.Errorf("screenshot_error = %q, want the spectacle failure", s.ScreenshotError)
+	}
+	if err := ValidateGroundSnapshot(context.Background(), s.SnapshotID, 1); err != nil {
+		t.Errorf("partial snapshot should validate: %v", err)
+	}
+}
+
+// TestGroundSpectacleDenialPropagates pins the F-M2R-29 boundary:
+// a DENIED screenshot must never become a partial result — the
+// denial propagates as an error. The denial here is the inner
+// shot's rate limit: a standalone capture primes its 1 s
+// min-interval, and the frozen fake clock means ground's
+// embedded capture hits it. (A sensitive-title denial cannot
+// be staged through the shot: ground marks the context
+// verified — AT-SPI + KWin already checked — so the shot skips
+// its own title check by design.)
+func TestGroundSpectacleDenialPropagates(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	if _, err := env.tool.shot.executeResult(context.Background(), json.RawMessage(`{}`), false); err != nil {
+		t.Fatalf("priming capture = %v, want nil", err)
+	}
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("rate-limited screenshot should propagate as an error, not a partial result")
+	}
+	var terr *ToolError
+	if !errors.As(err, &terr) || terr.Kind != "denied" {
+		t.Errorf("error = %v, want denied ToolError", err)
+	}
+}
+
 func TestGroundRefusesLockedScreen(t *testing.T) {
 	resetGroundSnapshots()
 	env := newFakeGroundEnv(t)

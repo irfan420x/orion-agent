@@ -289,6 +289,12 @@ type groundSummary struct {
 	// list from a truncated one on a dense page; Truncated
 	// above says whether the max_elements cap cut the list.
 	TotalMatched int `json:"total_matched,omitempty"`
+	// ScreenshotError (F-M2R-29): set on a tree-only partial
+	// result, when the screenshot failed but the tree survived.
+	// The summary then carries elements with no image; the error
+	// text says why, so the provider never mistakes a partial
+	// grounding for a complete one.
+	ScreenshotError string `json:"screenshot_error,omitempty"`
 }
 
 // groundWindowSummary is one window's share of a grounding
@@ -1251,11 +1257,26 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		"region":    a.Region,
 	})
 	shotRes, err := t.shot.executeResult(WithSensitiveVerified(ctx), shotArgs, false)
+	var shotErr error
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return failed("ground time budget of %v exceeded during capture", groundTimeBudget)
 		}
-		return ToolResult{}, err
+		// A denied screenshot (sensitive refusal, rate limit)
+		// propagates: a refusal must never become a partial
+		// result. An execution failure (spectacle missing or
+		// broken) with a good tree degrades to a tree-only
+		// partial result below (F-M2R-29) instead of throwing
+		// the tree away — and with no tree there is nothing to
+		// salvage, so the error stands.
+		var terr *ToolError
+		if errors.As(err, &terr) && terr.Kind == "denied" {
+			return ToolResult{}, err
+		}
+		if tree == nil {
+			return ToolResult{}, err
+		}
+		shotErr = err
 	}
 	// Tree age (F-M2R-11): from the end of the walk to the end
 	// of the capture — the bound on how stale the markers are.
@@ -1284,18 +1305,27 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 			}
 		}
 	}
-	if len(shotRes.Images) != 1 {
+	if shotErr == nil && len(shotRes.Images) != 1 {
 		return failed("screenshot returned %d images, want 1", len(shotRes.Images))
 	}
 	var shotSummary screenshotSummary
-	if err := json.Unmarshal([]byte(shotRes.Text), &shotSummary); err != nil {
-		return failed("cannot parse the screenshot summary: %v", err)
+	var img image.Image
+	var imgW, imgH int
+	if shotErr == nil {
+		if err := json.Unmarshal([]byte(shotRes.Text), &shotSummary); err != nil {
+			return failed("cannot parse the screenshot summary: %v", err)
+		}
+		var err error
+		img, _, err = image.Decode(bytes.NewReader(shotRes.Images[0].Data))
+		if err != nil {
+			return failed("cannot decode the captured image: %v", err)
+		}
+		imgW, imgH = img.Bounds().Dx(), img.Bounds().Dy()
+	} else {
+		// Tree-only partial result (F-M2R-29): no image, so the
+		// view bounds come from the tree's own windows.
+		imgW, imgH = treeScreenBounds(tree)
 	}
-	img, _, err := image.Decode(bytes.NewReader(shotRes.Images[0].Data))
-	if err != nil {
-		return failed("cannot decode the captured image: %v", err)
-	}
-	imgW, imgH := img.Bounds().Dx(), img.Bounds().Dy()
 
 	// The grounded view's origin and size in screen pixels: the
 	// region when given, else the whole capture. The screenshot
@@ -1323,54 +1353,8 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// (F-M2R-25), so the provider knows how many were cut.
 	elements, walked, totalMatched, listTruncated := filterGroundElements(tree, roleSet, a.Region, maxElements, originX, originY, viewW, viewH, kwinMinimizedWindowIndexes(tree, kwin))
 
-	// Number the elements (ids from 1, in tree order) and compute
-	// centres. Centre_norm is relative to the returned image
-	// (0-1000 over the grounded view), clamped to that range
-	// (F-M2R-21).
 	now := t.now()
-	summary := groundSummary{
-		SnapshotID:       newSnapshotID(now),
-		TakenAt:          now.Format(time.RFC3339),
-		Screen:           groundScreen{Width: imgW, Height: imgH, Scale: scale},
-		Region:           a.Region,
-		Elements:         []groundElement{},
-		WalkedNodes:      walked,
-		Correction:       correction,
-		TotalMatched:     totalMatched,
-		TreeWalkMs:       walkTime.Milliseconds(),
-		TreeAgeMs:        treeAge.Milliseconds(),
-		GeometryVerified: geometryVerified,
-	}
-	if tree != nil {
-		// Walk truncation (any window's node budget ran out)
-		// or list truncation (the element cap dropped eligible
-		// elements): either way the provider must be told the
-		// list is partial. The per-window table below names
-		// which window was cut short.
-		summary.Truncated = tree.Truncated || listTruncated
-		if len(tree.Windows) > 0 {
-			perWin := make([]int, len(tree.Windows))
-			for _, el := range elements {
-				if el.Win != nil && *el.Win >= 0 && *el.Win < len(perWin) {
-					perWin[*el.Win]++
-				}
-			}
-			for i, w := range tree.Windows {
-				summary.Windows = append(summary.Windows, groundWindowSummary{
-					Title: w.Title, App: w.App, Elements: perWin[i],
-					WalkedNodes: w.Walked, Truncated: w.Truncated,
-				})
-			}
-		}
-	}
-	if tree != nil {
-		summary.ShowingUnknown = tree.ShowingUnknown
-	}
-	if tree != nil {
-		summary.Coverage = "grounded"
-	} else {
-		summary.Coverage = "vision_only"
-	}
+	summary := buildGroundSummary(tree, elements, walked, totalMatched, listTruncated, correction, a.Region, originX, originY, viewW, viewH, imgW, imgH, scale, now, walkTime, treeAge, geometryVerified)
 	// Focused window: the AT-SPI tree's focused window first
 	// (it sees native Wayland windows); fall back to the
 	// screenshot tool's xdotool value.
@@ -1379,20 +1363,47 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	} else if shotSummary.FocusedWindow != "" {
 		summary.FocusedWindow = &groundWindowRef{Title: shotSummary.FocusedWindow}
 	}
-	for i, el := range elements {
-		id := i + 1
-		cx, cy := el.X+el.W/2, el.Y+el.H/2
-		summary.Elements = append(summary.Elements, groundElement{
-			ID:     id,
-			Role:   el.Role,
-			Name:   el.Name,
-			Box:    groundBox{X: el.X, Y: el.Y, W: el.W, H: el.H},
-			Centre: groundPoint{X: cx, Y: cy},
-			CentreNorm: groundPoint{
-				X: clampNorm((cx - originX) * 1000 / viewW),
-				Y: clampNorm((cy - originY) * 1000 / viewH),
-			},
-		})
+
+	// The registered elements carry their window's geometry
+	// (F-M2R-8): the input tool refuses the click when that
+	// window has moved or resized since the grounding. The
+	// tree's windows are KWin-corrected by now, so the binding
+	// is on compositor truth, not window-relative coordinates.
+	// Computed here so the tree-only partial path above
+	// registers the same binding.
+	elemWindows := map[int]WindowGeometry{}
+	if tree != nil {
+		for i, el := range elements {
+			if el.Win == nil {
+				continue
+			}
+			wi := *el.Win
+			if wi < 0 || wi >= len(tree.Windows) {
+				continue
+			}
+			w := tree.Windows[wi]
+			elemWindows[i+1] = WindowGeometry{App: w.App, X: w.X, Y: w.Y, W: w.W, H: w.H}
+		}
+	}
+
+	if shotErr != nil {
+		// Tree-only partial result (F-M2R-29): the elements
+		// survived even though the screenshot failed. The
+		// snapshot is registered like a full grounding — the
+		// input tool clicks registered centres, which need no
+		// image — and the summary names the failure so the
+		// provider never mistakes the partial result for a
+		// complete grounding. The registration carries the same
+		// chat binding and window geometries (F-A23W2-19 /
+		// F-M2R-8) as the full path, so a click from the partial
+		// grounding is validated the same way.
+		summary.ScreenshotError = shotErr.Error()
+		groundSnapshots.register(summary.SnapshotID, chatIDFromContext(ctx), now, summary.Elements, elemWindows)
+		text, err := json.Marshal(summary)
+		if err != nil {
+			return failed("cannot encode the grounding summary: %v", err)
+		}
+		return ToolResult{Text: string(text)}, nil
 	}
 
 	// Draw the numbered markers on the captured image.
@@ -1430,25 +1441,6 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// registry's centre, never a model-typed coordinate. The
 	// snapshot is bound to this turn's chat (F-A23W2-19): a
 	// click from any other chat refuses, even on an id collision.
-	// They also carry their window's geometry (F-M2R-8): the input
-	// tool refuses the click when that window has moved or
-	// resized since the grounding. The tree's windows are
-	// KWin-corrected by now, so the binding is on compositor
-	// truth, not window-relative coordinates.
-	elemWindows := map[int]WindowGeometry{}
-	if tree != nil {
-		for i, el := range elements {
-			if el.Win == nil {
-				continue
-			}
-			wi := *el.Win
-			if wi < 0 || wi >= len(tree.Windows) {
-				continue
-			}
-			w := tree.Windows[wi]
-			elemWindows[i+1] = WindowGeometry{App: w.App, X: w.X, Y: w.Y, W: w.W, H: w.H}
-		}
-	}
 	groundSnapshots.register(summary.SnapshotID, chatIDFromContext(ctx), now, summary.Elements, elemWindows)
 
 	text, err := json.Marshal(summary)
@@ -1728,6 +1720,100 @@ func (t *groundTool) checkRateLimit() error {
 	}
 	t.lastCall = now
 	return nil
+}
+
+// buildGroundSummary numbers the filtered elements (ids from 1,
+// in tree order) and assembles the summary: centres, centres
+// relative to the grounded view (centre_norm, 0-1000, clamped),
+// coverage, and the truncation disclosure. Shared by the full
+// path (with image) and the tree-only partial path (F-M2R-29) so
+// the two can never drift apart on what a grounding reports.
+// It also carries the F-M2R-11 staleness fields (walk/age/
+// geometry-verified) and the per-window table (F-A23-W4-1 /
+// F-M2R-12): truncated is the list cap alone, and the reported
+// Truncated ORs it with the helper's walk truncation.
+func buildGroundSummary(tree *atspiOutput, elements []atspiElement, walked, totalMatched int, truncated bool, correction *groundCorrection, region *region, originX, originY, viewW, viewH, imgW, imgH int, scale float64, now time.Time, walkTime, treeAge time.Duration, geometryVerified bool) groundSummary {
+	summary := groundSummary{
+		SnapshotID:       newSnapshotID(now),
+		TakenAt:          now.Format(time.RFC3339),
+		Screen:           groundScreen{Width: imgW, Height: imgH, Scale: scale},
+		Region:           region,
+		Elements:         []groundElement{},
+		WalkedNodes:      walked,
+		Correction:       correction,
+		TotalMatched:     totalMatched,
+		Truncated:        truncated,
+		TreeWalkMs:       walkTime.Milliseconds(),
+		TreeAgeMs:        treeAge.Milliseconds(),
+		GeometryVerified: geometryVerified,
+	}
+	if tree != nil {
+		summary.Coverage = "grounded"
+		summary.ShowingUnknown = tree.ShowingUnknown
+		// Walk truncation (any window's node budget ran out)
+		// or list truncation (the element cap dropped eligible
+		// elements): either way the provider must be told the
+		// list is partial. The per-window table below names
+		// which window was cut short.
+		summary.Truncated = tree.Truncated || truncated
+		if len(tree.Windows) > 0 {
+			perWin := make([]int, len(tree.Windows))
+			for _, el := range elements {
+				if el.Win != nil && *el.Win >= 0 && *el.Win < len(perWin) {
+					perWin[*el.Win]++
+				}
+			}
+			for i, w := range tree.Windows {
+				summary.Windows = append(summary.Windows, groundWindowSummary{
+					Title: w.Title, App: w.App, Elements: perWin[i],
+					WalkedNodes: w.Walked, Truncated: w.Truncated,
+				})
+			}
+		}
+	} else {
+		summary.Coverage = "vision_only"
+	}
+	for i, el := range elements {
+		id := i + 1
+		cx, cy := el.X+el.W/2, el.Y+el.H/2
+		summary.Elements = append(summary.Elements, groundElement{
+			ID:     id,
+			Role:   el.Role,
+			Name:   el.Name,
+			Box:    groundBox{X: el.X, Y: el.Y, W: el.W, H: el.H},
+			Centre: groundPoint{X: cx, Y: cy},
+			CentreNorm: groundPoint{
+				X: clampNorm((cx - originX) * 1000 / viewW),
+				Y: clampNorm((cy - originY) * 1000 / viewH),
+			},
+		})
+	}
+	return summary
+}
+
+// treeScreenBounds returns the union of the tree's window boxes
+// (F-M2R-29): with no screenshot there is no image to measure,
+// so the windows themselves bound the view centre_norm is
+// relative to. Falls back to 1920x1080 when the tree has no
+// usable window box.
+func treeScreenBounds(tree *atspiOutput) (int, int) {
+	maxX, maxY := 0, 0
+	if tree != nil {
+		for _, w := range tree.Windows {
+			if w.W > 0 && w.H > 0 && w.X >= 0 && w.Y >= 0 {
+				if w.X+w.W > maxX {
+					maxX = w.X + w.W
+				}
+				if w.Y+w.H > maxY {
+					maxY = w.Y + w.H
+				}
+			}
+		}
+	}
+	if maxX <= 0 || maxY <= 0 {
+		return 1920, 1080
+	}
+	return maxX, maxY
 }
 
 // filterGroundElements applies the design §4.3 filters to the
