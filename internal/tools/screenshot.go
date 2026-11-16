@@ -98,6 +98,17 @@ const (
 	screenshotMaxWidth      = 1920
 	screenshotRetention     = 24 * time.Hour
 	screenshotMaxScaleTries = 4
+	// screenshotRawRetention bounds crash leftovers (F-M2R-33):
+	// the raw spectacle PNG is removed by defer on a clean return,
+	// but a killed process (or a crash between capture and return)
+	// never runs the defer. Raw files therefore get a much shorter
+	// retention than finished screenshots: a raw capture older than
+	// an hour cannot belong to a live capture (one capture takes
+	// seconds), so the next capture's prune sweep deletes it. The
+	// "raw file never remains" claim is now true within an hour
+	// even for kills, not only on clean returns. Finished
+	// screenshot-* files keep the 24 h retention.
+	screenshotRawRetention = time.Hour
 )
 
 // screenshotArgs is the tool's JSON arguments.
@@ -468,7 +479,9 @@ func (t *screenshotTool) executeResult(ctx context.Context, args json.RawMessage
 	}
 
 	// Store the final file 0600; the raw spectacle PNG is removed
-	// by the deferred cleanup above.
+	// by the deferred cleanup above on a clean return, and by the
+	// prune sweep (1 h raw retention) on the next capture if this
+	// process is killed first (F-M2R-33).
 	ext := ".jpg"
 	if format == "png" {
 		ext = ".png"
@@ -585,18 +598,30 @@ func (t *screenshotTool) screenshotDir() (string, error) {
 
 // pruneOld deletes screenshots older than the retention window.
 // Best effort: a failure to list or delete never fails a capture.
+// Raw spectacle captures (capture-*.png) get the short raw
+// retention (F-M2R-33): a raw file older than an hour is a
+// kill/crash leftover — the deferred cleanup never ran — so it is
+// swept here, on the next capture, instead of lingering for the
+// full 24 h. Finished screenshot-* files keep the 24 h retention.
 func (t *screenshotTool) pruneOld(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	cutoff := t.now().Add(-screenshotRetention)
+	rawCutoff := t.now().Add(-screenshotRawRetention)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), "capture-") {
+			if info.ModTime().Before(rawCutoff) {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
 			continue
 		}
 		if info.ModTime().Before(cutoff) {

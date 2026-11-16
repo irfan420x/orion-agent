@@ -236,6 +236,60 @@ func TestScreenshotInvalidArgs(t *testing.T) {
 	}
 }
 
+// TestScreenshotPrunesStaleRawCaptures pins F-M2R-33: a raw
+// spectacle PNG left behind by a killed process (the deferred
+// cleanup never ran) must not linger for the full 24 h — the next
+// capture's prune sweep deletes raw captures older than an hour,
+// while a recent raw file and finished screenshots keep their
+// retention.
+func TestScreenshotPrunesStaleRawCaptures(t *testing.T) {
+	env := newFakeScreenshotEnv(t)
+	dir := filepath.Join(env.home, ".orion", "screenshots")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("mkdir screenshots: %v", err)
+	}
+	// A 2 h-old raw capture: a kill leftover, must be swept.
+	staleRaw := filepath.Join(dir, "capture-20260101-000000-1.png")
+	// A 10 min-old raw capture: could belong to a live capture,
+	// must survive.
+	freshRaw := filepath.Join(dir, "capture-20261116-120000-2.png")
+	// A 25 h-old finished screenshot: past the 24 h retention,
+	// must be swept (pre-existing behaviour).
+	staleFinal := filepath.Join(dir, "screenshot-20260101-000000-3.jpg")
+	// A 1 h-old finished screenshot: inside the 24 h retention,
+	// must survive.
+	freshFinal := filepath.Join(dir, "screenshot-20261116-110000-4.jpg")
+	for _, p := range []string{staleRaw, freshRaw, staleFinal, freshFinal} {
+		if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	old := func(p string, d time.Duration) {
+		mt := env.clock.Add(-d)
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatalf("chtimes %s: %v", p, err)
+		}
+	}
+	old(staleRaw, 2*time.Hour)
+	old(freshRaw, 10*time.Minute)
+	old(staleFinal, 25*time.Hour)
+	old(freshFinal, time.Hour)
+	env.call(t, `{}`)
+	for _, tc := range []struct {
+		path string
+		want bool // true = still present
+	}{
+		{staleRaw, false},
+		{freshRaw, true},
+		{staleFinal, false},
+		{freshFinal, true},
+	} {
+		if _, err := os.Stat(tc.path); (err == nil) != tc.want {
+			t.Errorf("file %s present = %v, want %v", filepath.Base(tc.path), err == nil, tc.want)
+		}
+	}
+}
+
 func TestScreenshotRegistryValidation(t *testing.T) {
 	// The schema layer (registry validateArgs) rejects out-of-range
 	// values before tool code runs.
