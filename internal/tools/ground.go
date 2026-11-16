@@ -49,6 +49,13 @@
 //     boxes (w<=1 || h<=1 || x<0 || y<0) excluded;
 //   - password fields: role + box only, value/text never read,
 //     never in results or logs (the helper cannot read values);
+//   - data minimisation (F-M2R-17): element names are capped at
+//     60 runes, correction entries carry the app (never a window
+//     title), snapshots bind windows by app + box (never a
+//     title), and the KWin helper never prints a title — the
+//     output carries only what a click needs (id, role, short
+//     name, box, centre) plus the focused window and the
+//     correction;
 //   - sensitive-window refusal BEFORE grounding, using the AT-SPI
 //     window titles (which see native Wayland windows xdotool
 //     cannot) plus the KWin sensitive flag (which sees the Qt
@@ -186,6 +193,14 @@ const (
 	groundMinInterval = time.Second
 	groundMaxPerTurn  = captureMaxPerTurn
 	groundMaxPerHour  = captureMaxPerHour
+	// groundMaxNameRunes caps element names in the output
+	// (F-M2R-17 data minimisation): the model needs a label to
+	// tell elements apart, not a full document title or message
+	// subject — accessible names can carry content. Names over
+	// the cap are cut to 59 runes + "…". The AT-SPI helper
+	// enforces the same cap, so the bound holds even if the Go
+	// filter is bypassed.
+	groundMaxNameRunes = 60
 )
 
 // defaultInteractiveRoles is the default `roles` filter: roles a
@@ -480,9 +495,9 @@ func applyWindowOffsets(tree *atspiOutput, offsets map[int][2]int) {
 // can carry sensitive text and are not needed to bind a window —
 // app + box is the identity.
 type WindowGeometry struct {
-	App    string
-	X, Y   int
-	W, H   int
+	App  string
+	X, Y int
+	W, H int
 }
 
 // groundSnapshot is one grounding's registered state: the element
@@ -504,7 +519,6 @@ type groundSnapshot struct {
 	centres        map[int]groundPoint
 	elementWindows map[int]WindowGeometry
 	seq            int64
-}
 }
 
 // groundSnapshotRegistry keeps the last groundMaxSnapshots
@@ -1412,6 +1426,13 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 		// Empty name -> the role is the name, never a guess.
 		if strings.TrimSpace(el.Name) == "" {
 			el.Name = el.Role
+		}
+		// Data minimisation (F-M2R-17): the model gets a label,
+		// not the full accessible name — long names can carry
+		// document titles or message text. Over the cap, cut to
+		// 59 runes + "…" (runes, never bytes: no split UTF-8).
+		if runes := []rune(el.Name); len(runes) > groundMaxNameRunes {
+			el.Name = string(runes[:groundMaxNameRunes-1]) + "…"
 		}
 		kept = append(kept, el)
 	}

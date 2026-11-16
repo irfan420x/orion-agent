@@ -82,7 +82,7 @@ def main():
                     showing = ss.contains(Atspi.StateType.SHOWING)
             except Exception:
                 showing = None
-            el = {"role": role, "name": name[:120],
+            el = {"role": role, "name": name[:60],
                   "x": box[0], "y": box[1],
                   "w": box[2], "h": box[3], "win": win_idx}
             if showing is not None:

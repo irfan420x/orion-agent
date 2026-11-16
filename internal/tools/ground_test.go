@@ -1456,3 +1456,38 @@ func TestSameKWinGeometry(t *testing.T) {
 		t.Errorf("changed window count compares same")
 	}
 }
+
+// TestGroundNameTruncation pins F-M2R-17 (data minimisation):
+// a long accessible name is capped at 60 runes in the output —
+// the model gets a label, not a full document title or message
+// subject. Short names pass through untouched.
+func TestGroundNameTruncation(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	longName := strings.Repeat("A very long document title that keeps going ", 3) // 129 chars
+	env.helper = `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 993}],
+	"elements": [
+		{"role": "button", "name": "` + longName + `", "x": 784, "y": 520, "w": 352, "h": 40, "showing": true},
+		{"role": "button", "name": "Sign in", "x": 784, "y": 600, "w": 352, "h": 40, "showing": true}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 10}`
+	res := env.call(t, `{}`)
+	s := parseGroundSummary(t, res)
+	if len(s.Elements) != 2 {
+		t.Fatalf("got %d elements, want 2", len(s.Elements))
+	}
+	got := s.Elements[0].Name
+	if n := len([]rune(got)); n != groundMaxNameRunes {
+		t.Errorf("long name is %d runes, want exactly %d (capped)", n, groundMaxNameRunes)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("long name %q has no truncation marker", got)
+	}
+	if strings.Contains(res.Text, longName) {
+		t.Errorf("full long name leaked into the summary")
+	}
+	if s.Elements[1].Name != "Sign in" {
+		t.Errorf("short name = %q, want it untouched", s.Elements[1].Name)
+	}
+}
