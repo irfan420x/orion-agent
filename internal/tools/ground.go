@@ -1127,8 +1127,13 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// matched pattern, never the title (F-M2R-15) — no KWin
 	// caption ever reaches Go. The raw KWin output is kept for
 	// the correction step after the walk, so the helper still
-	// runs once.
-	kwin, _ := t.kwinWindows(ctx)
+	// runs once. Skipped outright where KWin cannot succeed
+	// (F-M2R-26): X11 sessions and non-Plasma desktops never
+	// spawn the helper.
+	var kwin []kwinWindow
+	if kwinPrecheck() {
+		kwin, _ = t.kwinWindows(ctx)
+	}
 	if kwin != nil {
 		for _, w := range kwin {
 			if w.Sens != "" {
@@ -1602,6 +1607,61 @@ func (t *groundTool) kwinWindows(ctx context.Context) ([]kwinWindow, error) {
 		return nil, fmt.Errorf("KWin helper output does not parse: %v", err)
 	}
 	return out.Windows, nil
+}
+
+// kwinPrecheckCache memoises kwinPrecheckUncached per process,
+// keyed on the session environment it reads (F-M2R-26): the
+// session type and desktop never change under a running daemon,
+// so the check is effectively computed once — but the key keeps
+// tests (which change the environment per case) honest instead
+// of freezing the first answer process-wide.
+var (
+	kwinPrecheckCacheMu sync.Mutex
+	kwinPrecheckCache   = map[string]bool{}
+)
+
+// kwinPrecheck reports whether a KWin query can possibly
+// succeed on this session. KWin is the KDE Plasma compositor:
+// on an X11 session AT-SPI coordinates are already absolute (no
+// correction exists to measure), and on a non-Plasma desktop
+// org.kde.KWin never answers — both cases used to pay for a
+// helper spawn plus a D-Bus round trip on every grounding. The
+// check reads only environment (no spawn, no D-Bus), and an
+// unknown session attempts the query: a failed helper is still
+// the fail-safe path, so the pre-check never blocks a session it
+// cannot classify.
+func kwinPrecheck() bool {
+	key := strings.Join([]string{
+		os.Getenv("XDG_SESSION_TYPE"),
+		os.Getenv("XDG_CURRENT_DESKTOP"),
+	}, "\x00")
+	kwinPrecheckCacheMu.Lock()
+	if v, ok := kwinPrecheckCache[key]; ok {
+		kwinPrecheckCacheMu.Unlock()
+		return v
+	}
+	kwinPrecheckCacheMu.Unlock()
+	v := kwinPrecheckUncached()
+	kwinPrecheckCacheMu.Lock()
+	kwinPrecheckCache[key] = v
+	kwinPrecheckCacheMu.Unlock()
+	return v
+}
+
+// kwinPrecheckUncached is the uncached pre-check (see
+// kwinPrecheck): false on X11 sessions and on desktops that are
+// not KDE/Plasma, true otherwise (including unknown sessions).
+func kwinPrecheckUncached() bool {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("XDG_SESSION_TYPE")), "x11") {
+		return false
+	}
+	if desktop := strings.TrimSpace(os.Getenv("XDG_CURRENT_DESKTOP")); desktop != "" {
+		lower := strings.ToLower(desktop)
+		if !strings.Contains(lower, "kde") && !strings.Contains(lower, "plasma") {
+			return false
+		}
+	}
+	return true
 }
 
 // defaultRunHelper runs the helper with the depth/node caps and

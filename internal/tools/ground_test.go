@@ -38,6 +38,7 @@ type fakeGroundEnv struct {
 	helperCalled bool   // runHelper was invoked (F-M2R-30 ordering)
 	kwinOK       bool   // runKWinHelper succeeds
 	kwin         string // canned KWin JSON
+	kwinCalled   bool   // runKWinHelper was invoked (F-M2R-26 pre-check)
 }
 
 func groundTreeJSON() string {
@@ -92,6 +93,7 @@ func newFakeGroundEnv(t *testing.T) *fakeGroundEnv {
 		return []byte(groundTreeJSON()), nil
 	}
 	tool.runKWinHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		env.kwinCalled = true
 		if !env.kwinOK {
 			return nil, errors.New("fake KWin helper failure")
 		}
@@ -1257,6 +1259,63 @@ func TestClampNorm(t *testing.T) {
 		if got := clampNorm(tc.in); got != tc.want {
 			t.Errorf("clampNorm(%d) = %d, want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestKWinPrecheck pins F-M2R-26: the KWin helper is skipped
+// where it cannot succeed (X11 sessions, non-Plasma desktops)
+// and attempted everywhere else, including unknown sessions.
+func TestKWinPrecheck(t *testing.T) {
+	cases := []struct {
+		session, desktop string
+		want             bool
+	}{
+		{"x11", "", false},
+		{"X11", "KDE", false}, // session type wins over desktop
+		{"wayland", "KDE", true},
+		{"wayland", "plasma", true},
+		{"wayland", "GNOME", false},
+		{"wayland", "Hyprland", false},
+		{"", "KDE", true},
+		{"", "GNOME", false},
+		{"", "", true}, // unknown session: attempt (fail-safe)
+	}
+	for _, c := range cases {
+		t.Setenv("XDG_SESSION_TYPE", c.session)
+		t.Setenv("XDG_CURRENT_DESKTOP", c.desktop)
+		if got := kwinPrecheckUncached(); got != c.want {
+			t.Errorf("kwinPrecheckUncached(session=%q, desktop=%q) = %v, want %v", c.session, c.desktop, got, c.want)
+		}
+	}
+	// The cached wrapper agrees with the uncached check for a
+	// fresh key (the cache is keyed on the same environment).
+	t.Setenv("XDG_SESSION_TYPE", "x11")
+	t.Setenv("XDG_CURRENT_DESKTOP", "KDE")
+	if got := kwinPrecheck(); got {
+		t.Errorf("kwinPrecheck() on x11 = true, want false")
+	}
+}
+
+// TestGroundKWinSkippedOnX11 pins F-M2R-26 end to end: on an X11
+// session the KWin helper is never spawned, even when it would
+// succeed — the grounding still returns, uncorrected, with the
+// correction status saying unavailable.
+func TestGroundKWinSkippedOnX11(t *testing.T) {
+	resetGroundSnapshots()
+	t.Setenv("XDG_SESSION_TYPE", "x11")
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	env.kwin = kwinFirefoxJSON()
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if env.kwinCalled {
+		t.Errorf("KWin helper ran on an X11 session — the pre-check must skip it")
+	}
+	if s.Correction == nil || s.Correction.Status != "unavailable" {
+		t.Errorf("summary correction = %+v, want status unavailable", s.Correction)
+	}
+	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
+		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
 	}
 }
 
