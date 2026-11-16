@@ -161,7 +161,7 @@ func TestSubagentExecutorChildRegistryHasNoSubagentTools(t *testing.T) {
 // The removal is loud (newChildRegistry fails if a name is
 // missing), so a future rename cannot silently re-expose one.
 func TestSubagentExecutorChildRegistryHasNoComputerUseTools(t *testing.T) {
-	reg, err := newChildRegistry(testSubagentConfig(5))
+	reg, err := newChildRegistry(testSubagentConfig(5), nil)
 	if err != nil {
 		t.Fatalf("newChildRegistry: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestSubagentExecutorChildDestructiveToolsDenied(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(10), nil, nil, nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(10), nil, nil, nil, nil, nil)
 	out, _, err := exec(context.Background(), "do destructive things")
 	if err != nil {
 		t.Fatalf("executor: %v", err)

@@ -126,7 +126,6 @@ var networkTools = map[string]bool{
 	"ground":        true,
 	"screenshot":    true,
 }
-}
 
 // safeTools are the tools that run without approval. This is an
 // explicit allowlist, not a default: Classify returns

@@ -882,6 +882,7 @@ func TestGroundUnattendedRefusedViaGateMarker(t *testing.T) {
 		t.Errorf("gate-marked unattended refusal still captured %d screenshot(s)", env.captures)
 	}
 }
+
 // TestGroundSixteenthAfterBeginTurn is the F-M2R-35 regression
 // test for F-M2R-1: the ground limiter was tested in isolation,
 // but no test went through the real registry — BeginTurn, ground
