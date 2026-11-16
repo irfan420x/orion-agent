@@ -2754,6 +2754,18 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 	nextConfirm := g.Offset()
 	decided := make(map[int64]bool)
 	inFlight := make(map[int64]bool)
+	// logged tracks update ids whose "received update" line was
+	// already emitted (F-A23-POLL). The watermark only advances
+	// when a handler completes, so while a turn runs every poll
+	// re-fetches the in-flight batch — and the old code logged
+	// every re-fetch, so one 5-minute turn produced 639 lines
+	// for 8 distinct updates (update 181487784 alone 243x).
+	// The diagnostic value ("did getUpdates return this
+	// update?") is fully carried by the first line; re-logging
+	// it adds only noise that buries real signal. Pruned with
+	// decided, against the same fetch offset, so it stays
+	// bounded. Only the poll loop touches it (see logOnce).
+	logged := make(map[int64]bool)
 	// completed is signalled (non-blocking, depth 1) on every
 	// markDecided, so the poll loop can wake promptly from its
 	// no-progress wait when a handler finishes.
@@ -2827,6 +2839,22 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		confirmMu.Lock()
 		defer confirmMu.Unlock()
 		delete(inFlight, id)
+	}
+	// logOnce reports whether update id's receipt line still
+	// needs emitting, claiming it when it does: the first receipt
+	// of an id logs, every re-fetch of the same id (in-flight or
+	// decided-but-behind-the-watermark) is silent (F-A23-POLL).
+	// Delivery semantics are untouched — this only gates the log
+	// line; dispatch, isDecided/markInFlight and the watermark
+	// are unchanged.
+	logOnce := func(id int64) bool {
+		confirmMu.Lock()
+		defer confirmMu.Unlock()
+		if logged[id] {
+			return false
+		}
+		logged[id] = true
+		return true
 	}
 	// noteBatchStart handles the first update of a fetched batch
 	// starting above the watermark (a gap that cannot occur on
@@ -2990,13 +3018,25 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 						// message waits behind it instead.
 						g.sendBusyAck(ctx, chatID, st, mode, true)
 					} else {
-						g.sendBusyAck(ctx, chatID, st, mode, false)
-						// Cancel a pending question FIRST, with
+						// Cancel any pending question FIRST, with
 						// a visible card edit: the run is about
-						// to be cancelled, and a cancelled wait
-						// otherwise leaves a live-looking card.
+						// to be cancelled, and the wait must be
+						// resolved by the card edit — not by the
+						// run's own ctx-cancellation cleanup,
+						// which would leave no edit behind.
 						g.cancelQuestionForChat(chatID)
-						st.cancelRun()
+						// Cancel the run, then ack (F-A23W3-12):
+						// the ack must only claim a redirect
+						// when the actual running turn was
+						// cancelled. A stamped state can
+						// outlive its run (this handler started
+						// late, after the turn finished): the
+						// dead ctx cancels nothing, and the
+						// message simply runs as its own turn
+						// — no ack, never the redirect claim.
+						if st.cancelRun() {
+							g.sendBusyAck(ctx, chatID, st, mode, false)
+						}
 					}
 				}
 			}
@@ -3168,7 +3208,7 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// window sees no busy run and simply waits on the lock).
 		turnCtx, turnCancel := context.WithCancel(handlerCtx)
 		defer turnCancel()
-		busySt = g.registerBusy(chatID, turnCancel)
+		busySt = g.registerBusy(chatID, turnCtx, turnCancel)
 		defer g.unregisterBusy(chatID, busySt)
 		reply, stats, herr := handler(turnCtx, chatID, text, images, emit)
 		stopTyping()
@@ -3217,7 +3257,13 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// PollStream ctx, not the turn ctx: an interrupt has
 		// already cancelled the turn ctx by the time leftovers
 		// run, and a leftover must not die with the run it
-		// outlived. The hook drains (returns and clears), so a
+		// outlived. Each leftover runs on its own cancellable
+		// ctx, whose cancel is registered in the busy state
+		// (F-A23W3-12): an interrupt arriving during a leftover
+		// must cancel the leftover that is actually running,
+		// not the finished main turn's dead ctx — and the
+		// redirect ack is only honest when that cancel lands.
+		// The hook drains (returns and clears), so a
 		// well-behaved hook can never make this loop spin.
 		for {
 			leftovers := g.steerLeftoversFor(chatID)
@@ -3225,12 +3271,14 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				break
 			}
 			for _, lf := range leftovers {
-				lfCtx := core.WithUpdateID(handlerCtx, lf.UpdateID)
+				lfCtx, lfCancel := context.WithCancel(core.WithUpdateID(handlerCtx, lf.UpdateID))
 				// Leftover steers are text-only by construction
 				// (core.SteeredMessage carries Text + UpdateID,
 				// no images — photos never enter the steer path),
 				// so the images argument is nil.
+				busySt.setCancel(lfCtx, lfCancel)
 				lreply, lstats, lerr := handler(lfCtx, chatID, lf.Text, nil, emit)
+				lfCancel()
 				sendTurnResult(lreply, lstats, lerr)
 			}
 		}
@@ -3430,6 +3478,11 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 				delete(decided, id)
 			}
 		}
+		for id := range logged {
+			if id < fetchOffset {
+				delete(logged, id)
+			}
+		}
 		confirmMu.Unlock()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -3494,9 +3547,15 @@ func (g *TelegramGateway) PollStream(ctx context.Context, handler TurnFunc) erro
 		// reads either "received update N callback_query" (the
 		// loss is downstream of the poll) or nothing at all (the
 		// loss is upstream: another poller confirmed it, or
-		// Telegram never delivered it).
+		// Telegram never delivered it). Each id logs ONCE, at
+		// first receipt (F-A23-POLL, see logOnce): while a turn
+		// runs, every poll re-fetches the in-flight batch, and
+		// logging each re-fetch buried real signal under
+		// hundreds of duplicate lines.
 		for _, upd := range updates {
-			g.logReceivedUpdate(upd)
+			if logOnce(upd.UpdateID) {
+				g.logReceivedUpdate(upd)
+			}
 		}
 
 		// Confirmation state (F-A8-2, see the tracker above
