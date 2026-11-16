@@ -41,12 +41,18 @@ type fakeInputEnv struct {
 
 	cursor          cursorPos
 	screen          inputScreen
-	stuck           bool       // ydotool moves never land
-	firstMoveFactor float64    // acceleration distortion on the 1st move only (1.0 = exact)
-	oracleFixed     *cursorPos // oracle reports this instead of cursor (disagreement)
-	oracleErr       bool
-	kwinWindows     []kwinWindow
-	moveCount       int
+	stuck           bool    // ydotool moves never land
+	firstMoveFactor float64 // acceleration distortion on the 1st move only (1.0 = exact)
+	// moveFactor, when set, replaces firstMoveFactor for every
+	// move: the simulated acceleration factor for an issued
+	// (dx, dy) residual. A test uses it to model
+	// magnitude-dependent distortion (large deltas land far
+	// short, small ones nearly exact).
+	moveFactor  func(dx, dy int) float64
+	oracleFixed *cursorPos // oracle reports this instead of cursor (disagreement)
+	oracleErr   bool
+	kwinWindows []kwinWindow
+	moveCount   int
 
 	tree          string // canned AT-SPI tree JSON ("" = default benign tree)
 	treeErr       bool   // atspiTree fails -> xdotool fallback
@@ -117,7 +123,9 @@ func newFakeInputEnv(t *testing.T) *fakeInputEnv {
 			}
 			if !env.stuck {
 				f := 1.0
-				if env.moveCount == 1 {
+				if env.moveFactor != nil {
+					f = env.moveFactor(dx, dy)
+				} else if env.moveCount == 1 {
 					f = env.firstMoveFactor
 				}
 				env.cursor.X += int(float64(dx) * f)
@@ -241,7 +249,11 @@ func TestInputMoveConvergesAfterDistortedLanding(t *testing.T) {
 	env := newFakeInputEnv(t)
 	// The first relative move lands at 40% (libinput acceleration
 	// fighting the landing, as in the live M3 probe); the loop
-	// must correct the residual and converge.
+	// must correct the residual and converge. The (100,100) to
+	// (960,540) jump is ~966 px, so it runs staged in 3 legs of
+	// <=400 px: the distorted first move lands short of the
+	// first waypoint, one exact correction finishes that leg,
+	// and the two remaining legs land exactly — 4 moves total.
 	env.firstMoveFactor = 0.4
 	res := env.call(t, `{"op": "move", "x": 960, "y": 540}`)
 	s := parseInputSummary(t, res)
@@ -254,17 +266,97 @@ func TestInputMoveConvergesAfterDistortedLanding(t *testing.T) {
 	if s.Target == nil || *s.Target != (cursorPos{X: 960, Y: 540}) {
 		t.Errorf("target = %+v, want {960 540}", s.Target)
 	}
-	if s.Iterations != 2 {
-		t.Errorf("correction_moves = %d, want 2 (distorted landing + exact correction)", s.Iterations)
+	if s.Iterations != 4 {
+		t.Errorf("correction_moves = %d, want 4 (distorted first leg + exact correction + 2 exact legs)", s.Iterations)
 	}
-	if got := len(env.mousemoveCalls()); got != 2 {
-		t.Errorf("got %d mousemove calls, want 2", got)
+	if got := len(env.mousemoveCalls()); got != 4 {
+		t.Errorf("got %d mousemove calls, want 4", got)
 	}
-	// The first call moves the exact residual from the oracle
-	// reading (860, 440); the second corrects what is left.
+	// The first call moves toward the first waypoint (387, 247),
+	// not the whole residual (860, 440) — the jump is staged.
 	first := env.mousemoveCalls()[0]
-	if fmt.Sprint(first.args) != fmt.Sprint([]string{"mousemove", "-x", "860", "-y", "440"}) {
-		t.Errorf("first mousemove = %v, want the exact residual (860, 440)", first.args)
+	if fmt.Sprint(first.args) != fmt.Sprint([]string{"mousemove", "-x", "287", "-y", "147"}) {
+		t.Errorf("first mousemove = %v, want the first leg's residual (287, 147)", first.args)
+	}
+}
+
+// TestInputMoveLongJumpStagedConverges pins F-A23-W4-2 (Audit 23,
+// live): the first move to (744, 998) failed — 5 correction moves
+// from (1655,176) did not converge and the cursor stuck at
+// (970,1023) — while a retry from a nearer start succeeded in 2
+// moves. The fake models the cause, magnitude-dependent
+// acceleration distortion: a relative move lands at 55% when
+// either component exceeds 400 px, at 95% for small steps. Under
+// that model a single 5-move loop cannot converge the ~1,227 px
+// jump (each full-residual move leaves 45% behind), but staged
+// legs of <=400 px converge in 2 moves each — so the move must
+// succeed, issuing only small steps, and take more than the old
+// 5-move budget to do it.
+func TestInputMoveLongJumpStagedConverges(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.cursor = cursorPos{X: 1655, Y: 176}
+	env.moveFactor = func(dx, dy int) float64 {
+		if dx < 0 {
+			dx = -dx
+		}
+		if dy < 0 {
+			dy = -dy
+		}
+		if dx > 400 || dy > 400 {
+			return 0.55
+		}
+		return 0.95
+	}
+	res := env.call(t, `{"op": "move", "x": 744, "y": 998}`)
+	s := parseInputSummary(t, res)
+	if s.Op != "move" || !s.Reached {
+		t.Errorf("summary = %+v, want op move reached", s)
+	}
+	if s.Final == nil || !withinTolerance(*s.Final, 744, 998) {
+		t.Errorf("final = %+v, want within 5 px of {744 998}", s.Final)
+	}
+	if s.Iterations <= 5 {
+		t.Errorf("correction_moves = %d, want more than 5 (the old single-loop budget, which live failed to converge)", s.Iterations)
+	}
+	// Every issued step is a small step: no single relative
+	// move exceeds the 400 px stage cap on either axis.
+	for _, c := range env.mousemoveCalls() {
+		for i := 1; i+1 < len(c.args); i += 2 {
+			v, _ := strconv.Atoi(c.args[i+1])
+			if v < 0 {
+				v = -v
+			}
+			if v > 400 {
+				t.Errorf("mousemove %v issues a %d px step, want every step <= %d px", c.args, v, inputMoveStagePx)
+			}
+		}
+	}
+}
+
+// TestInputMoveLongJumpStillGivesUpWhenStuck pins the honest
+// failure of a staged move: a cursor that never lands fails on
+// the FIRST leg (5 correction moves, no infinite loop, no click
+// follows) and the error still names the real target and the
+// final oracle position.
+func TestInputMoveLongJumpStillGivesUpWhenStuck(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.stuck = true
+	env.cursor = cursorPos{X: 1655, Y: 176}
+	err := env.callErr(t, `{"op": "move", "x": 744, "y": 998}`)
+	if !strings.Contains(err.Error(), "could not reach (744, 998)") {
+		t.Errorf("err = %v, want 'could not reach (744, 998)'", err)
+	}
+	if !strings.Contains(err.Error(), "leg 1 of 4 failed") {
+		t.Errorf("err = %v, want the failed leg named", err)
+	}
+	if !strings.Contains(err.Error(), "after 5 correction moves") {
+		t.Errorf("err = %v, want the per-leg iteration count in the message", err)
+	}
+	if !strings.Contains(err.Error(), "cursor is at (1655, 176)") {
+		t.Errorf("err = %v, want the final oracle position in the message", err)
+	}
+	if got := len(env.mousemoveCalls()); got != 5 {
+		t.Errorf("got %d mousemove calls, want 5 (first leg exhausted, not infinite)", got)
 	}
 }
 

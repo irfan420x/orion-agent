@@ -31,7 +31,12 @@
 // (relative deltas are exact arithmetic from a known start —
 // the oracle reading — unlike --absolute, which trusts an
 // assumed start), re-read, correct again, up to
-// inputMaxMoveIterations times, within inputMoveTolerancePx.
+// inputMaxMoveIterations times per leg, within
+// inputMoveTolerancePx. Long jumps are staged into legs of at
+// most inputMoveStagePx (F-A23-W4-2): acceleration distorts
+// large deltas far more than small ones, and a ~1,230 px jump
+// live never converged in 5 moves while a retry from nearer
+// converged in 2.
 // Disabling acceleration instead would need a libinput
 // device-config change and would alter the user's own pointer
 // behaviour for every app — a system change for one tool's
@@ -120,6 +125,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -152,11 +158,20 @@ const (
 	inputMaxPerHour        = captureMaxPerHour
 	inputMaxTypeRunes      = 1000 // longest text one type call may enter
 	inputMoveTolerancePx   = 5    // closed-loop success: both axes within 5 px
-	inputMaxMoveIterations = 5    // correction moves before giving up honestly
-	inputMoveSettle        = 100 * time.Millisecond
-	inputYdotoolTimeout    = 10 * time.Second
-	inputKWinTimeout       = 5 * time.Second // same as ground's KWin timeout
-	inputKWinHelperFile    = "input-kwin-helper.py"
+	inputMaxMoveIterations = 5    // correction moves per leg before giving up honestly
+	// inputMoveStagePx caps one leg of a staged move (F-A23-W4-2):
+	// pointer acceleration distorts large relative deltas far
+	// more than small ones, so a long jump is split into legs
+	// of at most this many pixels, each closed-loop corrected
+	// on its own. 400 px keeps a leg well inside the range
+	// where a correction converges in 1-2 moves (live: a retry
+	// from a nearer start converged in 2 moves, while the
+	// ~1,230 px jump never converged in 5).
+	inputMoveStagePx    = 400
+	inputMoveSettle     = 100 * time.Millisecond
+	inputYdotoolTimeout = 10 * time.Second
+	inputKWinTimeout    = 5 * time.Second // same as ground's KWin timeout
+	inputKWinHelperFile = "input-kwin-helper.py"
 	// inputScreenCacheTTL bounds how long the cached screen size
 	// may be trusted for the fail-fast coordinate check
 	// (F-A23W2-17): the oracle re-reads on every move/click, so
@@ -828,11 +843,19 @@ func withinTolerance(cur cursorPos, x, y int) bool {
 // doMove moves the cursor to (x, y) with closed-loop correction
 // and returns the oracle-confirmed final position plus the
 // number of ydotool moves issued. A move that is already within
-// tolerance issues no ydotool call at all. A move that does not
-// converge within inputMaxMoveIterations returns an error that
-// says so — with the final oracle position — and NEVER claims
-// success: the caller reports the failure, the model re-grounds
-// or retries, and no click ever follows a failed move.
+// tolerance issues no ydotool call at all.
+//
+// Long jumps are staged (F-A23-W4-2): the path is split into
+// legs of at most inputMoveStagePx, each corrected on its own.
+// One long jump does not converge — live, 5 correction moves
+// from (1655,176) to (744,998) left the cursor stuck at
+// (970,1023), while a retry from a nearer start converged in 2
+// moves — because pointer acceleration distorts large relative
+// deltas far more than small ones. A leg that does not converge
+// fails the move honestly (with the final oracle position) and
+// NEVER claims success: the caller reports the failure, the
+// model re-grounds or retries, and no click ever follows a
+// failed move.
 func (t *inputTool) doMove(ctx context.Context, x, y int) (cursorPos, int, error) {
 	cur, err := t.readCursor(ctx)
 	if err != nil {
@@ -855,12 +878,46 @@ func (t *inputTool) doMove(ctx context.Context, x, y int) (cursorPos, int, error
 	if withinTolerance(cur.Cursor, x, y) {
 		return cur.Cursor, 0, nil
 	}
+	start := cur.Cursor
+	dx, dy := x-start.X, y-start.Y
+	legs := int(math.Ceil(math.Hypot(float64(dx), float64(dy)) / inputMoveStagePx))
+	if legs < 1 {
+		legs = 1
+	}
+	total := 0
+	pos := start
+	for leg := 1; leg <= legs; leg++ {
+		// Waypoint leg/legs along the straight start->target
+		// line; the last waypoint is the exact target (the
+		// float arithmetic lands on it, and Round keeps it).
+		wx := int(math.Round(float64(start.X) + float64(dx)*float64(leg)/float64(legs)))
+		wy := int(math.Round(float64(start.Y) + float64(dy)*float64(leg)/float64(legs)))
+		var iters int
+		pos, iters, err = t.correctTo(ctx, wx, wy, pos)
+		total += iters
+		if err != nil {
+			return pos, total, fmt.Errorf("could not reach (%d, %d) within %d px: leg %d of %d failed: %v", x, y, inputMoveTolerancePx, leg, legs, err)
+		}
+	}
+	return pos, total, nil
+}
+
+// correctTo corrects the cursor onto one waypoint (tx, ty) from
+// the oracle-confirmed position cur, issuing at most
+// inputMaxMoveIterations relative ydotool moves. Each move sends
+// the exact residual as a RELATIVE move: exact arithmetic from
+// the oracle's known start. --absolute is not used: on a
+// relative-only device it is relative deltas from a start
+// position ydotool cannot know. A waypoint that does not
+// converge within the iteration budget returns an error that
+// says so — with the final oracle position — and NEVER claims
+// success.
+func (t *inputTool) correctTo(ctx context.Context, tx, ty int, cur cursorPos) (cursorPos, int, error) {
+	if withinTolerance(cur, tx, ty) {
+		return cur, 0, nil
+	}
 	for i := 1; i <= inputMaxMoveIterations; i++ {
-		// The residual as a RELATIVE move: exact arithmetic
-		// from the oracle's known start. --absolute is not
-		// used: on a relative-only device it is relative
-		// deltas from a start position ydotool cannot know.
-		dx, dy := x-cur.Cursor.X, y-cur.Cursor.Y
+		dx, dy := tx-cur.X, ty-cur.Y
 		if _, err := t.ydotool(ctx, "", "mousemove", "-x", strconv.Itoa(dx), "-y", strconv.Itoa(dy)); err != nil {
 			return cursorPos{}, i, fmt.Errorf("ydotool mousemove failed: %v", err)
 		}
@@ -868,16 +925,17 @@ func (t *inputTool) doMove(ctx context.Context, x, y int) (cursorPos, int, error
 		// oracle re-reads, or the loop corrects a stale
 		// position and oscillates.
 		t.sleep(inputMoveSettle)
-		cur, err = t.readCursor(ctx)
+		out, err := t.readCursor(ctx)
 		if err != nil {
 			return cursorPos{}, i, err
 		}
-		if withinTolerance(cur.Cursor, x, y) {
-			return cur.Cursor, i, nil
+		cur = out.Cursor
+		if withinTolerance(cur, tx, ty) {
+			return cur, i, nil
 		}
 	}
-	return cur.Cursor, inputMaxMoveIterations,
-		fmt.Errorf("could not reach (%d, %d) within %d px after %d correction moves: the cursor is at (%d, %d) — the screen may have moved, or pointer acceleration is fighting the correction; ground again and retry, or move in smaller steps", x, y, inputMoveTolerancePx, inputMaxMoveIterations, cur.Cursor.X, cur.Cursor.Y)
+	return cur, inputMaxMoveIterations,
+		fmt.Errorf("could not reach (%d, %d) within %d px after %d correction moves: the cursor is at (%d, %d) — the screen may have moved, or pointer acceleration is fighting the correction; ground again and retry from nearer the target", tx, ty, inputMoveTolerancePx, inputMaxMoveIterations, cur.X, cur.Y)
 }
 
 // clickOutcome is what a click returns: the oracle-confirmed
