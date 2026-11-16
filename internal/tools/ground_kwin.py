@@ -35,8 +35,14 @@ unloads the script. Reliability measured 2026-11-15: 10/10
 trials, ~0.1 s each, identical geometries across trials (the M3
 cursorPos oracle's 2/5 flakiness did not reproduce with unique
 markers + proper load/start/unload sequencing). Note: start()
-starts ALL loaded scripts (that is the KWin API); other scripts'
-start is idempotent for well-behaved scripts.
+starts ALL loaded scripts (that is the KWin API — there is no
+per-script start), so a foreign or broken script can fail the
+start call; the defence is the unique per-run marker (pid +
+random), so only lines carrying this run's marker are ever
+parsed — another script's output cannot corrupt this run's
+result (F-M2R-24). A script that fails to load or start is
+unloaded before this helper exits, so a loaded-never-started
+script never lingers to print stale geometry on the next run.
 
 Marker (F-A23W2-11): pid + 64-bit secrets randomness +
 nanosecond timestamp, echoed as "nonce" in the JSON payload and
@@ -100,10 +106,15 @@ def fail(msg):
 def journal_grep(marker):
     for _ in range(POLL_TRIES):
         try:
+            # F-M2R-24: the journalctl timeout was 15 s — when the
+            # Go caller kills this helper on its 5 s timeout, an
+            # in-flight journalctl child orphaned for up to 15 s.
+            # 3 s bounds the orphan; the Go side also kills the
+            # helper's whole process group on timeout.
             r = subprocess.run(
                 ["journalctl", "--user", "-u", "plasma-kwin_wayland.service",
                  "-n", "200", "--no-pager"],
-                capture_output=True, text=True, timeout=15)
+                capture_output=True, text=True, timeout=3)
         except Exception:
             return None
         for line in r.stdout.splitlines():
@@ -136,13 +147,29 @@ def main():
                 "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", None)
         except Exception as e:
             fail("cannot reach KWin scripting: %s" % e)
+        load_attempted = False
         try:
+            load_attempted = True
             proxy.call_sync("loadScript",
                             GLib.Variant("(ss)", (js_path, name)),
                             Gio.DBusCallFlags.NONE, -1, None)
             proxy.call_sync("start", None,
                             Gio.DBusCallFlags.NONE, -1, None)
         except Exception as e:
+            if load_attempted:
+                # F-M2R-24: a loaded-never-started script used to
+                # linger in KWin (unload ran only after a
+                # successful start) and print stale geometry on
+                # the next start. Unload it before failing — even
+                # when loadScript itself threw, KWin may have
+                # loaded the script first, so the unload is
+                # best-effort and its own failure is ignored.
+                try:
+                    proxy.call_sync("unloadScript",
+                                    GLib.Variant("(s)", (name,)),
+                                    Gio.DBusCallFlags.NONE, -1, None)
+                except Exception:
+                    pass
             fail("loadScript/start failed: %s" % e)
         line = journal_grep(marker)
         try:

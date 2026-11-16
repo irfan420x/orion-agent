@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stubAtspiSource is a fake gi.repository.Atspi: one desktop, one
@@ -266,9 +267,187 @@ func TestRealAtspiHelperShowingUnknown(t *testing.T) {
 	}
 }
 
-// TestRealAtspiHelperCleanRun pins the stub itself: with no
-// failure injected the real helper returns the full document, so
-// a red test here means the harness (not the helper) broke.
+// --- KWin helper stub (F-M2R-24, F-M2R-28) ---
+
+// stubKwinSource is a fake gi.repository with Gio/GLib for the KWin
+// helper: a fake D-Bus proxy that records every call_sync in
+// $KWINSTUB_RECORD (one method name per line), captures the
+// geometry marker from the loaded JS into $KWINSTUB_DIR/marker,
+// and fails on demand:
+//
+//   KWINSTUB_FAIL=start — the start call raises.
+//   KWINSTUB_FAIL=proxy — creating the proxy raises.
+const stubKwinSource = `
+import json, os, re
+
+class _Flags:
+    NONE = 0
+
+class _BusType:
+    SESSION = 0
+
+class GLib:
+    @staticmethod
+    def Variant(spec, value):
+        return value
+
+class _Proxy:
+    def call_sync(self, method, *args):
+        record = os.environ.get("KWINSTUB_RECORD", "")
+        if record:
+            with open(record, "a") as f:
+                f.write(method + "\n")
+        if method == "loadScript":
+            variant = args[0]
+            js_path, name = variant[0], variant[1]
+            with open(js_path) as f:
+                js = f.read()
+            m = re.search(r"ORION-KWIN-GEOM-[0-9]+-[0-9a-f]+", js)
+            marker = m.group(0) if m else ""
+            d = os.environ.get("KWINSTUB_DIR", "")
+            if d:
+                with open(os.path.join(d, "marker"), "w") as f:
+                    f.write(marker)
+            return None
+        if method == "start":
+            if os.environ.get("KWINSTUB_FAIL") == "start":
+                raise Exception("flaky D-Bus: start failed")
+            return None
+        if method == "unloadScript":
+            return None
+        return None
+
+class _DBusProxy:
+    @staticmethod
+    def new_for_bus_sync(*args):
+        if os.environ.get("KWINSTUB_FAIL") == "proxy":
+            raise Exception("flaky D-Bus: cannot reach KWin scripting")
+        return _Proxy()
+
+class Gio:
+    BusType = _BusType
+    DBusProxyFlags = _Flags
+    DBusCallFlags = _Flags
+    DBusProxy = _DBusProxy
+`
+
+// fakeJournalctl installs a fake `journalctl` on PATH that prints
+// one journal line carrying the marker recorded by the stub proxy
+// plus the payload from $KWINSTUB_DIR/payload (a JSON window list).
+// It returns the temp dir holding the stub state (KWINSTUB_DIR)
+// and the record file path (KWINSTUB_RECORD).
+func fakeJournalctl(t *testing.T, payload string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	script := "#!/bin/sh\n" +
+		"marker=$(cat \"$KWINSTUB_DIR/marker\" 2>/dev/null)\n" +
+		"payload=$(cat \"$KWINSTUB_DIR/payload\" 2>/dev/null)\n" +
+		"echo \"Nov 16 12:00:00 host plasma-kwin_wayland[123]: ${marker}${payload}\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "journalctl"), []byte(script), 0755); err != nil {
+		t.Fatalf("write fake journalctl: %v", err)
+	}
+	if payload != "" {
+		if err := os.WriteFile(filepath.Join(dir, "payload"), []byte(payload), 0600); err != nil {
+			t.Fatalf("write fake payload: %v", err)
+		}
+	}
+	return dir, filepath.Join(dir, "record")
+}
+
+// kwinStubEnv builds the environment for a real-KWin-helper run:
+// stub gi on PYTHONPATH, fake journalctl first on PATH, stub state
+// in dir, plus failure flags from extra.
+func kwinStubEnv(t *testing.T, stubDir, stateDir, record string, extra map[string]string) map[string]string {
+	t.Helper()
+	env := map[string]string{
+		"KWINSTUB_DIR":    stateDir,
+		"KWINSTUB_RECORD": record,
+		"PATH":            filepath.Join(stateDir, "bin") + ":" + os.Getenv("PATH"),
+	}
+	for k, v := range extra {
+		env[k] = v
+	}
+	return env
+}
+
+// TestRealKWinHelperUnloadOnStartFailure pins F-M2R-24 (a): when
+// start() throws, the loaded-never-started script must be
+// unloaded before the helper exits — the record must show
+// unloadScript after the failed start, and the helper must exit
+// non-zero with no JSON on stdout.
+func TestRealKWinHelperUnloadOnStartFailure(t *testing.T) {
+	stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+	stateDir, record := fakeJournalctl(t, "")
+	stdout, stderr, err := runRealHelper(t, kwinHelperSource, nil, stubDir,
+		kwinStubEnv(t, stubDir, stateDir, record, map[string]string{"KWINSTUB_FAIL": "start"}))
+	if err == nil {
+		t.Fatalf("helper succeeded with stdout %q, want a non-zero exit on start failure", stdout)
+	}
+	if !strings.Contains(stderr, "loadScript/start failed") {
+		t.Errorf("stderr = %q, want the loadScript/start failure", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("stdout = %q, want empty (no JSON on failure)", stdout)
+	}
+	calls, rerr := os.ReadFile(record)
+	if rerr != nil {
+		t.Fatalf("read call record: %v", rerr)
+	}
+	want := "loadScript\nstart\nunloadScript\n"
+	if string(calls) != want {
+		t.Errorf("D-Bus calls = %q, want %q (unload must follow the failed start)", string(calls), want)
+	}
+}
+
+// TestRunHelperProcessKillsProcessGroup pins F-M2R-24 (c): when
+// the helper times out, the whole process GROUP is killed — a
+// spawned child (the journalctl stand-in) must not survive as an
+// orphan.
+func TestRunHelperProcessKillsProcessGroup(t *testing.T) {
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		t.Skip("pgrep not available — cannot prove the child is gone")
+	}
+	unique := "w-e-groupkill-" + filepath.Base(t.TempDir())
+	script := "#!/bin/sh\npython3 -c \"import time; time.sleep(60)\" \"" + unique + "\" &\nsleep 60\n"
+	work := t.TempDir()
+	path := filepath.Join(work, "helper.sh")
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("write helper script: %v", err)
+	}
+	start := time.Now()
+	_, err := runHelperProcess(context.Background(), path, nil, 200*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("runHelperProcess err = %v, want a timeout error", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("runHelperProcess took %v, want a prompt timeout kill", elapsed)
+	}
+	out, _ := exec.Command("pgrep", "-f", unique).Output()
+	if len(bytes.TrimSpace(out)) > 0 {
+		t.Errorf("orphaned helper child still running (pids %s) — the process group was not killed", strings.TrimSpace(string(out)))
+	}
+}
+
+// TestRunHelperProcessSuccessAndFailure pins the shared runner's
+// basic contract: stdout on success, stderr text on failure.
+func TestRunHelperProcessSuccessAndFailure(t *testing.T) {
+	out, err := runHelperProcess(context.Background(), "sh", []string{"-c", "echo hello"}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("runHelperProcess(echo) = %v, want nil", err)
+	}
+	if string(out) != "hello\n" {
+		t.Errorf("stdout = %q, want \"hello\\n\"", string(out))
+	}
+	_, err = runHelperProcess(context.Background(), "sh", []string{"-c", "echo oops >&2; exit 3"}, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "oops") {
+		t.Errorf("failing helper err = %v, want the stderr text", err)
+	}
+}
+
 func TestRealAtspiHelperCleanRun(t *testing.T) {
 	stubDir := writeStubGi(t, t.TempDir(), stubAtspiSource)
 	stdout, stderr, err := runRealHelper(t, atspiHelperSource, []string{"12", "1000"}, stubDir, nil)

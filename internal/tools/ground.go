@@ -120,6 +120,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/irfan/orion/internal/model"
@@ -1711,20 +1712,15 @@ func kwinPrecheckUncached() bool {
 // code, timeout, empty output) is an error — the caller degrades
 // to vision_only.
 func (t *groundTool) defaultRunHelper(ctx context.Context, helperPath string) ([]byte, error) {
-	hctx, cancel := context.WithTimeout(ctx, groundHelperTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(hctx, "python3", helperPath,
-		strconv.Itoa(groundMaxDepth), strconv.Itoa(groundMaxNodes))
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("AT-SPI helper failed: %v (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	out, err := runHelperProcess(ctx, "python3", []string{helperPath,
+		strconv.Itoa(groundMaxDepth), strconv.Itoa(groundMaxNodes)}, groundHelperTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("AT-SPI helper failed: %v", err)
 	}
-	if stdout.Len() == 0 {
+	if len(out) == 0 {
 		return nil, fmt.Errorf("AT-SPI helper produced no output")
 	}
-	return stdout.Bytes(), nil
+	return out, nil
 }
 
 // defaultRunKWinHelper runs the KWin helper with the KWin timeout
@@ -1734,20 +1730,54 @@ func (t *groundTool) defaultRunHelper(ctx context.Context, helperPath string) ([
 // can run the sensitive check itself (F-M2R-15: titles never
 // leave KWin — only the matched pattern does).
 func (t *groundTool) defaultRunKWinHelper(ctx context.Context, helperPath string) ([]byte, error) {
-	hctx, cancel := context.WithTimeout(ctx, groundKWinTimeout())
+	// The sensitive substrings travel as argv so the helper's
+	// KWin script can run the sensitive check itself (F-M2R-15:
+	// titles never leave KWin — only the matched pattern does).
+	out, err := runHelperProcess(ctx, "python3", append([]string{helperPath}, sensitiveWindowTitles...), groundKWinTimeout())
+	if err != nil {
+		return nil, fmt.Errorf("KWin helper failed: %v", err)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("KWin helper produced no output")
+	}
+	return out, nil
+}
+
+// runHelperProcess runs name with args under timeout in its own
+// process group, returning stdout. Any failure (start error,
+// non-zero exit, timeout) is an error carrying the stderr text.
+// On timeout the whole process GROUP is killed (F-M2R-24): the
+// KWin helper spawns journalctl, and killing only the helper
+// would orphan the in-flight journalctl child for up to its own
+// timeout. The group kill is safe for helpers that spawn no
+// children (killing an empty group is a no-op).
+func runHelperProcess(ctx context.Context, name string, args []string, timeout time.Duration) ([]byte, error) {
+	hctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	args := append([]string{helperPath}, sensitiveWindowTitles...)
-	cmd := exec.CommandContext(hctx, "python3", args...)
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("KWin helper failed: %v (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("cannot start %s: %v", name, err)
 	}
-	if stdout.Len() == 0 {
-		return nil, fmt.Errorf("KWin helper produced no output")
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-hctx.Done():
+		if cmd.Process != nil {
+			// Negative pid = the whole process group.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		<-done
+		return nil, fmt.Errorf("timed out after %v", timeout)
+	case err := <-done:
+		if err != nil {
+			return nil, fmt.Errorf("%v (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+		}
+		return stdout.Bytes(), nil
 	}
-	return stdout.Bytes(), nil
 }
 
 // checkRateLimit enforces the min-interval (per tool instance)
