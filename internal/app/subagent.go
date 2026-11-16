@@ -61,6 +61,7 @@ import (
 	"github.com/irfan/orion/internal/hooks"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
+	"github.com/irfan/orion/internal/permissions"
 	"github.com/irfan/orion/internal/subagent"
 	"github.com/irfan/orion/internal/tools"
 )
@@ -144,6 +145,19 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 // cron_cancel in a child could drop the parent's jobs. The
 // scheduled turn itself runs on the parent chat's agent, never
 // in a child, so excluding the tools here costs nothing.
+//
+// The computer-use tools are excluded too (F-A23-2): input is
+// ClassDestructive — click/type/key acts directly on the desktop
+// — and a child turn has no approval surface, so a child that
+// could call input could click, type or submit things the parent
+// and the user never see (the child's transcript is ephemeral
+// and discarded, and no Telegram card is ever shown for a child's
+// tool call). ground and screenshot are ClassSafe, so no gate can
+// restrain them — removal from the registry is the ONLY control
+// for them — and it also removes each child's own capture budget
+// (30 captures/turn per child). input is denied by the child's
+// non-interactive gate as well (see newSubagentExecutor), so the
+// two controls back each other up.
 func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore) (*tools.Registry, error) {
 	if cfg == nil {
 		cfg = config.Default()
@@ -161,7 +175,7 @@ func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore
 	// means the default registry changed under us, and failing
 	// here beats silently handing a child a tool it must not
 	// have.
-	for _, name := range []string{"enter_plan_mode", "exit_plan_mode", "cron_schedule", "cron_list", "cron_cancel", "cron_enable"} {
+	for _, name := range []string{"enter_plan_mode", "exit_plan_mode", "cron_schedule", "cron_list", "cron_cancel", "cron_enable", "input", "ground", "screenshot"} {
 		if !reg.Remove(name) {
 			return nil, fmt.Errorf("app: newChildRegistry: default registry has no %q to exclude from the child registry", name)
 		}
@@ -175,12 +189,16 @@ func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore
 // tools, an ephemeral in-memory store, the same config (timeouts and
 // caps), the read-only typed-memory view, the parent's hook bus
 // (a PreToolUse hook can block a child's tool call exactly as it
-// blocks the parent's), and no session appender.
+// blocks the parent's), a non-interactive deny-by-default
+// permission gate (F-A23-2), and no session appender.
 // MCP tools and the skill tool are deliberately NOT in the child
-// registry: children run without the interactive permission gate,
-// and MCP tools are ClassNetwork — adding ungated network tools to
-// children would widen the hole the gate closes. Revisit when
-// children get a non-interactive gate.
+// registry: MCP tools are ClassNetwork, and the skill tool's
+// orchestration is a parent-turn concern. The child gate
+// (permissions.NewChildGate) would deny any gated tool that ever
+// reached the registry, so the exclusion is defence in depth
+// now, not the only control — but it stays, because a tool that
+// is never listed can never be called, whatever a future gate
+// or classification change does.
 // The executor is safe to call concurrently — every spawn builds its
 // own agent, registry and store, sharing only the provider.
 // parentPlanning is the parent registry's planning store (Audit 5
@@ -199,6 +217,17 @@ func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *
 		if err != nil {
 			return "", subagent.Usage{}, err
 		}
+		// Permission gate (F-A23-2): the child runs under a
+		// non-interactive deny-by-default gate — destructive
+		// and network tools (shell_exec, file_write, web_fetch,
+		// input, ...) are denied promptly, with no approval
+		// surface that could ever answer. A child turn has no
+		// Telegram card and no user present, so prompting
+		// would only burn the approval window; the child
+		// gate has no prompter by construction. Safe tools
+		// (file_read, grep, calculator, task_create) still
+		// run, so a child can do read/compute work.
+		child.SetPermissionGate(permissions.NewChildGate())
 		if logger != nil {
 			child.SetLogger(logger)
 		}

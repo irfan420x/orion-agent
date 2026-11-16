@@ -110,10 +110,15 @@ var destructiveTools = map[string]bool{
 }
 
 // networkTools are the tools that move data off the machine or fetch
-// remote content.
+// remote content. cron_schedule is here too (Audit 23 F-A23W2-15):
+// it creates no network traffic itself, but a scheduled job is a
+// persistent recurring agent turn, so creating one needs approval
+// like a network call — the model must not commit the user to
+// future unattended turns without being asked.
 var networkTools = map[string]bool{
-	"web_fetch":  true,
-	"web_search": true,
+	"cron_schedule": true,
+	"web_fetch":     true,
+	"web_search":    true,
 }
 
 // safeTools are the tools that run without approval. This is an
@@ -139,7 +144,6 @@ var safeTools = map[string]bool{
 	"cron_cancel":       true,
 	"cron_enable":       true,
 	"cron_list":         true,
-	"cron_schedule":     true,
 	"datetime":          true,
 	"enter_plan_mode":   true,
 	"exit_plan_mode":    true,
@@ -533,6 +537,25 @@ func NewGate(rules *RuleStore, prompter Prompter) *Gate {
 		pending:  map[string]*pendingRequest{},
 		logger:   log.New(os.Stderr, "orion/permissions: ", log.LstdFlags),
 	}
+}
+
+// NewChildGate builds the non-interactive, deny-by-default gate for
+// subagent child agents (F-A23-2). A child turn has no approval
+// surface — no Telegram card can be shown for it and no user is
+// present in the child turn — so the gate is built with no rule
+// store and no prompter: every gated (destructive or network) tool
+// is denied PROMPTLY with "no approver is configured", never
+// prompted and never left waiting the approval window. ClassSafe
+// tools still run, so a child keeps the read/compute tools it
+// needs (file_read, grep, calculator, task_create). The tools a
+// gate cannot restrain because they are classified safe (ground,
+// screenshot) are removed from the child registry instead
+// (internal/app newChildRegistry), and input is both removed
+// there and denied here (ClassDestructive) — either control
+// alone closes the hole, and both together survive a future
+// registry or classification change to one of them.
+func NewChildGate() *Gate {
+	return NewGate(nil, nil)
 }
 
 // Rules returns the gate's standing-rule store, or nil when the

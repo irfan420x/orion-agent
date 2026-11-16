@@ -153,6 +153,118 @@ func TestSubagentExecutorChildRegistryHasNoSubagentTools(t *testing.T) {
 	}
 }
 
+// TestSubagentExecutorChildRegistryHasNoComputerUseTools (F-A23-2):
+// the child registry exposes none of the computer-use tools. input
+// is ClassDestructive and acts directly on the desktop, and ground
+// and screenshot are ClassSafe, so no gate could restrain them —
+// removal from the registry is the only control for those two.
+// The removal is loud (newChildRegistry fails if a name is
+// missing), so a future rename cannot silently re-expose one.
+func TestSubagentExecutorChildRegistryHasNoComputerUseTools(t *testing.T) {
+	reg, err := newChildRegistry(testSubagentConfig(5))
+	if err != nil {
+		t.Fatalf("newChildRegistry: %v", err)
+	}
+	for _, n := range []string{"input", "ground", "screenshot"} {
+		if _, ok := reg.Get(n); ok {
+			t.Errorf("child registry contains %q (F-A23-2: computer-use tools must not reach a child)", n)
+		}
+	}
+	// Ordinary read/compute tools survive the exclusion: a child
+	// that could not read or compute could do no useful work.
+	for _, n := range []string{"calculator", "file_read", "grep"} {
+		if _, ok := reg.Get(n); !ok {
+			t.Errorf("child registry lost ordinary tool %q", n)
+		}
+	}
+}
+
+// TestSubagentExecutorChildDestructiveToolsDenied (F-A23-2): a child
+// agent runs under a non-interactive deny-by-default gate, so its
+// destructive and network tool calls are denied promptly — the
+// tool NEVER runs — and the turn continues with the denial fed
+// back to the model. The shell command would create a marker
+// file and the file_write would create a file if either ever
+// executed; their absence on disk is the proof neither ran.
+// input is in the list too: it is removed from the child
+// registry AND denied by the gate, so the gate is the backstop
+// even for a tool the registry no longer lists. file_delete has
+// no registered tool at all — the gate denies it as unclassified
+// before the registry is ever consulted.
+func TestSubagentExecutorChildDestructiveToolsDenied(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "shell-marker")
+	writeTarget := filepath.Join(dir, "child-write.txt")
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("do not delete"), 0o600); err != nil {
+		t.Fatalf("seed victim: %v", err)
+	}
+	calls := []model.ToolCall{
+		{ID: "c1", Name: "input", Arguments: `{"op":"move","x":10,"y":10}`},
+		{ID: "c2", Name: "shell_exec", Arguments: `{"command":"touch ` + marker + `"}`},
+		{ID: "c3", Name: "file_write", Arguments: `{"path":"` + writeTarget + `","content":"pwned"}`},
+		{ID: "c4", Name: "web_fetch", Arguments: `{"url":"https://example.com"}`},
+		{ID: "c5", Name: "file_delete", Arguments: `{"path":"` + victim + `"}`},
+	}
+	var requests []*model.ChatRequest
+	childProv := &scriptedProvider{
+		name: "child",
+		chatFn: func(call int, req model.ChatRequest) (*model.ChatResponse, error) {
+			cp := req
+			requests = append(requests, &cp)
+			if call <= len(calls) {
+				return &model.ChatResponse{
+					Message: model.Message{
+						Role:      "assistant",
+						ToolCalls: []model.ToolCall{calls[call-1]},
+					},
+					FinishReason: "tool_calls",
+				}, nil
+			}
+			return &model.ChatResponse{
+				Message:      model.Message{Role: "assistant", Content: "child-answer"},
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	exec := newSubagentExecutor(childProv, testSubagentConfig(10), nil, nil, nil, nil)
+	out, _, err := exec(context.Background(), "do destructive things")
+	if err != nil {
+		t.Fatalf("executor: %v", err)
+	}
+	if out != "child-answer" {
+		t.Fatalf("out = %q, want %q (the loop must continue after gate denials)", out, "child-answer")
+	}
+	if len(requests) != len(calls)+1 {
+		t.Fatalf("provider calls = %d, want %d (%d denied calls + final answer)", len(requests), len(calls)+1, len(calls))
+	}
+	// Each request after a denied call must carry the gate
+	// denial fed back as the tool result: "permission denied"
+	// is produced ONLY by the gate path in executeToolResult —
+	// a registry error would read "Error executing tool" and a
+	// tool that ran would return its own output instead.
+	for i, tc := range calls {
+		raw, err := json.Marshal(requests[i+1])
+		if err != nil {
+			t.Fatalf("marshal request %d: %v", i+2, err)
+		}
+		if !strings.Contains(string(raw), "permission denied") {
+			t.Errorf("request after %q call does not contain a gate denial:\n%s", tc.Name, raw)
+		}
+	}
+	// Nothing ran: the shell marker and the written file must
+	// not exist, and the file_delete target must be intact.
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("shell marker %q exists: the child's shell_exec RAN despite the gate", marker)
+	}
+	if _, err := os.Stat(writeTarget); !os.IsNotExist(err) {
+		t.Errorf("write target %q exists: the child's file_write RAN despite the gate", writeTarget)
+	}
+	if b, err := os.ReadFile(victim); err != nil || string(b) != "do not delete" {
+		t.Errorf("victim file = %q, %v: the child's file_delete RAN despite the gate", b, err)
+	}
+}
+
 // TestReadOnlyTypedSource: the view handed to children delegates List
 // and Load to the parent's store, but does NOT expose
 // MarkTypedMemoryStale — core's drift check only calls that method
