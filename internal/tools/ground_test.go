@@ -1099,6 +1099,9 @@ func TestGroundKWinCorrectionFirefox(t *testing.T) {
 	if s.Correction == nil {
 		t.Fatal("summary has no correction, want kwin +29")
 	}
+	if s.Correction.Status != "ok" {
+		t.Errorf("correction status = %q, want ok", s.Correction.Status)
+	}
 	if s.Correction.Source != "kwin" {
 		t.Errorf("correction source = %q, want kwin", s.Correction.Source)
 	}
@@ -1108,6 +1111,30 @@ func TestGroundKWinCorrectionFirefox(t *testing.T) {
 	w := s.Correction.Windows[0]
 	if w.App != "Firefox" || w.DX != 0 || w.DY != 29 {
 		t.Errorf("correction window = %+v, want Firefox (0,29)", w)
+	}
+}
+
+// TestGroundKWinZeroShift pins the F-M2R-19 "ok" corner: KWin
+// matched a window but the shift is (0,0) — the coordinates were
+// verified against the compositor, not merely unshifted — so the
+// status is ok with an empty Windows list, not no_match.
+func TestGroundKWinZeroShift(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = groundTreeWithWinJSON()
+	env.kwinOK = true
+	// Only Kate, at its true position: a (0,0) match.
+	env.kwin = `{"kwin_windows": [{"caption": "Kate — notes.txt", "cls": "kate", "active": false, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600]}]}`
+	s := parseGroundSummary(t, env.call(t, `{}`))
+	if s.Correction == nil || s.Correction.Status != "ok" {
+		t.Fatalf("summary correction = %+v, want status ok (zero-shift match)", s.Correction)
+	}
+	if len(s.Correction.Windows) != 0 {
+		t.Errorf("correction windows = %+v, want empty (no non-zero shift)", s.Correction.Windows)
+	}
+	// Firefox unmatched: its elements stay uncorrected.
+	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
+		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
 	}
 }
 
@@ -1125,8 +1152,8 @@ func TestGroundKWinNoMatch(t *testing.T) {
 	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
 		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
 	}
-	if s.Correction != nil {
-		t.Errorf("summary correction = %+v, want nil (no match)", s.Correction)
+	if s.Correction == nil || s.Correction.Status != "no_match" {
+		t.Errorf("summary correction = %+v, want status no_match (F-M2R-19)", s.Correction)
 	}
 }
 
@@ -1144,8 +1171,8 @@ func TestGroundKWinAmbiguous(t *testing.T) {
 	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
 		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
 	}
-	if s.Correction != nil {
-		t.Errorf("summary correction = %+v, want nil (ambiguous)", s.Correction)
+	if s.Correction == nil || s.Correction.Status != "no_match" {
+		t.Errorf("summary correction = %+v, want status no_match (ambiguous, F-M2R-19)", s.Correction)
 	}
 }
 
@@ -1160,8 +1187,8 @@ func TestGroundKWinClassMismatch(t *testing.T) {
 	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
 		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
 	}
-	if s.Correction != nil {
-		t.Errorf("summary correction = %+v, want nil (class mismatch)", s.Correction)
+	if s.Correction == nil || s.Correction.Status != "no_match" {
+		t.Errorf("summary correction = %+v, want status no_match (class mismatch, F-M2R-19)", s.Correction)
 	}
 }
 
@@ -1175,8 +1202,8 @@ func TestGroundKWinFailure(t *testing.T) {
 	if got := findGroundElement(t, s, "Sign in").Centre; got.X != 960 || got.Y != 540 {
 		t.Errorf("Sign in centre = %+v, want uncorrected (960,540)", got)
 	}
-	if s.Correction != nil {
-		t.Errorf("summary correction = %+v, want nil (KWin unavailable)", s.Correction)
+	if s.Correction == nil || s.Correction.Status != "unavailable" {
+		t.Errorf("summary correction = %+v, want status unavailable (KWin failed, F-M2R-19)", s.Correction)
 	}
 	if s.Coverage != "grounded" {
 		t.Errorf("coverage = %q, want grounded", s.Coverage)

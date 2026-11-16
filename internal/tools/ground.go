@@ -300,12 +300,23 @@ type groundWindowSummary struct {
 // groundCorrection records the KWin-measured per-window
 // coordinate correction applied to this grounding (F2): each
 // entry is a window whose AT-SPI coordinates were shifted by
-// (DX, DY) to match the compositor's true geometry. Absent when
-// the KWin query was unavailable — then the elements are raw
-// AT-SPI coordinates, uncorrected. A present correction with an
-// empty Windows list means KWin ran and found nothing to shift.
+// (DX, DY) to match the compositor's true geometry.
+//
+// Status is tri-state (F-M2R-19) so the model can tell the three
+// indistinguishable-looking cases apart: "ok" means KWin ran and
+// matched at least one window (Windows lists the non-zero shifts;
+// an all-zero match still reports ok with an empty list — the
+// coordinates were verified, not merely unshifted); "no_match"
+// means KWin ran but no window matched uniquely (wrong title,
+// class, size, or an ambiguous duplicate), so the elements are
+// raw AT-SPI coordinates; "unavailable" means the KWin helper
+// itself failed (no KWin, no journal, timeout), so no
+// verification happened at all. The field is present whenever
+// there is a tree; it is absent only with no tree at all
+// (coverage vision_only), where no KWin attempt was made.
 type groundCorrection struct {
 	Source  string              `json:"source"` // always "kwin"
+	Status  string              `json:"status"` // ok | no_match | unavailable
 	Windows []groundWindowShift `json:"windows"`
 }
 
@@ -1044,13 +1055,24 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// sensitive check's second source, and the only one that
 	// sees Qt windows. A KWin failure (no KWin, no journal,
 	// timeout) leaves the tree uncorrected: the grounding still
-	// returns, with no correction field, rather than failing or
-	// faking coordinates.
+	// returns, with the correction reporting its status, rather
+	// than failing or faking coordinates. The correction status
+	// is tri-state (F-M2R-19): ok (matched >=1 window), no_match (KWin ran,
+	// nothing matched), or unavailable (no KWin list at all) —
+	// nil no longer conflates the three, so the model knows
+	// whether the coordinates were ever verified.
 	var correction *groundCorrection
-	if tree != nil && kwin != nil {
-		offsets := matchKWinWindows(tree, kwin)
-		if len(offsets) > 0 {
-			correction = &groundCorrection{Source: "kwin", Windows: []groundWindowShift{}}
+	if tree != nil {
+		switch {
+		case kwin == nil:
+			correction = &groundCorrection{Source: "kwin", Status: "unavailable", Windows: []groundWindowShift{}}
+		default:
+			offsets := matchKWinWindows(tree, kwin)
+			status := "no_match"
+			if len(offsets) > 0 {
+				status = "ok"
+			}
+			correction = &groundCorrection{Source: "kwin", Status: status, Windows: []groundWindowShift{}}
 			for i := range tree.Windows {
 				if off, ok := offsets[i]; ok && (off[0] != 0 || off[1] != 0) {
 					correction.Windows = append(correction.Windows, groundWindowShift{
