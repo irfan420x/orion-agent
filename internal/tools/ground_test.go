@@ -28,16 +28,16 @@ import (
 // probe: username entry, password field, two links, plus the
 // degenerate/offscreen/heading traps the filters must catch).
 type fakeGroundEnv struct {
-	tool     *groundTool
-	clock    time.Time
-	home     string
-	png      []byte // 1920x1080 test capture
-	captures int
-	helperOK bool   // runHelper succeeds
-	helper   string // canned helper JSON ("" = default tree)
-	helperCalled bool // runHelper was invoked (F-M2R-30 ordering)
-	kwinOK   bool   // runKWinHelper succeeds
-	kwin     string // canned KWin JSON
+	tool         *groundTool
+	clock        time.Time
+	home         string
+	png          []byte // 1920x1080 test capture
+	captures     int
+	helperOK     bool   // runHelper succeeds
+	helper       string // canned helper JSON ("" = default tree)
+	helperCalled bool   // runHelper was invoked (F-M2R-30 ordering)
+	kwinOK       bool   // runKWinHelper succeeds
+	kwin         string // canned KWin JSON
 }
 
 func groundTreeJSON() string {
@@ -1326,8 +1326,12 @@ func TestKWinClassCompatible(t *testing.T) {
 		app, class string
 		want       bool
 	}{
-		{"Firefox", "firefox-esr", true}, // prefix at '-', live case
-		{"firefox", "Firefox", true},     // case-insensitive
+		{"Firefox", "firefox-esr", true},     // prefix at '-', live case
+		{"firefox", "Firefox", true},         // case-insensitive
+		{"Mozilla Firefox", "firefox", true}, // F-M2R-22: multi-word app name
+		{"Mozilla Firefox", "firefox-esr", true},
+		{"Firefox", "org.mozilla.firefox", true}, // dotted class
+		{"Mozilla Firefox", "chromium", false},
 		{"kate", "kate", true},           // equal
 		{"kate", "kate-wayland", true},   // prefix at '-'
 		{"Firefox", "chromium", false},   // different app
@@ -1341,6 +1345,30 @@ func TestKWinClassCompatible(t *testing.T) {
 		if got := kwinClassCompatible(c.app, c.class); got != c.want {
 			t.Errorf("kwinClassCompatible(%q, %q) = %v, want %v", c.app, c.class, got, c.want)
 		}
+	}
+}
+
+// TestMatchKWinWindowsMinimizedDuplicate pins the F-M2R-22 (c)
+// rule: a minimized window with the same class/size as the
+// visible one must not veto the visible window's correction, and
+// an all-minimized candidate set matches nothing. (The title leg
+// of F-M2R-22 is NOT pinned here: matching deliberately uses no
+// titles — F-M2R-15, the KWin helper reports none.)
+func TestMatchKWinWindowsMinimizedDuplicate(t *testing.T) {
+	tree := &atspiOutput{
+		Windows: []atspiWindow{
+			{Title: "Sign in to GitHub · GitHub — Mozilla Firefox", App: "Firefox", X: 0, Y: 0, W: 1920, H: 993},
+		},
+	}
+	visible := kwinWindow{Class: "firefox-esr", FG: [4]int{0, 29, 1920, 993}}
+	minimized := kwinWindow{Class: "firefox-esr", Minimized: true, FG: [4]int{0, 29, 1920, 993}}
+	// Visible + minimized duplicate: the visible one wins.
+	if offsets := matchKWinWindows(tree, []kwinWindow{minimized, visible}); offsets[0] != [2]int{0, 29} {
+		t.Errorf("visible+minimized offsets = %v, want Firefox (0,29)", offsets)
+	}
+	// Minimized only: nothing on screen to correct against.
+	if offsets := matchKWinWindows(tree, []kwinWindow{minimized}); len(offsets) != 0 {
+		t.Errorf("minimized-only offsets = %v, want none", offsets)
 	}
 }
 

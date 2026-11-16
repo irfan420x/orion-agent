@@ -454,9 +454,9 @@ type kwinOutput struct {
 // matchKWinWindows matches KWin's true geometries to the AT-SPI
 // windows and returns the per-window coordinate shift (KWin
 // geometry minus AT-SPI box) for each matched window, keyed by the
-// AT-SPI window index. A window matches when exactly one KWin
-// window has a compatible app class and the same size; the shift
-// is then a pure translation (the app reports window-relative
+// AT-SPI window index. A window matches when exactly one VISIBLE
+// KWin window has a compatible app class and the same size; the
+// shift is then a pure translation (the app reports window-relative
 // coordinates — Firefox's window at (0,0) while KWin places it
 // at (0,29)). Anything ambiguous or unmatched gets no shift: an
 // uncorrected element is never worse than a wrongly-shifted one.
@@ -471,6 +471,14 @@ type kwinOutput struct {
 // Titles are deliberately NOT used for matching (F-M2R-15): the
 // KWin helper no longer reports them, so two same-app, same-size
 // windows are ambiguous and stay uncorrected rather than guessed.
+// A minimized duplicate never vetoes the visible window's
+// correction (F-M2R-22): only visible candidates count, and two
+// visible candidates are still ambiguous.
+//
+// Matching is deliberately tolerant where the two sides disagree
+// on spelling (F-M2R-22), and strict where a wrong match would
+// shift coordinates: classes compare per word ("Mozilla Firefox" vs
+// "firefox").
 //
 // The focused/active flags are deliberately NOT used for
 // matching: AT-SPI reported focused=false for the active Firefox
@@ -481,35 +489,78 @@ func matchKWinWindows(tree *atspiOutput, kwin []kwinWindow) map[int][2]int {
 		return offsets
 	}
 	for i, w := range tree.Windows {
-		var matches [][2]int
+		// A candidate carries its KWin window (for the
+		// Minimized flag) with the shift from whichever
+		// geometry matched (FG first, then CG — F-M2R-9).
+		type kwinCandidate struct {
+			kw    kwinWindow
+			shift [2]int
+		}
+		var candidates []kwinCandidate
 		for _, kw := range kwin {
 			if !kwinClassCompatible(w.App, kw.Class) {
 				continue
 			}
 			if w.W == kw.FG[2] && w.H == kw.FG[3] {
-				matches = append(matches, [2]int{kw.FG[0] - w.X, kw.FG[1] - w.Y})
+				candidates = append(candidates, kwinCandidate{kw, [2]int{kw.FG[0] - w.X, kw.FG[1] - w.Y}})
 			} else if w.W == kw.CG[2] && w.H == kw.CG[3] {
-				matches = append(matches, [2]int{kw.CG[0] - w.X, kw.CG[1] - w.Y})
+				candidates = append(candidates, kwinCandidate{kw, [2]int{kw.CG[0] - w.X, kw.CG[1] - w.Y}})
 			}
 		}
-		if len(matches) != 1 {
+		// A minimized duplicate must not veto the visible
+		// window: only visible candidates count. All-minimized
+		// means nothing on screen to correct against.
+		var visible []kwinCandidate
+		for _, m := range candidates {
+			if !m.kw.Minimized {
+				visible = append(visible, m)
+			}
+		}
+		if len(visible) != 1 {
 			continue
 		}
-		offsets[i] = matches[0]
+		offsets[i] = visible[0].shift
 	}
 	return offsets
 }
 
 // kwinClassCompatible reports whether an AT-SPI app name and a
-// KWin resource class name the same app: lowercased, equal, or
-// one a prefix of the other at a word boundary ("firefox" matches
+// KWin resource class name the same app. Both sides are split
+// into words (on spaces and the separators classes use) and any
+// word pair may match: "Mozilla Firefox" matches "firefox" and
+// "firefox-esr", and "Firefox" matches "org.mozilla.firefox".
+// A word pair matches when lowercased-equal, or one is a prefix
+// of the other at a word boundary ("firefox" matches
 // "firefox-esr" — the next char is '-'; "fire" never matches
 // "firefox", and "firefox" never matches "firefoxesr").
 func kwinClassCompatible(app, class string) bool {
-	a, c := strings.ToLower(strings.TrimSpace(app)), strings.ToLower(strings.TrimSpace(class))
+	a := strings.ToLower(strings.TrimSpace(app))
+	c := strings.ToLower(strings.TrimSpace(class))
 	if a == "" || c == "" {
 		return false
 	}
+	for _, aw := range splitClassWords(a) {
+		for _, cw := range splitClassWords(c) {
+			if classWordCompatible(aw, cw) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// splitClassWords splits an app name or resource class into
+// words on spaces and the separators ('-', '_', '.') that
+// desktop-file-style classes use.
+func splitClassWords(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return r == ' ' || r == '-' || r == '_' || r == '.'
+	})
+}
+
+// classWordCompatible is the single-word rule: equal, or one a
+// prefix of the other at a word boundary.
+func classWordCompatible(a, c string) bool {
 	if a == c {
 		return true
 	}
