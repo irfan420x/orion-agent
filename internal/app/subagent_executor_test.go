@@ -87,7 +87,7 @@ func TestSubagentExecutorRealChildLoop(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, nil, nil)
 	out, usage, err := exec(context.Background(), "do the thing")
 	if err != nil {
 		t.Fatalf("executor: %v", err)
@@ -121,7 +121,7 @@ func TestSubagentExecutorPropagatesMaxStepsError(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(2), nil, nil, nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(2), nil, nil, nil, nil, nil)
 	out, _, err := exec(context.Background(), "loop forever")
 	if out != "" {
 		t.Fatalf("output = %q, want empty when the child errors", out)
@@ -139,7 +139,7 @@ func TestSubagentExecutorPropagatesMaxStepsError(t *testing.T) {
 // the factory builds for children exposes none of the four subagent
 // tools, so a child cannot spawn subagents by construction.
 func TestSubagentExecutorChildRegistryHasNoSubagentTools(t *testing.T) {
-	reg, err := newChildRegistry(testSubagentConfig(5))
+	reg, err := newChildRegistry(testSubagentConfig(5), nil)
 	if err != nil {
 		t.Fatalf("newChildRegistry: %v", err)
 	}
@@ -401,7 +401,7 @@ func runSubagentManagerEndToEnd(t *testing.T, maxSteps, minChildPolls int) int {
 			}, nil
 		},
 	}
-	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(childProv, cfg, nil, nil, nil, nil))
+	mgr := subagent.NewManagerWithExecutor(4, newSubagentExecutor(childProv, cfg, nil, nil, nil, nil, nil))
 	defer mgr.Shutdown()
 
 	parentProv := &scriptedProvider{
@@ -589,7 +589,7 @@ func TestRC9ChildAgentGetsHooks(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, bus, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, bus, nil, nil)
 	out, _, err := exec(context.Background(), "compute 1+1")
 	if err != nil {
 		t.Fatalf("executor: %v", err)
@@ -646,7 +646,7 @@ func TestSubagentExecutorChildSharesParentPlanningStore(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, parentStore)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, parentStore, nil)
 	if _, _, err := exec(context.Background(), "plan this"); err != nil {
 		t.Fatalf("executor: %v", err)
 	}
@@ -686,7 +686,7 @@ func TestSubagentExecutorWithoutParentPlanningStoreIsIsolated(t *testing.T) {
 			}, nil
 		},
 	}
-	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, nil)
+	exec := newSubagentExecutor(childProv, testSubagentConfig(5), nil, nil, nil, nil, nil)
 	if _, _, err := exec(context.Background(), "plan this"); err != nil {
 		t.Fatalf("executor: %v", err)
 	}

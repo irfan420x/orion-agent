@@ -68,6 +68,13 @@ type App struct {
 	// registry's own in-memory store; the executor then gets nil
 	// (isolated per-child planning, the old behaviour).
 	planningStore *tools.PlanningStore
+	// captureBudget is the shared computer-use budget
+	// (F-A23W2-14 / F-M2R-16), created in Build: the parent
+	// registry owns it and every child registry charges it
+	// without resetting it, so one parent turn's captures are
+	// bounded across parent + children. Nil for hand-built Apps,
+	// which keep per-registry budgets (the old behaviour).
+	captureBudget *tools.CaptureBudget
 	Logger        *log.Logger
 	// StartedAt is when the app was built (zero for a hand-built App);
 	// StatusLine reports uptime from it and omits the line when zero.
@@ -188,10 +195,18 @@ func Build(path string) (*App, error) {
 	if err := planningStore.SetDataDir(cfg.DataDir); err != nil {
 		return nil, fmt.Errorf("app: planning store: %w", err)
 	}
+	// Shared computer-use budget (F-A23W2-14 / F-M2R-16): one
+	// counter for ground + screenshot + input, owned by the
+	// parent registry and charged (never reset) by every child
+	// registry — created here so both the registry and the
+	// subagent executor below receive the same instance.
+	captureBudget := tools.NewCaptureBudget()
 	registry, err := tools.DefaultRegistryWithDeps(tools.ToolDeps{
 		SandboxCfg:         cfg.Sandbox,
 		TrustedEgressCIDRs: cfg.TrustedEgressCIDRs,
 		PlanningStore:      planningStore,
+		CaptureBudget:      captureBudget,
+		CaptureBudgetOwner: true,
 	})
 	if err != nil {
 		return nil, err
@@ -251,7 +266,7 @@ func Build(path string) (*App, error) {
 	// parent turn) and pollutes the parent's history. The child
 	// shares only the provider (concurrent-safe) and the typed
 	// memories (read-only view).
-	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, planningStore), cfg.DataDir)
+	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, planningStore, captureBudget), cfg.DataDir)
 
 	// Model-visible subagent tools, registered on the PARENT
 	// registry only (children get a registry without them, so no
@@ -310,6 +325,7 @@ func Build(path string) (*App, error) {
 		Hooks:         hookBus,
 		MCP:           mcpMgr,
 		planningStore: planningStore,
+		captureBudget: captureBudget,
 		StartedAt:     time.Now(),
 		typedStore:    typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
 	}

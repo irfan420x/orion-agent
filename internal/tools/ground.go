@@ -67,10 +67,19 @@
 //
 // Rate limits: the M1 screenshot discipline (min 1 s between
 // captures, max 15 per turn, max 120 per hour), enforced here on
-// ground calls; the inner screenshot capture enforces its own
-// identical limits on top, so a ground call consumes one slot of
-// each. The two counters are separate (one per tool instance), so
-// the combined worst case is 30 captures per turn — still bounded.
+// ground calls — but the per-turn/hour counting is SHARED with
+// the screenshot and input tools through one CaptureBudget
+// (F-A23W2-14 / F-M2R-16): a ground call charges the shared
+// budget once, and the inner screenshot capture it takes is
+// already paid for, so it does not charge again. One grounding
+// is one capture, not two, and the combined worst case per turn
+// is 15 computer-use calls across ground + screenshot + input
+// (parent and children together), not 30 captures + 15 inputs.
+// The shared budget also fixes F-M2R-1 as a side effect: the
+// embedded screenshot's own counter used to never reset (its
+// BeginTurn was never called — it is not a registry tool), so
+// ground died permanently after 15 groundings; the shared
+// budget resets with ground's BeginTurn.
 package tools
 
 import (
@@ -80,6 +89,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -106,7 +116,7 @@ var kwinHelperSource string
 
 func init() {
 	RegisterFactory("ground", func(deps ToolDeps) (Tool, error) {
-		return newGroundTool(), nil
+		return newGroundToolWithBudget(deps.CaptureBudget, deps.CaptureBudgetOwner), nil
 	})
 }
 
@@ -148,10 +158,13 @@ const (
 )
 
 // Ground rate limits (M1 screenshot discipline, plan §4.1).
+// The per-turn/hour numbers alias the shared capture budget's
+// (F-A23W2-14): one limit across ground + screenshot + input,
+// not one per tool. The min interval stays per tool instance.
 const (
 	groundMinInterval = time.Second
-	groundMaxPerTurn  = 15
-	groundMaxPerHour  = 120
+	groundMaxPerTurn  = captureMaxPerTurn
+	groundMaxPerHour  = captureMaxPerHour
 )
 
 // defaultInteractiveRoles is the default `roles` filter: roles a
@@ -585,15 +598,23 @@ func (r *groundSnapshotRegistry) snapshotIDs(id string) (map[int]bool, bool) {
 // --- the tool ---
 
 type groundTool struct {
-	mu        sync.Mutex
-	lastCall  time.Time
-	hourCalls []time.Time
-	turnCalls int
+	mu       sync.Mutex
+	lastCall time.Time // per-tool min-interval only; turn/hour counting is the shared budget's
+
+	// budget is the shared computer-use budget (F-A23W2-14):
+	// ground, screenshot and input charge the same per-turn and
+	// per-hour counters. budgetOwner says whether this tool's
+	// BeginTurn resets it (parent registry only — a child
+	// registry's tools share the budget but never reset it).
+	budget      *CaptureBudget
+	budgetOwner bool
 
 	// shot is the M1 screenshot tool, reused whole: ground takes
 	// its own screenshot so image and tree are the same instant,
 	// and the capture (spectacle probe, sensitive check, scaling,
-	// 0600 storage) is never duplicated here.
+	// 0600 storage) is never duplicated here. It shares this
+	// tool's budget (and never charges it — the grounding
+	// already paid for the capture).
 	shot *screenshotTool
 
 	// Seams, overridable in tests. Defaults run the real helpers.
@@ -608,11 +629,27 @@ type groundTool struct {
 }
 
 func newGroundTool() *groundTool {
+	return newGroundToolWithBudget(NewCaptureBudget(), true)
+}
+
+// newGroundToolWithBudget builds a ground tool charging budget
+// (nil becomes a fresh private budget). owner says whether this
+// tool's BeginTurn resets the budget — true for the parent
+// registry's tool, false for a child registry's. The embedded
+// screenshot tool shares the budget but never owns it: its
+// BeginTurn is never called (it is not a registry tool), and
+// ground's BeginTurn is the reset point for both.
+func newGroundToolWithBudget(budget *CaptureBudget, owner bool) *groundTool {
+	if budget == nil {
+		budget = NewCaptureBudget()
+	}
 	t := &groundTool{
-		shot:     newScreenshotTool(),
-		lookPath: exec.LookPath,
-		homeDir:  os.UserHomeDir,
-		now:      time.Now,
+		budget:      budget,
+		budgetOwner: owner,
+		shot:        newScreenshotToolWithBudget(budget, false),
+		lookPath:    exec.LookPath,
+		homeDir:     os.UserHomeDir,
+		now:         time.Now,
 	}
 	t.execCmd = defaultExecCmd
 	t.runHelper = t.defaultRunHelper
@@ -661,11 +698,18 @@ func (t *groundTool) Definition() model.ToolDefinition {
 // screen and the accessibility tree and changes nothing.
 func (t *groundTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
-// BeginTurn resets the per-turn capture counter (see TurnResetter).
+// BeginTurn resets the per-turn capture counter (see
+// TurnResetter) — but only when this tool owns the shared
+// budget (F-A23W2-14): a child registry's tools share the
+// budget and must never reset it mid-parent-turn. Resetting is
+// idempotent, so the parent registry's ground, screenshot and
+// input tools may all call it.
 func (t *groundTool) BeginTurn() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.turnCalls = 0
+	if t.budgetOwner {
+		t.budget.BeginTurn()
+	}
 }
 
 // Execute is the text-only Tool interface method: the same
@@ -801,15 +845,17 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// Capture with the M1 screenshot tool at full resolution
 	// (max_width 1920, scale 1.0): image pixels must BE screen
 	// pixels, or the markers would not land on the boxes. The
-	// screenshot tool still enforces its own rate limits and its
-	// own sensitive check on top.
+	// screenshot tool still enforces its own sensitive check on
+	// top — but the capture is NOT charged to the shared budget
+	// again: this grounding already charged it once above, and
+	// one grounding is one capture (F-A23W2-14).
 	shotArgs, _ := json.Marshal(map[string]any{
 		"format":    "jpeg",
 		"scale":     1.0,
 		"max_width": 1920,
 		"region":    a.Region,
 	})
-	shotRes, err := t.shot.ExecuteResult(ctx, shotArgs)
+	shotRes, err := t.shot.executeResult(ctx, shotArgs, false)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -1069,9 +1115,11 @@ func (t *groundTool) defaultRunKWinHelper(ctx context.Context, helperPath string
 	return stdout.Bytes(), nil
 }
 
-// checkRateLimit enforces the min-interval, per-turn and per-hour
-// limits and records the call. Same shape as the screenshot
-// tool's, with ground's own counters.
+// checkRateLimit enforces the min-interval (per tool instance)
+// and the per-turn + per-hour limits (the SHARED capture budget,
+// F-A23W2-14) and records the call. The budget refusal is
+// wrapped in ground's own message, so the model hears the same
+// "at most 15 groundings per turn" as before.
 func (t *groundTool) checkRateLimit() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1079,23 +1127,13 @@ func (t *groundTool) checkRateLimit() error {
 	if !t.lastCall.IsZero() && now.Sub(t.lastCall) < groundMinInterval {
 		return fmt.Errorf("ground rate limit: at most one grounding per second (last grounding %v ago)", now.Sub(t.lastCall).Round(time.Millisecond))
 	}
-	if t.turnCalls >= groundMaxPerTurn {
-		return fmt.Errorf("ground rate limit: at most %d groundings per turn", groundMaxPerTurn)
-	}
-	cutoff := now.Add(-time.Hour)
-	kept := t.hourCalls[:0]
-	for _, ts := range t.hourCalls {
-		if ts.After(cutoff) {
-			kept = append(kept, ts)
+	if err := t.budget.Charge(now, groundMaxPerTurn, groundMaxPerHour); err != nil {
+		if errors.Is(err, errCaptureBudgetTurn) {
+			return fmt.Errorf("ground rate limit: at most %d groundings per turn", groundMaxPerTurn)
 		}
-	}
-	t.hourCalls = kept
-	if len(t.hourCalls) >= groundMaxPerHour {
 		return fmt.Errorf("ground rate limit: at most %d groundings per hour", groundMaxPerHour)
 	}
 	t.lastCall = now
-	t.turnCalls++
-	t.hourCalls = append(t.hourCalls, now)
 	return nil
 }
 

@@ -106,7 +106,11 @@
 //     a turn would re-execute clicks and keystrokes.
 //
 // Rate limits: the M1 screenshot discipline (1 s min interval,
-// 15 per turn, 120 per hour), same numbers as ground/screenshot.
+// 15 per turn, 120 per hour) — but the per-turn/hour counting is
+// SHARED with ground and screenshot through one CaptureBudget
+// (F-A23W2-14 / F-M2R-16): an input call and a capture draw on
+// the same 15/turn pool, parent and children together. The
+// min interval stays per tool instance.
 package tools
 
 import (
@@ -114,6 +118,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -133,15 +138,18 @@ var inputKWinHelperSource string
 
 func init() {
 	RegisterFactory("input", func(deps ToolDeps) (Tool, error) {
-		return newInputTool(), nil
+		return newInputToolWithBudget(deps.CaptureBudget, deps.CaptureBudgetOwner), nil
 	})
 }
 
-// Input limits (M1 screenshot discipline + M3 move bounds).
+// Input limits (M1 screenshot discipline + M3 move bounds). The
+// per-turn/hour numbers alias the shared capture budget's
+// (F-A23W2-14): one limit across ground + screenshot + input,
+// not one per tool. The min interval stays per tool instance.
 const (
 	inputMinInterval       = time.Second
-	inputMaxPerTurn        = 15
-	inputMaxPerHour        = 120
+	inputMaxPerTurn        = captureMaxPerTurn
+	inputMaxPerHour        = captureMaxPerHour
 	inputMaxTypeRunes      = 1000 // longest text one type call may enter
 	inputMoveTolerancePx   = 5    // closed-loop success: both axes within 5 px
 	inputMaxMoveIterations = 5    // correction moves before giving up honestly
@@ -259,10 +267,16 @@ type inputWindowInfo struct {
 }
 
 type inputTool struct {
-	mu        sync.Mutex
-	lastCall  time.Time
-	hourCalls []time.Time
-	turnCalls int
+	mu       sync.Mutex
+	lastCall time.Time // per-tool min-interval only; turn/hour counting is the shared budget's
+
+	// budget is the shared computer-use budget (F-A23W2-14):
+	// ground, screenshot and input charge the same per-turn and
+	// per-hour counters. budgetOwner says whether this tool's
+	// BeginTurn resets it (parent registry only — a child
+	// registry's tools share the budget but never reset it).
+	budget      *CaptureBudget
+	budgetOwner bool
 	// screenW/H is the virtual screen size from the KWin oracle,
 	// cached on first sight (0 = unknown yet), with the time it
 	// was read. Coordinate validation uses it when known AND
@@ -298,13 +312,30 @@ type inputTool struct {
 }
 
 func newInputTool() *inputTool {
+	return newInputToolWithBudget(NewCaptureBudget(), true)
+}
+
+// newInputToolWithBudget builds an input tool charging budget
+// (nil becomes a fresh private budget). owner says whether this
+// tool's BeginTurn resets the budget — true for the parent
+// registry's tool, false for a child registry's. The internal
+// ground/shot instances keep private budgets: they are only
+// ever used for the AT-SPI tree, window titles and the
+// screen-locked check — never for a charged capture — so they
+// never touch the shared budget.
+func newInputToolWithBudget(budget *CaptureBudget, owner bool) *inputTool {
+	if budget == nil {
+		budget = NewCaptureBudget()
+	}
 	t := &inputTool{
-		ground:   newGroundTool(),
-		shot:     newScreenshotTool(),
-		lookPath: exec.LookPath,
-		homeDir:  os.UserHomeDir,
-		now:      time.Now,
-		sleep:    time.Sleep,
+		budget:      budget,
+		budgetOwner: owner,
+		ground:      newGroundTool(),
+		shot:        newScreenshotTool(),
+		lookPath:    exec.LookPath,
+		homeDir:     os.UserHomeDir,
+		now:         time.Now,
+		sleep:       time.Sleep,
 	}
 	t.ydotool = t.defaultYdotool
 	t.runKWinHelper = t.defaultRunKWinHelper
@@ -362,11 +393,18 @@ func (t *inputTool) Definition() model.ToolDefinition {
 // approves the whole input call, move included).
 func (t *inputTool) RiskClass() permissions.Class { return permissions.ClassDestructive }
 
-// BeginTurn resets the per-turn call counter (see TurnResetter).
+// BeginTurn resets the per-turn call counter (see TurnResetter)
+// — but only when this tool owns the shared budget (F-A23W2-14):
+// a child registry's tools share the budget and must never
+// reset it mid-parent-turn. Resetting is idempotent, so the
+// parent registry's ground, screenshot and input tools may all
+// call it.
 func (t *inputTool) BeginTurn() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.turnCalls = 0
+	if t.budgetOwner {
+		t.budget.BeginTurn()
+	}
 }
 
 // Execute is the text-only Tool interface method.
@@ -903,9 +941,11 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int) error {
 	return fmt.Errorf("this screen shows a %s: I will not click while it is visible", SensitiveTitleCategory(hit))
 }
 
-// checkRateLimit enforces the min-interval, per-turn and per-hour
-// limits and records the call. Same shape as the ground and
-// screenshot tools' checks, with input's own counters.
+// checkRateLimit enforces the min-interval (per tool instance)
+// and the per-turn + per-hour limits (the SHARED capture budget,
+// F-A23W2-14) and records the call. The budget refusal is
+// wrapped in input's own message, so the model hears the same
+// "at most 15 input calls per turn" as before.
 func (t *inputTool) checkRateLimit() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -913,22 +953,12 @@ func (t *inputTool) checkRateLimit() error {
 	if !t.lastCall.IsZero() && now.Sub(t.lastCall) < inputMinInterval {
 		return fmt.Errorf("input rate limit: at most one input call per second (last call %v ago)", now.Sub(t.lastCall).Round(time.Millisecond))
 	}
-	if t.turnCalls >= inputMaxPerTurn {
-		return fmt.Errorf("input rate limit: at most %d input calls per turn", inputMaxPerTurn)
-	}
-	cutoff := now.Add(-time.Hour)
-	kept := t.hourCalls[:0]
-	for _, ts := range t.hourCalls {
-		if ts.After(cutoff) {
-			kept = append(kept, ts)
+	if err := t.budget.Charge(now, inputMaxPerTurn, inputMaxPerHour); err != nil {
+		if errors.Is(err, errCaptureBudgetTurn) {
+			return fmt.Errorf("input rate limit: at most %d input calls per turn", inputMaxPerTurn)
 		}
-	}
-	t.hourCalls = kept
-	if len(t.hourCalls) >= inputMaxPerHour {
 		return fmt.Errorf("input rate limit: at most %d input calls per hour", inputMaxPerHour)
 	}
 	t.lastCall = now
-	t.turnCalls++
-	t.hourCalls = append(t.hourCalls, now)
 	return nil
 }

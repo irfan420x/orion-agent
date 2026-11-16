@@ -915,8 +915,8 @@ func TestInputFailedCallsDoNotEatRateLimitSlots(t *testing.T) {
 			t.Fatalf("locked call #%d err = %v, want the locked-screen error", i+1, err)
 		}
 	}
-	if env.tool.turnCalls != 0 || len(env.tool.hourCalls) != 0 {
-		t.Errorf("after 20 locked failures: turnCalls = %d, hourCalls = %d, want 0, 0", env.tool.turnCalls, len(env.tool.hourCalls))
+	if env.tool.budget.TurnCalls() != 0 || env.tool.budget.HourCalls() != 0 {
+		t.Errorf("after 20 locked failures: turnCalls = %d, hourCalls = %d, want 0, 0", env.tool.budget.TurnCalls(), env.tool.budget.HourCalls())
 	}
 	// Daemon down: same — the socket is gone, the call fails
 	// before the rate-limit check.
@@ -929,8 +929,8 @@ func TestInputFailedCallsDoNotEatRateLimitSlots(t *testing.T) {
 			t.Fatalf("daemon-down call #%d err = %v, want the daemon-down error", i+1, err)
 		}
 	}
-	if env.tool.turnCalls != 0 || len(env.tool.hourCalls) != 0 {
-		t.Errorf("after 20 daemon-down failures: turnCalls = %d, hourCalls = %d, want 0, 0", env.tool.turnCalls, len(env.tool.hourCalls))
+	if env.tool.budget.TurnCalls() != 0 || env.tool.budget.HourCalls() != 0 {
+		t.Errorf("after 20 daemon-down failures: turnCalls = %d, hourCalls = %d, want 0, 0", env.tool.budget.TurnCalls(), env.tool.budget.HourCalls())
 	}
 	// The quota is still whole: 15 moves succeed, the 16th is
 	// rate-limited — the 40 failures above bought nothing.

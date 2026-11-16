@@ -224,7 +224,7 @@ func TestCronCLIChannelNotSerialisedByTurnLock(t *testing.T) {
 // not commit the parent's chat to recurring work or cancel its
 // jobs.
 func TestCronExcludedFromChildRegistry(t *testing.T) {
-	reg, err := newChildRegistry(config.Default())
+	reg, err := newChildRegistry(config.Default(), nil)
 	if err != nil {
 		t.Fatalf("newChildRegistry: %v", err)
 	}

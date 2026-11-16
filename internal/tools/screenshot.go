@@ -45,14 +45,20 @@
 //   - cron/unattended turns refuse outright (plan §11.3).
 //
 // Rate limits (plan §4.1, enforced here): min 1s between captures,
-// max 15 per turn, max 120 per hour. The per-turn counter resets on
-// BeginTurn, which the agent loop calls once per turn.
+// max 15 per turn, max 120 per hour. The min interval is per tool
+// instance; the per-turn/hour counting is the SHARED capture
+// budget (F-A23W2-14 / F-M2R-16) — ground, screenshot and input
+// charge one counter, parent and children together. The per-turn
+// counter resets on BeginTurn, which the agent loop calls once
+// per turn — but only for the budget's owner (see
+// CaptureBudget): a child registry's tools never reset it.
 package tools
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/draw"
@@ -73,15 +79,18 @@ import (
 
 func init() {
 	RegisterFactory("screenshot", func(deps ToolDeps) (Tool, error) {
-		return newScreenshotTool(), nil
+		return newScreenshotToolWithBudget(deps.CaptureBudget, deps.CaptureBudgetOwner), nil
 	})
 }
 
-// Screenshot limits (plan §4.1).
+// Screenshot limits (plan §4.1). The per-turn/hour numbers alias
+// the shared capture budget's (F-A23W2-14): one limit across
+// ground + screenshot + input, not one per tool. The min
+// interval stays per tool instance.
 const (
 	screenshotMinInterval   = time.Second
-	screenshotMaxPerTurn    = 15
-	screenshotMaxPerHour    = 120
+	screenshotMaxPerTurn    = captureMaxPerTurn
+	screenshotMaxPerHour    = captureMaxPerHour
 	screenshotDefaultWidth  = 1280
 	screenshotMinWidth      = 640
 	screenshotMaxWidth      = 1920
@@ -130,10 +139,16 @@ type cursorPos struct {
 }
 
 type screenshotTool struct {
-	mu        sync.Mutex
-	lastCall  time.Time
-	hourCalls []time.Time
-	turnCalls int
+	mu       sync.Mutex
+	lastCall time.Time // per-tool min-interval only; turn/hour counting is the shared budget's
+
+	// budget is the shared computer-use budget (F-A23W2-14):
+	// ground, screenshot and input charge the same per-turn and
+	// per-hour counters. budgetOwner says whether this tool's
+	// BeginTurn resets it (parent registry only — a child
+	// registry's tools share the budget but never reset it).
+	budget      *CaptureBudget
+	budgetOwner bool
 
 	// Seams, overridable in tests. Defaults run the real backends.
 	execCmd      func(ctx context.Context, name string, args ...string) (string, error)
@@ -147,10 +162,24 @@ type screenshotTool struct {
 }
 
 func newScreenshotTool() *screenshotTool {
+	return newScreenshotToolWithBudget(NewCaptureBudget(), true)
+}
+
+// newScreenshotToolWithBudget builds a screenshot tool charging
+// budget (nil becomes a fresh private budget). owner says
+// whether this tool's BeginTurn resets the budget — true for the
+// parent registry's tool, false for a child registry's (and for
+// ground's embedded instance, whose BeginTurn is never called).
+func newScreenshotToolWithBudget(budget *CaptureBudget, owner bool) *screenshotTool {
+	if budget == nil {
+		budget = NewCaptureBudget()
+	}
 	t := &screenshotTool{
-		lookPath: exec.LookPath,
-		homeDir:  os.UserHomeDir,
-		now:      time.Now,
+		budget:      budget,
+		budgetOwner: owner,
+		lookPath:    exec.LookPath,
+		homeDir:     os.UserHomeDir,
+		now:         time.Now,
 	}
 	t.execCmd = defaultExecCmd
 	t.windowTitles = t.defaultWindowTitles
@@ -209,11 +238,18 @@ func (t *screenshotTool) Definition() model.ToolDefinition {
 // model inside the provider request, never anywhere else.
 func (t *screenshotTool) RiskClass() permissions.Class { return permissions.ClassSafe }
 
-// BeginTurn resets the per-turn capture counter (see TurnResetter).
+// BeginTurn resets the per-turn capture counter (see
+// TurnResetter) — but only when this tool owns the shared
+// budget (F-A23W2-14): a child registry's tools share the
+// budget and must never reset it mid-parent-turn. Resetting is
+// idempotent, so the parent registry's ground, screenshot and
+// input tools may all call it.
 func (t *screenshotTool) BeginTurn() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.turnCalls = 0
+	if t.budgetOwner {
+		t.budget.BeginTurn()
+	}
 }
 
 // Execute is the text-only Tool interface method: the same capture,
@@ -229,6 +265,17 @@ func (t *screenshotTool) Execute(ctx context.Context, args json.RawMessage) (str
 // ExecuteResult captures the screen and returns the JSON summary
 // plus the image.
 func (t *screenshotTool) ExecuteResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+	return t.executeResult(ctx, args, true)
+}
+
+// executeResult runs the capture. charge=false skips the shared
+// budget charge: ground calls this for its embedded capture
+// after already charging the shared budget for the grounding —
+// one grounding is one capture, not two (F-A23W2-14). Everything
+// else (unattended refusal, sensitive check, backend probe,
+// min-interval) still runs: the embedded call is a real capture,
+// just already paid for.
+func (t *screenshotTool) executeResult(ctx context.Context, args json.RawMessage, charge bool) (ToolResult, error) {
 	invalid := func(format string, v ...any) (ToolResult, error) {
 		return ToolResult{}, &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf(format, v...)}
 	}
@@ -302,8 +349,10 @@ func (t *screenshotTool) ExecuteResult(ctx context.Context, args json.RawMessage
 	}
 
 	// Rate limits (plan §4.1): min 1s between captures, max 15
-	// per turn, max 120 per hour.
-	if err := t.checkRateLimit(); err != nil {
+	// per turn, max 120 per hour on the SHARED capture budget
+	// (F-A23W2-14) — unless this is ground's embedded capture,
+	// which already paid for the grounding (charge=false).
+	if err := t.checkRateLimit(charge); err != nil {
 		return denied("%v", err)
 	}
 
@@ -443,33 +492,29 @@ func (t *screenshotTool) screenCastNotSupported(reason string) (ToolResult, erro
 	}
 }
 
-// checkRateLimit enforces the min-interval, per-turn and per-hour
-// limits and records the call. It must be called once per capture,
-// after argument validation.
-func (t *screenshotTool) checkRateLimit() error {
+// checkRateLimit enforces the min-interval (per tool instance)
+// and the per-turn + per-hour limits (the SHARED capture
+// budget, F-A23W2-14) and records the call. It must be called
+// once per capture, after argument validation. charge=false
+// skips the budget charge (ground's embedded capture — the
+// grounding already paid) but still enforces the min-interval
+// and records the call time.
+func (t *screenshotTool) checkRateLimit(charge bool) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
 	if !t.lastCall.IsZero() && now.Sub(t.lastCall) < screenshotMinInterval {
 		return fmt.Errorf("screenshot rate limit: at most one capture per second (last capture %v ago)", now.Sub(t.lastCall).Round(time.Millisecond))
 	}
-	if t.turnCalls >= screenshotMaxPerTurn {
-		return fmt.Errorf("screenshot rate limit: at most %d captures per turn", screenshotMaxPerTurn)
-	}
-	cutoff := now.Add(-time.Hour)
-	kept := t.hourCalls[:0]
-	for _, ts := range t.hourCalls {
-		if ts.After(cutoff) {
-			kept = append(kept, ts)
+	if charge {
+		if err := t.budget.Charge(now, screenshotMaxPerTurn, screenshotMaxPerHour); err != nil {
+			if errors.Is(err, errCaptureBudgetTurn) {
+				return fmt.Errorf("screenshot rate limit: at most %d captures per turn", screenshotMaxPerTurn)
+			}
+			return fmt.Errorf("screenshot rate limit: at most %d captures per hour", screenshotMaxPerHour)
 		}
 	}
-	t.hourCalls = kept
-	if len(t.hourCalls) >= screenshotMaxPerHour {
-		return fmt.Errorf("screenshot rate limit: at most %d captures per hour", screenshotMaxPerHour)
-	}
 	t.lastCall = now
-	t.turnCalls++
-	t.hourCalls = append(t.hourCalls, now)
 	return nil
 }
 

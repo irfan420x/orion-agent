@@ -352,9 +352,10 @@ func TestScreenshotRateLimits(t *testing.T) {
 	}
 
 	// Per-turn cap: seed 14 calls, one more is allowed, the 16th
-	// is not; BeginTurn resets the counter.
+	// is not; BeginTurn resets the counter. The counters live on
+	// the shared budget now (F-A23W2-14), seeded directly here.
 	env.advance()
-	env.tool.turnCalls = screenshotMaxPerTurn - 1
+	env.tool.budget.turnCalls = screenshotMaxPerTurn - 1
 	env.call(t, `{}`)
 	env.advance()
 	if _, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`)); err == nil {
@@ -365,9 +366,9 @@ func TestScreenshotRateLimits(t *testing.T) {
 	env.call(t, `{}`)
 
 	// Per-hour cap: 120 calls in the last hour blocks the next.
-	env.tool.hourCalls = make([]time.Time, screenshotMaxPerHour)
-	for i := range env.tool.hourCalls {
-		env.tool.hourCalls[i] = env.clock.Add(-time.Minute)
+	env.tool.budget.hourCalls = make([]time.Time, screenshotMaxPerHour)
+	for i := range env.tool.budget.hourCalls {
+		env.tool.budget.hourCalls[i] = env.clock.Add(-time.Minute)
 	}
 	env.advance()
 	if _, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`)); err == nil {

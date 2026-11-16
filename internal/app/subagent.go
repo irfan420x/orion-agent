@@ -113,6 +113,15 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 // parent — but WITHOUT the subagent tools, which are only registered
 // on the parent registry. A child therefore cannot spawn subagents.
 //
+// The computer-use tools are NOT in a child registry at all
+// (F-A23-2 — see the note on newChildRegistry below), so the
+// shared computer-use budget (F-A23W2-14 / F-M2R-16) is spent
+// only by the parent registry's tools. A child mints zero
+// captures: there is no per-child pool to share or to reset,
+// which exceeds F-A23W2-14's "no fresh pool per child" rather
+// than violating it. captureBudget is still threaded through
+// the executor wiring (uniform call shape) but is inert here.
+//
 // The plan-mode tools are likewise excluded (F-A22-16):
 // enter_plan_mode needs a Telegram gateway, which a child never
 // gets (it would guaranteed-fail), and exit_plan_mode touches the
@@ -136,8 +145,10 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 // the run context, so it lands in the same chat's bucket. Omit it
 // (or pass nil) and the child keeps its own fresh in-memory store,
 // the old behaviour, which callers that never wired a data dir rely
-// on. The variadic form keeps the existing newChildRegistry(cfg)
-// call sites compiling while the executor wiring passes the store.
+// on. The variadic form keeps the existing newChildRegistry(cfg,
+// nil) call sites compiling while the executor wiring passes the
+// store. (captureBudget is inert for a child — see the note on
+// newChildRegistry — but is still accepted for a uniform shape.)
 // The cron tools are likewise excluded: scheduling is a
 // parent-chat commitment (recurring turns, token spend, approval
 // prompts in the parent's chat), so a child running a brief must
@@ -158,11 +169,30 @@ func (a *App) childTypedSource() *readOnlyTypedSource {
 // (30 captures/turn per child). input is denied by the child's
 // non-interactive gate as well (see newSubagentExecutor), so the
 // two controls back each other up.
-func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore) (*tools.Registry, error) {
+//
+// NOTE on captureBudget (F-A23W2-14 vs F-A23-2): the parameter
+// is still accepted so the executor wiring stays uniform, but it
+// is INERT for a child — the tools it would charge (ground,
+// screenshot, input) are excluded from this registry just above,
+// so nothing in a child can spend from the shared pool. The
+// shared budget is spent only by the parent registry's tools;
+// F-A23W2-14's "no per-child fresh pool" is exceeded, not
+// violated: a child mints zero captures, not a shared 15.
+func newChildRegistry(cfg *config.Config, captureBudget *tools.CaptureBudget, parentPlanning ...*tools.PlanningStore) (*tools.Registry, error) {
 	if cfg == nil {
 		cfg = config.Default()
 	}
-	deps := tools.ToolDeps{SandboxCfg: cfg.Sandbox, TrustedEgressCIDRs: cfg.TrustedEgressCIDRs}
+	deps := tools.ToolDeps{
+		SandboxCfg:         cfg.Sandbox,
+		TrustedEgressCIDRs: cfg.TrustedEgressCIDRs,
+		CaptureBudget:      captureBudget,
+		// Never the owner: only the parent registry's BeginTurn
+		// resets the shared budget (F-A23W2-14). A nil budget
+		// becomes a fresh one owned by this registry (see
+		// DefaultRegistryWithDeps), so a nil here keeps the old
+		// per-child-budget behaviour.
+		CaptureBudgetOwner: false,
+	}
 	if len(parentPlanning) > 0 && parentPlanning[0] != nil {
 		deps.PlanningStore = parentPlanning[0]
 	}
@@ -205,10 +235,16 @@ func newChildRegistry(cfg *config.Config, parentPlanning ...*tools.PlanningStore
 // F-A5-P2-35): the child re-points its planning tools at it, so a
 // child's task_create/todo_write lands in the chat's files instead
 // of an ephemeral per-child bucket that dies with the child. Nil
-// keeps the old isolated behaviour.
-func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger, hooksBus *hooks.Bus, parentPlanning *tools.PlanningStore) subagent.Executor {
+// keeps the old isolated behaviour. captureBudget is the parent
+// registry's shared computer-use budget (F-A23W2-14 / F-M2R-16),
+// threaded through for a uniform call shape — but inert for a
+// child: the child's computer-use tools are excluded from its
+// registry (F-A23-2), so nothing in a child can charge it. Nil
+// means DefaultRegistryWithDeps mints a fresh private budget
+// for the child registry — inert either way, for the same reason.
+func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger, hooksBus *hooks.Bus, parentPlanning *tools.PlanningStore, captureBudget *tools.CaptureBudget) subagent.Executor {
 	return func(ctx context.Context, brief string) (string, subagent.Usage, error) {
-		childReg, err := newChildRegistry(cfg, parentPlanning)
+		childReg, err := newChildRegistry(cfg, captureBudget, parentPlanning)
 		if err != nil {
 			return "", subagent.Usage{}, err
 		}

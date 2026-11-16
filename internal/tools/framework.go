@@ -59,6 +59,21 @@ type ToolDeps struct {
 	FileRoots          []string
 	TrustedEgressCIDRs []string
 	PlanningStore      *PlanningStore
+	// CaptureBudget is the shared computer-use budget
+	// (F-A23W2-14 / F-M2R-16): ground, screenshot and input in
+	// this registry charge it, and a child registry charges the
+	// SAME budget its parent passed in, so a child cannot mint
+	// itself a fresh 15/turn. Nil means DefaultRegistryWithDeps
+	// creates a fresh budget owned by this registry.
+	CaptureBudget *CaptureBudget
+	// CaptureBudgetOwner says whether this registry owns the
+	// shared budget: its tools reset the per-turn counter at
+	// BeginTurn. The parent registry owns it; a child registry
+	// shares the budget with owner=false, so a child turn
+	// starting mid-parent-turn never wipes the parent's count.
+	// Ignored when CaptureBudget is nil (the fresh budget is
+	// always owned by its registry).
+	CaptureBudgetOwner bool
 }
 
 // Factory builds one tool from deps. It returns an error when the
@@ -127,6 +142,18 @@ func DefaultRegistryWithDeps(deps ToolDeps) (*Registry, error) {
 	}
 	if deps.PlanningStore == nil {
 		deps.PlanningStore = NewPlanningStore("")
+	}
+	// The shared computer-use budget (F-A23W2-14 / F-M2R-16):
+	// one budget per registry when the caller passes none, so
+	// ground + screenshot + input in this registry always share
+	// a counter even for bare DefaultRegistry() callers; a
+	// caller that passes a budget (the App, for parent + child
+	// registries) shares it, and the owner flag decides whose
+	// BeginTurn resets it. The deps are rewritten before the
+	// factories run, so every factory sees the same budget.
+	if deps.CaptureBudget == nil {
+		deps.CaptureBudget = NewCaptureBudget()
+		deps.CaptureBudgetOwner = true
 	}
 	r := NewRegistry()
 	for _, e := range registeredFactories() {

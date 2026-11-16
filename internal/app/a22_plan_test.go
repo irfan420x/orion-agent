@@ -27,7 +27,7 @@ func TestChildRegistryExcludesPlanModeTools(t *testing.T) {
 	parentStore := tools.NewPlanningStore(dataDir)
 	chat := permissions.WithApprovalContext(context.Background(), 4242, 4242)
 
-	childReg, err := newChildRegistry(testSubagentConfig(5), parentStore)
+	childReg, err := newChildRegistry(testSubagentConfig(5), nil, parentStore)
 	if err != nil {
 		t.Fatalf("newChildRegistry: %v", err)
 	}

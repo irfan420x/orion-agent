@@ -179,9 +179,10 @@ func TestGroundHappyPath(t *testing.T) {
 	if s.FocusedWindow == nil || s.FocusedWindow.Title != "Sign in to GitHub · GitHub — Mozilla Firefox" || s.FocusedWindow.App != "Firefox" {
 		t.Errorf("focused_window = %+v, want the AT-SPI focused window", s.FocusedWindow)
 	}
-	// snapshot_id shape: g-YYYYMMDD-HHMMSS-xxxx.
-	if ok, _ := regexp.MatchString(`^g-\d{8}-\d{6}-[0-9a-f]{4}$`, s.SnapshotID); !ok {
-		t.Errorf("snapshot_id = %q, want g-YYYYMMDD-HHMMSS-xxxx", s.SnapshotID)
+	// snapshot_id shape: g-YYYYMMDD-HHMMSS-<16 hex> (64-bit
+	// random suffix, F-A23W2-19).
+	if ok, _ := regexp.MatchString(`^g-\d{8}-\d{6}-[0-9a-f]{16}$`, s.SnapshotID); !ok {
+		t.Errorf("snapshot_id = %q, want g-YYYYMMDD-HHMMSS-<16 hex>", s.SnapshotID)
 	}
 	if _, err := time.Parse(time.RFC3339, s.TakenAt); err != nil {
 		t.Errorf("taken_at = %q does not parse as RFC3339: %v", s.TakenAt, err)
