@@ -9,6 +9,19 @@
 //     The daemon marks a scheduled turn's context with
 //     WithUnattendedTurn (see cmd/oriond runScheduledTurn); a tool
 //     that sees the mark refuses before doing anything.
+//     There are TWO unattended markers in the codebase — this one
+//     and permissions.WithUnattendedContext (set in runAgentTurn
+//     when the turn is unattended) — and a future caller could set
+//     only one of them (F-A23W3-18 / F-M2R-18). The two are
+//     therefore unified HERE: WithUnattendedTurn sets both
+//     markers, and UnattendedTurnFromContext reports true when
+//     EITHER is set, so a computer-use tool can never silently
+//     run in a turn the gate treats as unattended, or vice versa.
+//     The reverse direction cannot be closed from the
+//     permissions package (it cannot import tools — tools imports
+//     permissions), so this file is the single unification point:
+//     every scheduled-turn path sets the tools marker, which now
+//     carries the permissions marker with it.
 //   - Sensitive windows: when a password manager, bank/payment app
 //     or similar is focused or visible, the tool refuses to
 //     describe the screen at all — it never mentions, stores or
@@ -32,18 +45,26 @@ type unattendedContextKey struct{}
 // WithUnattendedTurn returns ctx marked as an unattended turn (a
 // cron/scheduled turn with nobody present to approve or to see a
 // portal dialog). Computer-use tools refuse on such a context.
+//
+// It sets BOTH unattended markers (F-A23W3-18 / F-M2R-18): this
+// package's own marker and the permissions package's
+// WithUnattendedContext, which the approval gate reads. A caller
+// that marks a turn unattended through this function therefore
+// marks it for the gate too, and the two markers cannot drift
+// apart on this path.
 func WithUnattendedTurn(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithValue(ctx, unattendedContextKey{}, true)
+	ctx = context.WithValue(ctx, unattendedContextKey{}, true)
+	return permissions.WithUnattendedContext(ctx)
 }
 
 // UnattendedTurnFromContext reports whether ctx is marked as an
 // unattended turn. It is false for every context that was never
 // marked — interactive Telegram turns, CLI runs, tests.
 //
-// It honours EITHER unattended marker (F-A23W3-18): this package's
+// It honours EITHER unattended marker (F-A23W3-18 / F-M2R-18): this package's
 // own WithUnattendedTurn marker, and the permission gate's
 // WithUnattendedContext marker (permissions.UnattendedFrom). The
 // two are set at different call sites — runScheduledTurn sets the
@@ -56,7 +77,10 @@ func WithUnattendedTurn(ctx context.Context) context.Context {
 // gap for all three at once. (permissions does not import tools,
 // so the reverse check — gate honouring the tools marker — would
 // be an import cycle; the gate marker is the one runAgentTurn
-// sets, and it is checked here.)
+// sets, and it is checked here. The reverse direction is closed
+// from this side instead: WithUnattendedTurn above sets BOTH
+// markers, so a caller that marks a turn unattended through this
+// function marks it for the gate too.)
 func UnattendedTurnFromContext(ctx context.Context) bool {
 	if ctx == nil {
 		return false
