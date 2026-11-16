@@ -302,7 +302,7 @@ class _Proxy:
             js_path, name = variant[0], variant[1]
             with open(js_path) as f:
                 js = f.read()
-            m = re.search(r"ORION-KWIN-GEOM-[0-9]+-[0-9a-f]+", js)
+            m = re.search(r"ORION-KWIN-GEOM-[0-9]+-[0-9a-f]+-[0-9]+:", js)
             marker = m.group(0) if m else ""
             d = os.environ.get("KWINSTUB_DIR", "")
             if d:
@@ -334,6 +334,8 @@ class Gio:
 // fakeJournalctl installs a fake `journalctl` on PATH that prints
 // one journal line carrying the marker recorded by the stub proxy
 // plus the payload from $KWINSTUB_DIR/payload (a JSON window list).
+// With an empty payload it prints an unrelated line (no marker),
+// so the helper's "no geometry in the journal" path is exercised.
 // It returns the temp dir holding the stub state (KWINSTUB_DIR)
 // and the record file path (KWINSTUB_RECORD).
 func fakeJournalctl(t *testing.T, payload string) (string, string) {
@@ -343,10 +345,23 @@ func fakeJournalctl(t *testing.T, payload string) (string, string) {
 	if err := os.MkdirAll(bin, 0700); err != nil {
 		t.Fatalf("mkdir fake bin: %v", err)
 	}
-	script := "#!/bin/sh\n" +
-		"marker=$(cat \"$KWINSTUB_DIR/marker\" 2>/dev/null)\n" +
-		"payload=$(cat \"$KWINSTUB_DIR/payload\" 2>/dev/null)\n" +
-		"echo \"Nov 16 12:00:00 host plasma-kwin_wayland[123]: ${marker}${payload}\"\n"
+	var script string
+	if payload == "" {
+		script = "#!/bin/sh\n" +
+			"echo \"Nov 16 12:00:00 host plasma-kwin_wayland[123]: some other log line\"\n"
+	} else {
+		// The journal line carries the marker plus the payload
+		// wrapped in the helper's current protocol (F-A23W2-11):
+		// a dict with the run's nonce and kwin_windows — the
+		// nonce is the marker minus its prefix and trailing
+		// colon. The payload file holds just the window list.
+		script = "#!/bin/sh\n" +
+			"marker=$(cat \"$KWINSTUB_DIR/marker\" 2>/dev/null)\n" +
+			"payload=$(cat \"$KWINSTUB_DIR/payload\" 2>/dev/null)\n" +
+			"nonce=${marker#ORION-KWIN-GEOM-}\n" +
+			"nonce=${nonce%:}\n" +
+			"echo \"Nov 16 12:00:00 host plasma-kwin_wayland[123]: ${marker}{\\\"nonce\\\": \\\"${nonce}\\\", \\\"kwin_windows\\\": ${payload}}\"\n"
+	}
 	if err := os.WriteFile(filepath.Join(bin, "journalctl"), []byte(script), 0755); err != nil {
 		t.Fatalf("write fake journalctl: %v", err)
 	}
@@ -445,6 +460,164 @@ func TestRunHelperProcessSuccessAndFailure(t *testing.T) {
 	_, err = runHelperProcess(context.Background(), "sh", []string{"-c", "echo oops >&2; exit 3"}, 5*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "oops") {
 		t.Errorf("failing helper err = %v, want the stderr text", err)
+	}
+}
+
+// TestRealKWinHelperSuccessPath pins F-M2R-28: the real helper,
+// driven by a stubbed KWin proxy and a fake journalctl carrying
+// the marker + a geometry payload, prints the parsed window list
+// — exercising the real script's load/start/unload sequencing,
+// journal polling, and output parsing end to end.
+func TestRealKWinHelperSuccessPath(t *testing.T) {
+	stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+	payload := `[{"caption": "Sign in to GitHub · GitHub — Mozilla Firefox", "cls": "firefox-esr", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}, {"caption": "Kate — notes.txt", "cls": "kate", "active": false, "minimized": false, "fg": [0, 0, 800, 600], "cg": [0, 0, 800, 600]}]`
+	stateDir, record := fakeJournalctl(t, payload)
+	stdout, stderr, err := runRealHelper(t, kwinHelperSource, nil, stubDir,
+		kwinStubEnv(t, stubDir, stateDir, record, nil))
+	if err != nil {
+		t.Fatalf("helper failed on the success path: %v (stderr: %s)", err, stderr)
+	}
+	var out kwinOutput
+	if jerr := json.Unmarshal([]byte(stdout), &out); jerr != nil {
+		t.Fatalf("helper stdout %q does not parse: %v", stdout, jerr)
+	}
+	if len(out.Windows) != 2 {
+		t.Fatalf("kwin_windows = %+v, want the 2 payload windows", out.Windows)
+	}
+	fx := out.Windows[0]
+	// No caption assertion: the helper's JSON carries no titles
+	// (F-M2R-15) — the payload's caption keys are ignored by the
+	// parser, so the parsed window is checked on class, active
+	// flag and geometry.
+	if fx.Class != "firefox-esr" || !fx.Active || fx.FG != [4]int{0, 29, 1920, 993} || fx.CG != [4]int{0, 29, 1920, 993} {
+		t.Errorf("firefox window = %+v, want the payload geometry", fx)
+	}
+	if out.Windows[1].Class != "kate" || out.Windows[1].FG != [4]int{0, 0, 800, 600} {
+		t.Errorf("kate window = %+v, want the payload geometry", out.Windows[1])
+	}
+	calls, rerr := os.ReadFile(record)
+	if rerr != nil {
+		t.Fatalf("read call record: %v", rerr)
+	}
+	if want := "loadScript\nstart\nunloadScript\n"; string(calls) != want {
+		t.Errorf("D-Bus calls = %q, want %q", string(calls), want)
+	}
+}
+
+// TestRealKWinHelperMarkerUnique pins F-M2R-28: two runs must use
+// different markers — the marker is what keeps one run's journal
+// poll from reading another run's (stale) geometry.
+func TestRealKWinHelperMarkerUnique(t *testing.T) {
+	payload := `[{"caption": "Firefox", "cls": "firefox", "active": true, "minimized": false, "fg": [0, 0, 1920, 1080], "cg": [0, 0, 1920, 1080]}]`
+	markers := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+		stateDir, record := fakeJournalctl(t, payload)
+		if _, _, err := runRealHelper(t, kwinHelperSource, nil, stubDir,
+			kwinStubEnv(t, stubDir, stateDir, record, nil)); err != nil {
+			t.Fatalf("run %d failed: %v", i+1, err)
+		}
+		marker, err := os.ReadFile(filepath.Join(stateDir, "marker"))
+		if err != nil {
+			t.Fatalf("run %d: read marker: %v", i+1, err)
+		}
+		markers = append(markers, string(marker))
+	}
+	if markers[0] == "" || markers[0] == markers[1] {
+		t.Errorf("markers = %q, want two distinct non-empty markers", markers)
+	}
+}
+
+// TestRealKWinHelperJournalPolls pins the journal-poll loop: the
+// fake journalctl prints nothing until its third invocation, so
+// the helper must keep polling instead of failing on the first
+// empty read.
+func TestRealKWinHelperJournalPolls(t *testing.T) {
+	stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+	payload := `[{"caption": "Firefox", "cls": "firefox", "active": true, "minimized": false, "fg": [0, 0, 1920, 1080], "cg": [0, 0, 1920, 1080]}]`
+	stateDir, record := fakeJournalctl(t, payload)
+	// Replace the fake journalctl with a counting one: silent
+	// for the first two calls, marker line from the third.
+	script := "#!/bin/sh\n" +
+		"n=$(cat \"$KWINSTUB_DIR/count\" 2>/dev/null || echo 0)\n" +
+		"n=$((n + 1))\n" +
+		"echo \"$n\" > \"$KWINSTUB_DIR/count\"\n" +
+		"if [ \"$n\" -lt 3 ]; then exit 0; fi\n" +
+		"marker=$(cat \"$KWINSTUB_DIR/marker\" 2>/dev/null)\n" +
+		"payload=$(cat \"$KWINSTUB_DIR/payload\" 2>/dev/null)\n" +
+		"nonce=${marker#ORION-KWIN-GEOM-}\n" +
+		"nonce=${nonce%:}\n" +
+		"echo \"Nov 16 12:00:00 host plasma-kwin_wayland[123]: ${marker}{\\\"nonce\\\": \\\"${nonce}\\\", \\\"kwin_windows\\\": ${payload}}\"\n"
+	if err := os.WriteFile(filepath.Join(stateDir, "bin", "journalctl"), []byte(script), 0755); err != nil {
+		t.Fatalf("write counting journalctl: %v", err)
+	}
+	stdout, stderr, err := runRealHelper(t, kwinHelperSource, nil, stubDir,
+		kwinStubEnv(t, stubDir, stateDir, record, nil))
+	if err != nil {
+		t.Fatalf("helper failed despite the marker arriving on poll 3: %v (stderr: %s)", err, stderr)
+	}
+	var out kwinOutput
+	if jerr := json.Unmarshal([]byte(stdout), &out); jerr != nil || len(out.Windows) != 1 {
+		t.Fatalf("helper stdout %q, want the 1 payload window: %v", stdout, jerr)
+	}
+	count, _ := os.ReadFile(filepath.Join(stateDir, "count"))
+	if strings.TrimSpace(string(count)) != "3" {
+		t.Errorf("journalctl invocations = %q, want 3 (marker on the third poll)", strings.TrimSpace(string(count)))
+	}
+}
+
+// TestRealKWinHelperJournalFailures pins the failure paths of
+// the journal parse: no marker in the journal, malformed JSON,
+// and a non-list payload all exit non-zero with no JSON.
+func TestRealKWinHelperJournalFailures(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		wantErr string
+	}{
+		{"no marker in journal", "", "no KWin geometry output"},
+		{"malformed payload", "not json at all", "cannot parse KWin geometry output"},
+		{"non-list payload", `{"caption": "Firefox"}`, "not a list"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+			stateDir, record := fakeJournalctl(t, tc.payload)
+			stdout, stderr, err := runRealHelper(t, kwinHelperSource, nil, stubDir,
+				kwinStubEnv(t, stubDir, stateDir, record, nil))
+			if err == nil {
+				t.Fatalf("helper succeeded with stdout %q, want a non-zero exit", stdout)
+			}
+			if !strings.Contains(stderr, tc.wantErr) {
+				t.Errorf("stderr = %q, want %q", stderr, tc.wantErr)
+			}
+			if strings.TrimSpace(stdout) != "" {
+				t.Errorf("stdout = %q, want empty (no JSON on failure)", stdout)
+			}
+		})
+	}
+}
+
+// TestRealKWinHelperProxyUnreachable pins the earliest failure:
+// when the KWin proxy cannot even be created, the helper fails
+// cleanly with no D-Bus calls at all (nothing was loaded, so
+// nothing needs unloading).
+func TestRealKWinHelperProxyUnreachable(t *testing.T) {
+	stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+	stateDir, record := fakeJournalctl(t, "")
+	stdout, stderr, err := runRealHelper(t, kwinHelperSource, nil, stubDir,
+		kwinStubEnv(t, stubDir, stateDir, record, map[string]string{"KWINSTUB_FAIL": "proxy"}))
+	if err == nil {
+		t.Fatalf("helper succeeded with stdout %q, want a non-zero exit", stdout)
+	}
+	if !strings.Contains(stderr, "cannot reach KWin scripting") {
+		t.Errorf("stderr = %q, want the proxy failure", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("stdout = %q, want empty", stdout)
+	}
+	if calls, _ := os.ReadFile(record); len(calls) != 0 {
+		t.Errorf("D-Bus calls = %q, want none (proxy never created)", string(calls))
 	}
 }
 
