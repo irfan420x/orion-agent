@@ -180,7 +180,11 @@ func TestFileReadMultiMBTruncates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry file_read: %v", err)
 	}
-	if len(regOut) > DefaultMaxToolResultBytes+100 {
+	if len(regOut) > DefaultMaxToolResultBytes+512 {
+		// +512, not +100: the registry truncates at the cap and
+		// then wraps an external-content result in the
+		// untrusted-data delimiters (Audit 23 F-A23W3-13),
+		// which add ~370 bytes after truncation.
 		t.Fatalf("registry result not capped: %d bytes", len(regOut))
 	}
 	wantMarker := fmt.Sprintf("[truncated: showing first %d bytes of %d total bytes]", DefaultMaxToolResultBytes, maxFileRead+len(marker))

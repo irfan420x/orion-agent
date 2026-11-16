@@ -291,7 +291,7 @@ func (m *scriptedModel) decide(req model.ChatRequest) (*model.ChatResponse, erro
 		case 2:
 			return toolCallResponse("call-3", "file_read", jsonArgs(map[string]string{"path": path})), nil
 		default:
-			return textResponse("Verified: the file contains " + strings.TrimSpace(lastResult) + "."), nil
+			return textResponse("Verified: the file contains " + strings.TrimSpace(unwrapExternalResult(lastResult)) + "."), nil
 		}
 	case "SHELL":
 		if phase == 0 {
@@ -440,6 +440,20 @@ func calcResult(toolResult string) string {
 		return strings.TrimSpace(toolResult[idx+3:])
 	}
 	return strings.TrimSpace(toolResult)
+}
+
+// unwrapExternalResult strips the external-content delimiters
+// (Audit 23 F-A23W3-13) from a tool result the scripted model
+// echoes back: the scripted model stands in for a real model,
+// which synthesises the value out of the delimited result
+// instead of pasting the raw result. An undelimited result
+// passes through unchanged.
+func unwrapExternalResult(toolResult string) string {
+	lines := strings.Split(toolResult, "\n")
+	if len(lines) >= 3 && strings.HasPrefix(lines[0], "[begin external tool result from ") && lines[len(lines)-1] == "[end external tool result]" {
+		return strings.Join(lines[1:len(lines)-1], "\n")
+	}
+	return toolResult
 }
 
 // jsonArgs marshals a string map to a JSON object string (never

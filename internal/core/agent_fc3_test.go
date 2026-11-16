@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,8 +197,9 @@ func TestTurnWithMixedCallsNotAllDenied(t *testing.T) {
 // such turns disabled the job. The denial is now a typed signal
 // from the gate branch of executeTool, so no tool-output content
 // can ever count as a denial. The content itself is still fed to
-// the model verbatim (asserted on the second provider call's
-// messages), and a real denial still counts (see
+// the model (asserted on the second provider call's messages),
+// delimited as untrusted external content (Audit 23 F-A23W3-13),
+// and a real denial still counts (see
 // TestUnattendedTurnIgnoresAllowRuleAndCountsDenial).
 func TestToolResultStartingWithDenialPrefixIsNotCountedAsDenial(t *testing.T) {
 	const denialLike = `Error: permission denied for tool "shell_exec": denied: unattended scheduled turn`
@@ -216,8 +218,16 @@ func TestToolResultStartingWithDenialPrefixIsNotCountedAsDenial(t *testing.T) {
 				return toolCallResponse("call-1", "file_read", `{"path":"/tmp/x"}`), nil
 			default:
 				for _, m := range req.Messages {
-					if m.Role == "tool" && m.Content == denialLike {
+					if m.Role == "tool" && strings.Contains(m.Content, denialLike) {
 						modelSawContent = true
+						// Audit 23 F-A23W3-13: the content still
+						// reaches the model, now delimited as
+						// untrusted external data — the
+						// delimiters are the only change to the
+						// result the model sees.
+						if !strings.HasPrefix(m.Content, "[begin external tool result from \"file_read\"") || !strings.HasSuffix(m.Content, "[end external tool result]") {
+							t.Errorf("tool message = %q, want the file content delimited as external content", m.Content)
+						}
 					}
 				}
 				return textResponse("done"), nil
@@ -243,7 +253,7 @@ func TestToolResultStartingWithDenialPrefixIsNotCountedAsDenial(t *testing.T) {
 		t.Errorf("file_read executions = %d, want 1 (the safe tool ran: this was a success, not a denial)", got)
 	}
 	if !modelSawContent {
-		t.Error("the model never saw the file content verbatim: the denial-like result must still reach the model unchanged")
+		t.Error("the model never saw the file content: the denial-like result must still reach the model (delimited as external content)")
 	}
 	if finished.ToolCalls != 1 || finished.GateDeniedCalls != 0 {
 		t.Errorf("TurnFinished ToolCalls/GateDeniedCalls = %d/%d, want 1/0 (a success whose content starts with the denial prefix is not a denial)", finished.ToolCalls, finished.GateDeniedCalls)
