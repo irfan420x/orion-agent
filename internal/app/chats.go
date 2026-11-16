@@ -556,6 +556,11 @@ func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input str
 		defer agent.SetTurnUsageLimitCheck(nil)
 	}
 	providerName, modelName := a.chatProviderInfo(chatID)
+	// Vision gate (F-M2R-3): mark the run context with the chat's
+	// provider/model, so ground/screenshot refuse the capture on
+	// a model that cannot see images instead of returning an
+	// image the model can never read.
+	ctx = tools.WithVisionInfo(ctx, providerName, modelName)
 	var stats *core.TurnStats
 	wrapped := func(ev core.ProgressEvent) {
 		if ev.Kind == core.EventTurnFinished {

@@ -30,6 +30,7 @@ import (
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/security"
+	"github.com/irfan/orion/internal/tools"
 )
 
 // agent returns the current agent under a read lock. Handle and
@@ -81,6 +82,11 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 		providerName = p.Name()
 	}
 	modelName := a.activeModel()
+	// Vision gate (F-M2R-3): mark the run context with the
+	// provider/model, so ground/screenshot refuse the capture on
+	// a model that cannot see images instead of returning an
+	// image the model can never read.
+	ctx = tools.WithVisionInfo(ctx, providerName, modelName)
 	var stats *core.TurnStats
 	wrapped := func(ev core.ProgressEvent) {
 		if ev.Kind == core.EventTurnFinished {

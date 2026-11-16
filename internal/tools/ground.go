@@ -744,6 +744,12 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		return denied("computer-use is off in unattended (cron) turns: ground refused")
 	}
 
+	// Vision gate (F-M2R-3): the grounding's value is the image,
+	// and a text-only model can never read it.
+	if err := visionGateError(ctx, "ground"); err != nil {
+		return denied("%v", err)
+	}
+
 	var a groundArgs
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &a); err != nil {

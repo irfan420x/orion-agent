@@ -295,6 +295,12 @@ func (t *screenshotTool) executeResult(ctx context.Context, args json.RawMessage
 		return denied("computer-use is off in unattended (cron) turns: screenshot refused")
 	}
 
+	// Vision gate (F-M2R-3): the capture's value is the image,
+	// and a text-only model can never read it.
+	if err := visionGateError(ctx, "screenshot"); err != nil {
+		return denied("%v", err)
+	}
+
 	var a screenshotArgs
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &a); err != nil {

@@ -607,6 +607,15 @@ func (a *App) Handle(ctx context.Context, input string) (string, error) {
 	// hooks itself), so re-assert it here on every turn — a switch
 	// must never silently drop the hook policy.
 	a.agent().SetHooks(a.Hooks)
+	// Vision gate (F-M2R-3): mark the run context with the
+	// provider/model, so ground/screenshot refuse the capture on
+	// a model that cannot see images instead of returning an
+	// image the model can never read.
+	providerName := ""
+	if p := a.provider(); p != nil {
+		providerName = p.Name()
+	}
+	ctx = tools.WithVisionInfo(ctx, providerName, a.activeModel())
 	reply, err := a.agent().Run(ctx, input)
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))

@@ -35,8 +35,10 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
 )
 
@@ -89,6 +91,72 @@ func UnattendedTurnFromContext(ctx context.Context) bool {
 		return true
 	}
 	return permissions.UnattendedFrom(ctx)
+}
+
+// --- vision gate (F-M2R-3) ---
+//
+// ground and screenshot return an image the model must SEE: on a
+// text-only provider/model the capture is pure waste — the image
+// can never be read, and worse, a provider that silently
+// substitutes "[Unsupported Image]" lets the model answer about
+// a screen it never saw. The gate refuses the capture when the
+// run's provider/model is known not to support vision.
+//
+// The tool cannot know the provider/model itself, so the app layer
+// (which resolves the chat's provider/model per turn) marks the
+// run context with WithVisionInfo before the agent run; the tools
+// read it back here. A context that was never marked is "unknown"
+// and the tools proceed — the gate only ever refuses on a KNOWN
+// non-vision model, so CLI runs, tests and hand-built agents that
+// never mark the context keep working.
+
+type visionContextKey struct{}
+
+type visionInfo struct {
+	provider string
+	model    string
+	capable  bool
+}
+
+// WithVisionInfo returns ctx marked with the run's provider/model
+// and whether that pair can see images (model.SupportsVision).
+// The app layer calls this once per turn, before the agent run.
+func WithVisionInfo(ctx context.Context, provider, modelName string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, visionContextKey{}, visionInfo{
+		provider: provider,
+		model:    modelName,
+		capable:  model.SupportsVision(provider, modelName),
+	})
+}
+
+// VisionInfoFromContext returns the provider/model vision info
+// carried by ctx. known is false when the context was never marked
+// with WithVisionInfo — the tools must then proceed (unknown is
+// not a refusal).
+func VisionInfoFromContext(ctx context.Context) (provider, modelName string, capable, known bool) {
+	if ctx == nil {
+		return "", "", false, false
+	}
+	info, _ := ctx.Value(visionContextKey{}).(visionInfo)
+	if info.provider == "" && info.model == "" {
+		return "", "", false, false
+	}
+	return info.provider, info.model, info.capable, true
+}
+
+// visionGateError is the computer-use vision gate: nil when the
+// capture may proceed (vision-capable model, or an unmarked
+// context where the model is unknown), otherwise a refusal that
+// names the model so the user can switch to a vision-capable one.
+func visionGateError(ctx context.Context, tool string) error {
+	provider, modelName, capable, known := VisionInfoFromContext(ctx)
+	if !known || capable {
+		return nil
+	}
+	return fmt.Errorf("the current model %s/%s cannot see images (no vision support): %s refused — switch to a vision-capable model (e.g. deepseek-flash) to capture the screen", provider, modelName, tool)
 }
 
 // sensitiveWindowTitles are case-insensitive substrings of window
