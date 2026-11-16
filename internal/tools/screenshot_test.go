@@ -440,3 +440,33 @@ func TestScreenshotEmptyWindowListIsOk(t *testing.T) {
 		t.Errorf("focused_window = %q, want empty (no X window focused)", s.FocusedWindow)
 	}
 }
+
+func TestScreenshotRiskClassNetwork(t *testing.T) {
+	// F-M2R-6: screenshot is Network, not Safe — the captured
+	// image is sent to the model provider, so the call is gated
+	// and disclosed, never silently auto-approved.
+	r, err := DefaultRegistry()
+	if err != nil {
+		t.Fatalf("DefaultRegistry failed: %v", err)
+	}
+	tool, ok := r.Get("screenshot")
+	if !ok {
+		t.Fatal("screenshot is not in the default registry")
+	}
+	rc, ok := tool.(RiskClasser)
+	if !ok {
+		t.Fatal("screenshot does not implement RiskClasser")
+	}
+	if rc.RiskClass() != permissions.ClassNetwork {
+		t.Errorf("screenshot risk class = %v, want Network", rc.RiskClass())
+	}
+	if got, want := permissions.Classify("screenshot"), permissions.ClassNetwork; got != want {
+		t.Errorf("gate classifies screenshot as %v, want Network", got)
+	}
+	if !permissions.IsGated("screenshot") {
+		t.Errorf("screenshot is not gated, want gated (F-M2R-6)")
+	}
+	if !strings.Contains(tool.Description(), "DISCLOSURE") || !strings.Contains(tool.Description(), "model provider") {
+		t.Errorf("screenshot description %q does not disclose that the image is sent to the model provider", tool.Description())
+	}
+}

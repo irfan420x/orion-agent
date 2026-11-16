@@ -48,7 +48,8 @@
 //     cannot) and falling back to the screenshot tool's xdotool
 //     check when there is no tree;
 //   - empty name -> the role is the name, never a guessed name.
-//   - read-only, RiskClass Safe; refused in unattended turns.
+//   - read-only, RiskClass Network (the image leaves the machine
+//     to the model provider — F-M2R-6); refused in unattended turns.
 //
 // Stale-refusal (§5): every grounding registers its snapshot_id +
 // element list in the package-level snapshot registry
@@ -662,7 +663,7 @@ func newGroundToolWithBudget(budget *CaptureBudget, owner bool) *groundTool {
 func (t *groundTool) Name() string { return "ground" }
 
 func (t *groundTool) Description() string {
-	return "Ground the screen: capture a screenshot with numbered markers and return the exact name, role and bounding box of every interactive element on screen, so a click can target an element number instead of a guessed coordinate. Read-only: it takes no input from the screen and changes nothing. Returns a snapshot_id plus the element list; a later click must quote that snapshot_id and an element id from it (stale snapshots are refused). When no accessibility tree is available the screenshot is still returned with an empty element list and coverage \"vision_only\" — never faked elements. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns."
+	return "Ground the screen: capture a screenshot with numbered markers and return the exact name, role and bounding box of every interactive element on screen, so a click can target an element number instead of a guessed coordinate. Read-only on the desktop: it takes no input from the screen and changes nothing. DISCLOSURE: the captured image is sent to the model provider (data leaves this machine) — this call is gated and needs approval. Returns a snapshot_id plus the element list; a later click must quote that snapshot_id and an element id from it (stale snapshots are refused). When no accessibility tree is available the screenshot is still returned with an empty element list and coverage \"vision_only\" — never faked elements. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns."
 }
 
 func (t *groundTool) Definition() model.ToolDefinition {
@@ -694,9 +695,11 @@ func (t *groundTool) Definition() model.ToolDefinition {
 	}
 }
 
-// RiskClass declares the tool safe: read-only — it looks at the
-// screen and the accessibility tree and changes nothing.
-func (t *groundTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+// RiskClass declares the tool Network (F-M2R-6): it changes nothing
+// on the desktop, but the marked image it returns is sent to the
+// model provider — data leaves the machine — so a grounding is a
+// gated, disclosed action, never silently auto-approved.
+func (t *groundTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
 
 // BeginTurn resets the per-turn capture counter (see
 // TurnResetter) — but only when this tool owns the shared

@@ -114,11 +114,18 @@ var destructiveTools = map[string]bool{
 // it creates no network traffic itself, but a scheduled job is a
 // persistent recurring agent turn, so creating one needs approval
 // like a network call — the model must not commit the user to
-// future unattended turns without being asked.
+// future unattended turns without being asked. ground and
+// screenshot are here too, not in safeTools (F-M2R-6): a capture
+// is read-only on the desktop, but the image is sent to the model
+// provider — data leaves the machine — so the capture is a gated,
+// disclosed action, never a silent auto-approved one.
 var networkTools = map[string]bool{
 	"cron_schedule": true,
 	"web_fetch":     true,
 	"web_search":    true,
+	"ground":        true,
+	"screenshot":    true,
+}
 }
 
 // safeTools are the tools that run without approval. This is an
@@ -151,10 +158,8 @@ var safeTools = map[string]bool{
 	"file_read":         true,
 	"glob":              true,
 	"grep":              true,
-	"ground":            true,
 	"process_list":      true,
 	"skill":             true,
-	"screenshot":        true,
 	"subagent_list":     true,
 	"subagent_result":   true,
 	"subagent_stop":     true,

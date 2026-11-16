@@ -766,14 +766,23 @@ func TestGroundFrameworkIntegration(t *testing.T) {
 	if !ok {
 		t.Fatal("ground does not implement RiskClasser")
 	}
-	if rc.RiskClass() != permissions.ClassSafe {
-		t.Errorf("ground risk class = %v, want Safe", rc.RiskClass())
+	// F-M2R-6: ground is Network, not Safe — the marked image is
+	// sent to the model provider, so the call is gated and
+	// disclosed, never silently auto-approved.
+	if rc.RiskClass() != permissions.ClassNetwork {
+		t.Errorf("ground risk class = %v, want Network", rc.RiskClass())
 	}
 	// The gate's maps must agree with the factory set (the same
-	// pin TestClassifyMapsMatchFactorySet enforces): a Safe
+	// pin TestClassifyMapsMatchFactorySet enforces): a Network
 	// declaration with no gate entry would fail registration.
-	if got, want := permissions.Classify("ground"), permissions.ClassSafe; got != want {
-		t.Errorf("gate classifies ground as %v, want Safe", got)
+	if got, want := permissions.Classify("ground"), permissions.ClassNetwork; got != want {
+		t.Errorf("gate classifies ground as %v, want Network", got)
+	}
+	if !permissions.IsGated("ground") {
+		t.Errorf("ground is not gated, want gated (F-M2R-6)")
+	}
+	if !strings.Contains(tool.Description(), "DISCLOSURE") || !strings.Contains(tool.Description(), "model provider") {
+		t.Errorf("ground description %q does not disclose that the image is sent to the model provider", tool.Description())
 	}
 }
 

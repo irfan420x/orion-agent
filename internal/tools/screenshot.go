@@ -2,8 +2,10 @@
 //
 // screenshot captures the desktop and returns the image to the model
 // as a ToolResult image, plus a JSON summary (focused window, cursor
-// position, backend, file). It is read-only — RiskClass Safe — and it
-// takes NO input: no click, no key, no window control (plan §6.2 M1).
+// position, backend, file). It is read-only on the desktop —
+// RiskClass Network, because the image is sent to the model provider
+// (F-M2R-6) — and it takes NO input: no click, no key, no window
+// control (plan §6.2 M1).
 //
 // Backends, in order (M0 verdict + M1 probes, all live on the laptop):
 //  1. spectacle — proven non-interactive, no portal dialog. This is
@@ -202,7 +204,7 @@ func defaultExecCmd(ctx context.Context, name string, args ...string) (string, e
 func (t *screenshotTool) Name() string { return "screenshot" }
 
 func (t *screenshotTool) Description() string {
-	return "Take a screenshot of the desktop and return it as an image the model can see, with a JSON summary (focused window, numeric cursor position, file). Read-only: it takes no input and changes nothing on screen. The pointer is NOT visible in the screenshot image on this machine — use the numeric cursor position in the JSON, never look for the pointer in the picture. Refuses when a password manager, bank/payment app or one-time-code dialog is focused or visible, and never runs in unattended (cron) turns. Backends: spectacle (routine, no dialog); portal ScreenCast is not supported yet."
+	return "Take a screenshot of the desktop and return it as an image the model can see, with a JSON summary (focused window, numeric cursor position, file). Read-only on the desktop: it takes no input and changes nothing on screen. DISCLOSURE: the captured image is sent to the model provider (data leaves this machine) — this call is gated and needs approval. The pointer is NOT visible in the screenshot image on this machine — use the numeric cursor position in the JSON, never look for the pointer in the picture. Refuses when a password manager, bank/payment app or one-time-code dialog is focused or visible, and never runs in unattended (cron) turns. Backends: spectacle (routine, no dialog); portal ScreenCast is not supported yet."
 }
 
 func (t *screenshotTool) Definition() model.ToolDefinition {
@@ -232,11 +234,12 @@ func (t *screenshotTool) Definition() model.ToolDefinition {
 	}
 }
 
-// RiskClass declares the tool safe: it only reads the screen and
-// writes Orion's own 0600 screenshot file — never user files, never
-// the shell, never the network. The image it returns goes to the
-// model inside the provider request, never anywhere else.
-func (t *screenshotTool) RiskClass() permissions.Class { return permissions.ClassSafe }
+// RiskClass declares the tool Network (F-M2R-6): it only reads the
+// screen and writes Orion's own 0600 screenshot file — never user
+// files, never the shell, never the network directly — but the image
+// it returns is sent to the model provider, so the capture is a
+// gated, disclosed action, never silently auto-approved.
+func (t *screenshotTool) RiskClass() permissions.Class { return permissions.ClassNetwork }
 
 // BeginTurn resets the per-turn capture counter (see
 // TurnResetter) — but only when this tool owns the shared
