@@ -39,6 +39,7 @@ from "Firefox only" to "every app's every window".
 """
 import json
 import sys
+import time
 
 import gi
 gi.require_version('Atspi', '2.0')
@@ -46,6 +47,19 @@ from gi.repository import Atspi
 
 MAX_DEPTH = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 MAX_NODES = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
+
+
+def try_twice(fn):
+    """Run fn, retrying once after a short pause (F-M2R-23): a
+    single flaky D-Bus call must not lose the whole tree. The
+    second failure propagates — the caller decides whether to
+    skip that subtree (desktop/app) or fail the helper (no
+    desktop count at all means there is no tree to salvage)."""
+    try:
+        return fn()
+    except Exception:
+        time.sleep(0.05)
+        return fn()
 
 
 def extents(acc):
@@ -146,11 +160,29 @@ def main():
     # elements must be tagged, never blanket-shifted). The
     # windows array itself stays in desktop order; only the WALK
     # order is prioritised.
+    # F-M2R-23: the outer enumeration used to call get_desktop /
+    # get_child_count unwrapped — one flaky D-Bus call raised
+    # straight out of main, losing the whole tree. Each outer
+    # call is now retried once (try_twice) and, failing that,
+    # the affected desktop is skipped (not the whole walk).
+    # Only a failing desktop count is fatal (no tree to salvage).
     windows = []
     win_accs = []
-    for d in range(Atspi.get_desktop_count()):
-        desk = Atspi.get_desktop(d)
-        for i in range(desk.get_child_count()):
+    try:
+        n_desks = try_twice(Atspi.get_desktop_count)
+    except Exception as e:
+        print("atspi helper: get_desktop_count failed: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    for d in range(n_desks):
+        try:
+            desk = try_twice(lambda: Atspi.get_desktop(d))
+        except Exception:
+            continue
+        try:
+            n_apps = try_twice(desk.get_child_count)
+        except Exception:
+            continue
+        for i in range(n_apps):
             try:
                 app = desk.get_child_at_index(i)
             except Exception:
