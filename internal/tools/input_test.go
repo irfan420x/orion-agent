@@ -58,6 +58,7 @@ type fakeInputEnv struct {
 	socketPath   string
 	ydotoolCalls []fakeYdotoolCall
 	kwinCalls    int
+	kwinFlipTo   string // F-A23W2-10: from the 2nd KWin call on, this caption is the active window (simulates a focus change mid-call)
 }
 
 func benignInputTreeJSON() string {
@@ -135,7 +136,16 @@ func newFakeInputEnv(t *testing.T) *fakeInputEnv {
 		if env.oracleFixed != nil {
 			cur = *env.oracleFixed
 		}
-		out := inputCursorOutput{Cursor: cur, Screen: &env.screen, Windows: env.kwinWindows}
+		wins := env.kwinWindows
+		if env.kwinFlipTo != "" && env.kwinCalls > 1 {
+			flipped := make([]kwinWindow, len(wins))
+			copy(flipped, wins)
+			for i := range flipped {
+				flipped[i].Active = flipped[i].Caption == env.kwinFlipTo
+			}
+			wins = flipped
+		}
+		out := inputCursorOutput{Cursor: cur, Screen: &env.screen, Windows: wins}
 		raw, err := json.Marshal(out)
 		if err != nil {
 			t.Fatalf("fake KWin marshal: %v", err)
@@ -1222,5 +1232,76 @@ func TestInputClickDeliveredButUnverifiedWhenOracleFails(t *testing.T) {
 	}
 	if got := len(env.clickCalls()); got != 1 {
 		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+// --- F-A23W2-10 (type/key TOCTOU): the focus must be re-checked
+// right before typing — the safety check is ~5 s before the
+// keystrokes, and the focus can move in between. ---
+
+func TestInputTypeRefusedWhenFocusChanges(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.kwinWindows = []kwinWindow{
+		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Caption: "Kate — notes.txt", Class: "kate", Active: false, FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
+	}
+	// Between the safety check and the keystrokes the user
+	// Alt-Tabs to Kate: the text must not go there.
+	env.kwinFlipTo = "Kate — notes.txt"
+	err := env.callErr(t, `{"op": "type", "text": "secret"}`)
+	if !strings.Contains(err.Error(), "focused window changed") {
+		t.Errorf("type after a focus change err = %v, want the 'focused window changed' refusal", err)
+	}
+	if got := len(env.ydotoolCalls); got != 0 {
+		t.Errorf("got %d ydotool calls, want 0 (refused before typing)", got)
+	}
+}
+
+func TestInputKeyRefusedWhenFocusChanges(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.kwinWindows = []kwinWindow{
+		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Caption: "Kate — notes.txt", Class: "kate", Active: false, FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
+	}
+	env.kwinFlipTo = "Kate — notes.txt"
+	err := env.callErr(t, `{"op": "key", "key": "Return"}`)
+	if !strings.Contains(err.Error(), "focused window changed") {
+		t.Errorf("key after a focus change err = %v, want the 'focused window changed' refusal", err)
+	}
+	if got := len(env.ydotoolCalls); got != 0 {
+		t.Errorf("got %d ydotool calls, want 0", got)
+	}
+}
+
+func TestInputTypeRefusedWhenSensitiveWindowTakesFocus(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.kwinWindows = []kwinWindow{
+		{Caption: "Sign in to GitHub · GitHub — Mozilla Firefox", Class: "firefox-esr", Active: true, FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Caption: "KeePassXC — passwords.kdbx", Class: "keepassxc", Active: false, FG: [4]int{100, 100, 800, 600}, CG: [4]int{100, 100, 800, 600}},
+	}
+	// A password-manager popup takes focus after the safety
+	// check (which saw only Firefox): typing into it is refused.
+	// The AT-SPI titles do not list KeePassXC — only the KWin
+	// focus re-check can catch this.
+	env.kwinFlipTo = "KeePassXC — passwords.kdbx"
+	err := env.callErr(t, `{"op": "type", "text": "secret"}`)
+	if !strings.Contains(err.Error(), "password manager") {
+		t.Errorf("type after a sensitive window took focus err = %v, want the password-manager refusal", err)
+	}
+	if got := len(env.ydotoolCalls); got != 0 {
+		t.Errorf("got %d ydotool calls, want 0", got)
+	}
+}
+
+func TestInputTypeRefusedWhenFocusCannotBeConfirmed(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.treeErr = true  // no AT-SPI tree for the fallback either
+	env.oracleErr = true // KWin oracle down at re-check time
+	err := env.callErr(t, `{"op": "type", "text": "secret"}`)
+	if !strings.Contains(err.Error(), "cannot confirm which window is focused") {
+		t.Errorf("type with no focus authority err = %v, want the fail-closed 'cannot confirm' refusal", err)
+	}
+	if got := len(env.ydotoolCalls); got != 0 {
+		t.Errorf("got %d ydotool calls, want 0", got)
 	}
 }
