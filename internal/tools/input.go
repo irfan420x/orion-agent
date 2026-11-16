@@ -569,7 +569,7 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 		// The sensitive check is on the CLICK target, before
 		// the move: a refused click never moves the cursor
 		// towards a sensitive window.
-		if err := t.checkClickSensitive(ctx, target.X, target.Y); err != nil {
+		if err := t.checkClickSensitive(ctx, target.X, target.Y, a.SnapshotID, a.ElementID); err != nil {
 			return denied("%v", err)
 		}
 		final, iters, err := t.doClick(ctx, button, clicks, a.SnapshotID, a.ElementID, *target)
@@ -917,15 +917,24 @@ func (t *inputTool) checkTypeSensitive(ctx context.Context) error {
 // is KWin-corrected and the target lies outside all of them, in
 // which case the click is elsewhere on screen. Titles-only
 // enumeration, an uncorrected sensitive window, or no
-// enumeration at all refuses the click.
-func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int) error {
+// enumeration at all refuses the click. For a snapshot click it
+// also verifies the geometry binding (F-M2R-8): the window that
+// held the element at ground time must still be at the same
+// app + box in the fresh window list — a moved or resized window
+// refuses the click, because the registered centre no longer
+// names the element. The fresh list comes from the same walk
+// this check already paid for, so the binding costs no second
+// walk. (Movement between this check and the click itself is
+// still open — doClick re-validates only TTL/supersession —
+// see F-A23W2-1.)
+func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotID string, elementID *int) error {
 	info := t.windowInfo(ctx)
 	if !info.available {
 		return fmt.Errorf("cannot determine the visible windows (no accessibility tree and no window list): I will not click blind")
 	}
 	hit := FindSensitiveTitle(info.titles)
 	if hit == "" {
-		return nil
+		return t.checkSnapshotGeometry(snapshotID, elementID, info.windows)
 	}
 	if info.sensitivePrecise {
 		for _, w := range info.windows {
@@ -936,9 +945,23 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int) error {
 				return fmt.Errorf("the click target (%d, %d) is inside a %s: I will not click there", x, y, SensitiveTitleCategory(w.Title))
 			}
 		}
-		return nil
+		return t.checkSnapshotGeometry(snapshotID, elementID, info.windows)
 	}
 	return fmt.Errorf("this screen shows a %s: I will not click while it is visible", SensitiveTitleCategory(hit))
+}
+
+// checkSnapshotGeometry verifies a snapshot click's geometry
+// binding against the fresh window list (nil when the click is
+// by coordinates — nothing is bound then).
+func (t *inputTool) checkSnapshotGeometry(snapshotID string, elementID *int, windows []atspiWindow) error {
+	if snapshotID == "" || elementID == nil {
+		return nil
+	}
+	current := make([]WindowGeometry, 0, len(windows))
+	for _, w := range windows {
+		current = append(current, WindowGeometry{App: w.App, X: w.X, Y: w.Y, W: w.W, H: w.H})
+	}
+	return CheckGroundSnapshotGeometry(snapshotID, *elementID, current)
 }
 
 // checkRateLimit enforces the min-interval (per tool instance)

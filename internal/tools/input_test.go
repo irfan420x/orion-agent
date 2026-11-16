@@ -365,9 +365,15 @@ func TestInputClickButtonsAndDouble(t *testing.T) {
 
 func TestInputClickBySnapshot(t *testing.T) {
 	resetGroundSnapshots()
+	// Both elements are bound to the Firefox window exactly as
+	// the benign fake tree reports it (0,0,1920,1080): the
+	// geometry binding holds, so the click proceeds.
 	groundSnapshots.register("g-test-1", 0, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
 		{ID: 2, Centre: groundPoint{X: 960, Y: 484}},
+	}, map[int]WindowGeometry{
+		1: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},
+		2: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},
 	})
 	env := newFakeInputEnv(t)
 	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
@@ -387,7 +393,7 @@ func TestInputClickBySnapshotRefusals(t *testing.T) {
 	resetGroundSnapshots()
 	groundSnapshots.register("g-test-1", 0, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
-	})
+	}, nil)
 	env := newFakeInputEnv(t)
 	// Unknown snapshot: refused before any desktop touch.
 	err := env.callErr(t, `{"op": "click", "snapshot_id": "g-nope", "element_id": 1}`)
@@ -403,7 +409,7 @@ func TestInputClickBySnapshotRefusals(t *testing.T) {
 	resetGroundSnapshots()
 	groundSnapshots.register("g-old", 0, time.Now().Add(-61*time.Second), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
-	})
+	}, nil)
 	err = env.callErr(t, `{"op": "click", "snapshot_id": "g-old", "element_id": 1}`)
 	if !strings.Contains(err.Error(), "old") {
 		t.Errorf("stale snapshot err = %v, want the age refusal", err)
@@ -418,7 +424,7 @@ func TestInputSnapshotCentreLookup(t *testing.T) {
 	groundSnapshots.register("g-c", 0, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
 		{ID: 2, Centre: groundPoint{X: 100, Y: 200}},
-	})
+	}, nil)
 	ctx := context.Background()
 	c, err := GroundSnapshotElementCentre(ctx, "g-c", 2)
 	if err != nil {
@@ -943,5 +949,33 @@ func TestInputFailedCallsDoNotEatRateLimitSlots(t *testing.T) {
 	err := env.callErr(t, `{"op": "move", "x": 300, "y": 300}`)
 	if !strings.Contains(err.Error(), "at most 15 input calls per turn") {
 		t.Errorf("16th move err = %v, want the per-turn limit", err)
+	}
+}
+
+// TestInputClickBySnapshotMovedWindow pins F-M2R-8 at the click:
+// the snapshot binds element 1 to Firefox at (0,0,1920,1080),
+// but the live tree now reports Firefox at (100,0,1920,1080) —
+// the window moved after the grounding, so the click is refused
+// before the cursor moves anywhere near the stale centre.
+func TestInputClickBySnapshotMovedWindow(t *testing.T) {
+	resetGroundSnapshots()
+	groundSnapshots.register("g-moved", time.Now(), []groundElement{
+		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
+	}, map[int]WindowGeometry{
+		1: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},
+	})
+	env := newFakeInputEnv(t)
+	env.tree = `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 100, "y": 0, "w": 1920, "h": 1080},
+		{"title": "Kate — notes.txt", "app": "Kate", "role": "frame", "focused": false, "x": 0, "y": 0, "w": 800, "h": 600}],
+	"elements": [],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 140}`
+	err := env.callErr(t, `{"op": "click", "snapshot_id": "g-moved", "element_id": 1}`)
+	if !strings.Contains(err.Error(), "moved or resized") {
+		t.Errorf("moved-window click err = %v, want the moved-or-resized refusal", err)
+	}
+	if len(env.ydotoolCalls) != 0 {
+		t.Errorf("got %d ydotool calls, want 0 (refused before touching the desktop)", len(env.ydotoolCalls))
 	}
 }

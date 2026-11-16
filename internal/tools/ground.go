@@ -57,9 +57,12 @@
 // (groundSnapshots, max 3 retained — the same last-3 retention as
 // M1's screenshot history eviction, so an evicted snapshot's
 // elements are no longer clickable). ValidateGroundSnapshot,
-// used by the future M3 mouse tool, refuses when the snapshot is
+// used by the M3 mouse tool, refuses when the snapshot is
 // >60 s old, superseded by a newer grounding, evicted, or the
 // element id is not in that snapshot. Ground itself never clicks.
+// The registry also binds each element to its window's geometry
+// at ground time (F-M2R-8): CheckGroundSnapshotGeometry refuses
+// the click when that window has moved or resized since.
 //
 // Markers: Go stdlib image/draw only — no new deps. The stdlib
 // has no text rendering, so a tiny 5x7 bitmap digit font is
@@ -445,6 +448,17 @@ func applyWindowOffsets(tree *atspiOutput, offsets map[int][2]int) {
 
 // --- snapshot registry (stale-refusal, design §5) ---
 
+// WindowGeometry is one window's app + box, recorded at ground
+// time so a later click can verify the window is still where the
+// grounding saw it (F-M2R-8 geometry binding). No title: titles
+// can carry sensitive text and are not needed to bind a window —
+// app + box is the identity.
+type WindowGeometry struct {
+	App    string
+	X, Y   int
+	W, H   int
+}
+
 // groundSnapshot is one grounding's registered state: the element
 // ids the M3 input tool may click, their centres (the click
 // targets — the registry, not the model, supplies coordinates),
@@ -452,15 +466,19 @@ func applyWindowOffsets(tree *atspiOutput, offsets map[int][2]int) {
 // registered in one chat must never be clickable from another —
 // the registry is process-wide, so without the binding a
 // same-second id collision could click the wrong chat's element),
-// and the sequence number that decides supersession (only the
-// newest snapshot is live).
+// the window geometry each element was grounded in (the geometry
+// binding — a click refuses when that window has moved or
+// resized since the grounding), and the sequence number that
+// decides supersession (only the newest snapshot is live).
 type groundSnapshot struct {
-	id       string
-	chatID   int64 // 0 when the grounding ran with no chat in context (CLI, tests)
-	takenAt  time.Time
-	elements map[int]bool
-	centres  map[int]groundPoint
-	seq      int64
+	id             string
+	chatID         int64 // 0 when the grounding ran with no chat in context (CLI, tests)
+	takenAt        time.Time
+	elements       map[int]bool
+	centres        map[int]groundPoint
+	elementWindows map[int]WindowGeometry
+	seq            int64
+}
 }
 
 // groundSnapshotRegistry keeps the last groundMaxSnapshots
@@ -495,8 +513,12 @@ var groundSnapshots = newGroundSnapshotRegistry()
 // the model typed (a model-typed coordinate is a guess; the
 // registry's centre is the grounded truth). chatID binds the
 // snapshot to the chat that grounded it (F-A23W2-19): a lookup
-// from any other chat refuses, even on an id collision.
-func (r *groundSnapshotRegistry) register(id string, chatID int64, takenAt time.Time, elements []groundElement) int64 {
+// from any other chat refuses, even on an id collision. windows binds each
+// element id to the geometry of the window that held it at
+// ground time (nil when the grounding recorded none — e.g. an
+// untagged element — in which case that element has no geometry
+// binding and only the TTL/supersession checks apply).
+func (r *groundSnapshotRegistry) register(id string, chatID int64, takenAt time.Time, elements []groundElement, windows map[int]WindowGeometry) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seq++
@@ -506,7 +528,7 @@ func (r *groundSnapshotRegistry) register(id string, chatID int64, takenAt time.
 		els[e.ID] = true
 		cen[e.ID] = e.Centre
 	}
-	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, chatID: chatID, takenAt: takenAt, elements: els, centres: cen, seq: r.seq})
+	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, chatID: chatID, takenAt: takenAt, elements: els, centres: cen, elementWindows: windows, seq: r.seq})
 	for len(r.snapshots) > groundMaxSnapshots {
 		r.snapshots = r.snapshots[1:]
 	}
@@ -561,6 +583,35 @@ func GroundSnapshotElementCentre(ctx context.Context, id string, elementID int) 
 		return groundPoint{}, err
 	}
 	return snap.centres[elementID], nil
+}
+
+// CheckGroundSnapshotGeometry is the M3 input tool's geometry
+// binding (F-M2R-8): it validates (snapshot, element) exactly as
+// ValidateGroundSnapshot does, then verifies the window that
+// held the element at ground time is still at the same app + box
+// in current (the caller's fresh window list, KWin-corrected).
+// A window that moved or resized — or is gone — refuses the
+// click: the registered centre no longer names the element.
+// An element with no recorded window (untagged at ground time)
+// has nothing to bind and passes this check; the TTL /
+// supersession / membership validation still applies to it.
+// current is the live window list; an empty list with a recorded
+// binding fails closed (nothing to verify against).
+func CheckGroundSnapshotGeometry(id string, elementID int, current []WindowGeometry) error {
+	snap, err := groundSnapshots.lookup(id, elementID, time.Now())
+	if err != nil {
+		return err
+	}
+	bound, ok := snap.elementWindows[elementID]
+	if !ok {
+		return nil
+	}
+	for _, w := range current {
+		if w == bound {
+			return nil
+		}
+	}
+	return fmt.Errorf("the window holding element %d has moved or resized since the grounding (was %s %dx%d at %d,%d): ground again and use the new snapshot", elementID, bound.App, bound.W, bound.H, bound.X, bound.Y)
 }
 
 // lookup is the shared validation for validate and
@@ -1018,7 +1069,26 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// registry's centre, never a model-typed coordinate. The
 	// snapshot is bound to this turn's chat (F-A23W2-19): a
 	// click from any other chat refuses, even on an id collision.
-	groundSnapshots.register(summary.SnapshotID, chatIDFromContext(ctx), now, summary.Elements)
+	// They also carry their window's geometry (F-M2R-8): the input
+	// tool refuses the click when that window has moved or
+	// resized since the grounding. The tree's windows are
+	// KWin-corrected by now, so the binding is on compositor
+	// truth, not window-relative coordinates.
+	elemWindows := map[int]WindowGeometry{}
+	if tree != nil {
+		for i, el := range elements {
+			if el.Win == nil {
+				continue
+			}
+			wi := *el.Win
+			if wi < 0 || wi >= len(tree.Windows) {
+				continue
+			}
+			w := tree.Windows[wi]
+			elemWindows[i+1] = WindowGeometry{App: w.App, X: w.X, Y: w.Y, W: w.W, H: w.H}
+		}
+	}
+	groundSnapshots.register(summary.SnapshotID, chatIDFromContext(ctx), now, summary.Elements, elemWindows)
 
 	text, err := json.Marshal(summary)
 	if err != nil {
