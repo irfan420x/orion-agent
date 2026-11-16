@@ -234,6 +234,18 @@ type inputSummary struct {
 	Element    *inputElement `json:"element,omitempty"`     // click by snapshot
 	CharsTyped int           `json:"chars_typed,omitempty"` // type: count only, never the text
 	Key        string        `json:"key,omitempty"`
+	// Click verification (F-A23W2-9): the oracle re-read after
+	// the click. PostClickCursor is the cursor right after the
+	// click (nil when the re-read failed); ClickVerified is true
+	// only when that re-read agreed the cursor is still on
+	// target. ClickMayHaveLanded is true when the click command
+	// itself timed out — the click may already have landed, and
+	// Warning says to verify before retrying instead of
+	// clicking again blindly.
+	PostClickCursor    *cursorPos `json:"post_click_cursor,omitempty"`
+	ClickVerified      bool       `json:"click_verified,omitempty"`
+	ClickMayHaveLanded bool       `json:"click_may_have_landed,omitempty"`
+	Warning            string     `json:"warning,omitempty"`
 }
 
 type inputElement struct {
@@ -581,16 +593,30 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 		if err := t.checkClickSensitive(ctx, target.X, target.Y, a.SnapshotID, a.ElementID); err != nil {
 			return denied("%v", err)
 		}
-		final, iters, err := t.doClick(ctx, button, clicks, a.SnapshotID, a.ElementID, *target)
+		out, err := t.doClick(ctx, button, clicks, a.SnapshotID, a.ElementID, *target)
 		if err != nil {
 			return failed("%v", err)
 		}
 		summary.Target = target
-		summary.Final = &final
-		summary.Iterations = iters
+		summary.Final = &out.final
+		summary.Iterations = out.iters
 		summary.Reached = true
 		summary.Button = button
 		summary.Clicks = clicks
+		summary.PostClickCursor = out.postClick
+		summary.ClickVerified = out.verified
+		if out.uncertain {
+			// The click command timed out: the click may
+			// already have landed. This is a result, not an
+			// error — an error would make the model retry and
+			// double-click.
+			summary.ClickMayHaveLanded = true
+			summary.Warning = "the click command timed out — the click may already have landed. Verify on screen before retrying; do not click again blindly."
+		} else if out.postClick == nil {
+			summary.Warning = "the click was sent but the post-click check could not run (KWin oracle unavailable): verify on screen before retrying."
+		} else if !out.verified {
+			summary.Warning = "the click was sent but the cursor is no longer on the target — verify on screen before retrying."
+		}
 		if a.SnapshotID != "" {
 			summary.Element = &inputElement{SnapshotID: a.SnapshotID, ElementID: *a.ElementID}
 		}
@@ -679,6 +705,15 @@ func (t *inputTool) defaultYdotool(ctx context.Context, stdin string, args ...st
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Run(); err != nil {
+		// A timeout (or a cancelled step) is NOT a plain
+		// failure: the command may already have taken effect
+		// when the deadline fired. Wrap the context error so
+		// the caller can tell the two apart (F-A23W2-9) — a
+		// timed-out click must report "may have landed",
+		// never a retryable error.
+		if cctx.Err() != nil {
+			return buf.String(), fmt.Errorf("ydotool %s timed out: %w (output: %s)", args[0], cctx.Err(), strings.TrimSpace(buf.String()))
+		}
 		return buf.String(), fmt.Errorf("ydotool %s failed: %v (output: %s)", args[0], err, strings.TrimSpace(buf.String()))
 	}
 	return buf.String(), nil
@@ -827,31 +862,68 @@ func (t *inputTool) doMove(ctx context.Context, x, y int) (cursorPos, int, error
 		fmt.Errorf("could not reach (%d, %d) within %d px after %d correction moves: the cursor is at (%d, %d) — the screen may have moved, or pointer acceleration is fighting the correction; ground again and retry, or move in smaller steps", x, y, inputMoveTolerancePx, inputMaxMoveIterations, cur.Cursor.X, cur.Cursor.Y)
 }
 
+// clickOutcome is what a click returns: the oracle-confirmed
+// cursor after the move, the correction moves issued, and the
+// post-click verification (F-A23W2-9). Uncertain is true when
+// the click command itself timed out: the click may already
+// have landed, and the caller must say so instead of returning
+// a retryable error.
+type clickOutcome struct {
+	final     cursorPos
+	iters     int
+	postClick *cursorPos // oracle cursor right after the click, nil when the re-read failed
+	verified  bool       // the post-click oracle agreed the cursor is still on target
+	uncertain bool       // the click command timed out: it may have landed
+}
+
 // doClick moves to the target (closed-loop — a failed move
 // aborts before any click, so a click never lands in the wrong
-// place) and then clicks. For a snapshot click the element is
-// re-validated fresh immediately before the click: the registry
-// check alone (TTL/id) cannot see that the element moved since
-// grounding, and a stale centre can land on a different control.
-func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snapshotID string, elementID *int, target cursorPos) (cursorPos, int, error) {
+// place), clicks, and then verifies with an oracle re-read.
+// For a snapshot click the element is re-validated fresh
+// immediately before the click: the registry check alone
+// (TTL/id) cannot see that the element moved since grounding,
+// and a stale centre can land on a different control.
+// A coordinate click re-checks the freshness gate instead (the
+// grounding may have gone stale during the sensitive check and
+// the move).
+func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snapshotID string, elementID *int, target cursorPos) (clickOutcome, error) {
 	final, iters, err := t.doMove(ctx, target.X, target.Y)
 	if err != nil {
-		return cursorPos{}, iters, err
+		return clickOutcome{}, err
 	}
 	if snapshotID != "" && elementID != nil {
 		if err := t.revalidateSnapshotElement(ctx, snapshotID, *elementID, final); err != nil {
-			return cursorPos{}, iters, err
+			return clickOutcome{}, err
 		}
 	} else if err := requireFreshGrounding(); err != nil {
 		// Coordinate click: the grounding may have gone stale
 		// during the sensitive check and the move.
-		return cursorPos{}, iters, err
+		return clickOutcome{}, err
 	}
 	code := inputClickCodes[button]
 	if _, err := t.ydotool(ctx, "", "click", "--repeat", strconv.Itoa(clicks), fmt.Sprintf("0x%02X", code)); err != nil {
-		return cursorPos{}, iters, fmt.Errorf("ydotool click failed: %v", err)
+		// The click command timed out (or the step was
+		// cancelled) mid-click: the click may already have
+		// landed. Report that, never a plain failure — a
+		// failure makes the model retry into a double-click
+		// (double-submit / double-purchase).
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return clickOutcome{final: final, iters: iters, uncertain: true}, nil
+		}
+		return clickOutcome{}, fmt.Errorf("ydotool click failed: %v", err)
 	}
-	return final, iters, nil
+	// Post-click verification: the oracle re-reads the cursor
+	// right after the click. A click is only verified when the
+	// re-read succeeds and the cursor is still on target. A
+	// failed re-read does not fail the click — ydotool already
+	// reported success — but the result says so, so the model
+	// verifies on screen before retrying.
+	out := clickOutcome{final: final, iters: iters}
+	if post, err := t.readCursor(ctx); err == nil {
+		out.postClick = &post.Cursor
+		out.verified = withinTolerance(post.Cursor, target.X, target.Y)
+	}
+	return out, nil
 }
 
 // requireFreshGrounding is the F-A23W2-8 gate for coordinate

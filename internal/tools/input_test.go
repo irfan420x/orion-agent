@@ -1143,3 +1143,84 @@ func TestInputCoordClickRefusedWhenGroundingStale(t *testing.T) {
 		t.Errorf("got %d ydotool calls, want 0", got)
 	}
 }
+
+// --- F-A23W2-9 (no post-click verification): a click must be
+// oracle-verified after delivery, and a timeout mid-click must
+// say the click may have landed instead of failing (a failure
+// makes the model retry into a double-click). ---
+
+func TestInputClickVerifiedAfterSuccess(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	res := env.call(t, `{"op": "click", "x": 500, "y": 300}`)
+	s := parseInputSummary(t, res)
+	if s.PostClickCursor == nil || *s.PostClickCursor != (cursorPos{X: 500, Y: 300}) {
+		t.Errorf("post_click_cursor = %+v, want {500 300} (oracle re-read after the click)", s.PostClickCursor)
+	}
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (the oracle re-read agreed the cursor is on target)")
+	}
+}
+
+func TestInputClickTimeoutReportsMayHaveLanded(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	orig := env.tool.ydotool
+	env.tool.ydotool = func(ctx context.Context, stdin string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "click" {
+			// Record the call, then report the timeout: the
+			// click was issued once and timed out mid-flight.
+			_, _ = orig(ctx, stdin, args...)
+			return "", fmt.Errorf("ydotool click timed out: %w", context.DeadlineExceeded)
+		}
+		return orig(ctx, stdin, args...)
+	}
+	// ExecuteResult must NOT return an error here — an error
+	// would make the model retry and double-click.
+	res, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{"op": "click", "x": 500, "y": 300}`))
+	if err != nil {
+		t.Fatalf("timed-out click returned error %v, want a result saying the click may have landed", err)
+	}
+	s := parseInputSummary(t, res)
+	if !s.ClickMayHaveLanded {
+		t.Errorf("click_may_have_landed = false, want true")
+	}
+	if !strings.Contains(s.Warning, "may already have landed") || !strings.Contains(s.Warning, "before retrying") {
+		t.Errorf("warning = %q, want 'may already have landed' + 'before retrying'", s.Warning)
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1 (no retry inside the tool)", got)
+	}
+}
+
+func TestInputClickDeliveredButUnverifiedWhenOracleFails(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	orig := env.tool.ydotool
+	env.tool.ydotool = func(ctx context.Context, stdin string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "click" {
+			env.oracleErr = true // the post-click oracle re-read fails
+		}
+		return orig(ctx, stdin, args...)
+	}
+	res := env.call(t, `{"op": "click", "x": 500, "y": 300}`)
+	s := parseInputSummary(t, res)
+	if !s.Reached {
+		t.Errorf("summary = %+v, want reached (the click was delivered)", s)
+	}
+	if s.ClickVerified {
+		t.Errorf("click_verified = true with a failed oracle re-read, want false")
+	}
+	if s.PostClickCursor != nil {
+		t.Errorf("post_click_cursor = %+v, want nil (no oracle reading)", s.PostClickCursor)
+	}
+	if !strings.Contains(s.Warning, "verify") {
+		t.Errorf("warning = %q, want a verify-before-retrying note", s.Warning)
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
