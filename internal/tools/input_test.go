@@ -365,7 +365,7 @@ func TestInputClickButtonsAndDouble(t *testing.T) {
 
 func TestInputClickBySnapshot(t *testing.T) {
 	resetGroundSnapshots()
-	groundSnapshots.register("g-test-1", time.Now(), []groundElement{
+	groundSnapshots.register("g-test-1", 0, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
 		{ID: 2, Centre: groundPoint{X: 960, Y: 484}},
 	})
@@ -385,7 +385,7 @@ func TestInputClickBySnapshot(t *testing.T) {
 
 func TestInputClickBySnapshotRefusals(t *testing.T) {
 	resetGroundSnapshots()
-	groundSnapshots.register("g-test-1", time.Now(), []groundElement{
+	groundSnapshots.register("g-test-1", 0, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
 	})
 	env := newFakeInputEnv(t)
@@ -401,7 +401,7 @@ func TestInputClickBySnapshotRefusals(t *testing.T) {
 	}
 	// Stale snapshot (older than the 60 s TTL).
 	resetGroundSnapshots()
-	groundSnapshots.register("g-old", time.Now().Add(-61*time.Second), []groundElement{
+	groundSnapshots.register("g-old", 0, time.Now().Add(-61*time.Second), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
 	})
 	err = env.callErr(t, `{"op": "click", "snapshot_id": "g-old", "element_id": 1}`)
@@ -415,22 +415,53 @@ func TestInputClickBySnapshotRefusals(t *testing.T) {
 
 func TestInputSnapshotCentreLookup(t *testing.T) {
 	resetGroundSnapshots()
-	groundSnapshots.register("g-c", time.Now(), []groundElement{
+	groundSnapshots.register("g-c", 0, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
 		{ID: 2, Centre: groundPoint{X: 100, Y: 200}},
 	})
-	c, err := GroundSnapshotElementCentre("g-c", 2)
+	ctx := context.Background()
+	c, err := GroundSnapshotElementCentre(ctx, "g-c", 2)
 	if err != nil {
 		t.Fatalf("GroundSnapshotElementCentre = %v, want nil", err)
 	}
 	if c != (groundPoint{X: 100, Y: 200}) {
 		t.Errorf("centre = %+v, want {100 200}", c)
 	}
-	if _, err := GroundSnapshotElementCentre("g-c", 99); err == nil {
+	if _, err := GroundSnapshotElementCentre(ctx, "g-c", 99); err == nil {
 		t.Errorf("unknown element should be refused")
 	}
-	if _, err := GroundSnapshotElementCentre("g-nope", 1); err == nil {
+	if _, err := GroundSnapshotElementCentre(ctx, "g-nope", 1); err == nil {
 		t.Errorf("unknown snapshot should be refused")
+	}
+}
+
+// TestInputClickBySnapshotCrossChat (F-A23W2-19): a snapshot
+// grounded in chat 111 cannot be clicked from chat 222 — the
+// click refuses before any desktop touch — while the same chat
+// clicks it fine. The id is identical in both cases: the chat
+// binding, not the id, decides.
+func TestInputClickBySnapshotCrossChat(t *testing.T) {
+	resetGroundSnapshots()
+	groundSnapshots.register("g-cross", 111, time.Now(), []groundElement{
+		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
+	})
+	env := newFakeInputEnv(t)
+	ctxOther := permissions.WithApprovalContext(context.Background(), 222, 222)
+	_, err := env.tool.ExecuteResult(ctxOther, json.RawMessage(`{"op": "click", "snapshot_id": "g-cross", "element_id": 1}`))
+	if err == nil || !strings.Contains(err.Error(), "different chat") {
+		t.Errorf("cross-chat click err = %v, want 'different chat'", err)
+	}
+	if len(env.ydotoolCalls) != 0 {
+		t.Errorf("got %d ydotool calls, want 0 (refused before touching the desktop)", len(env.ydotoolCalls))
+	}
+	ctxSame := permissions.WithApprovalContext(context.Background(), 111, 111)
+	env.advance()
+	res, err := env.tool.ExecuteResult(ctxSame, json.RawMessage(`{"op": "click", "snapshot_id": "g-cross", "element_id": 1}`))
+	if err != nil {
+		t.Fatalf("same-chat click = %v, want nil", err)
+	}
+	if s := parseInputSummary(t, res); !s.Reached {
+		t.Errorf("same-chat click summary = %+v, want reached", s)
 	}
 }
 

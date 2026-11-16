@@ -420,10 +420,15 @@ func applyWindowOffsets(tree *atspiOutput, offsets map[int][2]int) {
 // groundSnapshot is one grounding's registered state: the element
 // ids the M3 input tool may click, their centres (the click
 // targets — the registry, not the model, supplies coordinates),
+// the chat the grounding belongs to (F-A23W2-19: a snapshot
+// registered in one chat must never be clickable from another —
+// the registry is process-wide, so without the binding a
+// same-second id collision could click the wrong chat's element),
 // and the sequence number that decides supersession (only the
 // newest snapshot is live).
 type groundSnapshot struct {
 	id       string
+	chatID   int64 // 0 when the grounding ran with no chat in context (CLI, tests)
 	takenAt  time.Time
 	elements map[int]bool
 	centres  map[int]groundPoint
@@ -434,6 +439,11 @@ type groundSnapshot struct {
 // groundings. Anything older is evicted and its elements are no
 // longer clickable — the registry is the enforcement point for
 // the M1 last-3 eviction rule applied to grounding snapshots.
+// Retention is global, not per chat: one chat's groundings can
+// evict another chat's snapshot, but that only ever fails closed
+// (the click is refused and the provider grounds again) — it can
+// never retarget a click, because lookup also checks the chat
+// binding (F-A23W2-19).
 type groundSnapshotRegistry struct {
 	mu        sync.Mutex
 	snapshots []*groundSnapshot // oldest first
@@ -455,8 +465,10 @@ var groundSnapshots = newGroundSnapshotRegistry()
 // number. Centres are stored alongside the ids: the M3 input
 // tool clicks an element's registered centre, never a coordinate
 // the model typed (a model-typed coordinate is a guess; the
-// registry's centre is the grounded truth).
-func (r *groundSnapshotRegistry) register(id string, takenAt time.Time, elements []groundElement) int64 {
+// registry's centre is the grounded truth). chatID binds the
+// snapshot to the chat that grounded it (F-A23W2-19): a lookup
+// from any other chat refuses, even on an id collision.
+func (r *groundSnapshotRegistry) register(id string, chatID int64, takenAt time.Time, elements []groundElement) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seq++
@@ -466,7 +478,7 @@ func (r *groundSnapshotRegistry) register(id string, takenAt time.Time, elements
 		els[e.ID] = true
 		cen[e.ID] = e.Centre
 	}
-	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, takenAt: takenAt, elements: els, centres: cen, seq: r.seq})
+	r.snapshots = append(r.snapshots, &groundSnapshot{id: id, chatID: chatID, takenAt: takenAt, elements: els, centres: cen, seq: r.seq})
 	for len(r.snapshots) > groundMaxSnapshots {
 		r.snapshots = r.snapshots[1:]
 	}
@@ -483,17 +495,29 @@ func (r *groundSnapshotRegistry) latest() *groundSnapshot {
 	return r.snapshots[len(r.snapshots)-1]
 }
 
+// chatIDFromContext reads the chat id the approval context
+// carries (set by runAgentTurn), or 0 when the call runs with no
+// chat in context (CLI runs, tests). Snapshot binding treats 0
+// as its own chat: no-context callers share chat 0, exactly as
+// they shared the unbound registry before — the binding only ever
+// separates callers that DO carry different chat ids.
+func chatIDFromContext(ctx context.Context) int64 {
+	chatID, _, _ := permissions.ApprovalContextFrom(ctx)
+	return chatID
+}
+
 // ValidateGroundSnapshot is the M3 input tool's gate: it refuses a
 // click when (a) the snapshot is unknown or evicted, (b) it is
 // older than the 60 s TTL, (c) a newer grounding has superseded
-// it, or (d) the element id is not in that snapshot. The error
+// it, (d) the element id is not in that snapshot, or (e) the
+// snapshot belongs to a different chat (F-A23W2-19). The error
 // always tells the provider to ground again — never a coordinate.
-func ValidateGroundSnapshot(id string, elementID int) error {
-	return groundSnapshots.validate(id, elementID, time.Now())
+func ValidateGroundSnapshot(ctx context.Context, id string, elementID int) error {
+	return groundSnapshots.validate(id, chatIDFromContext(ctx), elementID, time.Now())
 }
 
-func (r *groundSnapshotRegistry) validate(id string, elementID int, now time.Time) error {
-	_, err := r.lookup(id, elementID, now)
+func (r *groundSnapshotRegistry) validate(id string, chatID int64, elementID int, now time.Time) error {
+	_, err := r.lookup(id, chatID, elementID, now)
 	return err
 }
 
@@ -503,8 +527,8 @@ func (r *groundSnapshotRegistry) validate(id string, elementID int, now time.Tim
 // in absolute screen pixels. The input tool clicks this centre
 // — the registry's grounded truth — never a coordinate from the
 // model. The error always tells the provider to ground again.
-func GroundSnapshotElementCentre(id string, elementID int) (groundPoint, error) {
-	snap, err := groundSnapshots.lookup(id, elementID, time.Now())
+func GroundSnapshotElementCentre(ctx context.Context, id string, elementID int) (groundPoint, error) {
+	snap, err := groundSnapshots.lookup(id, chatIDFromContext(ctx), elementID, time.Now())
 	if err != nil {
 		return groundPoint{}, err
 	}
@@ -513,8 +537,11 @@ func GroundSnapshotElementCentre(id string, elementID int) (groundPoint, error) 
 
 // lookup is the shared validation for validate and
 // GroundSnapshotElementCentre: it returns the snapshot only when
-// it is known, fresh, newest, and contains the element.
-func (r *groundSnapshotRegistry) lookup(id string, elementID int, now time.Time) (*groundSnapshot, error) {
+// it is known, fresh, newest, contains the element, and belongs
+// to the caller's chat (F-A23W2-19). The chat-mismatch error
+// never names the other chat: the id alone is enough for the
+// provider to ground again in its own chat.
+func (r *groundSnapshotRegistry) lookup(id string, chatID int64, elementID int, now time.Time) (*groundSnapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var snap *groundSnapshot
@@ -526,6 +553,9 @@ func (r *groundSnapshotRegistry) lookup(id string, elementID int, now time.Time)
 	}
 	if snap == nil {
 		return nil, fmt.Errorf("snapshot %s is not available (unknown or evicted — only the last %d groundings are kept): ground again and use the new snapshot", id, groundMaxSnapshots)
+	}
+	if snap.chatID != chatID {
+		return nil, fmt.Errorf("snapshot %s belongs to a different chat: ground again in this chat and use the new snapshot", id)
 	}
 	if now.Sub(snap.takenAt) > groundSnapshotTTL {
 		return nil, fmt.Errorf("snapshot %s is %v old (max %v): the screen has moved on — ground again and use the new snapshot", id, now.Sub(snap.takenAt).Round(time.Second), groundSnapshotTTL)
@@ -888,8 +918,10 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// what the last-3 eviction applies to — a 4th grounding
 	// evicts the oldest snapshot here. The registered elements
 	// carry their centres, so the input tool clicks the
-	// registry's centre, never a model-typed coordinate.
-	groundSnapshots.register(summary.SnapshotID, now, summary.Elements)
+	// registry's centre, never a model-typed coordinate. The
+	// snapshot is bound to this turn's chat (F-A23W2-19): a
+	// click from any other chat refuses, even on an id collision.
+	groundSnapshots.register(summary.SnapshotID, chatIDFromContext(ctx), now, summary.Elements)
 
 	text, err := json.Marshal(summary)
 	if err != nil {
@@ -1117,10 +1149,14 @@ func filterGroundElements(tree *atspiOutput, roleSet map[string]bool, region *re
 }
 
 // newSnapshotID builds a unique snapshot id like
-// "g-20261115-182033-7f3a": a timestamp plus 2 random bytes, so
-// two groundings in the same second still differ.
+// "g-20261115-182033-7f3a91c4d2e8b506": a timestamp plus 8 random
+// bytes (64-bit entropy, F-A23W2-19 — the old 2-byte suffix gave
+// only 65,536 possibilities per second, so two chats grounding
+// in the same second could collide and the registry's first
+// match would serve the wrong chat's snapshot). Two groundings
+// in the same second still differ.
 func newSnapshotID(now time.Time) string {
-	var b [2]byte
+	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// Randomness failing must not fail the grounding: fall
 		// back to a nanosecond suffix, still unique per call.

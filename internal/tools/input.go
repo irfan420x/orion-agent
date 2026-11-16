@@ -430,7 +430,7 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 			if a.SnapshotID == "" || a.ElementID == nil {
 				return invalid("click by element needs both snapshot_id and element_id")
 			}
-			centre, err := GroundSnapshotElementCentre(a.SnapshotID, *a.ElementID)
+			centre, err := GroundSnapshotElementCentre(ctx, a.SnapshotID, *a.ElementID)
 			if err != nil {
 				return invalid("cannot click element %d in snapshot %s: %v", *a.ElementID, a.SnapshotID, err)
 			}
@@ -762,7 +762,7 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 		return cursorPos{}, iters, err
 	}
 	if snapshotID != "" && elementID != nil {
-		if _, err := GroundSnapshotElementCentre(snapshotID, *elementID); err != nil {
+		if _, err := GroundSnapshotElementCentre(ctx, snapshotID, *elementID); err != nil {
 			return cursorPos{}, iters, fmt.Errorf("snapshot went stale before the click: %v (ground again)", err)
 		}
 	}

@@ -224,10 +224,10 @@ func TestGroundHappyPath(t *testing.T) {
 		t.Errorf("check box element = %+v, want name = role", checkbox)
 	}
 	// The snapshot is registered and validates for its elements.
-	if err := ValidateGroundSnapshot(s.SnapshotID, 1); err != nil {
+	if err := ValidateGroundSnapshot(context.Background(), s.SnapshotID, 1); err != nil {
 		t.Errorf("fresh snapshot should validate: %v", err)
 	}
-	if err := ValidateGroundSnapshot(s.SnapshotID, 99); err == nil {
+	if err := ValidateGroundSnapshot(context.Background(), s.SnapshotID, 99); err == nil {
 		t.Errorf("unknown element id should be refused")
 	}
 }
@@ -561,28 +561,55 @@ func TestGroundSnapshotRegistry(t *testing.T) {
 	resetGroundSnapshots()
 	r := groundSnapshots
 	now := time.Now()
+	const chatA, chatB int64 = 111, 222
 	id1 := "g-test-1"
-	r.register(id1, now, []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}, {ID: 2, Centre: groundPoint{X: 20, Y: 20}}, {ID: 3, Centre: groundPoint{X: 30, Y: 30}}})
-	if err := r.validate(id1, 2, now); err != nil {
+	r.register(id1, chatA, now, []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}, {ID: 2, Centre: groundPoint{X: 20, Y: 20}}, {ID: 3, Centre: groundPoint{X: 30, Y: 30}}})
+	if err := r.validate(id1, chatA, 2, now); err != nil {
 		t.Errorf("fresh snapshot validate = %v, want nil", err)
 	}
-	if err := r.validate(id1, 99, now); err == nil || !strings.Contains(err.Error(), "not in snapshot") {
+	if err := r.validate(id1, chatA, 99, now); err == nil || !strings.Contains(err.Error(), "not in snapshot") {
 		t.Errorf("unknown element err = %v, want 'not in snapshot'", err)
 	}
-	if err := r.validate("g-nope", 1, now); err == nil || !strings.Contains(err.Error(), "not available") {
+	if err := r.validate("g-nope", chatA, 1, now); err == nil || !strings.Contains(err.Error(), "not available") {
 		t.Errorf("unknown snapshot err = %v, want 'not available'", err)
 	}
+	// F-A23W2-19: the same snapshot id from another chat refuses
+	// — even though the id is known and fresh, the binding, not
+	// the id, decides. The refusal must not name the other chat.
+	crossErr := r.validate(id1, chatB, 1, now)
+	if crossErr == nil || !strings.Contains(crossErr.Error(), "different chat") {
+		t.Errorf("cross-chat snapshot err = %v, want 'different chat'", crossErr)
+	} else if strings.Contains(crossErr.Error(), "222") || strings.Contains(crossErr.Error(), "111") {
+		t.Errorf("cross-chat refusal names a chat id — it must not: %v", crossErr)
+	}
+	// The ctx-aware entry points read the chat from the approval
+	// context: same chat validates, another chat refuses, and a
+	// context with no chat (chat 0) is its own binding.
+	ctxA := permissions.WithApprovalContext(context.Background(), chatA, chatA)
+	ctxB := permissions.WithApprovalContext(context.Background(), chatB, chatB)
+	if err := ValidateGroundSnapshot(ctxA, id1, 1); err != nil {
+		t.Errorf("ValidateGroundSnapshot(same chat) = %v, want nil", err)
+	}
+	if err := ValidateGroundSnapshot(ctxB, id1, 1); err == nil || !strings.Contains(err.Error(), "different chat") {
+		t.Errorf("ValidateGroundSnapshot(other chat) err = %v, want 'different chat'", err)
+	}
+	if _, err := GroundSnapshotElementCentre(ctxA, id1, 2); err != nil {
+		t.Errorf("GroundSnapshotElementCentre(same chat) = %v, want nil", err)
+	}
+	if _, err := GroundSnapshotElementCentre(ctxB, id1, 2); err == nil {
+		t.Errorf("GroundSnapshotElementCentre(other chat) = nil, want a refusal")
+	}
 	// Older than the 60 s TTL: refused even though it is newest.
-	if err := r.validate(id1, 1, now.Add(61*time.Second)); err == nil || !strings.Contains(err.Error(), "old") {
+	if err := r.validate(id1, chatA, 1, now.Add(61*time.Second)); err == nil || !strings.Contains(err.Error(), "old") {
 		t.Errorf("61s-old snapshot err = %v, want stale-age refusal", err)
 	}
 	// A newer grounding supersedes the old one.
 	id2 := "g-test-2"
-	r.register(id2, now.Add(time.Second), []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}})
-	if err := r.validate(id1, 1, now.Add(2*time.Second)); err == nil || !strings.Contains(err.Error(), "superseded") {
+	r.register(id2, chatA, now.Add(time.Second), []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}})
+	if err := r.validate(id1, chatA, 1, now.Add(2*time.Second)); err == nil || !strings.Contains(err.Error(), "superseded") {
 		t.Errorf("superseded snapshot err = %v, want 'superseded'", err)
 	}
-	if err := r.validate(id2, 1, now.Add(2*time.Second)); err != nil {
+	if err := r.validate(id2, chatA, 1, now.Add(2*time.Second)); err != nil {
 		t.Errorf("newest snapshot validate = %v, want nil", err)
 	}
 	// Retention: only the last 3 snapshots are kept — the 4th
@@ -592,12 +619,12 @@ func TestGroundSnapshotRegistry(t *testing.T) {
 	base := time.Now()
 	ids := []string{"g-a", "g-b", "g-c", "g-d"}
 	for i, id := range ids {
-		r.register(id, base.Add(time.Duration(i)*time.Second), []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}})
+		r.register(id, chatA, base.Add(time.Duration(i)*time.Second), []groundElement{{ID: 1, Centre: groundPoint{X: 10, Y: 10}}})
 	}
-	if err := groundSnapshots.validate("g-a", 1, base.Add(4*time.Second)); err == nil || !strings.Contains(err.Error(), "not available") {
+	if err := groundSnapshots.validate("g-a", chatA, 1, base.Add(4*time.Second)); err == nil || !strings.Contains(err.Error(), "not available") {
 		t.Errorf("evicted snapshot err = %v, want 'not available'", err)
 	}
-	if err := groundSnapshots.validate("g-d", 1, base.Add(4*time.Second)); err != nil {
+	if err := groundSnapshots.validate("g-d", chatA, 1, base.Add(4*time.Second)); err != nil {
 		t.Errorf("newest of 4 validate = %v, want nil", err)
 	}
 }
@@ -619,6 +646,21 @@ func TestGroundSnapshotIDsUnique(t *testing.T) {
 	// Two groundings in the same second still differ (random suffix).
 	if a, b := newSnapshotID(env.clock), newSnapshotID(env.clock); a == b {
 		t.Errorf("same-second snapshot ids collide: %q", a)
+	}
+	// F-A23W2-19: the random suffix is 8 bytes (64-bit entropy),
+	// not 2 — 65,536 possibilities per second could collide
+	// across two chats grounding in the same second.
+	id := newSnapshotID(env.clock)
+	parts := strings.Split(id, "-")
+	suffix := parts[len(parts)-1]
+	if len(suffix) != 16 {
+		t.Errorf("snapshot id %q has a %d-char random suffix, want 16 hex chars (64-bit)", id, len(suffix))
+	}
+	for _, c := range suffix {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			t.Errorf("snapshot id %q suffix %q is not lowercase hex", id, suffix)
+			break
+		}
 	}
 }
 
