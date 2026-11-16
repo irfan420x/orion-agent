@@ -563,16 +563,35 @@ func matchKWinVisible(w atspiWindow, kwin []kwinWindow) []kwinCandidate {
 	return visible
 }
 
-// kwinActiveWindow returns the first active KWin window, or nil
-// when none is active (F-M2R-37): KWin knows which window is
-// active even when AT-SPI never sets FOCUSED.
-func kwinActiveWindow(kwin []kwinWindow) *kwinWindow {
-	for i := range kwin {
-		if kwin[i].Active {
-			return &kwin[i]
+// kwinActiveWindowRef resolves the KWin active window to a
+// (title, app) pair for focused_window (F-M2R-37): KWin knows
+// which window is active even when AT-SPI never sets FOCUSED.
+// The title comes from the AT-SPI window matched to the active
+// KWin window — KWin reports no titles (F-M2R-15) — and the app
+// is the KWin resource class. The match is the same class+size
+// rule as the geometry correction; an ambiguous or missing
+// match yields nothing and the caller falls back to the
+// screenshot tool's xdotool value.
+func kwinActiveWindowRef(tree *atspiOutput, kwin []kwinWindow) (string, string, bool) {
+	active := kwinActiveWindow(kwin)
+	if tree == nil || active == nil {
+		return "", "", false
+	}
+	var found *atspiWindow
+	for i := range tree.Windows {
+		for _, m := range matchKWinCandidates(tree.Windows[i], kwin) {
+			if m.kw == *active {
+				if found != nil {
+					return "", "", false // ambiguous
+				}
+				found = &tree.Windows[i]
+			}
 		}
 	}
-	return nil
+	if found == nil {
+		return "", "", false
+	}
+	return found.Title, active.Class, true
 }
 
 // kwinMinimizedWindowIndexes returns the AT-SPI window indexes
@@ -979,7 +998,7 @@ func newGroundToolWithBudget(budget *CaptureBudget, owner bool) *groundTool {
 func (t *groundTool) Name() string { return "ground" }
 
 func (t *groundTool) Description() string {
-	return "Ground the screen: capture a screenshot with numbered markers and return the exact name, role and bounding box of every interactive element on screen, so a click can target an element number instead of a guessed coordinate. Read-only on the desktop: it takes no input from the screen and changes nothing. DISCLOSURE: the captured image is sent to the model provider (data leaves this machine) — this call is gated and needs approval. Returns a snapshot_id plus the element list; a later click must quote that snapshot_id and an element id from it (stale snapshots are refused). When no accessibility tree is available the screenshot is still returned with an empty element list and coverage \"vision_only\" — never faked elements. The walk visits every window (focused window first, each with its own node budget), the element list is shared fairly across windows, and when the walk or the list is truncated the summary says so (truncated plus per-window counts) — a window with 0 listed elements was not reached, so re-ground with a region zoom on it. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns."
+	return "Ground the screen: capture a screenshot with numbered markers and return the exact name, role and bounding box of every interactive element on screen, so a click can target an element number instead of a guessed coordinate. Read-only on the desktop: it takes no input from the screen and changes nothing. DISCLOSURE: the captured image is sent to the model provider (data leaves this machine) — this call is gated and needs approval. Returns a snapshot_id plus the element list; a later click must quote that snapshot_id and an element id from it (stale snapshots are refused). When no accessibility tree is available the screenshot is still returned with an empty element list and coverage \"vision_only\" — never faked elements — unless this model cannot see images, in which case that is an error instead. The walk visits every window (focused window first, each with its own node budget), the element list is shared fairly across windows, and when the walk or the list is truncated the summary says so (truncated plus per-window counts) — a window with 0 listed elements was not reached, so re-ground with a region zoom on it. Refuses on sensitive windows (password manager / bank / payment / one-time-code) and in unattended (cron) turns."
 }
 
 func (t *groundTool) Definition() model.ToolDefinition {
@@ -1171,6 +1190,18 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	walkEnd := time.Now()
 	if tree == nil && ctx.Err() == context.DeadlineExceeded {
 		return failed("ground time budget of %v exceeded during the accessibility walk", groundTimeBudget)
+	}
+
+	// vision_only is a coverage mode only for a model that can
+	// see: on a non-vision model the returned image is unusable,
+	// so a tree-less grounding is an error, not a result
+	// (F-M2R-32). The model is known only when the caller marked
+	// the context (WithVisionSupport); unknown keeps the old
+	// vision_only behaviour — tools must not guess the model.
+	if tree == nil {
+		if supported, known := VisionSupportedFromContext(ctx); known && !supported {
+			return failed("no accessibility tree is available and this model cannot see images: grounding is unavailable without a tree — the screenshot would be unusable")
+		}
 	}
 
 	// KWin geometry correction (F2) + the KWin sensitive source
@@ -1372,10 +1403,13 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 	// window (F-M2R-37 — AT-SPI never sets FOCUSED live, so every
 	// summary showed focused_window null even with Firefox
 	// active); fall back to the screenshot tool's xdotool value.
+	// The KWin leg's title comes from the AT-SPI window matched
+	// to the active KWin window (F-M2R-15: KWin reports no
+	// titles); the app is the KWin resource class.
 	if tree != nil && tree.FocusedWindow != nil && tree.FocusedWindow.Title != "" {
 		summary.FocusedWindow = &groundWindowRef{Title: tree.FocusedWindow.Title, App: tree.FocusedWindow.App}
-	} else if active := kwinActiveWindow(kwin); active != nil {
-		summary.FocusedWindow = &groundWindowRef{Title: active.Caption, App: active.Class}
+	} else if title, app, ok := kwinActiveWindowRef(tree, kwin); ok {
+		summary.FocusedWindow = &groundWindowRef{Title: title, App: app}
 	} else if shotSummary.FocusedWindow != "" {
 		summary.FocusedWindow = &groundWindowRef{Title: shotSummary.FocusedWindow}
 	}

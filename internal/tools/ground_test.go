@@ -604,6 +604,57 @@ func TestGroundHiddenElementsExcluded(t *testing.T) {
 	}
 }
 
+// TestGroundVisionOnlyNonVisionModelErrors pins F-M2R-32:
+// "vision_only" is a coverage mode only for a model that can see.
+// On a model the context marks as non-vision, a tree-less
+// grounding is an error — the image would be unusable — not a
+// result. An unmarked context (unknown model) keeps the old
+// vision_only behaviour.
+func TestGroundVisionOnlyNonVisionModelErrors(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helperOK = false
+	ctx := WithVisionSupport(context.Background(), false)
+	_, err := env.tool.ExecuteResult(ctx, json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("non-vision model with no tree should error, not return vision_only")
+	}
+	if !strings.Contains(err.Error(), "cannot see images") {
+		t.Errorf("error = %v, want the non-vision refusal", err)
+	}
+	if env.captures != 0 {
+		t.Errorf("non-vision refusal still captured %d screenshot(s)", env.captures)
+	}
+	// Supported model: vision_only as before. The KWin list
+	// (empty, nothing sensitive) is what lets the grounding
+	// past the F-M2R-5 fail-closed check — with no tree AND no
+	// KWin list the screen cannot be verified at all.
+	env2 := newFakeGroundEnv(t)
+	env2.helperOK = false
+	env2.kwinOK = true
+	env2.kwin = `{"kwin_windows": []}`
+	res, err := env2.tool.ExecuteResult(WithVisionSupport(context.Background(), true), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("vision model with no tree err = %v, want vision_only", err)
+	}
+	if s := parseGroundSummary(t, res); s.Coverage != "vision_only" {
+		t.Errorf("coverage = %q, want vision_only", s.Coverage)
+	}
+	// Unknown model (unmarked context): vision_only as before
+	// (KWin list present, as above, so F-M2R-5 passes).
+	env3 := newFakeGroundEnv(t)
+	env3.helperOK = false
+	env3.kwinOK = true
+	env3.kwin = `{"kwin_windows": []}`
+	res, err = env3.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("unknown model with no tree err = %v, want vision_only", err)
+	}
+	if s := parseGroundSummary(t, res); s.Coverage != "vision_only" {
+		t.Errorf("coverage = %q, want vision_only", s.Coverage)
+	}
+}
+
 func TestGroundVisionOnly(t *testing.T) {
 	resetGroundSnapshots()
 	// Helper run fails: screenshot still returned, empty list.

@@ -582,6 +582,10 @@ func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input str
 			emit(ev)
 		}
 	}
+	// F-M2R-32: tell the tools whether this chat's model can see
+	// images, so ground refuses vision_only on a non-vision model
+	// instead of returning an unusable image as a coverage mode.
+	ctx = tools.WithVisionSupport(ctx, model.SupportsVision(providerName, modelName))
 	reply, err := agent.RunWithEventHandlerWithImages(ctx, input, images, wrapped)
 	if stats != nil {
 		// Subagent sweep (F-A5-7): charge finished tasks the

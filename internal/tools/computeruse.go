@@ -191,6 +191,33 @@ func SensitiveVerifiedFromContext(ctx context.Context) bool {
 	return v
 }
 
+type visionSupportContextKey struct{}
+
+// WithVisionSupport returns ctx marked with whether the current
+// provider/model can see images (F-M2R-32). The agent layer
+// knows the chat's provider and model; tools do not — the marker
+// is how that fact reaches them, mirroring WithUnattendedTurn.
+// A context that was never marked is "unknown": tools keep their
+// previous behaviour (vision_only) instead of guessing.
+func WithVisionSupport(ctx context.Context, supported bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, visionSupportContextKey{}, supported)
+}
+
+// VisionSupportedFromContext reports whether the current
+// provider/model can see images, and whether that is known at
+// all: (supported, known). Unknown (false) means no caller set
+// the marker — the tool must not treat unknown as unsupported.
+func VisionSupportedFromContext(ctx context.Context) (bool, bool) {
+	if ctx == nil {
+		return false, false
+	}
+	v, ok := ctx.Value(visionSupportContextKey{}).(bool)
+	return v, ok
+}
+
 // sensitiveWindowTitles are case-insensitive substrings of window
 // titles that mark a window as sensitive: password managers,
 // banks/payment/crypto apps, vaults and OTP/2FA dialogs. The list

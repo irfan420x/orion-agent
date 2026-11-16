@@ -616,6 +616,11 @@ func (a *App) Handle(ctx context.Context, input string) (string, error) {
 		providerName = p.Name()
 	}
 	ctx = tools.WithVisionInfo(ctx, providerName, a.activeModel())
+	// F-M2R-32: also tell the tools directly whether this model
+	// can see images, so ground refuses vision_only on a
+	// non-vision model instead of returning an unusable image
+	// as a coverage mode.
+	ctx = tools.WithVisionSupport(ctx, model.SupportsVision(a.defaultProviderName(), a.activeModel()))
 	reply, err := a.agent().Run(ctx, input)
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))

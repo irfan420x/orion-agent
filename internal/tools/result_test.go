@@ -164,3 +164,21 @@ func TestUnattendedTurnContext(t *testing.T) {
 		t.Errorf("UnattendedTurnFromContext(gate-marked) = false, want true")
 	}
 }
+
+func TestVisionSupportContext(t *testing.T) {
+	ctx := context.Background()
+	if supported, known := VisionSupportedFromContext(ctx); known || supported {
+		t.Errorf("VisionSupportedFromContext(background) = (%v, %v), want (false, false)", supported, known)
+	}
+	if _, known := VisionSupportedFromContext(nil); known {
+		t.Errorf("VisionSupportedFromContext(nil) known = true, want false")
+	}
+	marked := WithVisionSupport(ctx, false)
+	if supported, known := VisionSupportedFromContext(marked); !known || supported {
+		t.Errorf("VisionSupportedFromContext(marked false) = (%v, %v), want (false, true)", supported, known)
+	}
+	marked = WithVisionSupport(ctx, true)
+	if supported, known := VisionSupportedFromContext(marked); !known || !supported {
+		t.Errorf("VisionSupportedFromContext(marked true) = (%v, %v), want (true, true)", supported, known)
+	}
+}
