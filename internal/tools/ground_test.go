@@ -508,6 +508,45 @@ func TestGroundButtonRoleIncluded(t *testing.T) {
 // drop showing=false elements, keep showing=true ones, and keep
 // elements with no showing field (back-compat: a failed state
 // query must never drop an element).
+// TestGroundTextRoleIncluded pins the F-M2R-20 rationale:
+// Firefox reports multi-line text inputs (<textarea>,
+// contenteditable) with role "text", not "entry", so the default
+// roles must include "text" or those inputs are ungroundable.
+// Static text runs share the role (the flood risk the finding
+// flags); this test pins only that the editable case is listed —
+// the dense-page flood check is a live check, still outstanding.
+func TestGroundTextRoleIncluded(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.helper = `{"windows": [
+		{"title": "Comment — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 993}],
+	"elements": [
+		{"role": "text", "name": "Write a comment", "x": 100, "y": 200, "w": 400, "h": 120, "showing": true},
+		{"role": "entry", "name": "Title", "x": 100, "y": 100, "w": 400, "h": 40, "showing": true},
+		{"role": "button", "name": "Submit", "x": 100, "y": 340, "w": 100, "h": 40, "showing": true}],
+	"focused_window": {"title": "Comment — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 50}`
+	res := env.call(t, `{}`)
+	s := parseGroundSummary(t, res)
+	if len(s.Elements) != 3 {
+		t.Fatalf("got %d elements, want 3: %+v", len(s.Elements), s.Elements)
+	}
+	byName := make(map[string]groundElement, len(s.Elements))
+	for _, el := range s.Elements {
+		byName[el.Name] = el
+	}
+	ta, ok := byName["Write a comment"]
+	if !ok {
+		t.Fatalf("textarea %q missing from the element list", "Write a comment")
+	}
+	if ta.Role != "text" {
+		t.Errorf("textarea role = %q, want text", ta.Role)
+	}
+	if ta.Box != (groundBox{X: 100, Y: 200, W: 400, H: 120}) {
+		t.Errorf("textarea box = %+v, want {100 200 400 120}", ta.Box)
+	}
+}
+
 func TestGroundHiddenElementsExcluded(t *testing.T) {
 	resetGroundSnapshots()
 	env := newFakeGroundEnv(t)

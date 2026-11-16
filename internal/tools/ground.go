@@ -229,6 +229,20 @@ const (
 // here: tabs are a separate switching affordance, and list
 // items / canvases / menus are containers or non-button surfaces
 // whose nodes would add noise.
+//
+// "text" is in the set deliberately (F-M2R-20): Firefox reports
+// multi-line text inputs (<textarea>, contenteditable) with role
+// "text", not "entry" — without it those inputs are
+// ungroundable. The cost is real: static text runs report as
+// "text" too, so on a text-heavy page the role can flood the
+// max_elements cap in tree order ahead of the buttons below it.
+// That flood is bounded, not prevented: the cap and tree order
+// are the only mitigation, and no dense text-heavy page has been
+// grounded live yet — that live check is still outstanding (needs
+// the laptop). If it floods, the fix is to split the role (keep
+// editable "text", drop static runs) or to rank actionable roles
+// first, not to drop "text" outright: dropping it would lose
+// every textarea.
 var defaultInteractiveRoles = []string{
 	"push button", "button", "link", "entry", "text", "password text",
 	"check box", "radio button", "toggle button", "push button menu",
