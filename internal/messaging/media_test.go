@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
@@ -320,6 +321,39 @@ func TestValidateMediaPathDenylist(t *testing.T) {
 	}
 }
 
+// TestValidateMediaPathProcDenied pins F-M1: /proc/self/environ
+// (the daemon's live environment, including any secret passed via
+// env vars) must be refused, and so must /sys and /dev. Proc files
+// report size 0, so the size cap never binds — the denylist is the
+// only line of defence here. The /dev and /sys paths are checked
+// through mediaPathDenied directly: /dev holds no regular files to
+// validate end-to-end, and /sys files are kernel-owned.
+func TestValidateMediaPathProcDenied(t *testing.T) {
+	allow := t.TempDir()
+	for _, p := range []string{"/proc/self/environ", "/proc/version", "/proc/self/cmdline"} {
+		if _, err := os.Stat(p); err != nil {
+			t.Skipf("%s not present in this environment: %v", p, err)
+		}
+		if _, _, reason := validateMediaPath(p, []string{allow}, 50<<20); reason != "that path is never sendable" {
+			t.Errorf("validateMediaPath(%s): reason=%q, want %q", p, reason, "that path is never sendable")
+		}
+	}
+	for _, p := range []string{"/proc/self/environ", "/proc/version", "/sys/kernel/ostype", "/dev/null", "/dev/zero"} {
+		if !mediaPathDenied(p) {
+			t.Errorf("mediaPathDenied(%q) = false, want true", p)
+		}
+	}
+	// A symlink inside the allowed dir pointing at /proc/self/environ
+	// must be refused too: the denylist is checked on the resolved path.
+	link := filepath.Join(allow, "env.txt")
+	if err := os.Symlink("/proc/self/environ", link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, _, reason := validateMediaPath(link, []string{allow}, 50<<20); reason != "that path is never sendable" {
+		t.Errorf("symlink to /proc/self/environ: reason=%q, want %q", reason, "that path is never sendable")
+	}
+}
+
 func TestValidateMediaPathSymlinkEscape(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -342,6 +376,53 @@ func TestValidateMediaPathSymlinkEscape(t *testing.T) {
 	}
 	if resolved, _, reason := validateMediaPath(good, []string{allow}, 50<<20); reason != "" || resolved != real {
 		t.Fatalf("symlink to allowed file: resolved=%q reason=%q, want %q", resolved, reason, real)
+	}
+}
+
+// TestValidateMediaPathHardlinkRefused pins F-A23W2-6: a hard link
+// inside an allowed dir pointing at a denied file must be refused.
+// EvalSymlinks cannot see a hard link — the resolved path is the
+// allowed alias, not the denied target — so the nlink>1 check is
+// the only defence. Repro from the audit: ln
+// ~/.orion/config.json ~/Downloads/report.json, then
+// MEDIA:~/Downloads/report.json must not send the config.
+func TestValidateMediaPathHardlinkRefused(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	allow := t.TempDir()
+	secret := writeMediaFile(t, filepath.Join(home, ".orion"), "config.json", `{"token":"x"}`)
+	link := filepath.Join(allow, "report.json")
+	if err := os.Link(secret, link); err != nil {
+		t.Skipf("hard links unavailable in this environment: %v", err)
+	}
+	if _, _, reason := validateMediaPath(link, []string{allow}, 50<<20); reason != "file has more than one hard link; refusing to send" {
+		t.Fatalf("hard link to denied file: reason=%q, want the hard-link refusal", reason)
+	}
+	// A hard link to an allowed file is refused too: the check is
+	// on the link count, not on where the other name lives — the
+	// validator cannot know the other name is safe.
+	real := writeMediaFile(t, allow, "real.csv", "a,b\n")
+	alias := filepath.Join(allow, "alias.csv")
+	if err := os.Link(real, alias); err != nil {
+		t.Fatalf("hard link to allowed file: %v", err)
+	}
+	if _, _, reason := validateMediaPath(alias, []string{allow}, 50<<20); reason != "file has more than one hard link; refusing to send" {
+		t.Fatalf("hard link to allowed file: reason=%q, want the hard-link refusal", reason)
+	}
+	// End to end: the tag is replaced by a visible refusal note
+	// and nothing reaches the server.
+	fake := &mediaFake{}
+	g, _ := mediaGateway(t, fake, allow)
+	cleaned, report := g.deliverMedia(context.Background(), 77, "Here.\nMEDIA:"+link+"\n")
+	calls, _ := fake.snapshot()
+	if len(calls) != 0 {
+		t.Fatalf("server saw %d file calls, want 0 (hardlinked file must not be sent)", len(calls))
+	}
+	if strings.Contains(cleaned, "MEDIA:") {
+		t.Errorf("cleaned reply still contains a MEDIA: line: %q", cleaned)
+	}
+	if !strings.Contains(report, "more than one hard link") {
+		t.Errorf("report = %q, want the hard-link refusal", report)
 	}
 }
 
@@ -421,7 +502,9 @@ func TestValidateMediaPathAllowlist(t *testing.T) {
 
 // TestMediaDenylistSupersetOfSensitiveDirs pins that the media
 // denylist contains every entry of internal/tools sensitiveDirs()
-// (files.go: ~/.orion, ~/.ssh, ~/.gnupg) plus /etc. sensitiveDirs()
+// (files.go: ~/.orion, ~/.ssh, ~/.gnupg) plus /etc and the virtual
+// filesystems /proc, /sys and /dev (F-M1: /proc/self/environ must
+// never be sendable). sensitiveDirs()
 // is unexported in another package, so the three literals are
 // asserted here with a comment pointing at it; if the file-tools
 // list ever gains an entry, this test must gain it too.
@@ -434,6 +517,9 @@ func TestMediaDenylistSupersetOfSensitiveDirs(t *testing.T) {
 		filepath.Join(home, ".ssh"),   // sensitiveDirs() in internal/tools/files.go
 		filepath.Join(home, ".gnupg"), // sensitiveDirs() in internal/tools/files.go
 		"/etc",
+		"/proc", // F-M1: /proc/self/environ exposes daemon env secrets
+		"/sys",  // F-M1: kernel state, same class as /proc
+		"/dev",  // F-M1: device nodes, same class as /proc
 	}
 	for _, w := range want {
 		found := false
@@ -615,6 +701,252 @@ func TestCallMultipartStreams(t *testing.T) {
 		if b != 0 {
 			t.Fatalf("byte %d = %d, want 0 (sparse file)", i, b)
 		}
+	}
+}
+
+// TestCallMultipartReverifiesAfterSwap pins F-A23W2-12: the upload
+// re-verifies the opened file (O_NOFOLLOW + fd-path check +
+// denylist/size/hard-link re-checks), so a file swapped between
+// validation and open is refused before a byte is read. Each case
+// validates first (success), swaps the file, then uploads (must
+// fail, with nothing reaching the server).
+func TestCallMultipartReverifiesAfterSwap(t *testing.T) {
+	t.Run("path swapped to symlink at denied file", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		allow := t.TempDir()
+		p := writeMediaFile(t, allow, "report.csv", "a,b\n")
+		if _, _, reason := validateMediaPath(p, []string{allow}, 50<<20); reason != "" {
+			t.Fatalf("validate before swap: reason=%q, want success", reason)
+		}
+		secret := writeMediaFile(t, filepath.Join(home, ".orion"), "config.json", `{"token":"x"}`)
+		if err := os.Remove(p); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if err := os.Symlink(secret, p); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		fake := &mediaFake{}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+		g := newTestGateway(t, srv)
+		err := g.SendDocument(context.Background(), 77, p)
+		if err == nil {
+			t.Fatal("SendDocument(swapped to symlink at denied file): expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("error = %q, want it to name the symlink refusal", err)
+		}
+		if calls, _ := fake.snapshot(); len(calls) != 0 {
+			t.Fatalf("server saw %d file calls, want 0", len(calls))
+		}
+	})
+
+	t.Run("parent dir swapped to symlink", func(t *testing.T) {
+		base := t.TempDir()
+		dir := filepath.Join(base, "dir")
+		p := writeMediaFile(t, dir, "report.csv", "a,b\n")
+		if _, _, reason := validateMediaPath(p, []string{dir}, 50<<20); reason != "" {
+			t.Fatalf("validate before swap: reason=%q, want success", reason)
+		}
+		other := filepath.Join(base, "other")
+		writeMediaFile(t, other, "report.csv", "DIFFERENT\n")
+		moved := filepath.Join(base, "moved")
+		if err := os.Rename(dir, moved); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		if err := os.Symlink(other, dir); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		fake := &mediaFake{}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+		g := newTestGateway(t, srv)
+		err := g.SendDocument(context.Background(), 77, p)
+		if err == nil {
+			t.Fatal("SendDocument(swapped parent dir): expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "changed during upload") {
+			t.Errorf("error = %q, want the changed-during-upload refusal", err)
+		}
+		if calls, _ := fake.snapshot(); len(calls) != 0 {
+			t.Fatalf("server saw %d file calls, want 0", len(calls))
+		}
+	})
+
+	t.Run("hard link added after validation", func(t *testing.T) {
+		allow := t.TempDir()
+		p := writeMediaFile(t, allow, "report.csv", "a,b\n")
+		if _, _, reason := validateMediaPath(p, []string{allow}, 50<<20); reason != "" {
+			t.Fatalf("validate before swap: reason=%q, want success", reason)
+		}
+		if err := os.Link(p, filepath.Join(allow, "second.csv")); err != nil {
+			t.Skipf("hard links unavailable in this environment: %v", err)
+		}
+		fake := &mediaFake{}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+		g := newTestGateway(t, srv)
+		err := g.SendDocument(context.Background(), 77, p)
+		if err == nil {
+			t.Fatal("SendDocument(hard link added after validation): expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "hard link") {
+			t.Errorf("error = %q, want the hard-link refusal", err)
+		}
+		if calls, _ := fake.snapshot(); len(calls) != 0 {
+			t.Fatalf("server saw %d file calls, want 0", len(calls))
+		}
+	})
+
+	t.Run("direct Send of a symlink is refused", func(t *testing.T) {
+		allow := t.TempDir()
+		real := writeMediaFile(t, allow, "real.csv", "a,b\n")
+		link := filepath.Join(allow, "alias.csv")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		fake := &mediaFake{}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+		g := newTestGateway(t, srv)
+		// No validateMediaPath call here: the exported Send*
+		// methods are self-defending at upload time.
+		if err := g.SendDocument(context.Background(), 77, link); err == nil {
+			t.Fatal("SendDocument(symlink, direct): expected error, got nil")
+		}
+		if calls, _ := fake.snapshot(); len(calls) != 0 {
+			t.Fatalf("server saw %d file calls, want 0", len(calls))
+		}
+	})
+}
+
+// TestCallMultipartEnforcesCapWhileStreaming pins F-A23W2-24: a file
+// that grows mid-upload must not exceed the size cap on the wire.
+// The file starts at 8 MiB under a 10 MiB cap; the server reads
+// slowly, so the pipe backpressures and the writer is still copying
+// when a background appender grows the file past the cap — the
+// upload must then abort, and the server must never receive more
+// than the cap in file bytes. (A small file cannot exercise this:
+// the writer races ahead through socket buffers and finishes
+// before the file grows, in which case no byte over the cap is
+// ever sent and the upload legitimately succeeds.)
+func TestCallMultipartEnforcesCapWhileStreaming(t *testing.T) {
+	const limit = 10 << 20
+	const initial = 8 << 20
+	dir := t.TempDir()
+	p := filepath.Join(dir, "growing.bin")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := f.Truncate(initial); err != nil {
+		f.Close()
+		t.Fatalf("truncate: %v", err)
+	}
+	f.Close()
+
+	// Slow counting server: reads the file part in 64 KiB chunks
+	// with a 10 ms pause between them, counting the file bytes it
+	// actually receives; a fully-read upload gets an ok envelope.
+	var mu sync.Mutex
+	var fileBytes int64
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		w.Header().Set("Content-Type", "application/json")
+		mt, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mt != "multipart/form-data" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mr := multipart.NewReader(r.Body, params["boundary"])
+		buf := make([]byte, 64<<10)
+		for {
+			part, err := mr.NextPart()
+			if err != nil {
+				if err == io.EOF {
+					w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+				}
+				return
+			}
+			if part.FileName() == "" {
+				_, _ = io.ReadAll(part)
+				_ = part.Close()
+				continue
+			}
+			var sinceSleep int64
+			for {
+				n, rerr := part.Read(buf)
+				mu.Lock()
+				fileBytes += int64(n)
+				mu.Unlock()
+				sinceSleep += int64(n)
+				if rerr != nil {
+					break
+				}
+				// Throttle by bytes actually read, not per Read
+				// call: multipart may return small chunks, and a
+				// sleep per call would stall the drain to
+				// ~400 KiB/s. ~6.4 MB/s here.
+				if sinceSleep >= 64<<10 {
+					sinceSleep = 0
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			_ = part.Close()
+		}
+	}))
+	defer srv.Close()
+
+	// Grow the file far faster than the server can read it.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		af, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			return
+		}
+		defer af.Close()
+		chunk := make([]byte, 32<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := af.Write(chunk); err != nil {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	mc := config.MediaDeliveryConfig{Enabled: true, MaxFiles: 5, MaxBytes: limit}
+	g, err := NewTelegramGateway(testToken, WithBaseURL(srv.URL), WithMediaDelivery(mc))
+	if err != nil {
+		t.Fatalf("NewTelegramGateway: %v", err)
+	}
+	err = g.SendDocument(context.Background(), 77, p)
+	if err == nil {
+		t.Fatal("SendDocument(growing file): expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "grew past") {
+		t.Errorf("error = %q, want the grew-past-the-cap refusal", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("slow server handler did not finish within 10s")
+	}
+	mu.Lock()
+	got := fileBytes
+	mu.Unlock()
+	if got > limit {
+		t.Errorf("server received %d file bytes, want at most the %d-byte cap", got, limit)
+	}
+	if got < 1<<20 {
+		t.Errorf("server received only %d file bytes, want the upload to have been well underway", got)
 	}
 }
 

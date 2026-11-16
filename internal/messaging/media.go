@@ -31,6 +31,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/irfan/orion/internal/config"
@@ -148,23 +149,30 @@ func mediaWithin(path, dir string) bool {
 
 // mediaDenylistDirs returns the directories no media file may ever
 // come from, checked on the RESOLVED path: the agent's own state
-// dir, the SSH and GPG key dirs, and /etc. It mirrors
+// dir, the SSH and GPG key dirs, /etc, and the virtual filesystems
+// /proc, /sys and /dev — whose files can expose live process state
+// (F-M1: /proc/self/environ carries the daemon's environment,
+// including any secret passed via env vars, and proc files report
+// size 0 so the size cap never binds). It mirrors
 // internal/tools sensitiveDirs() (files.go) — which denies ~/.orion,
-// ~/.ssh and ~/.gnupg for the file tools — plus /etc. If
-// sensitiveDirs() ever gains an entry, this list must gain it too
-// (pinned by TestMediaDenylistSupersetOfSensitiveDirs). The
-// denylist is absolute: no override, no approval can lift it, not
-// even the owner.
+// ~/.ssh and ~/.gnupg for the file tools — plus /etc, /proc, /sys
+// and /dev. If sensitiveDirs() ever gains an entry, this list must
+// gain it too (pinned by TestMediaDenylistSupersetOfSensitiveDirs).
+// The denylist is absolute: no override, no approval can lift it,
+// not even the owner.
 func mediaDenylistDirs() []string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return []string{"/etc"}
+		return []string{"/etc", "/proc", "/sys", "/dev"}
 	}
 	return []string{
 		filepath.Join(home, ".orion"),
 		filepath.Join(home, ".ssh"),
 		filepath.Join(home, ".gnupg"),
 		"/etc",
+		"/proc",
+		"/sys",
+		"/dev",
 	}
 }
 
@@ -287,9 +295,13 @@ func resolveMediaAllowDirs(dirs []string) []string {
 //     a missing file is refused as "not found")
 //  3. regular-file check on the resolved path (no dirs, devices,
 //     sockets or FIFOs)
-//  4. denylist on the resolved path (absolute, non-overridable)
-//  5. size against maxBytes (clamped to the 50 MiB Bot API limit)
-//  6. allowlist, only when explicitly configured: an explicit
+//  4. hard-link check: a regular file with more than one hard link
+//     is refused outright (F-A23W2-6) — a hard link inside an
+//     allowed dir can point at a denied file, and EvalSymlinks
+//     cannot see it. Same rule as file_read (files.go, F-A5-P2-30).
+//  5. denylist on the resolved path (absolute, non-overridable)
+//  6. size against maxBytes (clamped to the 50 MiB Bot API limit)
+//  7. allowlist, only when explicitly configured: an explicit
 //     media_allow_dirs restricts delivery to those dirs. With no
 //     explicit list the default is denylist-only — any path that
 //     passed the checks above may be sent, from anywhere on the
@@ -329,6 +341,16 @@ func validateMediaPath(path string, allowDirs []string, maxBytes int64) (resolve
 	}
 	if !info.Mode().IsRegular() {
 		return "", 0, "is not a regular file"
+	}
+	// A hardlinked regular file is refused outright (F-A23W2-6):
+	// a hard link inside an allowed dir can point at a denied
+	// file (e.g. ~/.orion/config.json), and EvalSymlinks cannot
+	// see it — the resolved path is the allowed alias, not the
+	// denied target. Same rule as file_read (files.go, F-A5-P2-30):
+	// ordinary files have nlink=1, and a hardlinked file is
+	// refused with a clear reason instead of sent.
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+		return "", 0, "file has more than one hard link; refusing to send"
 	}
 	if mediaPathDenied(resolvedPath) {
 		return "", 0, "that path is never sendable"
@@ -544,7 +566,11 @@ const mediaUploadTimeout = 10 * time.Minute
 // g.client's Transport (falling back to http.DefaultTransport),
 // so proxy behaviour is shared and the context carries the
 // 10-minute per-file deadline. filePath must be the resolved path
-// validation returned, never the raw tag path.
+// validation returned, never the raw tag path. The file is opened
+// with openVerifiedMediaFile (F-A23W2-12): O_NOFOLLOW + fd-path
+// verification + denylist/size/hard-link re-checks on the opened
+// descriptor, so a file swapped between validation and open is
+// refused before a byte is read.
 func (g *TelegramGateway) callMultipart(ctx context.Context, method, fieldName, filePath string, chatID int64) (json.RawMessage, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -552,7 +578,7 @@ func (g *TelegramGateway) callMultipart(ctx context.Context, method, fieldName, 
 	ctx, cancel := context.WithTimeout(ctx, mediaUploadTimeout)
 	defer cancel()
 
-	f, err := os.Open(filePath)
+	f, err := openVerifiedMediaFile(filePath, g.mediaCfg.MaxBytes)
 	if err != nil {
 		return nil, fmt.Errorf("messaging: telegram %s: open file: %w", method, err)
 	}
@@ -575,8 +601,24 @@ func (g *TelegramGateway) callMultipart(ctx context.Context, method, fieldName, 
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(part, f); err != nil {
+			// Enforce the size cap while streaming (F-A23W2-24):
+			// the cap was only checked at stat time, so a file
+			// growing mid-upload could exceed it. Copy at most
+			// limit bytes, then probe one more byte: if the file
+			// has more, it grew past the cap and the upload is
+			// aborted before any byte over the cap is sent. The
+			// probe byte itself is discarded, never written to
+			// the part. Same clamp as validateMediaPath.
+			limit := g.mediaCfg.MaxBytes
+			if limit <= 0 || limit > config.DefaultMediaMaxBytes {
+				limit = config.DefaultMediaMaxBytes
+			}
+			if _, err := io.Copy(part, io.LimitReader(f, limit)); err != nil {
 				return err
+			}
+			var one [1]byte
+			if n, _ := f.Read(one[:]); n > 0 {
+				return fmt.Errorf("file grew past the %s limit during upload; refusing to send more", formatMediaSize(limit))
 			}
 			return mw.Close()
 		}()
