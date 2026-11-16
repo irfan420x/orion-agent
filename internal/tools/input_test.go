@@ -450,7 +450,7 @@ func TestInputClickBySnapshotCrossChat(t *testing.T) {
 	resetGroundSnapshots()
 	groundSnapshots.register("g-cross", 111, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
-	})
+	}, nil)
 	env := newFakeInputEnv(t)
 	ctxOther := permissions.WithApprovalContext(context.Background(), 222, 222)
 	_, err := env.tool.ExecuteResult(ctxOther, json.RawMessage(`{"op": "click", "snapshot_id": "g-cross", "element_id": 1}`))
@@ -959,7 +959,7 @@ func TestInputFailedCallsDoNotEatRateLimitSlots(t *testing.T) {
 // before the cursor moves anywhere near the stale centre.
 func TestInputClickBySnapshotMovedWindow(t *testing.T) {
 	resetGroundSnapshots()
-	groundSnapshots.register("g-moved", time.Now(), []groundElement{
+	groundSnapshots.register("g-moved", 0, time.Now(), []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 403}},
 	}, map[int]WindowGeometry{
 		1: {App: "Firefox", X: 0, Y: 0, W: 1920, H: 1080},

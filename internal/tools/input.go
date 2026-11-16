@@ -934,7 +934,7 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotI
 	}
 	hit := FindSensitiveTitle(info.titles)
 	if hit == "" {
-		return t.checkSnapshotGeometry(snapshotID, elementID, info.windows)
+		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info.windows)
 	}
 	if info.sensitivePrecise {
 		for _, w := range info.windows {
@@ -945,7 +945,7 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotI
 				return fmt.Errorf("the click target (%d, %d) is inside a %s: I will not click there", x, y, SensitiveTitleCategory(w.Title))
 			}
 		}
-		return t.checkSnapshotGeometry(snapshotID, elementID, info.windows)
+		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info.windows)
 	}
 	return fmt.Errorf("this screen shows a %s: I will not click while it is visible", SensitiveTitleCategory(hit))
 }
@@ -953,7 +953,7 @@ func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotI
 // checkSnapshotGeometry verifies a snapshot click's geometry
 // binding against the fresh window list (nil when the click is
 // by coordinates — nothing is bound then).
-func (t *inputTool) checkSnapshotGeometry(snapshotID string, elementID *int, windows []atspiWindow) error {
+func (t *inputTool) checkSnapshotGeometry(ctx context.Context, snapshotID string, elementID *int, windows []atspiWindow) error {
 	if snapshotID == "" || elementID == nil {
 		return nil
 	}
@@ -961,7 +961,7 @@ func (t *inputTool) checkSnapshotGeometry(snapshotID string, elementID *int, win
 	for _, w := range windows {
 		current = append(current, WindowGeometry{App: w.App, X: w.X, Y: w.Y, W: w.W, H: w.H})
 	}
-	return CheckGroundSnapshotGeometry(snapshotID, *elementID, current)
+	return CheckGroundSnapshotGeometry(ctx, snapshotID, *elementID, current)
 }
 
 // checkRateLimit enforces the min-interval (per tool instance)

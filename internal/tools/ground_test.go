@@ -1194,7 +1194,7 @@ func TestGroundKWinHelperNoTitles(t *testing.T) {
 func TestGroundSnapshotGeometryBinding(t *testing.T) {
 	resetGroundSnapshots()
 	now := time.Now()
-	groundSnapshots.register("g-geo", now, []groundElement{
+	groundSnapshots.register("g-geo", 0, now, []groundElement{
 		{ID: 1, Centre: groundPoint{X: 960, Y: 540}},
 		{ID: 2, Centre: groundPoint{X: 200, Y: 115}},
 	}, map[int]WindowGeometry{
@@ -1204,48 +1204,48 @@ func TestGroundSnapshotGeometryBinding(t *testing.T) {
 	ff := WindowGeometry{App: "Firefox", X: 0, Y: 29, W: 1920, H: 993}
 	kate := WindowGeometry{App: "Kate", X: 0, Y: 0, W: 800, H: 600}
 	// Window unmoved: the click is bound and allowed.
-	if err := CheckGroundSnapshotGeometry("g-geo", 1, []WindowGeometry{ff, kate}); err != nil {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-geo", 1, []WindowGeometry{ff, kate}); err != nil {
 		t.Errorf("unmoved window check = %v, want nil", err)
 	}
 	// Window moved 100 px right: refused.
 	moved := ff
 	moved.X = 100
-	if err := CheckGroundSnapshotGeometry("g-geo", 1, []WindowGeometry{moved, kate}); err == nil || !strings.Contains(err.Error(), "moved or resized") {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-geo", 1, []WindowGeometry{moved, kate}); err == nil || !strings.Contains(err.Error(), "moved or resized") {
 		t.Errorf("moved window check = %v, want the moved-or-resized refusal", err)
 	}
 	// Window resized: refused.
 	resized := ff
 	resized.W = 1600
-	if err := CheckGroundSnapshotGeometry("g-geo", 1, []WindowGeometry{resized, kate}); err == nil || !strings.Contains(err.Error(), "moved or resized") {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-geo", 1, []WindowGeometry{resized, kate}); err == nil || !strings.Contains(err.Error(), "moved or resized") {
 		t.Errorf("resized window check = %v, want the moved-or-resized refusal", err)
 	}
 	// Window closed (absent from the live list): refused.
-	if err := CheckGroundSnapshotGeometry("g-geo", 1, []WindowGeometry{kate}); err == nil || !strings.Contains(err.Error(), "moved or resized") {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-geo", 1, []WindowGeometry{kate}); err == nil || !strings.Contains(err.Error(), "moved or resized") {
 		t.Errorf("closed window check = %v, want the moved-or-resized refusal", err)
 	}
 	// No live windows at all with a recorded binding: fail closed.
-	if err := CheckGroundSnapshotGeometry("g-geo", 1, nil); err == nil {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-geo", 1, nil); err == nil {
 		t.Errorf("empty live list with a binding = nil, want a refusal")
 	}
 	// The other element's binding is independent: Kate's check
 	// still passes when Firefox moved.
-	if err := CheckGroundSnapshotGeometry("g-geo", 2, []WindowGeometry{moved, kate}); err != nil {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-geo", 2, []WindowGeometry{moved, kate}); err != nil {
 		t.Errorf("Kate check with Firefox moved = %v, want nil", err)
 	}
 	// Unknown snapshot / element: the TTL/membership validation
 	// still runs first.
-	if err := CheckGroundSnapshotGeometry("g-nope", 1, []WindowGeometry{ff}); err == nil || !strings.Contains(err.Error(), "not available") {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-nope", 1, []WindowGeometry{ff}); err == nil || !strings.Contains(err.Error(), "not available") {
 		t.Errorf("unknown snapshot geometry check = %v, want 'not available'", err)
 	}
-	if err := CheckGroundSnapshotGeometry("g-geo", 99, []WindowGeometry{ff}); err == nil || !strings.Contains(err.Error(), "not in snapshot") {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-geo", 99, []WindowGeometry{ff}); err == nil || !strings.Contains(err.Error(), "not in snapshot") {
 		t.Errorf("unknown element geometry check = %v, want 'not in snapshot'", err)
 	}
 	// An element with no recorded window (untagged at ground
 	// time) has nothing to bind and passes this check.
-	groundSnapshots.register("g-untagged", now, []groundElement{
+	groundSnapshots.register("g-untagged", 0, now, []groundElement{
 		{ID: 1, Centre: groundPoint{X: 10, Y: 10}},
 	}, nil)
-	if err := CheckGroundSnapshotGeometry("g-untagged", 1, []WindowGeometry{ff}); err != nil {
+	if err := CheckGroundSnapshotGeometry(context.Background(), "g-untagged", 1, []WindowGeometry{ff}); err != nil {
 		t.Errorf("untagged element check = %v, want nil (no binding recorded)", err)
 	}
 }
@@ -1268,7 +1268,7 @@ func TestGroundRegistersWindowGeometry(t *testing.T) {
 		{App: "Firefox", X: 0, Y: 29, W: 1920, H: 993},
 		{App: "Kate", X: 0, Y: 0, W: 800, H: 600},
 	}
-	if err := CheckGroundSnapshotGeometry(s.SnapshotID, 1, corrected); err != nil {
+	if err := CheckGroundSnapshotGeometry(context.Background(), s.SnapshotID, 1, corrected); err != nil {
 		t.Errorf("corrected-geometry check = %v, want nil", err)
 	}
 	// Against the RAW AT-SPI boxes (Firefox at y=0) the binding
@@ -1277,7 +1277,7 @@ func TestGroundRegistersWindowGeometry(t *testing.T) {
 		{App: "Firefox", X: 0, Y: 0, W: 1920, H: 993},
 		{App: "Kate", X: 0, Y: 0, W: 800, H: 600},
 	}
-	if err := CheckGroundSnapshotGeometry(s.SnapshotID, 1, raw); err == nil || !strings.Contains(err.Error(), "moved or resized") {
+	if err := CheckGroundSnapshotGeometry(context.Background(), s.SnapshotID, 1, raw); err == nil || !strings.Contains(err.Error(), "moved or resized") {
 		t.Errorf("raw-geometry check = %v, want the moved-or-resized refusal", err)
 	}
 }

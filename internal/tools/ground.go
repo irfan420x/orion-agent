@@ -627,7 +627,8 @@ func GroundSnapshotElementCentre(ctx context.Context, id string, elementID int) 
 
 // CheckGroundSnapshotGeometry is the M3 input tool's geometry
 // binding (F-M2R-8): it validates (snapshot, element) exactly as
-// ValidateGroundSnapshot does, then verifies the window that
+// ValidateGroundSnapshot does — including the chat binding
+// (F-A23W2-19), read from ctx — then verifies the window that
 // held the element at ground time is still at the same app + box
 // in current (the caller's fresh window list, KWin-corrected).
 // A window that moved or resized — or is gone — refuses the
@@ -637,8 +638,8 @@ func GroundSnapshotElementCentre(ctx context.Context, id string, elementID int) 
 // supersession / membership validation still applies to it.
 // current is the live window list; an empty list with a recorded
 // binding fails closed (nothing to verify against).
-func CheckGroundSnapshotGeometry(id string, elementID int, current []WindowGeometry) error {
-	snap, err := groundSnapshots.lookup(id, elementID, time.Now())
+func CheckGroundSnapshotGeometry(ctx context.Context, id string, elementID int, current []WindowGeometry) error {
+	snap, err := groundSnapshots.lookup(id, chatIDFromContext(ctx), elementID, time.Now())
 	if err != nil {
 		return err
 	}
