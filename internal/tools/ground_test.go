@@ -938,6 +938,15 @@ func TestGroundExecuteTextMatches(t *testing.T) {
 // window 0 is Firefox (0,0,1920,993), window 1 is Kate
 // (0,0,800,600). The Sign in button's AT-SPI centre is (960,540);
 // the visible centre is (960,569) — the +29 KWin correction.
+//
+// F-M2R-27: the Kate leg is a UNIT-TEST fixture only, not live
+// behaviour. The M2 commit message says Kate does not register in
+// AT-SPI — a real Kate window would contribute no AT-SPI window
+// or elements at all, so the "Notes field" element here never
+// occurs live. The fixture exists to exercise matchKWinWindows /
+// applyWindowOffsets per-window (a shifted window next to an
+// unshifted one, plus an untagged element): do NOT cite it as
+// evidence that Kate grounds live.
 func groundTreeWithWinJSON() string {
 	return `{"windows": [
 		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 993},
