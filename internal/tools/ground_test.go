@@ -660,6 +660,28 @@ func TestGroundSensitiveRefusal(t *testing.T) {
 // by matching the caption itself (F-M2R-15: no KWin caption ever
 // reaches Go); the AT-SPI title check stays as the fallback when
 // KWin is unavailable.
+// TestGroundRefusesLockedScreen pins F-M2R-34: ground checks
+// the screen lock itself, before the KWin query and the AT-SPI
+// walk — a locked screen must not pay for a window enumeration.
+func TestGroundRefusesLockedScreen(t *testing.T) {
+	resetGroundSnapshots()
+	env := newFakeGroundEnv(t)
+	env.tool.shot.screenLocked = func(ctx context.Context) (bool, bool) { return true, true }
+	_, err := env.tool.ExecuteResult(context.Background(), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("locked screen should refuse grounding")
+	}
+	if !strings.Contains(err.Error(), "screen is locked") {
+		t.Errorf("error = %v, want the locked-screen refusal", err)
+	}
+	if env.helperCalled {
+		t.Errorf("locked-screen refusal still ran the AT-SPI walk")
+	}
+	if env.captures != 0 {
+		t.Errorf("locked-screen refusal still captured %d screenshot(s)", env.captures)
+	}
+}
+
 func TestGroundKWinTitlePrecheckRefusesBeforeWalk(t *testing.T) {
 	resetGroundSnapshots()
 	env := newFakeGroundEnv(t)

@@ -987,6 +987,18 @@ func (t *groundTool) ExecuteResult(ctx context.Context, args json.RawMessage) (T
 		return denied("%v", err)
 	}
 
+	// Screen locked (F-M2R-34): ground checks this itself, before
+	// the KWin query and the AT-SPI walk — the inner screenshot
+	// tool used to be the only check, so a locked screen still
+	// paid for a full window enumeration first. Same seam as the
+	// screenshot tool (loginctl LockedHint via shot.screenLocked).
+	// When the lock state cannot be determined (checked == false)
+	// the grounding proceeds, and a locked screen surfaces as a
+	// spectacle failure instead — never a silent capture.
+	if locked, _ := t.shot.screenLocked(ctx); locked {
+		return failed("the screen is locked (or the display is off): unlock it and ask again — I will not retry on my own")
+	}
+
 	// KWin geometry query FIRST (F-M2R-30): the compositor's window
 	// list is a cheap sensitive source, and the sensitive-window
 	// check runs on it BEFORE the AT-SPI walk. The old order walked
