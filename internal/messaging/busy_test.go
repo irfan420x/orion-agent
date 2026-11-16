@@ -400,6 +400,144 @@ func TestBusyInterruptCancelsRunningTurn(t *testing.T) {
 	}
 }
 
+// TestBusyInterruptCancelsLeftoverTurn (F-A23W3-12): an interrupt
+// arriving while a LEFTOVER turn runs must cancel the leftover —
+// not the finished main turn's dead ctx — and the redirect ack
+// must be honest. It FAILS on the old code: busyState.cancel still
+// held the main turn's turnCancel, so the interrupt cancelled
+// nothing while the leftover kept running, yet the user got a
+// "Redirected the current run" ack.
+func TestBusyInterruptCancelsLeftoverTurn(t *testing.T) {
+	h := newBusyHarness(t)
+	h.setLeftovers([]core.SteeredMessage{{Text: "leftover", UpdateID: 99}})
+	leftoverStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	cancelled := make(chan struct{}, 1)
+	h.setHandler(func(ctx context.Context, chatID int64, text string, images []model.ImageContent, emit func(core.ProgressEvent)) (string, *core.TurnStats, error) {
+		h.noteTurn(ctx, chatID, text)
+		switch text {
+		case "first":
+			return "first-done", nil, nil
+		case "leftover":
+			emit(started("shell_exec", mustJSONArgsForTest("command", "sleep 60")))
+			select {
+			case leftoverStarted <- struct{}{}:
+			default:
+			}
+			select {
+			case <-ctx.Done():
+				select {
+				case cancelled <- struct{}{}:
+				default:
+				}
+				return "", nil, nil
+			case <-release:
+				return "leftover-done", nil, nil
+			}
+		default:
+			return "reply-" + text, nil, nil
+		}
+	})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	h.fake.enqueue(busyMsg(1, "first"))
+	select {
+	case <-leftoverStarted:
+	case <-time.After(scaledTimeout(5 * time.Second)):
+		t.Fatal("leftover turn did not start")
+	}
+	h.fake.enqueue(busyMsg(2, "second"))
+	// The ack names the redirect and the running tool.
+	h.waitSent("Redirected the current run")
+	waitFor(t, "ack names the running tool", func() bool {
+		for _, s := range h.sentTexts() {
+			if strings.Contains(s, "Redirected") && strings.Contains(s, "running shell_exec") {
+				return true
+			}
+		}
+		return false
+	})
+	// The leftover's ctx is cancelled, and its handler returns
+	// suppressed — it sends no reply of its own.
+	select {
+	case <-cancelled:
+	case <-time.After(scaledTimeout(5 * time.Second)):
+		t.Fatal("leftover turn was not cancelled by the interrupt")
+	}
+	// The main reply, then the new turn; both updates are decided
+	// exactly once: the watermark advances past both.
+	h.waitTurns(3)
+	h.waitSent("reply-second")
+	h.waitSent("first-done")
+	h.waitOffset(3)
+	if got := h.turnsSnapshot(); len(got) != 3 || got[0].text != "first" || got[1].text != "leftover" || got[2].text != "second" {
+		t.Errorf("turns = %v, want [first leftover second]", got)
+	}
+	if got := h.turnIDsSnapshot(); len(got) != 3 || got[0] != 1 || got[1] != 99 || got[2] != 2 {
+		t.Errorf("turn update ids = %v, want [1 99 2]", got)
+	}
+	for _, s := range h.sentTexts() {
+		if strings.Contains(s, "leftover-done") {
+			t.Errorf("interrupted leftover sent a reply %q, want none", s)
+		}
+	}
+	if got := h.countSentContaining("Redirected"); got != 1 {
+		t.Errorf("redirect acks sent = %d, want exactly 1", got)
+	}
+}
+
+// TestBusyStateCancelRunReportsLiveness pins the busyState
+// mechanism behind F-A23W3-12: cancelRun reports whether it
+// actually cancelled a live turn, and setCancel retargets the
+// state at the currently-running turn.
+func TestBusyStateCancelRunReportsLiveness(t *testing.T) {
+	h := newBusyHarness(t)
+	// A live run: cancelRun reports true and cancels it; a second
+	// call reports false — the run is already done.
+	ctx, cancel := context.WithCancel(context.Background())
+	st := h.gw.registerBusy(77, ctx, cancel)
+	if !st.cancelRun() {
+		t.Error("cancelRun(live run) = false, want true")
+	}
+	if ctx.Err() == nil {
+		t.Error("cancelRun did not cancel the run's ctx")
+	}
+	if st.cancelRun() {
+		t.Error("cancelRun(finished run) = true, want false")
+	}
+	h.gw.unregisterBusy(77, st)
+	// setCancel retargets: cancelling now cancels the NEW ctx
+	// and leaves the superseded one alone.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	st2 := h.gw.registerBusy(77, ctx1, cancel1)
+	defer h.gw.unregisterBusy(77, st2)
+	st2.setCancel(ctx2, cancel2)
+	if !st2.cancelRun() {
+		t.Error("cancelRun(retargeted live run) = false, want true")
+	}
+	if ctx2.Err() == nil {
+		t.Error("cancelRun did not cancel the retargeted ctx")
+	}
+	if ctx1.Err() != nil {
+		t.Error("cancelRun cancelled the superseded ctx, want it untouched")
+	}
+	// A nil state cancels nothing and reports false.
+	var nilSt *busyState
+	if nilSt.cancelRun() {
+		t.Error("cancelRun(nil) = true, want false")
+	}
+	nilSt.setCancel(ctx2, cancel2)
+}
+
 func TestBusyAckCoalescingAndQueueOrdering(t *testing.T) {
 	h := newBusyHarness(t)
 	h.setMode(BusyModeQueue)

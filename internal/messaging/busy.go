@@ -111,6 +111,15 @@ type busyState struct {
 	ackSent bool
 	// interrupted is set when an arrival cancelled this run.
 	interrupted bool
+	// ctx is the context the running turn (main or leftover)
+	// runs on; cancel cancels it. Both are retargeted together
+	// by setCancel when a leftover turn starts (F-A23W3-12), so
+	// cancelRun always cancels the turn that is actually running
+	// — never a finished main turn while its leftover runs on.
+	// ctx is also how cancelRun knows whether there is anything
+	// live left to cancel: a Done ctx means the run already
+	// finished (or was already cancelled).
+	ctx context.Context
 	// cancel cancels the turn's context (the handler's ctx).
 	cancel context.CancelFunc
 }
@@ -167,18 +176,42 @@ func (s *busyState) detailLocked() string {
 }
 
 // cancelRun marks the run interrupted and cancels its context.
-// Cancelling twice is safe (context.CancelFunc is idempotent).
-func (s *busyState) cancelRun() {
+// It reports whether it actually cancelled a live turn
+// (F-A23W3-12): false when there is nothing live left to cancel —
+// the cancel func is nil, or the turn's ctx is already Done
+// (the run finished, or a previous interrupt already cancelled
+// it). In that case interrupted is NOT set: no run was
+// interrupted. Cancelling twice is safe (context.CancelFunc is
+// idempotent), but only the first cancel of a live run counts.
+func (s *busyState) cancelRun() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	if s.cancel == nil || (s.ctx != nil && s.ctx.Err() != nil) {
+		s.mu.Unlock()
+		return false
+	}
+	s.interrupted = true
+	cancel := s.cancel
+	s.mu.Unlock()
+	cancel()
+	return true
+}
+
+// setCancel retargets the state at the currently-running turn
+// (F-A23W3-12): a leftover turn runs on its own cancellable ctx,
+// so the busy state must point at that ctx (not the finished
+// main turn's) for as long as the leftover runs. The caller owns
+// the new cancel func's lifetime and calls it when the turn ends.
+func (s *busyState) setCancel(ctx context.Context, cancel context.CancelFunc) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	s.interrupted = true
-	cancel := s.cancel
-	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	defer s.mu.Unlock()
+	s.ctx = ctx
+	s.cancel = cancel
 }
 
 // composeBusyAck builds the ack text for a mode. degraded is the
@@ -466,8 +499,8 @@ func (g *TelegramGateway) busyFor(chatID int64) (*busyState, bool) {
 // handler runs — registering earlier would let a later arrival
 // cancel a turn that has not started yet, losing that message's
 // turn with no reply.
-func (g *TelegramGateway) registerBusy(chatID int64, cancel context.CancelFunc) *busyState {
-	st := &busyState{startedAt: time.Now(), cancel: cancel}
+func (g *TelegramGateway) registerBusy(chatID int64, ctx context.Context, cancel context.CancelFunc) *busyState {
+	st := &busyState{startedAt: time.Now(), ctx: ctx, cancel: cancel}
 	g.busyMu.Lock()
 	defer g.busyMu.Unlock()
 	if g.busy == nil {
