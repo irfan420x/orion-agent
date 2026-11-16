@@ -836,3 +836,66 @@ func TestInputFrameworkIntegration(t *testing.T) {
 		t.Errorf("Execute = %q, ExecuteResult = %q, want both to carry the move summary", textOut, resOut.Text)
 	}
 }
+
+// TestInputScreenCacheInvalidation (F-A23W2-17): the cached
+// screen size must stop being trusted once it is old, or a
+// resolution change leaves validatePoint checking against a dead
+// screen. The fake oracle starts at 800x600, then the screen
+// grows to 1920x1080 (monitor plugged in / resolution raised).
+func TestInputScreenCacheInvalidation(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.screen = inputScreen{X: 0, Y: 0, W: 800, H: 600}
+	env.cursor = cursorPos{X: 100, Y: 100}
+	env.call(t, `{"op": "move", "x": 400, "y": 300}`)
+	if env.tool.screenW != 800 || env.tool.screenH != 600 {
+		t.Fatalf("cached screen = %dx%d, want 800x600", env.tool.screenW, env.tool.screenH)
+	}
+
+	// The screen grows to 1920x1080. While the cache is still
+	// fresh (seconds old) the old bound is enforced fail-fast:
+	// (1500, 500) is outside the cached 800x600 screen.
+	env.screen = inputScreen{X: 0, Y: 0, W: 1920, H: 1080}
+	env.advance()
+	err := env.callErr(t, `{"op": "move", "x": 1500, "y": 500}`)
+	if !strings.Contains(err.Error(), "outside the 800x600 screen") {
+		t.Errorf("fresh-cache move err = %v, want the 800x600 bound", err)
+	}
+
+	// Past the TTL the stale bound is no longer enforced: the
+	// same target is valid on the real 1920x1080 screen, and
+	// the move lands (doMove re-validates against the fresh
+	// oracle reading before any ydotool call).
+	env.clock = env.clock.Add(inputScreenCacheTTL + time.Second)
+	env.advance()
+	res := env.call(t, `{"op": "move", "x": 1500, "y": 500}`)
+	if s := parseInputSummary(t, res); !s.Reached {
+		t.Errorf("stale-cache move summary = %+v, want reached on the grown screen", s)
+	}
+	// The oracle read refreshed the cache to the new size: a
+	// target outside 1920x1080 is refused again, against the
+	// fresh bound.
+	if env.tool.screenW != 1920 || env.tool.screenH != 1080 {
+		t.Errorf("cached screen after growth = %dx%d, want 1920x1080", env.tool.screenW, env.tool.screenH)
+	}
+	env.advance()
+	err = env.callErr(t, `{"op": "move", "x": 2000, "y": 500}`)
+	if !strings.Contains(err.Error(), "outside the 1920x1080 screen") {
+		t.Errorf("fresh-cache move err = %v, want the 1920x1080 bound", err)
+	}
+
+	// Shrink: the cache says 1920x1080 but the screen is back to
+	// 800x600 and the cache is stale — the arg-time check passes,
+	// but doMove's post-oracle re-validation refuses before any
+	// ydotool call, so the cursor never moves toward a dead target.
+	env.screen = inputScreen{X: 0, Y: 0, W: 800, H: 600}
+	env.clock = env.clock.Add(inputScreenCacheTTL + time.Second)
+	env.advance()
+	before := len(env.mousemoveCalls())
+	err = env.callErr(t, `{"op": "move", "x": 1500, "y": 500}`)
+	if !strings.Contains(err.Error(), "outside the 800x600 screen") {
+		t.Errorf("shrink move err = %v, want the 800x600 bound from the fresh oracle", err)
+	}
+	if len(env.mousemoveCalls()) != before {
+		t.Errorf("shrink move issued %d mousemove call(s), want 0", len(env.mousemoveCalls())-before)
+	}
+}

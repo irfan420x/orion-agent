@@ -149,6 +149,13 @@ const (
 	inputYdotoolTimeout    = 10 * time.Second
 	inputKWinTimeout       = 5 * time.Second // same as ground's KWin timeout
 	inputKWinHelperFile    = "input-kwin-helper.py"
+	// inputScreenCacheTTL bounds how long the cached screen size
+	// may be trusted for the fail-fast coordinate check
+	// (F-A23W2-17): the oracle re-reads on every move/click, so
+	// in active use the cache is seconds old; past this age the
+	// size is treated as unknown and the post-oracle check in
+	// doMove is the enforcement point.
+	inputScreenCacheTTL = 60 * time.Second
 )
 
 // inputClickCodes maps button names to the ydotool click hex
@@ -257,11 +264,21 @@ type inputTool struct {
 	hourCalls []time.Time
 	turnCalls int
 	// screenW/H is the virtual screen size from the KWin oracle,
-	// cached on first sight (0 = unknown yet). Coordinate
-	// validation uses it when known; without it only
-	// non-negativity is checked and the closed loop still fails
-	// honestly on an unreachable target.
+	// cached on first sight (0 = unknown yet), with the time it
+	// was read. Coordinate validation uses it when known AND
+	// fresh (F-A23W2-17: the old cache never invalidated, so a
+	// monitor plug/unplug or resolution change left
+	// validatePoint checking against a dead screen — a valid
+	// point on a bigger screen was rejected, and a point outside
+	// a shrunken screen was accepted until the move re-checked).
+	// A cache older than inputScreenCacheTTL is treated as
+	// unknown: only non-negativity is checked up front, and
+	// doMove re-validates against the fresh oracle reading
+	// before any ydotool call, so the stale bound can never
+	// cause a wrong move — only a fail-fast rejection while the
+	// cache is fresh.
 	screenW, screenH int
+	screenCachedAt time.Time
 
 	// ground supplies the AT-SPI tree for the sensitive-window
 	// check (the M2 safety layer); shot supplies the xdotool
@@ -555,17 +572,20 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 
 // validatePoint checks a target against the known screen size:
 // always non-negative, and inside the virtual screen when the
-// oracle has reported it. A target outside the screen is an
-// argument error, not a move to attempt — the compositor would
-// clamp it and the loop would give up after 5 wasted moves.
+// oracle has reported it RECENTLY (F-A23W2-17). A stale cached
+// size is not enforced here — the screen may have changed since
+// it was read — and doMove re-validates against the fresh oracle
+// reading before any ydotool call. A target outside the screen
+// is an argument error, not a move to attempt — the compositor
+// would clamp it and the loop would give up after 5 wasted moves.
 func (t *inputTool) validatePoint(x, y int) error {
 	if x < 0 || y < 0 {
 		return fmt.Errorf("coordinates must be non-negative, got (%d, %d)", x, y)
 	}
 	t.mu.Lock()
-	w, h := t.screenW, t.screenH
+	w, h, at := t.screenW, t.screenH, t.screenCachedAt
 	t.mu.Unlock()
-	if w > 0 && h > 0 && (x >= w || y >= h) {
+	if w > 0 && h > 0 && t.now().Sub(at) <= inputScreenCacheTTL && (x >= w || y >= h) {
 		return fmt.Errorf("coordinates (%d, %d) are outside the %dx%d screen", x, y, w, h)
 	}
 	return nil
@@ -654,9 +674,12 @@ func (t *inputTool) defaultRunKWinHelper(ctx context.Context, helperPath string)
 
 // readCursor asks KWin for the true cursor position (plus screen
 // size and window geometries). It caches the screen size on
-// first sight. Any oracle failure is an error: a move without
-// a position proof cannot run closed-loop, so it does not run
-// at all.
+// first sight and refreshes the cache (with its timestamp) on
+// every oracle read — the cache is only ever as old as the last
+// move/click, and validatePoint stops trusting it past
+// inputScreenCacheTTL (F-A23W2-17). Any oracle failure is an
+// error: a move without a position proof cannot run closed-loop,
+// so it does not run at all.
 func (t *inputTool) readCursor(ctx context.Context) (inputCursorOutput, error) {
 	helperPath, err := t.writeKWinHelper()
 	if err != nil {
@@ -673,6 +696,7 @@ func (t *inputTool) readCursor(ctx context.Context) (inputCursorOutput, error) {
 	if out.Screen != nil && out.Screen.W > 0 && out.Screen.H > 0 {
 		t.mu.Lock()
 		t.screenW, t.screenH = out.Screen.W, out.Screen.H
+		t.screenCachedAt = t.now()
 		t.mu.Unlock()
 	}
 	return out, nil
