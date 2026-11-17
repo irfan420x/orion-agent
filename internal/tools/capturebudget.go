@@ -97,6 +97,31 @@ func (b *CaptureBudget) Charge(now time.Time, maxPerTurn, maxPerHour int) error 
 	return nil
 }
 
+// Refund returns one previously charged slot, per-turn and
+// per-hour alike. It is for a charge whose call was then
+// REFUSED before acting — a sensitive-window denial, a focus
+// re-check denial — never for a call that may have taken
+// effect (a timed-out click may already have landed, a failed
+// move already moved the cursor part-way): refunding one of
+// those would hand the quota back for an effect already spent,
+// and invite a retry into a double-click. Refunding when
+// nothing is charged is a no-op, never negative.
+func (b *CaptureBudget) Refund() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.turnCalls > 0 {
+		b.turnCalls--
+	}
+	if len(b.hourCalls) > 0 {
+		// The slot just charged is the newest entry (Charge
+		// appends now last); dropping it restores the hour
+		// count exactly. The counts are anonymous, so under
+		// concurrent charges from another tool this still
+		// returns exactly one slot, whichever entry it is.
+		b.hourCalls = b.hourCalls[:len(b.hourCalls)-1]
+	}
+}
+
 // BeginTurn resets the per-turn counter. Only the budget's owner
 // calls this (see ToolDeps.CaptureBudgetOwner): a child
 // registry's tools share the budget but never reset it.

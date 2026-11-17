@@ -45,6 +45,39 @@ func TestCaptureBudgetChargeAndReset(t *testing.T) {
 	}
 }
 
+func TestCaptureBudgetRefund(t *testing.T) {
+	b := NewCaptureBudget()
+	now := time.Now()
+	// Refunding an empty budget is a no-op, never negative.
+	b.Refund()
+	if got := b.TurnCalls(); got != 0 {
+		t.Errorf("TurnCalls after refund of empty budget = %d, want 0", got)
+	}
+	if got := b.HourCalls(); got != 0 {
+		t.Errorf("HourCalls after refund of empty budget = %d, want 0", got)
+	}
+	// Charge 15 (the per-turn cap), refund one, and the next
+	// call fits again — the refunded slot is spendable.
+	for i := 0; i < captureMaxPerTurn; i++ {
+		if err := b.Charge(now.Add(time.Duration(i)*time.Second), captureMaxPerTurn, captureMaxPerHour); err != nil {
+			t.Fatalf("Charge #%d = %v, want nil", i+1, err)
+		}
+	}
+	if err := b.Charge(now.Add(30*time.Second), captureMaxPerTurn, captureMaxPerHour); !errors.Is(err, errCaptureBudgetTurn) {
+		t.Errorf("16th Charge = %v, want errCaptureBudgetTurn", err)
+	}
+	b.Refund()
+	if got := b.TurnCalls(); got != captureMaxPerTurn-1 {
+		t.Errorf("TurnCalls after refund = %d, want %d", got, captureMaxPerTurn-1)
+	}
+	if got := b.HourCalls(); got != captureMaxPerTurn-1 {
+		t.Errorf("HourCalls after refund = %d, want %d", got, captureMaxPerTurn-1)
+	}
+	if err := b.Charge(now.Add(31*time.Second), captureMaxPerTurn, captureMaxPerHour); err != nil {
+		t.Errorf("Charge after refund = %v, want nil (the refunded slot is spendable)", err)
+	}
+}
+
 func TestCaptureBudgetHourCap(t *testing.T) {
 	b := NewCaptureBudget()
 	now := time.Now()

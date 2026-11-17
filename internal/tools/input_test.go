@@ -1092,6 +1092,69 @@ func TestInputFailedCallsDoNotEatRateLimitSlots(t *testing.T) {
 	}
 }
 
+// TestInputSensitiveRefusalsDoNotEatRateLimitSlots (F-A23W2-18,
+// follow-up): a call charged by the rate check and then REFUSED
+// by a sensitive-window check performed no input, so it must not
+// consume a per-turn or per-hour slot — otherwise a password
+// manager on screen burns the whole quota on refusals, and the
+// turn has no input left once the window closes.
+func TestInputSensitiveRefusalsDoNotEatRateLimitSlots(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	env.tree = sensitiveInputTreeJSON()
+	// 10 type refusals + 10 click refusals: every one charges
+	// first (the rate check runs before the sensitive check)
+	// and is then denied — no ydotool call, no slot consumed.
+	for i := 0; i < 10; i++ {
+		err := env.callErr(t, `{"op": "type", "text": "secret"}`)
+		if !strings.Contains(err.Error(), "password manager") {
+			t.Fatalf("type refusal #%d err = %v, want the password-manager refusal", i+1, err)
+		}
+		env.advance()
+		err = env.callErr(t, `{"op": "click", "x": 500, "y": 200}`)
+		if !strings.Contains(err.Error(), "will not click while it is visible") {
+			t.Fatalf("click refusal #%d err = %v, want the sensitive-window click refusal", i+1, err)
+		}
+		// No advance after the last refusal: the min-interval
+		// check below needs a call in the same fake second.
+		if i < 9 {
+			env.advance()
+		}
+	}
+	if len(env.ydotoolCalls) != 0 {
+		t.Errorf("got %d ydotool calls, want 0 (refused before touching the desktop)", len(env.ydotoolCalls))
+	}
+	if got := env.tool.budget.TurnCalls(); got != 0 {
+		t.Errorf("after 20 sensitive refusals: turnCalls = %d, want 0", got)
+	}
+	if got := env.tool.budget.HourCalls(); got != 0 {
+		t.Errorf("after 20 sensitive refusals: hourCalls = %d, want 0", got)
+	}
+	// The min-interval stamp is NOT refunded: a refusal still
+	// counts as the last call, so an immediate retry is
+	// throttled rather than re-running the sensitive check.
+	err := env.callErr(t, `{"op": "type", "text": "secret"}`)
+	if !strings.Contains(err.Error(), "at most one input call per second") {
+		t.Errorf("immediate retry err = %v, want the min-interval denial", err)
+	}
+	// The quota is still whole: with the sensitive window gone,
+	// the full 15 moves succeed and the 16th is rate-limited.
+	env.tree = ""
+	for i := 0; i < inputMaxPerTurn; i++ {
+		env.advance()
+		env.call(t, fmt.Sprintf(`{"op": "move", "x": %d, "y": 200}`, 200+i))
+	}
+	if got := env.tool.budget.TurnCalls(); got != inputMaxPerTurn {
+		t.Errorf("after 15 moves: turnCalls = %d, want %d", got, inputMaxPerTurn)
+	}
+	env.advance()
+	err = env.callErr(t, `{"op": "move", "x": 300, "y": 300}`)
+	if !strings.Contains(err.Error(), "at most 15 input calls per turn") {
+		t.Errorf("16th move err = %v, want the per-turn limit", err)
+	}
+}
+
 // TestInputClickBySnapshotMovedWindow pins F-M2R-8 at the click:
 // the snapshot binds element 1 to Firefox at (0,0,1920,1080),
 // but the live tree now reports Firefox at (100,0,1920,1080) —

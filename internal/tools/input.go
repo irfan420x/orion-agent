@@ -460,7 +460,17 @@ func (t *inputTool) Execute(ctx context.Context, args json.RawMessage) (string, 
 }
 
 // ExecuteResult runs one input operation and returns its JSON summary.
-func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+//
+// F-A23W2-18: a call charged by checkRateLimit and then REFUSED
+// (denied) — the sensitive-window checks, the focus re-check —
+// performed no input, so the slot is refunded on the way out
+// (see the defer below). A FAILED call keeps its slot: it
+// attempted input, and a timed-out click or a half-moved cursor
+// may already have taken effect — refunding that would invite
+// a retry into a double-click. The min-interval lastCall stamp
+// is separate and is never refunded: it throttles attempts,
+// not quota, so a refused call still counts as the last call.
+func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (result ToolResult, err error) {
 	invalid := func(format string, v ...any) (ToolResult, error) {
 		return ToolResult{}, &ToolError{Tool: t.Name(), Kind: "invalid_args", Err: fmt.Errorf(format, v...)}
 	}
@@ -470,6 +480,23 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 	failed := func(format string, v ...any) (ToolResult, error) {
 		return ToolResult{}, &ToolError{Tool: t.Name(), Kind: "execution", Err: fmt.Errorf(format, v...)}
 	}
+
+	// Refund the budget slot when a charged call is refused
+	// after the rate check. Only Kind "denied" refunds: the
+	// rate-limit denial itself returns before charged is set,
+	// and invalid/failed returns never reach this with a
+	// charged slot they should give back (invalid returns
+	// before the charge; failed calls attempted input).
+	charged := false
+	defer func() {
+		if !charged {
+			return
+		}
+		var te *ToolError
+		if errors.As(err, &te) && te.Kind == "denied" {
+			t.budget.Refund()
+		}
+	}()
 
 	// Computer-use is OFF in unattended turns, no exceptions
 	// (plan §11.3) — refused before anything else happens. The
@@ -601,9 +628,14 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 	// a down daemon burns the whole quota on failures. Argument
 	// errors above never reach this check either, for the same
 	// reason: only a call that is about to act consumes a slot.
+	// A call charged here and then REFUSED (denied) by the
+	// sensitive/focus checks below gets its slot back from the
+	// defer at the top of ExecuteResult — a refusal performed
+	// no input, so it must not burn quota either.
 	if err := t.checkRateLimit(); err != nil {
 		return denied("%v", err)
 	}
+	charged = true
 
 	var summary inputSummary
 	summary.Op = op
