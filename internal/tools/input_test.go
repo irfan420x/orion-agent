@@ -91,6 +91,77 @@ func sensitiveInputTreeJSON() string {
 	"walked_nodes": 12}`
 }
 
+// contentSensitiveInputTreeJSON (F-M2R-14): a login page whose
+// window title is innocuous ("Welcome") but whose body holds a
+// password field — the title check alone cannot catch it.
+func contentSensitiveInputTreeJSON() string {
+	return `{"windows": [
+		{"title": "Welcome — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "heading", "name": "Welcome", "x": 800, "y": 300, "w": 200, "h": 30, "win": 0, "showing": true},
+		{"role": "entry", "name": "Username", "x": 784, "y": 383, "w": 352, "h": 40, "win": 0, "showing": true},
+		{"role": "password text", "name": "Password", "x": 784, "y": 464, "w": 352, "h": 40, "win": 0, "showing": true},
+		{"role": "push button", "name": "Log in", "x": 784, "y": 540, "w": 100, "h": 40, "win": 0, "showing": true}],
+	"focused_window": {"title": "Welcome — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 5}`
+}
+
+// contentOTPInputTreeJSON (F-M2R-14): the same innocuous title,
+// but a one-time-code field instead of a password field.
+func contentOTPInputTreeJSON() string {
+	return `{"windows": [
+		{"title": "Welcome — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "heading", "name": "Sign in", "x": 800, "y": 300, "w": 200, "h": 30, "win": 0, "showing": true},
+		{"role": "text", "name": "Enter one-time code", "x": 784, "y": 383, "w": 352, "h": 40, "win": 0, "showing": true},
+		{"role": "push button", "name": "Verify", "x": 784, "y": 460, "w": 100, "h": 40, "win": 0, "showing": true}],
+	"focused_window": {"title": "Welcome — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 4}`
+}
+
+// contentBenignSignInTreeJSON (F-M2R-14): a sign-in page in
+// words only — heading, username field, sign-in button — with
+// NO password or OTP field: typing and clicking into it must
+// stay allowed.
+func contentBenignSignInTreeJSON() string {
+	return `{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "heading", "name": "Sign in to GitHub", "x": 784, "y": 300, "w": 200, "h": 30, "win": 0, "showing": true},
+		{"role": "entry", "name": "Username or email address", "x": 784, "y": 383, "w": 352, "h": 40, "win": 0, "showing": true},
+		{"role": "push button", "name": "Sign in", "x": 784, "y": 460, "w": 100, "h": 40, "win": 0, "showing": true},
+		{"role": "link", "name": "Forgot password?", "x": 1019, "y": 439, "w": 117, "h": 21, "win": 0, "showing": true}],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 5}`
+}
+
+// contentHiddenPasswordTreeJSON (F-M2R-14): the password field
+// is hidden — a closed popup's node lingering in the tree —
+// so it must not refuse.
+func contentHiddenPasswordTreeJSON() string {
+	return `{"windows": [
+		{"title": "Welcome — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "password text", "name": "Password", "x": 784, "y": 464, "w": 352, "h": 40, "win": 0, "showing": false}],
+	"focused_window": {"title": "Welcome — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 2}`
+}
+
+// contentAndTitleTreeJSON (F-M2R-14): BOTH signals at once — a
+// title-sensitive KeePassXC window plus a content-sensitive
+// Firefox login page. A click inside the Firefox box but
+// outside the KeePassXC box must still refuse: the old
+// title-only check would have allowed it.
+func contentAndTitleTreeJSON() string {
+	return `{"windows": [
+		{"title": "KeePassXC — passwords.kdbx", "app": "KeePassXC", "role": "frame", "focused": false, "x": 100, "y": 100, "w": 800, "h": 600},
+		{"title": "Welcome — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [
+		{"role": "password text", "name": "Password", "x": 784, "y": 464, "w": 352, "h": 40, "win": 1, "showing": true}],
+	"focused_window": {"title": "Welcome — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 4}`
+}
+
 func newFakeInputEnv(t *testing.T) *fakeInputEnv {
 	t.Helper()
 	t.Setenv("DISPLAY", ":1")
@@ -828,6 +899,148 @@ func TestInputClickSensitiveUncorrectedRefused(t *testing.T) {
 	err := env.callErr(t, `{"op": "click", "x": 1500, "y": 900}`)
 	if !strings.Contains(err.Error(), "will not click while it is visible") {
 		t.Errorf("err = %v, want the coarse sensitive-window click refusal", err)
+	}
+}
+
+// TestInputTypeSensitiveContentRefused (F-M2R-14): a login page
+// whose title is innocuous ("Welcome") but whose body holds a
+// password field must refuse type/key — and the refusal must
+// name the category only, never the field name or the title.
+func TestInputTypeSensitiveContentRefused(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.tree = contentSensitiveInputTreeJSON()
+	for _, args := range []string{
+		`{"op": "type", "text": "secret"}`,
+		`{"op": "key", "key": "Return"}`,
+	} {
+		err := env.callErr(t, args)
+		if !strings.Contains(err.Error(), "sign-in form") {
+			t.Errorf("ExecuteResult(%s) err = %v, want the sign-in-form refusal", args, err)
+		}
+		if strings.Contains(err.Error(), "Password") || strings.Contains(err.Error(), "Welcome") {
+			t.Errorf("refusal %q names element content or the title — refusals name the category only", err.Error())
+		}
+		env.advance()
+	}
+	if len(env.ydotoolCalls) != 0 {
+		t.Errorf("got %d ydotool calls, want 0 (refused before typing)", len(env.ydotoolCalls))
+	}
+}
+
+// TestInputTypeSensitiveContentOTPRefused (F-M2R-14): the same
+// innocuous title, but a one-time-code field instead of a
+// password field, must refuse with the OTP category.
+func TestInputTypeSensitiveContentOTPRefused(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.tree = contentOTPInputTreeJSON()
+	err := env.callErr(t, `{"op": "type", "text": "123456"}`)
+	if !strings.Contains(err.Error(), "one-time-code / second-factor dialog") {
+		t.Errorf("err = %v, want the one-time-code refusal", err)
+	}
+	if len(env.ydotoolCalls) != 0 {
+		t.Errorf("got %d ydotool calls, want 0", len(env.ydotoolCalls))
+	}
+}
+
+// TestInputTypeSensitiveContentBenignSignInAllowed (F-M2R-14):
+// a sign-in page in words only — "sign in" heading, username
+// field, sign-in button, "Forgot password?" link — with NO
+// password or OTP field must stay typeable. This is the false
+// positive the narrow signal must not introduce.
+func TestInputTypeSensitiveContentBenignSignInAllowed(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.tree = contentBenignSignInTreeJSON()
+	res := env.call(t, `{"op": "type", "text": "hello"}`)
+	if s := parseInputSummary(t, res); s.CharsTyped != 5 {
+		t.Errorf("chars_typed = %d, want 5 (a sign-in page with no password/OTP field must stay typeable)", s.CharsTyped)
+	}
+	if got := len(env.ydotoolCalls); got != 1 {
+		t.Errorf("got %d ydotool calls, want 1", got)
+	}
+}
+
+// TestInputTypeSensitiveContentHiddenFieldAllowed (F-M2R-14): a
+// password field that is not showing (a closed popup's node
+// lingering in the tree) must not refuse typing.
+func TestInputTypeSensitiveContentHiddenFieldAllowed(t *testing.T) {
+	env := newFakeInputEnv(t)
+	env.tree = contentHiddenPasswordTreeJSON()
+	res := env.call(t, `{"op": "type", "text": "hello"}`)
+	if s := parseInputSummary(t, res); s.CharsTyped != 5 {
+		t.Errorf("chars_typed = %d, want 5 (a hidden password field must not refuse)", s.CharsTyped)
+	}
+}
+
+// TestInputClickSensitiveContentPreciseBox (F-M2R-14): the
+// content signal follows the same precise-box rule as titles.
+// KWin places the Firefox window 29 px lower than AT-SPI
+// reports (the M2 F2 shift): the corrected box is
+// (0,29)-(1920,1109). A click at (500,10) is inside the RAW
+// box but outside the corrected one — allowed only because the
+// correction is applied; a click at (500,200) is inside the
+// corrected box — refused.
+func TestInputClickSensitiveContentPreciseBox(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	env.tree = contentSensitiveInputTreeJSON()
+	env.kwinWindows = []kwinWindow{
+		{Class: "firefox", FG: [4]int{0, 29, 1920, 1080}, CG: [4]int{0, 29, 1920, 1080}},
+	}
+	res := env.call(t, `{"op": "click", "x": 500, "y": 10}`)
+	if s := parseInputSummary(t, res); !s.Reached {
+		t.Errorf("click outside the corrected content-sensitive box: summary = %+v, want reached", s)
+	}
+	env.advance()
+	err := env.callErr(t, `{"op": "click", "x": 500, "y": 200}`)
+	if !strings.Contains(err.Error(), "inside a sign-in form") {
+		t.Errorf("click inside the content-sensitive box err = %v, want the inside-a-sign-in-form refusal", err)
+	}
+	// Exactly one click call (the allowed one): the refused click
+	// never moved the cursor towards the window either.
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+// TestInputClickSensitiveContentUncorrectedRefused (F-M2R-14):
+// with no KWin correction the content-sensitive window's box
+// cannot be trusted, so the click refuses outright.
+func TestInputClickSensitiveContentUncorrectedRefused(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	env.tree = contentSensitiveInputTreeJSON()
+	env.oracleErr = true // no KWin -> boxes uncorrected -> coarse refusal
+	err := env.callErr(t, `{"op": "click", "x": 1500, "y": 900}`)
+	if !strings.Contains(err.Error(), "will not click while it is visible") {
+		t.Errorf("err = %v, want the coarse sensitive-window click refusal", err)
+	}
+	if !strings.Contains(err.Error(), "sign-in form") {
+		t.Errorf("err = %v, want the sign-in-form category", err)
+	}
+}
+
+// TestInputClickSensitiveContentAndTitleUnion (F-M2R-14): with
+// BOTH signals — a title-sensitive KeePassXC window plus a
+// content-sensitive Firefox login page — a click inside the
+// Firefox box but outside the KeePassXC box must still refuse.
+// The old title-only check would have allowed it.
+func TestInputClickSensitiveContentAndTitleUnion(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	env.tree = contentAndTitleTreeJSON()
+	env.kwinWindows = []kwinWindow{
+		{Class: "keepassxc", FG: [4]int{100, 129, 800, 600}, CG: [4]int{100, 129, 800, 600}},
+		{Class: "firefox", FG: [4]int{0, 29, 1920, 1080}, CG: [4]int{0, 29, 1920, 1080}},
+	}
+	err := env.callErr(t, `{"op": "click", "x": 1500, "y": 900}`)
+	if !strings.Contains(err.Error(), "inside a sign-in form") {
+		t.Errorf("click inside the content-sensitive box err = %v, want the inside-a-sign-in-form refusal", err)
+	}
+	if got := len(env.clickCalls()); got != 0 {
+		t.Errorf("got %d click calls, want 0", got)
 	}
 }
 

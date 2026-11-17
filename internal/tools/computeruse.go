@@ -37,6 +37,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/permissions"
@@ -301,4 +302,104 @@ func SensitiveTitleCategory(title string) string {
 		return "vault"
 	}
 	return "sensitive app"
+}
+
+// otpFieldNameMarkers are case-insensitive substrings of an
+// editable field's accessible name that mark it as a
+// one-time-code field. They are phrases, not single words: a
+// bare "otp" substring would also match "hotpot".
+var otpFieldNameMarkers = []string{
+	"one-time", "one time", "verification code",
+	"authentication code", "authenticator code",
+}
+
+// FindSensitiveContent reports whether the visible elements of
+// the accessibility tree contain a credential-entry form — a
+// password field, or a one-time-code field — even when every
+// window title is innocuous (F-M2R-14: a bank-login page titled
+// just "Welcome" is not caught by the title check). It returns
+// the refusal category ("" when nothing sensitive) and the set
+// of window indices holding a sensitive element. The window set
+// is nil when a sensitive element could not be placed in a
+// window, so the caller must refuse coarsely instead of
+// trusting a box; it is also nil when nothing is sensitive.
+//
+// The signal is deliberately narrow: a password field's ROLE is
+// the signal, not its name, and a one-time-code field needs
+// BOTH an editable-text role AND a one-time-code name. An
+// ordinary page that merely contains the words "sign in" — a
+// heading, a link, a button, even a username field — has
+// neither, and is not refused. Hidden elements (SHOWING=false,
+// e.g. a closed popup's nodes lingering in the tree) are
+// skipped; an element whose SHOWING state is unknown is kept,
+// as everywhere else — a missing signal never drops an
+// element.
+//
+// Nothing from the elements is ever logged or echoed: the
+// return values are a category and window indices only — never
+// a name, title, or value (F-M2R-15).
+func FindSensitiveContent(elements []atspiElement) (string, map[int]bool) {
+	category := ""
+	windows := map[int]bool{}
+	unplaced := false
+	for _, el := range elements {
+		if el.Showing != nil && !*el.Showing {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(el.Role))
+		var cat string
+		switch role {
+		case "password text":
+			cat = "sign-in form"
+		case "text", "entry":
+			if otpFieldName(el.Name) {
+				cat = "one-time-code / second-factor dialog"
+			}
+		}
+		if cat == "" {
+			continue
+		}
+		// A password field outranks a one-time-code field in
+		// the category, regardless of walk order: the form
+		// takes the credential, the code is the second factor.
+		if cat == "sign-in form" || category == "" {
+			category = cat
+		}
+		if el.Win == nil {
+			unplaced = true
+		} else {
+			windows[*el.Win] = true
+		}
+	}
+	if category == "" {
+		return "", nil
+	}
+	if unplaced {
+		return category, nil
+	}
+	return category, windows
+}
+
+// otpFieldName reports whether an editable field's accessible
+// name marks it as a one-time-code field. The phrase markers
+// match as substrings; "otp" and "2fa" match as whole words
+// only, so a field named "Hotpot" is not an OTP field.
+func otpFieldName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" {
+		return false
+	}
+	for _, needle := range otpFieldNameMarkers {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	for _, word := range strings.FieldsFunc(lower, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if word == "otp" || word == "2fa" {
+			return true
+		}
+	}
+	return false
 }

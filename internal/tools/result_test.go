@@ -143,6 +143,126 @@ func TestTitleLooksSensitive(t *testing.T) {
 	}
 }
 
+// TestFindSensitiveContent pins F-M2R-14: the content-based
+// sensitive signal — a password field, or a one-time-code field
+// — in the visible elements, even when every window title is
+// innocuous. The signal is the field's role (password) or its
+// role + one-time-code name (OTP); ordinary "sign in" text with
+// no credential field must not refuse.
+func TestFindSensitiveContent(t *testing.T) {
+	win := func(i int) *int { return &i }
+	show := func(b bool) *bool { return &b }
+	cases := []struct {
+		name     string
+		elements []atspiElement
+		wantCat  string
+		wantWins map[int]bool
+	}{
+		{
+			name: "password field",
+			elements: []atspiElement{
+				{Role: "password text", Name: "Password", Win: win(0), Showing: show(true)},
+			},
+			wantCat:  "sign-in form",
+			wantWins: map[int]bool{0: true},
+		},
+		{
+			name: "one-time-code text field",
+			elements: []atspiElement{
+				{Role: "text", Name: "Enter one-time code", Win: win(1), Showing: show(true)},
+			},
+			wantCat:  "one-time-code / second-factor dialog",
+			wantWins: map[int]bool{1: true},
+		},
+		{
+			name: "OTP word field",
+			elements: []atspiElement{
+				{Role: "text", Name: "OTP", Win: win(0), Showing: show(true)},
+			},
+			wantCat:  "one-time-code / second-factor dialog",
+			wantWins: map[int]bool{0: true},
+		},
+		{
+			name: "verification code field",
+			elements: []atspiElement{
+				{Role: "entry", Name: "Verification code", Win: win(0), Showing: show(true)},
+			},
+			wantCat:  "one-time-code / second-factor dialog",
+			wantWins: map[int]bool{0: true},
+		},
+		{
+			name: "password outranks OTP in the category",
+			elements: []atspiElement{
+				{Role: "text", Name: "One-time code", Win: win(0), Showing: show(true)},
+				{Role: "password text", Name: "Password", Win: win(0), Showing: show(true)},
+			},
+			wantCat:  "sign-in form",
+			wantWins: map[int]bool{0: true},
+		},
+		{
+			name: "unplaced sensitive element has no windows",
+			elements: []atspiElement{
+				{Role: "password text", Name: "Password", Showing: show(true)},
+			},
+			wantCat:  "sign-in form",
+			wantWins: nil,
+		},
+		{
+			name: "sign-in text with no credential field is allowed",
+			elements: []atspiElement{
+				{Role: "heading", Name: "Sign in to GitHub", Win: win(0), Showing: show(true)},
+				{Role: "entry", Name: "Username or email address", Win: win(0), Showing: show(true)},
+				{Role: "push button", Name: "Sign in", Win: win(0), Showing: show(true)},
+				{Role: "link", Name: "Forgot password?", Win: win(0), Showing: show(true)},
+			},
+			wantCat: "",
+		},
+		{
+			name: "Hotpot is not an OTP field",
+			elements: []atspiElement{
+				{Role: "text", Name: "Hotpot delivery", Win: win(0), Showing: show(true)},
+			},
+			wantCat: "",
+		},
+		{
+			name: "hidden password field is skipped",
+			elements: []atspiElement{
+				{Role: "password text", Name: "Password", Win: win(0), Showing: show(false)},
+			},
+			wantCat: "",
+		},
+		{
+			name: "unknown showing is kept, not dropped",
+			elements: []atspiElement{
+				{Role: "password text", Name: "Password", Win: win(0)},
+			},
+			wantCat:  "sign-in form",
+			wantWins: map[int]bool{0: true},
+		},
+		{
+			name:     "no elements",
+			elements: nil,
+			wantCat:  "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cat, wins := FindSensitiveContent(tc.elements)
+			if cat != tc.wantCat {
+				t.Errorf("FindSensitiveContent category = %q, want %q", cat, tc.wantCat)
+			}
+			if len(wins) != len(tc.wantWins) {
+				t.Errorf("FindSensitiveContent windows = %v, want %v", wins, tc.wantWins)
+			}
+			for w := range tc.wantWins {
+				if !wins[w] {
+					t.Errorf("FindSensitiveContent windows = %v, want window %d", wins, w)
+				}
+			}
+		})
+	}
+}
+
 func TestUnattendedTurnContext(t *testing.T) {
 	ctx := context.Background()
 	if UnattendedTurnFromContext(ctx) {

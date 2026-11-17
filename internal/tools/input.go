@@ -307,6 +307,17 @@ type inputWindowInfo struct {
 	windowsListed    bool          // true when an AT-SPI tree enumerated the windows at all
 	sensitivePrecise bool          // every sensitive window has a corrected box
 	focus            focusIdentity // focused window when enumerated, unknown when neither authority could name it
+	// F-M2R-14: content-based sensitive signal — a password or
+	// one-time-code field in the visible elements, even when
+	// every title is innocuous. contentHit is the refusal
+	// category ("" when none); contentWindows are the windows
+	// holding a sensitive element (nil when one could not be
+	// placed, so the click check must refuse coarsely);
+	// contentPrecise is true only when every such window has a
+	// KWin-corrected box.
+	contentHit     string
+	contentWindows map[int]bool
+	contentPrecise bool
 }
 
 type inputTool struct {
@@ -1296,6 +1307,16 @@ func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 	}
 	info.windows = tree.Windows
 	info.windowsListed = true
+	// F-M2R-14: content-based signal — a password or
+	// one-time-code field in the visible elements, even when
+	// every title is innocuous. Computed here, on the same walk
+	// the title check already paid for, so the content check
+	// costs no second walk. The category names the kind of form
+	// only, never an element name or title (F-M2R-15).
+	if cat, wins := FindSensitiveContent(tree.Elements); cat != "" {
+		info.contentHit = cat
+		info.contentWindows = wins
+	}
 	// Keep the uncorrected boxes alongside the corrected ones:
 	// a snapshot's recorded window geometry may be in either
 	// frame — a grounding stores the corrected box when KWin
@@ -1338,6 +1359,22 @@ func (t *inputTool) windowInfo(ctx context.Context) inputWindowInfo {
 			}
 		}
 		info.sensitivePrecise = precise
+		// F-M2R-14: the same correction condition for the
+		// content-sensitive windows — a click may only be
+		// allowed outside them when every such window's box
+		// is KWin-corrected. An unplaced sensitive element
+		// (contentWindows nil) is never precise: no box is
+		// trustworthy, so the click refuses outright.
+		if info.contentHit != "" {
+			contentPrecise := info.contentWindows != nil
+			for i := range info.contentWindows {
+				if _, ok := offsets[i]; !ok {
+					contentPrecise = false
+					break
+				}
+			}
+			info.contentPrecise = contentPrecise
+		}
 	}
 	return info
 }
@@ -1443,6 +1480,8 @@ func (t *inputTool) recheckFocus(ctx context.Context, before focusIdentity) erro
 // checkTypeSensitive refuses type/key when a sensitive window is
 // focused or visible, or when the windows cannot be enumerated
 // at all (fail closed — typing blind is the highest-risk op).
+// A window holding a password or one-time-code field is
+// sensitive too, even when its title is innocuous (F-M2R-14).
 // The refusal names the category only, never the title. It
 // returns the enumeration so the caller can re-check the focus
 // right before typing (F-A23W2-10).
@@ -1461,6 +1500,17 @@ func (t *inputTool) checkTypeSensitive(ctx context.Context) (inputWindowInfo, er
 	if info.focus.kwin && info.focus.sens != "" {
 		return info, fmt.Errorf("the focused window is a %s: I will not type or press keys into it", SensitiveTitleCategory(info.focus.sens))
 	}
+	// F-M2R-14: content-based refusal — a password or
+	// one-time-code field visible anywhere on screen, even
+	// when every window title is innocuous. Typing goes to
+	// the focused window, but a credential form anywhere
+	// visible means the keystrokes could land in it, so the
+	// refusal is screen-wide, like the title check. The
+	// refusal names the category only, never any element
+	// name or title.
+	if info.contentHit != "" {
+		return info, fmt.Errorf("this screen shows a %s: I will not type or press keys into it", info.contentHit)
+	}
 	return info, nil
 }
 
@@ -1469,37 +1519,59 @@ func (t *inputTool) checkTypeSensitive(ctx context.Context) (inputWindowInfo, er
 // is KWin-corrected and the target lies outside all of them, in
 // which case the click is elsewhere on screen. Titles-only
 // enumeration, an uncorrected sensitive window, or no
-// enumeration at all refuses the click. For a snapshot click it
-// also verifies the geometry binding (F-M2R-8): the window that
-// held the element at ground time must still be at the same
-// app + box in the fresh window list — a moved or resized window
-// refuses the click, because the registered centre no longer
-// names the element. The fresh list comes from the same walk
-// this check already paid for, so the binding costs no second
-// walk. (Movement between this check and the click itself is
-// still open — doClick re-validates the element fresh right
-// before the click — see F-A23W2-1.)
+// enumeration at all refuses the click. The same applies to the
+// F-M2R-14 content signal: a window holding a password or
+// one-time-code field is sensitive even when its title is
+// innocuous, and the click must clear its corrected box too.
+// For a snapshot click it also verifies the geometry binding
+// (F-M2R-8): the window that held the element at ground time
+// must still be at the same app + box in the fresh window list —
+// a moved or resized window refuses the click, because the
+// registered centre no longer names the element. The fresh list
+// comes from the same walk this check already paid for, so the
+// binding costs no second walk. (Movement between this check
+// and the click itself is still open — doClick re-validates the
+// element fresh right before the click — see F-A23W2-1.)
 func (t *inputTool) checkClickSensitive(ctx context.Context, x, y int, snapshotID string, elementID *int) error {
 	info := t.windowInfo(ctx)
 	if !info.available {
 		return fmt.Errorf("cannot determine the visible windows (no accessibility tree and no window list): I will not click blind")
 	}
 	hit := FindSensitiveTitle(info.titles)
-	if hit == "" {
+	if hit == "" && info.contentHit == "" {
 		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info)
 	}
-	if info.sensitivePrecise {
-		for _, w := range info.windows {
-			if !TitleLooksSensitive(w.Title) {
-				continue
-			}
-			if x >= w.X && x < w.X+w.W && y >= w.Y && y < w.Y+w.H {
-				return fmt.Errorf("the click target (%d, %d) is inside a %s: I will not click there", x, y, SensitiveTitleCategory(w.Title))
-			}
+	// Precise path: every sensitive window — title-sensitive,
+	// content-sensitive, or both — has a KWin-corrected box, so
+	// a click outside all of them is allowed. An uncorrected
+	// box on either signal refuses the click outright, naming
+	// the category of the signal that cannot be placed.
+	if hit != "" && !info.sensitivePrecise {
+		return fmt.Errorf("this screen shows a %s: I will not click while it is visible", SensitiveTitleCategory(hit))
+	}
+	if info.contentHit != "" && !info.contentPrecise {
+		return fmt.Errorf("this screen shows a %s: I will not click while it is visible", info.contentHit)
+	}
+	for _, w := range info.windows {
+		if !TitleLooksSensitive(w.Title) {
+			continue
 		}
-		return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info)
+		if x >= w.X && x < w.X+w.W && y >= w.Y && y < w.Y+w.H {
+			return fmt.Errorf("the click target (%d, %d) is inside a %s: I will not click there", x, y, SensitiveTitleCategory(w.Title))
+		}
 	}
-	return fmt.Errorf("this screen shows a %s: I will not click while it is visible", SensitiveTitleCategory(hit))
+	// F-M2R-14: the same point-in-box test for the windows
+	// holding a sensitive element. A click inside one refuses
+	// with the content category; a click outside every
+	// sensitive window — title or content — falls through to
+	// the snapshot geometry check.
+	for i := range info.contentWindows {
+		w := info.windows[i]
+		if x >= w.X && x < w.X+w.W && y >= w.Y && y < w.Y+w.H {
+			return fmt.Errorf("the click target (%d, %d) is inside a %s: I will not click there", x, y, info.contentHit)
+		}
+	}
+	return t.checkSnapshotGeometry(ctx, snapshotID, elementID, info)
 }
 
 // checkSnapshotGeometry verifies a snapshot click's geometry
