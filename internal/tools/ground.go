@@ -446,6 +446,16 @@ type atspiElement struct {
 	// element. False means hidden: the element stays in the tree
 	// (closed popups keep their nodes) but is not on screen.
 	Showing *bool `json:"showing,omitempty"`
+	// Focused is the AT-SPI FOCUSED state reported by the helper
+	// (F-A23W2-9 follow-up): the element that holds keyboard
+	// focus, read by the post-click element re-check. Nil means
+	// the helper did not report it (state query failed): the
+	// element is never treated as focused — a missing signal
+	// never demotes a click. False means known-not-focused.
+	// The window frame itself also reports focused when its
+	// window is active; readers skip role "frame" (that flag
+	// duplicates the KWin window signal).
+	Focused *bool `json:"focused,omitempty"`
 }
 
 // --- KWin helper output ---

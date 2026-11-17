@@ -5,12 +5,12 @@ Walks the AT-SPI desktop tree and prints one JSON document:
 {"windows": [...], "elements": [...], "focused_window": {...},
  "walked_nodes": N, "truncated": bool}.
 
-Reads ONLY name / role / screen extents. It NEVER reads text
-content or values — there is no get_text_iface anywhere in this
-file — so a password field's value is never touched: geometry +
-accessible name + role only. Each element also carries "win", the
-index of its window in the "windows" array, so the caller can
-apply per-window corrections (F2).
+Reads ONLY name / role / screen extents / state (SHOWING, FOCUSED).
+It NEVER reads text content or values — there is no get_text_iface
+anywhere in this file — so a password field's value is never touched:
+geometry + accessible name + role + state only. Each element also
+carries "win", the index of its window in the "windows" array, so the
+caller can apply per-window corrections (F2).
 
 Bounds (argv): depth cap, node cap. The Go caller passes both so a
 heavy app (big page, IDE) cannot hang the walk. On ANY failure the
@@ -109,13 +109,31 @@ def main():
             # plasmashell, Firefox's "Sign in" absent). The Go side
             # skips showing=false; a missing key (state query
             # failed) is kept, never dropped.
+            # FOCUSED comes from the SAME state-set query (one
+            # D-Bus call, no extra cost) and is what the
+            # post-click element re-check reads (F-A23W2-9
+            # follow-up): which control took focus from the press.
+            # A missing key means the query failed, same as
+            # SHOWING — the element is never treated as focused.
+            # The window frame itself also reports FOCUSED when
+            # its window is active; the Go side skips role
+            # "frame" when reading the focused element, since
+            # that flag duplicates the KWin window signal.
             showing = None
+            focused = None
             try:
                 ss = acc.get_state_set()
-                if ss is not None:
-                    showing = ss.contains(Atspi.StateType.SHOWING)
             except Exception:
-                showing = None
+                ss = None
+            if ss is not None:
+                try:
+                    showing = ss.contains(Atspi.StateType.SHOWING)
+                except Exception:
+                    showing = None
+                try:
+                    focused = ss.contains(Atspi.StateType.FOCUSED)
+                except Exception:
+                    focused = None
             if showing is None:
                 # F-M2R-21: the state query failed, so the Go side
                 # keeps this element on a missing signal — count
@@ -128,6 +146,8 @@ def main():
                   "w": box[2], "h": box[3], "win": win_idx}
             if showing is not None:
                 el["showing"] = showing
+            if focused is not None:
+                el["focused"] = focused
             # Name only (the accessible label, e.g. "Password");
             # never a value — the helper has no way to read one.
             elements.append(el)

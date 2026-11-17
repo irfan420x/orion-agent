@@ -253,11 +253,14 @@ type inputSummary struct {
 	// the click. PostClickCursor is the cursor right after the
 	// click (nil when the re-read failed); ClickVerified is true
 	// only when that re-read agreed the cursor is still on
-	// target AND the focus check did not prove a miss (the
-	// target window never took focus although the focus never
-	// moved — the click never reached the window). ClickVerified
-	// stays true for a click on the already-focused window that
-	// legitimately changes nothing visible: the focus check can
+	// target AND neither the focus check (the target window
+	// never took focus although the focus never moved — the
+	// click never reached the window) nor the element check
+	// (another control at the click point took focus — the
+	// click landed on the wrong control inside the already
+	// focused window) proved a miss. ClickVerified stays true
+	// for a click on the already-focused window that
+	// legitimately changes nothing visible: both checks can
 	// only demote on positive evidence of a miss.
 	// ClickMayHaveLanded is true when the click command
 	// itself timed out — the click may already have landed, and
@@ -690,6 +693,8 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (re
 			summary.Warning = "the click was sent but the post-click check could not run (KWin oracle unavailable): verify on screen before retrying."
 		} else if out.focusMiss {
 			summary.Warning = "the click was sent and the cursor is on the target, but the target window never took focus — the click may not have landed on it. Verify on screen before retrying."
+		} else if out.elementMiss {
+			summary.Warning = "the click was sent and the cursor is on the target, but another control at the click point took focus — the click may have landed on the wrong control. Verify on screen before retrying."
 		} else if !out.verified {
 			summary.Warning = "the click was sent but the cursor is no longer on the target — verify on screen before retrying."
 		}
@@ -1000,13 +1005,18 @@ func (t *inputTool) correctTo(ctx context.Context, tx, ty int, cur cursorPos) (c
 // target but the focus check positively showed the click never
 // reached the target window (see focusProvesMiss) — the
 // warning then says so instead of blaming the cursor.
+// elementMiss is true when the cursor is on target but the
+// element check positively showed the click landed on a
+// different control inside the already-focused window (see
+// elementProvesMiss).
 type clickOutcome struct {
-	final     cursorPos
-	iters     int
-	postClick *cursorPos // oracle cursor right after the click, nil when the re-read failed
-	verified  bool       // the post-click oracle agreed the cursor is still on target AND the focus check did not prove a miss
-	uncertain bool       // the click command timed out: it may have landed
-	focusMiss bool       // the click never reached the target window (focus never moved)
+	final       cursorPos
+	iters       int
+	postClick   *cursorPos // oracle cursor right after the click, nil when the re-read failed
+	verified    bool       // the post-click oracle agreed the cursor is still on target AND neither check proved a miss
+	uncertain   bool       // the click command timed out: it may have landed
+	focusMiss   bool       // the click never reached the target window (focus never moved)
+	elementMiss bool       // the click landed on a different control in the focused window (focus moved to it)
 }
 
 // doClick moves to the target (closed-loop — a failed move
@@ -1042,24 +1052,50 @@ type clickOutcome struct {
 // positive evidence of a miss, never on the absence of a
 // visible effect.
 //
-// What this cannot catch, stated plainly: a click that reached
-// the right window but missed the element inside it (the
-// element moved in the milliseconds between the pre-click
-// re-validation and the press, or the press landed on a
-// neighbouring control). The post-click element state cannot
-// distinguish that either — an element still in place may be a
-// landed click with no visible effect or a miss, and a moved or
-// vanished element may be the click's own effect — so no
-// element re-read is attempted after the click: it would either
-// false-negative real clicks or claim a certainty it does not
-// have.
+// The focus check cannot see inside the already-focused
+// window, so a snapshot click gets a second check after it:
+// the element re-check (elementProvesMiss). A press gives
+// keyboard focus to the control it lands on, so when the
+// focused control AFTER the click is a different, pre-existing
+// control sitting on the click point — while the target sits
+// there unchanged and the window never changed — the press
+// demonstrably landed on that other control, not the target.
+// Geometry alone could not prove this (the flat AT-SPI list
+// carries no z-order: two overlapping elements at the click
+// point say nothing about which one received the press); the
+// focused element is the disambiguator, and it comes from the
+// helper's per-element FOCUSED state, read off the same state
+// set the helper already queries for SHOWING. Coordinate
+// clicks have no element identity and get no element re-check.
+//
+// What the element re-check still cannot catch, stated
+// plainly: a miss onto a control that was ALREADY focused
+// before the click (the focus does not move, so it is
+// indistinguishable from a landed click on a control that
+// never takes focus); a miss onto a non-focusable control or
+// area (no focus signal is produced at all); a miss where the
+// target moved or vanished (that may be the click's own
+// effect); and any click whose toolkit never reports element
+// focus — then the check silently never fires, and the cursor
+// verdict stands. In every one of those cases the click still
+// verifies on the cursor rather than false-negative: the
+// element check, like the focus check, can only demote on
+// positive evidence of a miss.
 func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snapshotID string, elementID *int, target cursorPos) (clickOutcome, error) {
 	final, iters, err := t.doMove(ctx, target.X, target.Y)
 	if err != nil {
 		return clickOutcome{}, err
 	}
+	// The pre-click element state, for the post-click element
+	// re-check below: the revalidation walk already read the
+	// fresh tree, so capturing the state here costs no second
+	// walk. Nil for coordinate clicks (no element identity)
+	// and for snapshot entries without one.
+	var pre *preClickElementState
 	if snapshotID != "" && elementID != nil {
-		if err := t.revalidateSnapshotElement(ctx, snapshotID, *elementID, final); err != nil {
+		var err error
+		pre, err = t.revalidateSnapshotElement(ctx, snapshotID, *elementID, final)
+		if err != nil {
 			return clickOutcome{}, err
 		}
 	} else if err := requireFreshGrounding(); err != nil {
@@ -1096,10 +1132,10 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 	// Post-click verification: the oracle re-reads the cursor
 	// right after the click. A click is only verified when the
 	// re-read succeeds and the cursor is still on target — and
-	// the focus check does not prove a miss. A failed re-read
-	// does not fail the click — ydotool already reported
-	// success — but the result says so, so the model verifies
-	// on screen before retrying.
+	// neither the focus check nor the element check proves a
+	// miss. A failed re-read does not fail the click — ydotool
+	// already reported success — but the result says so, so
+	// the model verifies on screen before retrying.
 	out := clickOutcome{final: final, iters: iters}
 	if post, err := t.readCursor(ctx); err == nil {
 		out.postClick = &post.Cursor
@@ -1111,6 +1147,19 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 			// the click.
 			out.verified = false
 			out.focusMiss = true
+		}
+		if out.verified && pre != nil && sameWindowFocus(beforeFocus, post.Windows) {
+			// Snapshot click, cursor on target, window
+			// unchanged: the element re-check runs one
+			// more AT-SPI walk and demotes only when
+			// another control demonstrably took the press
+			// (see elementProvesMiss). A failed walk is
+			// no signal, not a miss — the cursor verdict
+			// stands.
+			if t.postClickElementMiss(ctx, pre, post.Windows, post.Cursor) {
+				out.verified = false
+				out.elementMiss = true
+			}
 		}
 	}
 	return out, nil
@@ -1194,10 +1243,16 @@ func requireFreshGrounding() error {
 // page) per snapshot click, on top of the sensitive check's
 // walk. That is the price of clicking a live element instead of
 // a remembered coordinate.
-func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID string, elementID int, cursor cursorPos) error {
+//
+// On success it also returns the pre-click element state for
+// the post-click element re-check (F-A23W2-9 follow-up): the
+// corrected fresh tree, the matched target, and which control
+// held focus just before the press. Capturing it here costs no
+// second walk — this is the same tree the re-check just read.
+func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID string, elementID int, cursor cursorPos) (*preClickElementState, error) {
 	snap, err := groundSnapshots.lookup(snapshotID, chatIDFromContext(ctx), elementID, time.Now())
 	if err != nil {
-		return fmt.Errorf("snapshot went stale before the click: %v (ground again)", err)
+		return nil, fmt.Errorf("snapshot went stale before the click: %v (ground again)", err)
 	}
 	want := snap.details[elementID]
 	// No recorded identity, nothing to re-check. The re-check
@@ -1213,18 +1268,18 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 	// and a snapshot whose element HAS an identity always
 	// goes through the fresh-tree match below.
 	if want.Role == "" && want.Name == "" {
-		return nil
+		return nil, nil
 	}
 	tree, _, err := t.ground.atspiTree(ctx)
 	if err != nil {
-		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: the accessibility tree failed (%v) — ground again", elementID, want.Role, want.Name, err)
+		return nil, fmt.Errorf("cannot re-check element %d (%s %q) before the click: the accessibility tree failed (%v) — ground again", elementID, want.Role, want.Name, err)
 	}
 	if tree == nil {
-		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: no accessibility tree — ground again", elementID, want.Role, want.Name)
+		return nil, fmt.Errorf("cannot re-check element %d (%s %q) before the click: no accessibility tree — ground again", elementID, want.Role, want.Name)
 	}
 	cur, err := t.readCursor(ctx)
 	if err != nil {
-		return fmt.Errorf("cannot re-check element %d (%s %q) before the click: the KWin oracle failed (%v) — ground again", elementID, want.Role, want.Name, err)
+		return nil, fmt.Errorf("cannot re-check element %d (%s %q) before the click: the KWin oracle failed (%v) — ground again", elementID, want.Role, want.Name, err)
 	}
 	if len(cur.Windows) > 0 {
 		applyWindowOffsets(tree, matchKWinWindows(tree, cur.Windows))
@@ -1245,7 +1300,8 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 	if cur.Screen != nil {
 		viewW, viewH = cur.Screen.W, cur.Screen.H
 	}
-	fresh, _, _, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements, 0, 0, viewW, viewH, kwinMinimizedWindowIndexes(tree, cur.Windows))
+	minimized := kwinMinimizedWindowIndexes(tree, cur.Windows)
+	fresh, _, _, _ := filterGroundElements(tree, roleSet, nil, groundMaxMaxElements, 0, 0, viewW, viewH, minimized)
 	var moved *atspiElement // same role+name, centre elsewhere
 	for i := range fresh {
 		el := &fresh[i]
@@ -1254,16 +1310,300 @@ func (t *inputTool) revalidateSnapshotElement(ctx context.Context, snapshotID st
 		}
 		cx, cy := el.X+el.W/2, el.Y+el.H/2
 		if withinTolerance(cursorPos{X: cx, Y: cy}, cursor.X, cursor.Y) {
-			return nil // still at the cursor: click
+			// Still at the cursor: click — and hand the
+			// post-click check the state it needs: the
+			// corrected fresh tree (any role — the
+			// control that takes focus need not share
+			// the target's role), the matched target,
+			// and the control that held focus before
+			// the press.
+			view := elementCheckView(tree, minimized)
+			focused, ambiguous := focusedControl(view)
+			return &preClickElementState{
+				elements:       view,
+				target:         *el,
+				focused:        focused,
+				focusAmbiguous: ambiguous,
+			}, nil
 		}
 		if moved == nil {
 			moved = el
 		}
 	}
 	if moved != nil {
-		return fmt.Errorf("element %d (%s %q) has moved since grounding: it was at (%d, %d), now at (%d, %d) — the click target is stale: ground again", elementID, want.Role, want.Name, want.Centre.X, want.Centre.Y, moved.X+moved.W/2, moved.Y+moved.H/2)
+		return nil, fmt.Errorf("element %d (%s %q) has moved since grounding: it was at (%d, %d), now at (%d, %d) — the click target is stale: ground again", elementID, want.Role, want.Name, want.Centre.X, want.Centre.Y, moved.X+moved.W/2, moved.Y+moved.H/2)
 	}
-	return fmt.Errorf("element %d (%s %q) is no longer on screen — ground again and pick an element from the new list", elementID, want.Role, want.Name)
+	return nil, fmt.Errorf("element %d (%s %q) is no longer on screen — ground again and pick an element from the new list", elementID, want.Role, want.Name)
+}
+
+// preClickElementState is what the post-click element re-check
+// needs from the pre-click revalidation walk: the corrected
+// fresh tree (every role — the control that takes focus need
+// not share the target's role), the matched target, and the
+// control that held focus just before the press.
+type preClickElementState struct {
+	// elements is the corrected pre-click tree, visibility
+	// filtered (hidden, degenerate and minimized-window
+	// elements removed): the set a post-click focus-taker
+	// must already be in, so a popup the click itself
+	// opened can never demote.
+	elements []atspiElement
+	// target is the fresh element the pre-click revalidation
+	// matched to the snapshot element.
+	target atspiElement
+	// focused is the unique control holding focus just before
+	// the click, or nil when none held focus;
+	// focusAmbiguous is true when more than one control
+	// reported focused (the signal is muddy: no demotion).
+	focused        *atspiElement
+	focusAmbiguous bool
+}
+
+// elementBoxTolerance is how far a post-click box may differ
+// from the pre-click box per coordinate and still count as the
+// same element in place (a pixel of KWin-correction jitter
+// between the two walks must not read as movement).
+const elementBoxTolerance = 2
+
+// elementCheckView is the corrected, visibility-filtered view of
+// a tree for the post-click element check: every element the
+// check may reason about, regardless of role (the focused
+// control can be any role). Hidden, degenerate and
+// minimized-window elements are removed, like the grounding
+// filter — a hidden node keeps stale state and can never have
+// taken focus from the press. Names are normalised exactly as
+// the grounding filter does (empty → role, over-long truncated),
+// so pre- and post-click elements compare equal.
+func elementCheckView(tree *atspiOutput, minimized map[int]bool) []atspiElement {
+	if tree == nil {
+		return nil
+	}
+	view := make([]atspiElement, 0, len(tree.Elements))
+	for _, el := range tree.Elements {
+		if el.Showing != nil && !*el.Showing {
+			continue
+		}
+		if el.Win != nil && minimized[*el.Win] {
+			continue
+		}
+		if el.W <= 1 || el.H <= 1 || el.X < 0 || el.Y < 0 {
+			continue
+		}
+		if strings.TrimSpace(el.Name) == "" {
+			el.Name = el.Role
+		}
+		if runes := []rune(el.Name); len(runes) > groundMaxNameRunes {
+			el.Name = string(runes[:groundMaxNameRunes-1]) + "…"
+		}
+		view = append(view, el)
+	}
+	return view
+}
+
+// focusedControl returns the unique control holding focus in
+// the view, or nil when none does; ambiguous is true when more
+// than one control reports focused (stale flags — the signal
+// is muddy and must never demote). The window frame itself is
+// skipped: it reports FOCUSED whenever its window is active,
+// which duplicates the KWin window signal the focus check
+// already reads — the control that took the press is what
+// matters here.
+func focusedControl(view []atspiElement) (focused *atspiElement, ambiguous bool) {
+	for i := range view {
+		el := &view[i]
+		if el.Role == "frame" {
+			continue
+		}
+		if el.Focused == nil || !*el.Focused {
+			continue
+		}
+		if focused != nil {
+			return nil, true
+		}
+		focused = el
+	}
+	return focused, false
+}
+
+// sameWindowFocus reports whether the KWin active window is
+// the same before and after the click (and known on both
+// sides): the element re-check only runs when the window never
+// changed — a landed click that opens a dialog or navigates
+// moves the focus as its own effect, and that must never
+// demote.
+func sameWindowFocus(before *focusIdentity, afterWindows []kwinWindow) bool {
+	if before == nil || !before.known || !before.kwin {
+		return false
+	}
+	after := kwinActiveWindow(afterWindows)
+	if after == nil {
+		return false
+	}
+	return before.equal(kwinFocusIdentity(*after))
+}
+
+// postClickElementMiss runs the post-click element re-check: one
+// more AT-SPI walk, KWin-corrected with the post-click windows,
+// judged by elementProvesMiss against the pre-click state. A
+// failed or empty walk is no signal, not a miss — the cursor
+// verdict stands.
+func (t *inputTool) postClickElementMiss(ctx context.Context, pre *preClickElementState, postWindows []kwinWindow, at cursorPos) bool {
+	tree, _, err := t.ground.atspiTree(ctx)
+	if err != nil || tree == nil {
+		return false
+	}
+	if len(postWindows) > 0 {
+		applyWindowOffsets(tree, matchKWinWindows(tree, postWindows))
+	}
+	post := elementCheckView(tree, kwinMinimizedWindowIndexes(tree, postWindows))
+	return elementProvesMiss(pre, post, at)
+}
+
+// elementProvesMiss reports whether the post-click tree
+// positively shows a snapshot click landed on a different
+// control than its target — the F-A23W2-9 element re-check.
+// A press gives keyboard focus to the control it lands on, so
+// the demotion needs ALL of these at once:
+//
+//   - the target is still there, unchanged (same role+name,
+//     centre on the click point, box unchanged): a moved or
+//     vanished target may be the click's own effect;
+//   - exactly one control holds focus after the click, and it
+//     is not the target;
+//   - that control's box contains the click point, in the same
+//     window as the target;
+//   - neither box contains the other: a focusable container
+//     taking focus instead of its child is not a miss;
+//   - the control pre-existed with the same box: a popup or
+//     menu item the click itself opened is not a miss;
+//   - the focus MOVED to it: the pre-click focus was nothing,
+//     or a different control — a control that was already
+//     focused before the press is indistinguishable from a
+//     landed click on a control that never takes focus.
+//
+// Any unknown is no signal, not a miss: no focused control,
+// several focused controls, an ambiguous pre-click focus, or
+// a missing tree all leave the cursor verdict standing. The
+// check therefore never demotes a click that legitimately
+// changes nothing visible, and never demotes on the absence of
+// a visible effect — only on a focus movement that positively
+// places the press on another control.
+func elementProvesMiss(pre *preClickElementState, post []atspiElement, at cursorPos) bool {
+	if pre == nil {
+		return false
+	}
+	// The target must still be there, unchanged.
+	target, ok := findTarget(post, pre.target, at)
+	if !ok {
+		return false
+	}
+	// Exactly one control holds focus after the click.
+	focused, ambiguous := focusedControl(post)
+	if ambiguous || focused == nil {
+		return false
+	}
+	b := *focused
+	// ... and it is not the target itself.
+	if sameElement(b, pre.target) {
+		return false
+	}
+	// ... its box contains the click point ...
+	if !containsPoint(b, at) {
+		return false
+	}
+	// ... in the same window as the target ...
+	if b.Win != nil && target.Win != nil && *b.Win != *target.Win {
+		return false
+	}
+	// ... and it is neither a container of the target nor a
+	// child of it.
+	if boxContains(b, pre.target) || boxContains(pre.target, b) {
+		return false
+	}
+	// ... it pre-existed with the same box (not a popup the
+	// click itself opened) ...
+	if !hasSameBox(pre.elements, b) {
+		return false
+	}
+	// ... and the focus moved to it.
+	if pre.focusAmbiguous {
+		return false
+	}
+	if pre.focused != nil && sameElement(*pre.focused, b) {
+		return false // already focused: no movement, no signal
+	}
+	return true
+}
+
+// findTarget finds the target in the post-click view: an
+// element with the target's role+name whose centre is on the
+// click point and whose box is unchanged. A same-named element
+// with a changed box is not the target in place — it may have
+// moved as the click's own effect — so it does not match.
+func findTarget(post []atspiElement, want atspiElement, at cursorPos) (atspiElement, bool) {
+	for _, el := range post {
+		if el.Role != want.Role || el.Name != want.Name {
+			continue
+		}
+		if !withinTolerance(cursorPos{X: el.X + el.W/2, Y: el.Y + el.H/2}, at.X, at.Y) {
+			continue
+		}
+		if !sameBox(el, want) {
+			continue
+		}
+		return el, true
+	}
+	return atspiElement{}, false
+}
+
+// sameBox reports whether two boxes agree within
+// elementBoxTolerance per coordinate (a pixel of
+// KWin-correction jitter between the two walks is not
+// movement).
+func sameBox(a, b atspiElement) bool {
+	diff := func(x, y int) int {
+		if x > y {
+			return x - y
+		}
+		return y - x
+	}
+	return diff(a.X, b.X) <= elementBoxTolerance &&
+		diff(a.Y, b.Y) <= elementBoxTolerance &&
+		diff(a.W, b.W) <= elementBoxTolerance &&
+		diff(a.H, b.H) <= elementBoxTolerance
+}
+
+// sameElement reports whether two elements are the same
+// control: same role+name and the same box.
+func sameElement(a, b atspiElement) bool {
+	return a.Role == b.Role && a.Name == b.Name && sameBox(a, b)
+}
+
+// hasSameBox reports whether the view holds an element with
+// the same role+name and box (the pre-existence check for a
+// post-click focus-taker).
+func hasSameBox(view []atspiElement, want atspiElement) bool {
+	for _, el := range view {
+		if sameElement(el, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsPoint reports whether the point lies inside the
+// element's box (half-open, like the window containment in
+// focusProvesMiss).
+func containsPoint(el atspiElement, p cursorPos) bool {
+	return p.X >= el.X && p.X < el.X+el.W && p.Y >= el.Y && p.Y < el.Y+el.H
+}
+
+// boxContains reports whether outer's box fully contains
+// inner's box (equal boxes contain each other).
+func boxContains(outer, inner atspiElement) bool {
+	return outer.X <= inner.X && outer.Y <= inner.Y &&
+		outer.X+outer.W >= inner.X+inner.W &&
+		outer.Y+outer.H >= inner.Y+inner.H
 }
 
 // windowInfo enumerates the visible windows for the sensitive

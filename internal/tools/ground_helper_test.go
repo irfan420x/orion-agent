@@ -85,7 +85,8 @@ class _Node:
         return self._children[i]
 
 def _build_tree():
-    button = _Node("OK", "push button", (100, 100, 80, 30))
+    button = _Node("OK", "push button", (100, 100, 80, 30),
+                   focused=(os.environ.get("ATSTUB_FOCUS_BUTTON") == "1"))
     entry = _Node("Name", "entry", (100, 150, 200, 30),
                   fail_state=(os.environ.get("ATSTUB_FAIL_STATE") == "1"))
     window = _Node("Test Window", "frame", (0, 0, 800, 600),
@@ -264,6 +265,49 @@ func TestRealAtspiHelperShowingUnknown(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("entry missing from elements: %+v", out.Elements)
+	}
+}
+
+// TestRealAtspiHelperReportsFocusedElement pins the F-A23W2-9
+// follow-up helper side: each element carries its FOCUSED state
+// (from the same state-set query as SHOWING — no extra D-Bus
+// call), so the Go side can read which control holds focus.
+// The focused button reports focused=true, the unfocused entry
+// focused=false; without the flag the button reports false too
+// (the field is populated, not just omitted).
+func TestRealAtspiHelperReportsFocusedElement(t *testing.T) {
+	stubDir := writeStubGi(t, t.TempDir(), stubAtspiSource)
+	stdout, stderr, err := runRealHelper(t, atspiHelperSource, []string{"12", "1000"}, stubDir,
+		map[string]string{"ATSTUB_FOCUS_BUTTON": "1"})
+	if err != nil {
+		t.Fatalf("helper failed: %v (stderr: %s)", err, stderr)
+	}
+	out := parseAtspiOutput(t, stdout)
+	want := map[string]bool{"OK": true, "Name": false}
+	for _, el := range out.Elements {
+		wantFocused, ok := want[el.Name]
+		if !ok {
+			continue
+		}
+		if el.Focused == nil {
+			t.Errorf("element %q focused = nil, want %v (the helper must report the state)", el.Name, wantFocused)
+		} else if *el.Focused != wantFocused {
+			t.Errorf("element %q focused = %v, want %v", el.Name, *el.Focused, wantFocused)
+		}
+	}
+	// Without the flag the button is unfocused: the field is
+	// still populated (false), never omitted.
+	stdout, stderr, err = runRealHelper(t, atspiHelperSource, []string{"12", "1000"}, stubDir, nil)
+	if err != nil {
+		t.Fatalf("helper failed: %v (stderr: %s)", err, stderr)
+	}
+	out = parseAtspiOutput(t, stdout)
+	for _, el := range out.Elements {
+		if el.Name == "OK" {
+			if el.Focused == nil || *el.Focused {
+				t.Errorf("button focused = %v, want false without the flag", el.Focused)
+			}
+		}
 	}
 }
 

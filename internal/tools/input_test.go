@@ -60,11 +60,19 @@ type fakeInputEnv struct {
 	kwinWindowsAfterClick []kwinWindow
 	moveCount             int
 
-	tree          string // canned AT-SPI tree JSON ("" = default benign tree)
-	treeErr       bool   // atspiTree fails -> xdotool fallback
-	xdotoolTitles []string
-	xdotoolErr    bool
-	locked        bool
+	tree string // canned AT-SPI tree JSON ("" = default benign tree)
+	// treeAfterClick, when set, replaces tree the moment the
+	// fake ydotool processes a click: the simulated desktop's
+	// reaction to the click (e.g. another control taking
+	// focus). treeErrAfterClick fails the tree walk after a
+	// click instead. Unset means the click changed nothing.
+	treeAfterClick    string
+	treeErrAfterClick bool
+	clicked           bool // the fake ydotool processed a click
+	treeErr           bool // atspiTree fails -> xdotool fallback
+	xdotoolTitles     []string
+	xdotoolErr        bool
+	locked            bool
 
 	socketExists bool
 	socketPath   string
@@ -187,11 +195,14 @@ func newFakeInputEnv(t *testing.T) *fakeInputEnv {
 	tool.socketPath = func() (string, error) { return env.socketPath, nil }
 	tool.ydotool = func(ctx context.Context, stdin string, args ...string) (string, error) {
 		env.ydotoolCalls = append(env.ydotoolCalls, fakeYdotoolCall{stdin: stdin, args: append([]string{}, args...)})
-		if len(args) > 0 && args[0] == "click" && env.kwinWindowsAfterClick != nil {
-			// The simulated desktop reacts to the click:
-			// from here on the KWin oracle reports the
-			// post-click window list (focus included).
-			env.kwinWindows = env.kwinWindowsAfterClick
+		if len(args) > 0 && args[0] == "click" {
+			env.clicked = true
+			if env.kwinWindowsAfterClick != nil {
+				// The simulated desktop reacts to the click:
+				// from here on the KWin oracle reports the
+				// post-click window list (focus included).
+				env.kwinWindows = env.kwinWindowsAfterClick
+			}
 		}
 		if len(args) > 0 && args[0] == "mousemove" {
 			env.moveCount++
@@ -256,6 +267,12 @@ func newFakeInputEnv(t *testing.T) *fakeInputEnv {
 		return "", nil
 	}
 	g.runHelper = func(ctx context.Context, helperPath string) ([]byte, error) {
+		if env.clicked && env.treeErrAfterClick {
+			return nil, errors.New("fake AT-SPI helper failure after the click")
+		}
+		if env.clicked && env.treeAfterClick != "" {
+			return []byte(env.treeAfterClick), nil
+		}
 		if env.treeErr {
 			return nil, errors.New("fake AT-SPI helper failure")
 		}
@@ -1762,6 +1779,300 @@ func TestInputSnapshotClickVerifiedWhenTargetWindowTakesFocus(t *testing.T) {
 	}
 	if got := len(env.clickCalls()); got != 1 {
 		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+// --- F-A23W2-9 element re-check (follow-up round): a click
+// that reaches the already-focused window but lands on the
+// wrong control must NOT verify. The press gives focus to the
+// control it lands on, so the post-click focused control is
+// the signal — the target sitting there unchanged while
+// another control at the click point takes focus proves the
+// press hit the other control. ---
+
+// focusTreeElement is one element in a canned tree for the
+// element re-check tests.
+type focusTreeElement struct {
+	role, name string
+	x, y, w, h int
+}
+
+var (
+	// The snapshot target: the "Sign in" button, centre (960, 403).
+	focusSignInButton = focusTreeElement{"button", "Sign in", 910, 378, 100, 50}
+	// A neighbouring control whose box covers the click point
+	// without containing the button's box (or being contained
+	// by it): the wrong control the press can land on.
+	focusSearchEntry = focusTreeElement{"entry", "Search", 850, 390, 300, 26}
+	// A control elsewhere on the page, holding focus before the
+	// click in most cases.
+	focusUsernameEntry = focusTreeElement{"entry", "Username", 784, 300, 352, 40}
+	// A container holding the button: focus moving to it
+	// instead of the button is not a miss.
+	focusFormPanel = focusTreeElement{"panel", "Form", 900, 370, 120, 70}
+)
+
+// focusTreeJSON builds a canned AT-SPI tree (Firefox window at
+// (0,0,1920,1080)) from the given elements; focused names the
+// element holding focus ("" = none). Every element carries an
+// explicit focused flag, so the fake tree exercises the same
+// signal the real helper reports.
+func focusTreeJSON(focused string, els ...focusTreeElement) string {
+	var b strings.Builder
+	b.WriteString(`{"windows": [
+		{"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox", "role": "frame", "focused": true, "x": 0, "y": 0, "w": 1920, "h": 1080}],
+	"elements": [`)
+	for i, el := range els {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"role": %q, "name": %q, "x": %d, "y": %d, "w": %d, "h": %d, "win": 0, "showing": true, "focused": %v}`,
+			el.role, el.name, el.x, el.y, el.w, el.h, el.name == focused)
+	}
+	b.WriteString(`],
+	"focused_window": {"title": "Sign in to GitHub · GitHub — Mozilla Firefox", "app": "Firefox"},
+	"walked_nodes": 140}`)
+	return b.String()
+}
+
+// focusClickEnv is a fake env for the element re-check tests:
+// Firefox already focused, the button at its grounded centre.
+func focusClickEnv(t *testing.T) *fakeInputEnv {
+	t.Helper()
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = firefoxKWinWindow(0)
+	// firefoxKWinWindow leaves Active unset; the element
+	// re-check only runs when the KWin active window is known
+	// and unchanged, so the focused window must be marked.
+	env.kwinWindows[0].Active = true
+	return env
+}
+
+func TestInputSnapshotClickUnverifiedWhenWrongControlTakesFocus(t *testing.T) {
+	env := focusClickEnv(t)
+	// Before the click the Username entry holds focus; the
+	// press lands on the Search entry instead of the Sign in
+	// button — the Search entry takes focus while the button
+	// sits there unchanged.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Search", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1 (the click was sent)", got)
+	}
+	if s.PostClickCursor == nil || *s.PostClickCursor != (cursorPos{X: 960, Y: 403}) {
+		t.Errorf("post_click_cursor = %+v, want {960 403} (the cursor IS on target — only the element check demotes this)", s.PostClickCursor)
+	}
+	if s.ClickVerified {
+		t.Errorf("click_verified = true with another control at the click point taking focus, want false (the click landed on the wrong control)")
+	}
+	if !strings.Contains(s.Warning, "wrong control") {
+		t.Errorf("warning = %q, want the 'wrong control' note", s.Warning)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenCorrectControlTakesFocus(t *testing.T) {
+	env := focusClickEnv(t)
+	// The press lands on the button and the button itself takes
+	// focus: the click landed, and the element check must not
+	// false-negative it.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Sign in", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (the target itself took focus: the click landed)")
+	}
+	if s.Warning != "" {
+		t.Errorf("warning = %q, want empty", s.Warning)
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenFocusStaysOnOtherControl(t *testing.T) {
+	env := focusClickEnv(t)
+	// The press lands on a control that never takes focus, so
+	// focus stays on the Username entry: a landed click that
+	// legitimately changes nothing visible must still verify.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (focus staying put is no evidence of a miss)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenWrongControlAlreadyFocused(t *testing.T) {
+	env := focusClickEnv(t)
+	// The Search entry was ALREADY focused before the click
+	// and still is: the focus did not move, so the press
+	// landing on it is indistinguishable from a landed click
+	// on a control that never takes focus — no demotion.
+	env.tree = focusTreeJSON("Search", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Search", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (an already-focused control is no signal)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenTargetVanishesAfterClick(t *testing.T) {
+	env := focusClickEnv(t)
+	// The button is gone after the click (its own effect — a
+	// dialog closed, a page navigated) while the Search entry
+	// took focus: a vanished target is ambiguous, never a
+	// demotion.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Search", focusSearchEntry, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (a vanished target may be the click's own effect)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenNewControlTakesFocus(t *testing.T) {
+	env := focusClickEnv(t)
+	// The Search entry did not exist before the click (a popup
+	// the click itself opened) and takes focus after it: a new
+	// control is the click's own effect, never a miss.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Search", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (a control created by the click is no evidence of a miss)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenContainerTakesFocus(t *testing.T) {
+	env := focusClickEnv(t)
+	// Focus moves to the Form panel containing the button: a
+	// focusable container taking focus instead of its child is
+	// not a miss.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusFormPanel, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Form", focusSignInButton, focusFormPanel, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (a container taking focus is not a miss)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenPostClickTreeWalkFails(t *testing.T) {
+	env := focusClickEnv(t)
+	// The post-click tree walk fails: a missing signal never
+	// demotes — the cursor verdict stands.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeErrAfterClick = true
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (a failed post-click walk is no signal)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputCoordClickSkipsElementRecheck(t *testing.T) {
+	// A coordinate click has no element identity, so the
+	// element re-check cannot run: even with another control
+	// taking focus after the click, the cursor verdict stands.
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = firefoxKWinWindow(0)
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Search", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	res := env.call(t, `{"op": "click", "x": 960, "y": 403}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (coordinate clicks have no element to re-check)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+// TestElementProvesMiss pins the element re-check's guards
+// directly: each case is one combination of the pre/post-click
+// trees, judged without the fake desktop.
+func TestElementProvesMiss(t *testing.T) {
+	at := cursorPos{X: 960, Y: 403}
+	el := func(role, name string, x, y, w, h, win int, focused bool) atspiElement {
+		wv, f, s := win, focused, true
+		return atspiElement{Role: role, Name: name, X: x, Y: y, W: w, H: h, Win: &wv, Showing: &s, Focused: &f}
+	}
+	// The geometry: the button at (910,378,100,50), the Search
+	// entry overlapping its centre, the Username entry
+	// elsewhere, the Form panel containing the button.
+	button := el("button", "Sign in", 910, 378, 100, 50, 0, false)
+	search := el("entry", "Search", 850, 390, 300, 26, 0, false)
+	searchFocused := el("entry", "Search", 850, 390, 300, 26, 0, true)
+	username := el("entry", "Username", 784, 300, 352, 40, 0, false)
+	usernameFocused := el("entry", "Username", 784, 300, 352, 40, 0, true)
+	buttonFocused := el("button", "Sign in", 910, 378, 100, 50, 0, true)
+	panelFocused := el("panel", "Form", 900, 370, 120, 70, 0, true)
+	panel := el("panel", "Form", 900, 370, 120, 70, 0, false)
+	frameFocused := el("frame", "Firefox", 0, 0, 1920, 1080, 0, true)
+	searchOtherWin := el("entry", "Search", 850, 390, 300, 26, 1, true)
+	searchOffPoint := el("entry", "Search", 1200, 390, 300, 26, 0, true)
+	buttonMoved := el("button", "Sign in", 910, 478, 100, 50, 0, false)
+
+	pre := func(focused *atspiElement, ambiguous bool, els ...atspiElement) *preClickElementState {
+		return &preClickElementState{elements: els, target: button, focused: focused, focusAmbiguous: ambiguous}
+	}
+	cases := []struct {
+		name string
+		pre  *preClickElementState
+		post []atspiElement
+		want bool
+	}{
+		{"wrongControlTakesFocus", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{button, searchFocused, username}, true},
+		{"targetTakesFocus", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{buttonFocused, search, username}, false},
+		{"focusStays", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{button, search, usernameFocused}, false},
+		{"alreadyFocusedWrongControl", pre(&searchFocused, false, button, searchFocused, username), []atspiElement{button, searchFocused, username}, false},
+		{"noFocusBefore", pre(nil, false, button, search, username), []atspiElement{button, searchFocused, username}, true},
+		{"targetVanished", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{searchFocused, username}, false},
+		{"targetMoved", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{buttonMoved, searchFocused, username}, false},
+		{"newControlTakesFocus", pre(&usernameFocused, false, button, usernameFocused), []atspiElement{button, searchFocused, username}, false},
+		{"containerTakesFocus", pre(&usernameFocused, false, button, panel, usernameFocused), []atspiElement{button, panelFocused, username}, false},
+		{"noFocusedControl", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{button, search, username}, false},
+		{"twoFocusedControls", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{button, searchFocused, usernameFocused}, false},
+		{"wrongControlNotAtPoint", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{button, searchOffPoint, username}, false},
+		{"wrongControlOtherWindow", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{button, searchOtherWin, username}, false},
+		{"preFocusAmbiguous", pre(nil, true, button, search, usernameFocused), []atspiElement{button, searchFocused, username}, false},
+		{"frameFocusIgnored", pre(&usernameFocused, false, button, search, usernameFocused), []atspiElement{button, searchFocused, username, frameFocused}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := elementProvesMiss(tc.pre, tc.post, at); got != tc.want {
+				t.Errorf("elementProvesMiss = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
