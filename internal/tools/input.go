@@ -253,7 +253,13 @@ type inputSummary struct {
 	// the click. PostClickCursor is the cursor right after the
 	// click (nil when the re-read failed); ClickVerified is true
 	// only when that re-read agreed the cursor is still on
-	// target. ClickMayHaveLanded is true when the click command
+	// target AND the focus check did not prove a miss (the
+	// target window never took focus although the focus never
+	// moved — the click never reached the window). ClickVerified
+	// stays true for a click on the already-focused window that
+	// legitimately changes nothing visible: the focus check can
+	// only demote on positive evidence of a miss.
+	// ClickMayHaveLanded is true when the click command
 	// itself timed out — the click may already have landed, and
 	// Warning says to verify before retrying instead of
 	// clicking again blindly.
@@ -639,6 +645,8 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (To
 			summary.Warning = "the click command timed out — the click may already have landed. Verify on screen before retrying; do not click again blindly."
 		} else if out.postClick == nil {
 			summary.Warning = "the click was sent but the post-click check could not run (KWin oracle unavailable): verify on screen before retrying."
+		} else if out.focusMiss {
+			summary.Warning = "the click was sent and the cursor is on the target, but the target window never took focus — the click may not have landed on it. Verify on screen before retrying."
 		} else if !out.verified {
 			summary.Warning = "the click was sent but the cursor is no longer on the target — verify on screen before retrying."
 		}
@@ -945,13 +953,17 @@ func (t *inputTool) correctTo(ctx context.Context, tx, ty int, cur cursorPos) (c
 // post-click verification (F-A23W2-9). Uncertain is true when
 // the click command itself timed out: the click may already
 // have landed, and the caller must say so instead of returning
-// a retryable error.
+// a retryable error. focusMiss is true when the cursor is on
+// target but the focus check positively showed the click never
+// reached the target window (see focusProvesMiss) — the
+// warning then says so instead of blaming the cursor.
 type clickOutcome struct {
 	final     cursorPos
 	iters     int
 	postClick *cursorPos // oracle cursor right after the click, nil when the re-read failed
-	verified  bool       // the post-click oracle agreed the cursor is still on target
+	verified  bool       // the post-click oracle agreed the cursor is still on target AND the focus check did not prove a miss
 	uncertain bool       // the click command timed out: it may have landed
+	focusMiss bool       // the click never reached the target window (focus never moved)
 }
 
 // doClick moves to the target (closed-loop — a failed move
@@ -964,6 +976,40 @@ type clickOutcome struct {
 // A coordinate click re-checks the freshness gate instead (the
 // grounding may have gone stale during the sensitive check and
 // the move).
+//
+// Post-click verification (F-A23W2-9) is the cursor AND the
+// focused window, not the cursor alone: the move already put
+// the cursor on target, so a re-read that agrees only re-proves
+// the move — a click that never landed still reports verified.
+// The check that can actually catch a missed click is the
+// focus: a button press that reaches an unfocused window
+// focuses it (KWin click-to-focus). The focus is therefore read
+// just before the click and again right after (the same oracle
+// reading that carries the post-click cursor); when the focus
+// never moved off a different window than the target's, the
+// press demonstrably never reached the target window and the
+// click is NOT verified, even though the cursor sits on target.
+// Every other outcome leaves the cursor verdict standing: a
+// click on the already-focused window need not move the focus,
+// a landed click may open a dialog that takes the focus
+// instead, and when KWin names no active window (or no window
+// contains the target) there is no focus signal to judge by —
+// so a click that legitimately changes nothing visible still
+// verifies on the cursor. The focus check can only demote on
+// positive evidence of a miss, never on the absence of a
+// visible effect.
+//
+// What this cannot catch, stated plainly: a click that reached
+// the right window but missed the element inside it (the
+// element moved in the milliseconds between the pre-click
+// re-validation and the press, or the press landed on a
+// neighbouring control). The post-click element state cannot
+// distinguish that either — an element still in place may be a
+// landed click with no visible effect or a miss, and a moved or
+// vanished element may be the click's own effect — so no
+// element re-read is attempted after the click: it would either
+// false-negative real clicks or claim a certainty it does not
+// have.
 func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snapshotID string, elementID *int, target cursorPos) (clickOutcome, error) {
 	final, iters, err := t.doMove(ctx, target.X, target.Y)
 	if err != nil {
@@ -977,6 +1023,20 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 		// Coordinate click: the grounding may have gone stale
 		// during the sensitive check and the move.
 		return clickOutcome{}, err
+	}
+	// The focus just before the click, for the post-click
+	// verification below: one cheap KWin read. A failed read
+	// means no focus signal — the cursor verdict stands on its
+	// own (the post-click read failing already reports the
+	// click unverified; a pre-click failure alone must not).
+	var beforeWindows []kwinWindow
+	var beforeFocus *focusIdentity
+	if cur, err := t.readCursor(ctx); err == nil {
+		beforeWindows = cur.Windows
+		if w := kwinActiveWindow(cur.Windows); w != nil {
+			f := kwinFocusIdentity(*w)
+			beforeFocus = &f
+		}
 	}
 	code := inputClickCodes[button]
 	if _, err := t.ydotool(ctx, "", "click", "--repeat", strconv.Itoa(clicks), fmt.Sprintf("0x%02X", code)); err != nil {
@@ -992,16 +1052,71 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 	}
 	// Post-click verification: the oracle re-reads the cursor
 	// right after the click. A click is only verified when the
-	// re-read succeeds and the cursor is still on target. A
-	// failed re-read does not fail the click — ydotool already
-	// reported success — but the result says so, so the model
-	// verifies on screen before retrying.
+	// re-read succeeds and the cursor is still on target — and
+	// the focus check does not prove a miss. A failed re-read
+	// does not fail the click — ydotool already reported
+	// success — but the result says so, so the model verifies
+	// on screen before retrying.
 	out := clickOutcome{final: final, iters: iters}
 	if post, err := t.readCursor(ctx); err == nil {
 		out.postClick = &post.Cursor
 		out.verified = withinTolerance(post.Cursor, target.X, target.Y)
+		if out.verified && focusProvesMiss(beforeFocus, beforeWindows, post.Windows, target) {
+			// The cursor is on target but the click never
+			// reached the target window: the focus never
+			// moved off the window that was active before
+			// the click.
+			out.verified = false
+			out.focusMiss = true
+		}
 	}
 	return out, nil
+}
+
+// focusProvesMiss reports whether the pre/post-click focus
+// readings positively show the click never reached the target
+// window: KWin named an active window before and after the
+// click, it is the SAME window in both, and the target point
+// lies inside a non-minimized KWin window that is NOT the
+// focused one. A button press that reaches an unfocused window
+// focuses it — when the focus never moved, the press never
+// reached the window. Any unknown is no signal, not a miss:
+// no active window before or after, or no window containing
+// the target (the click may be on the desktop or on a window
+// KWin does not list). Overlapping windows are judged
+// conservatively: when ANY window containing the target is the
+// focused one, there is no demotion — the press may have
+// landed on the focused window underneath an inactive one on
+// top, and the check must not false-negative that. Minimized
+// windows are skipped: a minimized window cannot receive the
+// press, so it is never the target window.
+func focusProvesMiss(before *focusIdentity, beforeWindows []kwinWindow, afterWindows []kwinWindow, target cursorPos) bool {
+	if before == nil || !before.known || !before.kwin {
+		return false
+	}
+	after := kwinActiveWindow(afterWindows)
+	if after == nil {
+		return false
+	}
+	if !before.equal(kwinFocusIdentity(*after)) {
+		return false // the focus moved: the click (or its effect) moved it
+	}
+	// The focus did not move. Demote only when the target
+	// point is inside some visible window other than the
+	// focused one.
+	targetInWindow := false
+	for _, w := range beforeWindows {
+		if w.Minimized {
+			continue
+		}
+		if target.X >= w.FG[0] && target.X < w.FG[0]+w.FG[2] && target.Y >= w.FG[1] && target.Y < w.FG[1]+w.FG[3] {
+			targetInWindow = true
+			if w.Class == before.class && w.FG == before.fg {
+				return false // the target is in the focused window: no signal
+			}
+		}
+	}
+	return targetInWindow
 }
 
 // requireFreshGrounding is the F-A23W2-8 gate for coordinate

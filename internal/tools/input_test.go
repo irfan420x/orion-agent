@@ -52,7 +52,13 @@ type fakeInputEnv struct {
 	oracleFixed *cursorPos // oracle reports this instead of cursor (disagreement)
 	oracleErr   bool
 	kwinWindows []kwinWindow
-	moveCount   int
+	// kwinWindowsAfterClick, when set, replaces kwinWindows the
+	// moment the fake ydotool processes a click: the simulated
+	// desktop's reaction to the click (e.g. the target window
+	// taking focus). Unset means the click changed nothing —
+	// the missed-click simulation.
+	kwinWindowsAfterClick []kwinWindow
+	moveCount             int
 
 	tree          string // canned AT-SPI tree JSON ("" = default benign tree)
 	treeErr       bool   // atspiTree fails -> xdotool fallback
@@ -110,6 +116,12 @@ func newFakeInputEnv(t *testing.T) *fakeInputEnv {
 	tool.socketPath = func() (string, error) { return env.socketPath, nil }
 	tool.ydotool = func(ctx context.Context, stdin string, args ...string) (string, error) {
 		env.ydotoolCalls = append(env.ydotoolCalls, fakeYdotoolCall{stdin: stdin, args: append([]string{}, args...)})
+		if len(args) > 0 && args[0] == "click" && env.kwinWindowsAfterClick != nil {
+			// The simulated desktop reacts to the click:
+			// from here on the KWin oracle reports the
+			// post-click window list (focus included).
+			env.kwinWindows = env.kwinWindowsAfterClick
+		}
 		if len(args) > 0 && args[0] == "mousemove" {
 			env.moveCount++
 			dx, dy := 0, 0
@@ -1344,6 +1356,133 @@ func TestInputClickDeliveredButUnverifiedWhenOracleFails(t *testing.T) {
 	}
 	if !strings.Contains(s.Warning, "verify") {
 		t.Errorf("warning = %q, want a verify-before-retrying note", s.Warning)
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+// --- F-A23W2-9 follow-up (cursor-only verification): a click
+// must also be judged by the focused window. A button press
+// that reaches an unfocused window focuses it, so when the
+// target window never takes focus although the focus never
+// moved, the click demonstrably never reached the window —
+// even though the cursor sits on target. ---
+
+// kwinWindowsClickTarget builds a fake KWin list for the focus
+// tests: the Firefox window (fullscreen — the click target
+// (960, 403) is inside it) and a small Kate window top-left
+// (the target is outside it), with the active flag on the named
+// class.
+func kwinWindowsClickTarget(activeClass string) []kwinWindow {
+	wins := []kwinWindow{
+		{Class: "firefox-esr", FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Class: "kate", FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
+	}
+	for i := range wins {
+		wins[i].Active = wins[i].Class == activeClass
+	}
+	return wins
+}
+
+func TestInputClickUnverifiedWhenTargetWindowNeverTakesFocus(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	// Kate is focused; the click target (960, 403) is inside
+	// the unfocused Firefox window only. The simulated desktop
+	// does not react to the click (no kwinWindowsAfterClick):
+	// the focus never moves off Kate.
+	env.kwinWindows = kwinWindowsClickTarget("kate")
+	res := env.call(t, `{"op": "click", "x": 960, "y": 403}`)
+	s := parseInputSummary(t, res)
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1 (the click was sent)", got)
+	}
+	if s.PostClickCursor == nil || *s.PostClickCursor != (cursorPos{X: 960, Y: 403}) {
+		t.Errorf("post_click_cursor = %+v, want {960 403} (the cursor IS on target — only the focus demotes this)", s.PostClickCursor)
+	}
+	if s.ClickVerified {
+		t.Errorf("click_verified = true with the focus never leaving Kate, want false (the click never reached the Firefox window)")
+	}
+	if !strings.Contains(s.Warning, "never took focus") {
+		t.Errorf("warning = %q, want the 'target window never took focus' note", s.Warning)
+	}
+}
+
+func TestInputClickVerifiedWhenTargetWindowTakesFocus(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = kwinWindowsClickTarget("kate")
+	// The click lands: Firefox takes focus.
+	env.kwinWindowsAfterClick = kwinWindowsClickTarget("firefox-esr")
+	res := env.call(t, `{"op": "click", "x": 960, "y": 403}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (the target window took focus: the click landed)")
+	}
+	if s.Warning != "" {
+		t.Errorf("warning = %q, want empty", s.Warning)
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputClickVerifiedWhenTargetWindowAlreadyFocused(t *testing.T) {
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	// Firefox is already focused and the click changes nothing
+	// visible (no kwinWindowsAfterClick): this is the click
+	// that legitimately changes nothing, and it must NOT
+	// false-negative — the cursor verdict stands.
+	env.kwinWindows = kwinWindowsClickTarget("firefox-esr")
+	res := env.call(t, `{"op": "click", "x": 960, "y": 403}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (already-focused window: the focus check has nothing to demote on)")
+	}
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1", got)
+	}
+}
+
+func TestInputSnapshotClickUnverifiedWhenTargetWindowNeverTakesFocus(t *testing.T) {
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = kwinWindowsClickTarget("kate")
+	// The button is still at its grounded centre, so the
+	// pre-click re-validation passes and the click is sent —
+	// but the focus never leaves Kate: the click never reached
+	// the Firefox window holding the button.
+	env.tree = treeWithButtonJSON(910, 378, 100, 50)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if got := len(env.clickCalls()); got != 1 {
+		t.Errorf("got %d click calls, want 1 (the click was sent)", got)
+	}
+	if s.ClickVerified {
+		t.Errorf("click_verified = true with the focus never leaving Kate, want false (the click never reached the element's window)")
+	}
+	if !strings.Contains(s.Warning, "never took focus") {
+		t.Errorf("warning = %q, want the 'target window never took focus' note", s.Warning)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenTargetWindowTakesFocus(t *testing.T) {
+	resetGroundSnapshots()
+	registerSignInSnapshot()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = kwinWindowsClickTarget("kate")
+	env.kwinWindowsAfterClick = kwinWindowsClickTarget("firefox-esr")
+	env.tree = treeWithButtonJSON(910, 378, 100, 50)
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (the element's window took focus: the click landed)")
 	}
 	if got := len(env.clickCalls()); got != 1 {
 		t.Errorf("got %d click calls, want 1", got)
