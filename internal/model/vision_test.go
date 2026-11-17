@@ -34,7 +34,7 @@ func TestSupportsVision(t *testing.T) {
 		{"anthropic", "claude-3-opus", false}, // unlisted: never assumed
 		{"ollama", "llava", true},
 		{"ollama", "llama3.2-vision", true},
-		{"ollama", "llama3.1", false},     // text-only local model
+		{"ollama", "llama3.1", false}, // text-only local model
 		{"ollama", "qwen2.5-0.5b-local", false},
 		// Unknown provider / empty input: honest false, never a guess.
 		{"unknown-provider", "deepseek-flash", false},

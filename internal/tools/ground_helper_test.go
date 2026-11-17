@@ -22,11 +22,11 @@ import (
 // app (Firefox), one window ("Test Window") with a button and an
 // entry. Failures are injected by environment:
 //
-//   ATSTUB_FAIL_DESKTOP_FIRST=1 — get_desktop raises once, then works.
-//   ATSTUB_FAIL_DESKTOP_ALWAYS=1 — get_desktop always raises.
-//   ATSTUB_FAIL_DESKTOP_COUNT_ALWAYS=1 — get_desktop_count always raises.
-//   ATSTUB_FAIL_CHILD_COUNT_ALWAYS=1 — the desktop's get_child_count always raises.
-//   ATSTUB_FAIL_STATE=1 — the entry's get_state_set raises (showing unknown).
+//	ATSTUB_FAIL_DESKTOP_FIRST=1 — get_desktop raises once, then works.
+//	ATSTUB_FAIL_DESKTOP_ALWAYS=1 — get_desktop always raises.
+//	ATSTUB_FAIL_DESKTOP_COUNT_ALWAYS=1 — get_desktop_count always raises.
+//	ATSTUB_FAIL_CHILD_COUNT_ALWAYS=1 — the desktop's get_child_count always raises.
+//	ATSTUB_FAIL_STATE=1 — the entry's get_state_set raises (showing unknown).
 const stubAtspiSource = `
 import os
 
@@ -275,8 +275,8 @@ func TestRealAtspiHelperShowingUnknown(t *testing.T) {
 // geometry marker from the loaded JS into $KWINSTUB_DIR/marker,
 // and fails on demand:
 //
-//   KWINSTUB_FAIL=start — the start call raises.
-//   KWINSTUB_FAIL=proxy — creating the proxy raises.
+//	KWINSTUB_FAIL=start — the start call raises.
+//	KWINSTUB_FAIL=proxy — creating the proxy raises.
 const stubKwinSource = `
 import json, os, re
 
