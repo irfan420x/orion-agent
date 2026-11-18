@@ -317,7 +317,9 @@ func TestRealAtspiHelperReportsFocusedElement(t *testing.T) {
 // helper: a fake D-Bus proxy that records every call_sync in
 // $KWINSTUB_RECORD (one method name per line), captures the
 // geometry marker from the loaded JS into $KWINSTUB_DIR/marker,
-// and fails on demand:
+// records the loaded script's path and mode into
+// $KWINSTUB_DIR/js_path / js_mode (the PrivateTmp fix pin), and
+// fails on demand:
 //
 //	KWINSTUB_FAIL=start — the start call raises.
 //	KWINSTUB_FAIL=proxy — creating the proxy raises.
@@ -344,11 +346,19 @@ class _Proxy:
         if method == "loadScript":
             variant = args[0]
             js_path, name = variant[0], variant[1]
+            d = os.environ.get("KWINSTUB_DIR", "")
+            if d:
+                # Record what KWin was asked to load: the path
+                # proves the temp-dir choice, the mode proves
+                # the 0600 creation.
+                with open(os.path.join(d, "js_path"), "w") as f:
+                    f.write(js_path)
+                with open(os.path.join(d, "js_mode"), "w") as f:
+                    f.write(oct(os.stat(js_path).st_mode & 0o777))
             with open(js_path) as f:
                 js = f.read()
-            m = re.search(r"ORION-KWIN-GEOM-[0-9]+-[0-9a-f]+-[0-9]+:", js)
+            m = re.search(r"ORION-(KWIN-GEOM|INPUT-CURSOR)-[0-9]+-[0-9a-f]+-[0-9]+:", js)
             marker = m.group(0) if m else ""
-            d = os.environ.get("KWINSTUB_DIR", "")
             if d:
                 with open(os.path.join(d, "marker"), "w") as f:
                     f.write(marker)
@@ -413,6 +423,37 @@ func fakeJournalctl(t *testing.T, payload string) (string, string) {
 		if err := os.WriteFile(filepath.Join(dir, "payload"), []byte(payload), 0600); err != nil {
 			t.Fatalf("write fake payload: %v", err)
 		}
+	}
+	return dir, filepath.Join(dir, "record")
+}
+
+// fakeInputJournalctl installs a fake `journalctl` on PATH for the
+// input cursor helper: one journal line carrying the marker
+// recorded by the stub proxy plus the payload from
+// $KWINSTUB_DIR/payload — a cursor/screen/window document whose
+// __NONCE__ placeholder the script replaces with the run's
+// nonce (derived from the marker by stripping the
+// ORION-INPUT-CURSOR- prefix and the trailing colon). It
+// returns the temp dir holding the stub state (KWINSTUB_DIR)
+// and the record file path (KWINSTUB_RECORD).
+func fakeInputJournalctl(t *testing.T, payload string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	script := "#!/bin/sh\n" +
+		"marker=$(cat \"$KWINSTUB_DIR/marker\" 2>/dev/null)\n" +
+		"payload=$(cat \"$KWINSTUB_DIR/payload\" 2>/dev/null)\n" +
+		"nonce=${marker#ORION-INPUT-CURSOR-}\n" +
+		"nonce=${nonce%:}\n" +
+		"echo \"Nov 16 12:00:00 host plasma-kwin_wayland[123]: ${marker}$(echo \"$payload\" | sed \"s/__NONCE__/$nonce/\")\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "journalctl"), []byte(script), 0755); err != nil {
+		t.Fatalf("write fake journalctl: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "payload"), []byte(payload), 0600); err != nil {
+		t.Fatalf("write fake payload: %v", err)
 	}
 	return dir, filepath.Join(dir, "record")
 }
@@ -683,5 +724,137 @@ func TestRealAtspiHelperCleanRun(t *testing.T) {
 	}
 	if out.WalkedNodes < 3 {
 		t.Errorf("walked_nodes = %d, want >= 3 (window + button + entry)", out.WalkedNodes)
+	}
+}
+
+// assertKWinScriptPlacement checks the stub-recorded script
+// path: under home/.orion (never under tmpdir), created 0600,
+// with the .orion dir at 0700 and no script left behind after
+// the run.
+func assertKWinScriptPlacement(t *testing.T, stateDir, home, tmpdir, prefix string) {
+	t.Helper()
+	jsPath, err := os.ReadFile(filepath.Join(stateDir, "js_path"))
+	if err != nil {
+		t.Fatalf("read recorded js_path: %v", err)
+	}
+	wantDir := filepath.Join(home, ".orion")
+	if !strings.HasPrefix(string(jsPath), wantDir+string(os.PathSeparator)) {
+		t.Errorf("KWin script path = %q, want it under %q", string(jsPath), wantDir)
+	}
+	if strings.HasPrefix(string(jsPath), tmpdir+string(os.PathSeparator)) {
+		t.Errorf("KWin script path = %q, want it outside the temp dir %q", string(jsPath), tmpdir)
+	}
+	mode, err := os.ReadFile(filepath.Join(stateDir, "js_mode"))
+	if err != nil {
+		t.Fatalf("read recorded js_mode: %v", err)
+	}
+	if strings.TrimSpace(string(mode)) != "0o600" {
+		t.Errorf("KWin script mode = %s, want 0o600", strings.TrimSpace(string(mode)))
+	}
+	info, err := os.Stat(wantDir)
+	if err != nil {
+		t.Fatalf("stat .orion dir: %v", err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Errorf(".orion dir mode = %o, want 0700", info.Mode().Perm())
+	}
+	left, err := filepath.Glob(filepath.Join(wantDir, prefix+"*.js"))
+	if err != nil {
+		t.Fatalf("glob leftover scripts: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("leftover KWin scripts in %q: %v (the helper must remove its script)", wantDir, left)
+	}
+}
+
+// TestRealKWinHelperScriptUnderOrionDir pins the PrivateTmp fix
+// for the grounding helper: the KWin script must be written
+// under ~/.orion (0600, dir 0700, removed after the run) —
+// never under TMPDIR, where KWin cannot read it when oriond
+// runs with PrivateTmp=true.
+func TestRealKWinHelperScriptUnderOrionDir(t *testing.T) {
+	home := t.TempDir()
+	tmpdir := t.TempDir()
+	stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+	payload := `[{"cls": "firefox", "active": true, "minimized": false, "fg": [0, 29, 1920, 993], "cg": [0, 29, 1920, 993]}]`
+	stateDir, record := fakeJournalctl(t, payload)
+	env := kwinStubEnv(t, stubDir, stateDir, record, nil)
+	env["HOME"] = home
+	env["TMPDIR"] = tmpdir
+	stdout, stderr, err := runRealHelper(t, kwinHelperSource, nil, stubDir, env)
+	if err != nil {
+		t.Fatalf("helper failed: %v (stderr: %s)", err, stderr)
+	}
+	var out kwinOutput
+	if jerr := json.Unmarshal([]byte(stdout), &out); jerr != nil || len(out.Windows) != 1 {
+		t.Fatalf("helper stdout %q, want the 1 payload window: %v", stdout, jerr)
+	}
+	assertKWinScriptPlacement(t, stateDir, home, tmpdir, "orion-kwin-geom-")
+}
+
+// TestRealInputKWinHelperScriptUnderOrionDir pins the same
+// PrivateTmp fix for the input cursor helper — and is the first
+// real run of input_kwin.py (previously only source-content
+// pins): the stubbed KWin proxy + fake journal carry a cursor
+// payload end to end.
+func TestRealInputKWinHelperScriptUnderOrionDir(t *testing.T) {
+	home := t.TempDir()
+	tmpdir := t.TempDir()
+	stubDir := writeStubGi(t, t.TempDir(), stubKwinSource)
+	payload := `{"nonce": "__NONCE__", "cursor": {"x": 134, "y": 36}, "screen": {"x": 0, "y": 0, "w": 1920, "h": 1080}, "kwin_windows": []}`
+	stateDir, record := fakeInputJournalctl(t, payload)
+	env := kwinStubEnv(t, stubDir, stateDir, record, nil)
+	env["HOME"] = home
+	env["TMPDIR"] = tmpdir
+	stdout, stderr, err := runRealHelper(t, inputKWinHelperSource, nil, stubDir, env)
+	if err != nil {
+		t.Fatalf("helper failed: %v (stderr: %s)", err, stderr)
+	}
+	var out struct {
+		Cursor struct{ X, Y int } `json:"cursor"`
+		Screen struct {
+			X, Y, W, H int
+		} `json:"screen"`
+	}
+	if jerr := json.Unmarshal([]byte(stdout), &out); jerr != nil {
+		t.Fatalf("helper stdout %q does not parse: %v", stdout, jerr)
+	}
+	if out.Cursor.X != 134 || out.Cursor.Y != 36 {
+		t.Errorf("cursor = %+v, want {134 36}", out.Cursor)
+	}
+	if out.Screen.W != 1920 || out.Screen.H != 1080 {
+		t.Errorf("screen = %+v, want 1920x1080", out.Screen)
+	}
+	calls, rerr := os.ReadFile(record)
+	if rerr != nil {
+		t.Fatalf("read call record: %v", rerr)
+	}
+	if want := "loadScript\nstart\nunloadScript\n"; string(calls) != want {
+		t.Errorf("D-Bus calls = %q, want %q", string(calls), want)
+	}
+	assertKWinScriptPlacement(t, stateDir, home, tmpdir, "orion-input-cursor-")
+}
+
+// TestKWinHelpersScriptDirSourcePin pins the PrivateTmp fix at
+// the source level for both helpers: the KWin script goes under
+// ~/.orion via kwin_script_dir, never via a bare mkstemp into
+// /tmp.
+func TestKWinHelpersScriptDirSourcePin(t *testing.T) {
+	sources := map[string]string{"ground": kwinHelperSource, "input": inputKWinHelperSource}
+	for name, src := range sources {
+		for _, want := range []string{"def kwin_script_dir", `".orion"`, "dir=script_dir"} {
+			if !strings.Contains(src, want) {
+				t.Errorf("%s KWin helper source lacks %q", name, want)
+			}
+		}
+	}
+	old := map[string]string{
+		"ground": `tempfile.mkstemp(prefix="orion-kwin-geom-", suffix=".js")`,
+		"input":  `tempfile.mkstemp(prefix="orion-input-cursor-", suffix=".js")`,
+	}
+	for name, src := range sources {
+		if strings.Contains(src, old[name]) {
+			t.Errorf("%s KWin helper still writes its script to /tmp (bare mkstemp)", name)
+		}
 	}
 }

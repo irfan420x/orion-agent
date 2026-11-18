@@ -117,10 +117,33 @@ def new_marker(prefix):
     return "%s-%s:" % (prefix, nonce), nonce
 
 
+def kwin_script_dir():
+    """Directory for the KWin script: ~/.orion, NOT /tmp.
+
+    oriond runs with PrivateTmp=true, so KWin — outside the
+    service's private /tmp namespace — cannot read a script
+    handed to loadScript from /tmp: loadScript silently loads
+    nothing and the oracle never runs. ~/.orion is outside any
+    private tmp (the Go installer puts the helpers themselves
+    there), so KWin can read it.
+    """
+    home = os.path.expanduser("~")
+    if not home or home == "~":
+        raise RuntimeError("cannot determine the home directory")
+    d = os.path.join(home, ".orion")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
 def main():
     marker, nonce = new_marker("ORION-INPUT-CURSOR")
     js = JS_TEMPLATE % (marker, nonce)
-    fd, js_path = tempfile.mkstemp(prefix="orion-input-cursor-", suffix=".js")
+    try:
+        script_dir = kwin_script_dir()
+    except Exception as e:
+        fail("cannot prepare the KWin script directory: %s" % e)
+    # ~/.orion, not /tmp: see kwin_script_dir.
+    fd, js_path = tempfile.mkstemp(prefix="orion-input-cursor-", suffix=".js", dir=script_dir)
     try:
         os.write(fd, js.encode())
         os.close(fd)
