@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -2073,6 +2074,220 @@ func TestElementProvesMiss(t *testing.T) {
 				t.Errorf("elementProvesMiss = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- F-A23W2-9 screenshot-diff third signal: when the focus
+// and element checks are silent, a click that changed nothing
+// visible around its target must NOT verify. The tests below
+// drive the diff through the diffCapture seam (synthetic
+// before/after images); the real spectacle path is covered by
+// the acceptance test in input_diff_acceptance_test.go. ---
+
+// setDiffImages installs the diffCapture seam returning before
+// on the first capture and after on the second, and returns a
+// counter of captures performed.
+func (e *fakeInputEnv) setDiffImages(before, after image.Image) *int {
+	calls := 0
+	e.tool.diffCapture = func(ctx context.Context) (image.Image, error) {
+		calls++
+		if calls == 1 {
+			return before, nil
+		}
+		return after, nil
+	}
+	return &calls
+}
+
+// setDiffCaptureErr installs a diffCapture seam that always
+// fails: the diff signal is unavailable.
+func (e *fakeInputEnv) setDiffCaptureErr() {
+	e.tool.diffCapture = func(ctx context.Context) (image.Image, error) {
+		return nil, errors.New("fake diff capture failure")
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenDiffShowsChange(t *testing.T) {
+	env := focusClickEnv(t)
+	// Focus stays on the Username entry (element check
+	// silent), but the screen visibly changes around the
+	// click point: the click had an effect, so it verifies —
+	// and both diff captures ran (3 budget slots: the input
+	// call plus before + after).
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	calls := env.setDiffImages(diffScreenImage(t, false), diffScreenImage(t, true))
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (the screen visibly changed: the click had an effect)")
+	}
+	if s.Warning != "" {
+		t.Errorf("warning = %q, want empty", s.Warning)
+	}
+	if *calls != 2 {
+		t.Errorf("diff captures = %d, want 2 (before + after)", *calls)
+	}
+	if got := env.tool.budget.TurnCalls(); got != 3 {
+		t.Errorf("budget TurnCalls = %d, want 3 (input call + 2 diff captures)", got)
+	}
+}
+
+func TestInputSnapshotClickVerifiedWhenTargetTakesFocusDespiteNoVisibleChange(t *testing.T) {
+	env := focusClickEnv(t)
+	// The button itself takes focus: positive hit evidence
+	// the press reached the control — the diff must not run,
+	// or it would demote a click-to-focus whose effect is
+	// invisible in a screenshot by construction. Only the
+	// before-capture ran (2 budget slots).
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Sign in", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	calls := env.setDiffImages(diffScreenImage(t, false), diffScreenImage(t, false))
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (the target itself took focus: the click landed)")
+	}
+	if s.Warning != "" {
+		t.Errorf("warning = %q, want empty", s.Warning)
+	}
+	if *calls != 1 {
+		t.Errorf("diff captures = %d, want 1 (the after-capture is skipped on a hit)", *calls)
+	}
+	if got := env.tool.budget.TurnCalls(); got != 2 {
+		t.Errorf("budget TurnCalls = %d, want 2 (input call + before-capture only)", got)
+	}
+}
+
+func TestInputSnapshotClickUnverifiedWhenWrongControlTakesFocusDespiteVisibleChange(t *testing.T) {
+	env := focusClickEnv(t)
+	// The Search entry takes focus (element miss) and the
+	// screen changes — the diff must NOT resurrect a click
+	// the element check already demoted: the warning stays
+	// the wrong-control one, and the after-capture never runs.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Search", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	calls := env.setDiffImages(diffScreenImage(t, false), diffScreenImage(t, true))
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if s.ClickVerified {
+		t.Errorf("click_verified = true with another control taking focus, want false (the diff never overrules a proven miss)")
+	}
+	if !strings.Contains(s.Warning, "wrong control") {
+		t.Errorf("warning = %q, want the 'wrong control' note", s.Warning)
+	}
+	if s.ClickNoVisibleEffect {
+		t.Errorf("click_no_visible_effect = true, want false (the demotion came from the element check, not the diff)")
+	}
+	if *calls != 1 {
+		t.Errorf("diff captures = %d, want 1 (the after-capture is skipped after a proven miss)", *calls)
+	}
+}
+
+func TestInputCoordClickUnverifiedWhenNothingVisibleChanges(t *testing.T) {
+	// Coordinate clicks have no element identity, but the
+	// diff still applies: the focus check is silent (target
+	// inside the already-focused Firefox window) and nothing
+	// changes on screen.
+	resetGroundSnapshots()
+	registerFreshGrounding()
+	env := newFakeInputEnv(t)
+	env.kwinWindows = kwinWindowsClickTarget("firefox-esr")
+	calls := env.setDiffImages(diffScreenImage(t, false), diffScreenImage(t, false))
+	res := env.call(t, `{"op": "click", "x": 960, "y": 403}`)
+	s := parseInputSummary(t, res)
+	if s.ClickVerified {
+		t.Errorf("click_verified = true with nothing on screen changing, want false (the click had no visible effect)")
+	}
+	if !s.ClickNoVisibleEffect {
+		t.Errorf("click_no_visible_effect = false, want true (the demotion came from the diff)")
+	}
+	if !strings.Contains(s.Warning, "no visible effect") {
+		t.Errorf("warning = %q, want the 'no visible effect' note", s.Warning)
+	}
+	if *calls != 2 {
+		t.Errorf("diff captures = %d, want 2 (before + after)", *calls)
+	}
+}
+
+func TestInputClickVerifiedWhenDiffCaptureFails(t *testing.T) {
+	env := focusClickEnv(t)
+	// The diff signal is unavailable (no backend, capture
+	// error): that is NO signal, never a demotion — the cursor
+	// verdict stands. The failed capture's budget slot is
+	// refunded, so only the input call itself is charged.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.setDiffCaptureErr()
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (a failed diff capture is no signal)")
+	}
+	if got := env.tool.budget.TurnCalls(); got != 1 {
+		t.Errorf("budget TurnCalls = %d, want 1 (the failed capture's slot is refunded)", got)
+	}
+}
+
+func TestInputClickVerifiedWhenNewWindowOpensDespiteNoVisibleChange(t *testing.T) {
+	env := focusClickEnv(t)
+	// The click opens a NEW window (a dialog): the new window
+	// is itself the click's effect, so the diff is skipped
+	// even though the crop in the old window did not change.
+	// Only the before-capture ran.
+	env.tree = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.treeAfterClick = focusTreeJSON("Username", focusSignInButton, focusSearchEntry, focusUsernameEntry)
+	env.kwinWindowsAfterClick = []kwinWindow{
+		{Class: "firefox-esr", FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Class: "kdialog", FG: [4]int{100, 100, 400, 300}, CG: [4]int{100, 100, 400, 300}, Active: true},
+	}
+	calls := env.setDiffImages(diffScreenImage(t, false), diffScreenImage(t, false))
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if !s.ClickVerified {
+		t.Errorf("click_verified = false, want true (the new window is itself the click's effect)")
+	}
+	if *calls != 1 {
+		t.Errorf("diff captures = %d, want 1 (the after-capture is skipped when a new window opened)", *calls)
+	}
+}
+
+func TestInputSnapshotClickUnverifiedWhenWrongWindowTakesFocusButNothingChanges(t *testing.T) {
+	// Case 2, narrowed: the press lands in a WRONG
+	// pre-existing window (a popup opened over the button
+	// after grounding) and focus moves there — the focus check
+	// has nothing to demote on, since the focus DID move —
+	// but nothing changes around the target, so the diff
+	// demotes it. (When the wrong window covers the crop, the
+	// pixels change and the click still verifies: the diff
+	// narrows case 2, it does not close it.)
+	env := focusClickEnv(t)
+	env.kwinWindows = []kwinWindow{
+		{Class: "firefox-esr", FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Class: "kate", FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}, Active: true},
+		{Class: "other", FG: [4]int{900, 300, 400, 300}, CG: [4]int{900, 300, 400, 300}},
+	}
+	env.kwinWindowsAfterClick = []kwinWindow{
+		{Class: "firefox-esr", FG: [4]int{0, 0, 1920, 1080}, CG: [4]int{0, 0, 1920, 1080}},
+		{Class: "kate", FG: [4]int{0, 0, 800, 600}, CG: [4]int{0, 0, 800, 600}},
+		{Class: "other", FG: [4]int{900, 300, 400, 300}, CG: [4]int{900, 300, 400, 300}, Active: true},
+	}
+	env.tree = treeWithButtonJSON(910, 378, 100, 50)
+	env.treeAfterClick = treeWithButtonJSON(910, 378, 100, 50)
+	calls := env.setDiffImages(diffScreenImage(t, false), diffScreenImage(t, false))
+	res := env.call(t, `{"op": "click", "snapshot_id": "g-test-1", "element_id": 1}`)
+	s := parseInputSummary(t, res)
+	if s.ClickVerified {
+		t.Errorf("click_verified = true with the focus moving to a wrong window and nothing changing, want false (the diff narrows case 2)")
+	}
+	if !s.ClickNoVisibleEffect {
+		t.Errorf("click_no_visible_effect = false, want true (the demotion came from the diff)")
+	}
+	if !strings.Contains(s.Warning, "no visible effect") {
+		t.Errorf("warning = %q, want the 'no visible effect' note", s.Warning)
+	}
+	if *calls != 2 {
+		t.Errorf("diff captures = %d, want 2 (before + after)", *calls)
 	}
 }
 

@@ -125,6 +125,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"math"
 	"os"
 	"os/exec"
@@ -258,18 +259,23 @@ type inputSummary struct {
 	// click never reached the window) nor the element check
 	// (another control at the click point took focus — the
 	// click landed on the wrong control inside the already
-	// focused window) proved a miss. ClickVerified stays true
-	// for a click on the already-focused window that
-	// legitimately changes nothing visible: both checks can
-	// only demote on positive evidence of a miss.
+	// focused window) proved a miss, AND — the scoped
+	// screenshot-diff third signal — the screen visibly changed
+	// around the click point, when the focus and element
+	// checks were silent (see screenshot_diff.go). A click
+	// demoted by the diff alone sets ClickNoVisibleEffect: the
+	// press may have landed on a control whose effect is
+	// invisible (placing the text caret, for one), so the
+	// result says "no visible effect", never "missed".
 	// ClickMayHaveLanded is true when the click command
 	// itself timed out — the click may already have landed, and
 	// Warning says to verify before retrying instead of
 	// clicking again blindly.
-	PostClickCursor    *cursorPos `json:"post_click_cursor,omitempty"`
-	ClickVerified      bool       `json:"click_verified,omitempty"`
-	ClickMayHaveLanded bool       `json:"click_may_have_landed,omitempty"`
-	Warning            string     `json:"warning,omitempty"`
+	PostClickCursor      *cursorPos `json:"post_click_cursor,omitempty"`
+	ClickVerified        bool       `json:"click_verified,omitempty"`
+	ClickNoVisibleEffect bool       `json:"click_no_visible_effect,omitempty"`
+	ClickMayHaveLanded   bool       `json:"click_may_have_landed,omitempty"`
+	Warning              string     `json:"warning,omitempty"`
 }
 
 type inputElement struct {
@@ -366,6 +372,11 @@ type inputTool struct {
 	runKWinHelper   func(ctx context.Context, helperPath string) ([]byte, error)
 	writeKWinHelper func() (string, error)
 	socketPath      func() (string, error)
+	// diffCapture, when set, replaces the real spectacle
+	// capture for the screenshot-diff signal (F-A23W2-9): the
+	// test seam for the before/after images. Nil means the real
+	// capture through the embedded screenshot tool.
+	diffCapture func(ctx context.Context) (image.Image, error)
 }
 
 func newInputTool() *inputTool {
@@ -682,6 +693,7 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (re
 		summary.Clicks = clicks
 		summary.PostClickCursor = out.postClick
 		summary.ClickVerified = out.verified
+		summary.ClickNoVisibleEffect = out.noVisibleEffect
 		if out.uncertain {
 			// The click command timed out: the click may
 			// already have landed. This is a result, not an
@@ -695,6 +707,8 @@ func (t *inputTool) ExecuteResult(ctx context.Context, args json.RawMessage) (re
 			summary.Warning = "the click was sent and the cursor is on the target, but the target window never took focus — the click may not have landed on it. Verify on screen before retrying."
 		} else if out.elementMiss {
 			summary.Warning = "the click was sent and the cursor is on the target, but another control at the click point took focus — the click may have landed on the wrong control. Verify on screen before retrying."
+		} else if out.noVisibleEffect {
+			summary.Warning = "the click was sent and the cursor is on the target, but nothing on screen changed around the click point — the click may have had no visible effect. Verify on screen before retrying; do not click again blindly."
 		} else if !out.verified {
 			summary.Warning = "the click was sent but the cursor is no longer on the target — verify on screen before retrying."
 		}
@@ -1017,6 +1031,12 @@ type clickOutcome struct {
 	uncertain   bool       // the click command timed out: it may have landed
 	focusMiss   bool       // the click never reached the target window (focus never moved)
 	elementMiss bool       // the click landed on a different control in the focused window (focus moved to it)
+	// noVisibleEffect is the screenshot-diff demotion
+	// (F-A23W2-9): the focus and element checks were silent
+	// and nothing on screen changed around the click point.
+	// Distinct from a miss — the press may have landed on a
+	// control whose effect is invisible.
+	noVisibleEffect bool
 }
 
 // doClick moves to the target (closed-loop — a failed move
@@ -1029,6 +1049,17 @@ type clickOutcome struct {
 // A coordinate click re-checks the freshness gate instead (the
 // grounding may have gone stale during the sensitive check and
 // the move).
+//
+// Verification is three signals, in order: the cursor re-read,
+// the focus check, the element check — and, when all three are
+// silent (verified, no miss proven, and the target did not
+// itself take focus), the screenshot-diff third signal
+// (F-A23W2-9): a crop around the target before the click is
+// compared with the same crop after it, and a click that
+// changed nothing visible demotes with the distinct reason "no
+// visible effect". A click that opened a new window skips the
+// diff (the new window is itself the effect). Any failure of
+// the diff signal is no signal: the cursor verdict stands.
 //
 // Post-click verification (F-A23W2-9) is the cursor AND the
 // focused window, not the cursor alone: the move already put
@@ -1117,6 +1148,16 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 			beforeFocus = &f
 		}
 	}
+	// The before-capture for the screenshot-diff third signal
+	// (F-A23W2-9): taken after every pre-click gate has passed
+	// and immediately before the click, so the crop shows the
+	// screen the press is about to land on. A failed capture
+	// is no signal — tryDiffCapture returns nil and the click
+	// proceeds exactly as before, unverified by the diff.
+	// beforeAt stamps the capture for the min-interval wait
+	// before the after-capture.
+	beforeAt := t.now()
+	beforeImg := t.tryDiffCapture(ctx)
 	code := inputClickCodes[button]
 	if _, err := t.ydotool(ctx, "", "click", "--repeat", strconv.Itoa(clicks), fmt.Sprintf("0x%02X", code)); err != nil {
 		// The click command timed out (or the step was
@@ -1136,7 +1177,13 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 	// miss. A failed re-read does not fail the click — ydotool
 	// already reported success — but the result says so, so
 	// the model verifies on screen before retrying.
+	// clickAt stamps the click for the diff's settle delay.
+	clickAt := t.now()
 	out := clickOutcome{final: final, iters: iters}
+	// elementHit is set by the element re-check below when the
+	// target itself took focus (positive hit evidence — the
+	// diff must not run then).
+	elementHit := false
 	if post, err := t.readCursor(ctx); err == nil {
 		out.postClick = &post.Cursor
 		out.verified = withinTolerance(post.Cursor, target.X, target.Y)
@@ -1155,10 +1202,43 @@ func (t *inputTool) doClick(ctx context.Context, button string, clicks int, snap
 			// another control demonstrably took the press
 			// (see elementProvesMiss). A failed walk is
 			// no signal, not a miss — the cursor verdict
-			// stands.
-			if t.postClickElementMiss(ctx, pre, post.Windows, post.Cursor) {
+			// stands. The re-check also reports a HIT —
+			// the target itself took focus — which is
+			// positive evidence the press reached the
+			// control, not silence: the diff below must
+			// not second-guess it.
+			switch t.postClickElementCheck(ctx, pre, post.Windows, post.Cursor) {
+			case elementCheckMiss:
 				out.verified = false
 				out.elementMiss = true
+			case elementCheckHit:
+				elementHit = true
+			}
+		}
+		if out.verified && beforeImg != nil && !elementHit && !focusMovedToNewWindow(beforeWindows, post.Windows) {
+			// Screenshot-diff third signal (F-A23W2-9):
+			// cursor, focus and element checks all silent,
+			// the target did not take focus, and the click
+			// opened no new window — compare the crop
+			// around the target before and after the click.
+			// The after-capture waits out the settle delay
+			// and the 1 s min interval since the
+			// before-capture (the interval subsumes the
+			// settle; on snapshot clicks the AT-SPI walk
+			// above usually already spent it). A failed
+			// after-capture is no signal, not a miss.
+			wait := time.Until(beforeAt.Add(inputMinInterval))
+			if clickSettle := time.Until(clickAt.Add(diffSettle)); clickSettle > wait {
+				wait = clickSettle
+			}
+			if wait > 0 {
+				t.sleep(wait)
+			}
+			if afterImg := t.tryDiffCapture(ctx); afterImg != nil {
+				if visible, _, err := diffVisibleChange(beforeImg, afterImg, target); err == nil && !visible {
+					out.verified = false
+					out.noVisibleEffect = true
+				}
 			}
 		}
 	}
@@ -1442,21 +1522,116 @@ func sameWindowFocus(before *focusIdentity, afterWindows []kwinWindow) bool {
 	return before.equal(kwinFocusIdentity(*after))
 }
 
-// postClickElementMiss runs the post-click element re-check: one
-// more AT-SPI walk, KWin-corrected with the post-click windows,
-// judged by elementProvesMiss against the pre-click state. A
-// failed or empty walk is no signal, not a miss — the cursor
-// verdict stands.
-func (t *inputTool) postClickElementMiss(ctx context.Context, pre *preClickElementState, postWindows []kwinWindow, at cursorPos) bool {
+// elementCheck is the post-click element re-check's verdict:
+// silent (no signal either way), miss (another control
+// demonstrably took the press), or hit (the target itself took
+// focus — positive evidence the press reached the control, not
+// silence: the screenshot-diff third signal must not run on a
+// hit, or it would demote a click-to-focus whose effect is
+// invisible in a screenshot by construction).
+type elementCheck int
+
+const (
+	elementCheckSilent elementCheck = iota
+	elementCheckMiss
+	elementCheckHit
+)
+
+// postClickElementCheck runs the post-click element re-check:
+// one more AT-SPI walk, KWin-corrected with the post-click
+// windows, judged by elementProvesMiss against the pre-click
+// state — and, when that proves no miss, by whether the target
+// itself took focus. A failed or empty walk is silent, never a
+// miss or a hit — the cursor verdict stands. The hit needs the
+// same guards as the miss side: the target still there
+// unchanged, exactly one focused control, it IS the target, and
+// the focus MOVED to it (it was not already focused before the
+// press — an already-focused target is no movement, no signal).
+func (t *inputTool) postClickElementCheck(ctx context.Context, pre *preClickElementState, postWindows []kwinWindow, at cursorPos) elementCheck {
 	tree, _, err := t.ground.atspiTree(ctx)
 	if err != nil || tree == nil {
-		return false
+		return elementCheckSilent
 	}
 	if len(postWindows) > 0 {
 		applyWindowOffsets(tree, matchKWinWindows(tree, postWindows))
 	}
 	post := elementCheckView(tree, kwinMinimizedWindowIndexes(tree, postWindows))
-	return elementProvesMiss(pre, post, at)
+	if elementProvesMiss(pre, post, at) {
+		return elementCheckMiss
+	}
+	if _, ok := findTarget(post, pre.target, at); !ok {
+		return elementCheckSilent
+	}
+	focused, ambiguous := focusedControl(post)
+	if ambiguous || focused == nil {
+		return elementCheckSilent
+	}
+	if !sameElement(*focused, pre.target) {
+		return elementCheckSilent
+	}
+	if pre.focusAmbiguous {
+		return elementCheckSilent
+	}
+	if pre.focused != nil && sameElement(*pre.focused, *focused) {
+		return elementCheckSilent
+	}
+	return elementCheckHit
+}
+
+// focusMovedToNewWindow reports whether the post-click active
+// window is NEW — absent from the pre-click window list. A
+// click that opened a dialog or a new window has already
+// proven its effect by opening it, so the screenshot-diff must
+// not judge it from a crop in the old window. Identity is the
+// same class + frame geometry the focus check trusts. An
+// unknown pre-click list (the pre-click read failed) makes
+// every post-click window look new, so the diff is skipped —
+// an unknown is no signal, and skipping fails safe (the
+// verdict stands) where running would false-demote a
+// dialog-opening click.
+func focusMovedToNewWindow(before, after []kwinWindow) bool {
+	active := kwinActiveWindow(after)
+	if active == nil {
+		return false
+	}
+	id := kwinFocusIdentity(*active)
+	for _, w := range before {
+		if kwinFocusIdentity(w).equal(id) {
+			return false
+		}
+	}
+	return true
+}
+
+// tryDiffCapture charges one shared-budget slot and captures
+// the screen for the screenshot-diff signal. It never errors:
+// a refused charge (budget exhausted) or a failed capture is
+// NO signal — the click verdict stands — so the caller gets
+// nil and carries on. A charge whose capture then produced no
+// image is refunded: nothing was captured, so no quota was
+// spent (the F-A23W2-18 rule: a call refused before acting
+// must not burn quota).
+func (t *inputTool) tryDiffCapture(ctx context.Context) image.Image {
+	if err := t.budget.Charge(t.now(), inputMaxPerTurn, inputMaxPerHour); err != nil {
+		return nil
+	}
+	img, err := t.diffCaptureImage(ctx)
+	if err != nil || img == nil {
+		t.budget.Refund()
+		return nil
+	}
+	return img
+}
+
+// diffCaptureImage is the diff capture itself: the diffCapture
+// seam when a test sets it, else the real spectacle capture
+// through the embedded screenshot tool (in-memory only — the
+// image is compared and discarded, never stored or sent).
+func (t *inputTool) diffCaptureImage(ctx context.Context) (image.Image, error) {
+	if t.diffCapture != nil {
+		return t.diffCapture(ctx)
+	}
+	return t.shot.captureScreen(ctx)
 }
 
 // elementProvesMiss reports whether the post-click tree
