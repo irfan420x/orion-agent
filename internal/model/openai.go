@@ -460,6 +460,18 @@ func (p *openAIProvider) buildRequest(req ChatRequest, stream bool) openAIChatRe
 		Tools:    toOpenAITools(req.Tools),
 		Stream:   stream,
 	}
+	if stream {
+		// Ask for the usage chunk on the final SSE event: without
+		// it a streamed turn can never report the cache split —
+		// the usage would be silently estimated instead. This is
+		// the READ side only: DeepSeek (and OpenAI) cache the
+		// stable history prefix server-side automatically, with
+		// no request flag to enable it — the same prefix sent
+		// again is served from cache. A provider that ignores
+		// stream_options simply sends no usage chunk and the
+		// caller falls back to the estimator.
+		r.StreamOptions = &openAIStreamOptions{IncludeUsage: true}
+	}
 	if req.Temperature != nil {
 		r.Temperature = req.Temperature
 	}
@@ -526,11 +538,11 @@ func (p *openAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		// is legitimate and unaffected.
 		return nil, fmt.Errorf("%s: response contained no content or tool calls", p.Name())
 	}
-	usage := estimateUsage(req, msg, Usage{
-		PromptTokens:     resp.Usage.PromptTokens,
-		CompletionTokens: resp.Usage.CompletionTokens,
-		TotalTokens:      resp.Usage.TotalTokens,
-	})
+	// The wire usage carries the cache split (toModelUsage); a
+	// provider that reports no usage leaves the estimator to fill
+	// the counts, and a provider that reports no cache fields
+	// leaves the split unreported, never a fabricated 0.
+	usage := estimateUsage(req, msg, toModelUsage(resp.Usage))
 	return &ChatResponse{Message: msg, FinishReason: choice.FinishReason, Usage: usage}, nil
 }
 
@@ -576,6 +588,7 @@ func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 
 		var content strings.Builder
 		var toolCalls []openAIToolCall
+		var streamUsage *openAIUsage
 		finishReason := ""
 		emitted := 0
 		scanner := bufio.NewScanner(resp.Body)
@@ -595,6 +608,14 @@ func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 			var chunk openAIStreamChunk
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				continue
+			}
+			if chunk.Usage != nil {
+				// The final usage chunk (sent because the
+				// request set stream_options.include_usage):
+				// the turn's real usage, including the cache
+				// split. Keep the last one seen — a provider
+				// sends at most one, on the final chunk.
+				streamUsage = chunk.Usage
 			}
 			if chunk.Error != nil {
 				// An explicit provider error inside the
@@ -682,9 +703,18 @@ func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 				finishReason = "stop"
 			}
 		}
-		// Streaming responses carry no usage unless stream_options is set;
-		// estimate the fields the provider left at zero.
-		usage := estimateUsage(req, msg, Usage{})
+		// A usage chunk arrived (stream_options.include_usage was
+		// honoured): report the provider's real counts, cache
+		// split included. Otherwise the provider left usage at
+		// zero and the estimator fills the counts — with no cache
+		// data, so the split stays unreported rather than a
+		// fabricated 0 hits.
+		var usage Usage
+		if streamUsage != nil {
+			usage = estimateUsage(req, msg, toModelUsage(*streamUsage))
+		} else {
+			usage = estimateUsage(req, msg, Usage{})
+		}
 		return &ChatResponse{Message: msg, FinishReason: finishReason, Usage: usage}, nil
 	}
 	return nil, fmt.Errorf("%s: stream failed after %d attempts", p.Name(), maxAttempts)
