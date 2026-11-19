@@ -686,16 +686,16 @@ func estimateUsage(req ChatRequest, msg Message, reported Usage) Usage {
 
 // apiError builds a descriptive error for a non-2xx response, including a
 // capped excerpt of the body so provider error messages stay visible
-// without flooding logs.
+// without flooding logs. It returns a typed *APIError so the failover
+// classifier (ClassifyProviderError) can read the status without
+// string matching; the Error text is the long-standing plain text,
+// byte-identical, so logs and existing error assertions are unchanged.
 func apiError(provider string, status int, body []byte) error {
 	excerpt := strings.TrimSpace(string(body))
 	if len(excerpt) > errBodyExcerpt {
 		excerpt = excerpt[:errBodyExcerpt] + "..."
 	}
-	if excerpt == "" {
-		return fmt.Errorf("%s: request failed with status %d (empty response body)", provider, status)
-	}
-	return fmt.Errorf("%s: request failed with status %d: %s", provider, status, excerpt)
+	return &APIError{Provider: provider, Status: status, Body: excerpt}
 }
 
 // bodyExcerpt is a small helper for stream error paths.
