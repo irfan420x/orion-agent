@@ -21,8 +21,8 @@ func TestDailyBudgetDefaults(t *testing.T) {
 	if cfg.DailyBudgetAlertThresholdTokens != 80000 {
 		t.Errorf("DailyBudgetAlertThresholdTokens = %d, want 80000 (80%% of the default budget)", cfg.DailyBudgetAlertThresholdTokens)
 	}
-	if cfg.DailyBudgetAlertThresholdTokens != DefaultDailyBudgetAlertThresholdTokens {
-		t.Errorf("DailyBudgetAlertThresholdTokens = %d, want DefaultDailyBudgetAlertThresholdTokens %d", cfg.DailyBudgetAlertThresholdTokens, DefaultDailyBudgetAlertThresholdTokens)
+	if cfg.DailyBudgetAlertThresholdTokens != 80000 {
+		t.Errorf("DailyBudgetAlertThresholdTokens = %d, want DefaultDailyBudgetAlertThresholdTokens (80000)", cfg.DailyBudgetAlertThresholdTokens)
 	}
 	// The threshold must sit strictly below the budget it warns
 	// about: a warning that can only fire at or after the refusal

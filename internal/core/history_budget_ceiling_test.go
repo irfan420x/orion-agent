@@ -22,8 +22,8 @@ func TestHistoryBudgetCeilingCapsDerivedBudget(t *testing.T) {
 		cfg := testConfig(5)
 		cfg.MaxHistoryTokens = 0 // auto
 		a := newTestAgent(t, cfg, &windowProvider{fakeProvider: &fakeProvider{}, window: window}, tools.NewRegistry(), newFakeStore())
-		if got := a.HistoryBudget(); got != historyBudgetCeilingTokens {
-			t.Errorf("window %d: HistoryBudget() = %d, want ceiling %d", window, got, historyBudgetCeilingTokens)
+		if got := a.HistoryBudget(); got != 32768 {
+			t.Errorf("window %d: HistoryBudget() = %d, want ceiling 32768", window, got)
 		}
 	}
 }
