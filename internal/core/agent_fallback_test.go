@@ -476,3 +476,29 @@ func TestAgentNoChainMeansNoFallback(t *testing.T) {
 		t.Errorf("error = %v, want it to carry the 402", err)
 	}
 }
+
+func TestAgentFallbackRestoresToHomeNotHead(t *testing.T) {
+	// An override chat lives on openai while the chain head is
+	// deepseek: after a failover, the next turn must restore to
+	// the chat's home (openai), NOT to the daemon default
+	// (deepseek) — otherwise a per-chat override would silently
+	// leak onto the default provider after one failure.
+	deepseek := &namedScriptProvider{name: "deepseek"}
+	openai := &namedScriptProvider{name: "openai"}
+	a := newTestAgent(t, testConfig(5), deepseek, tools.NewRegistry(), newFakeStore())
+	a.SetFallbackChain(testChain(t, map[string]*namedScriptProvider{"deepseek": deepseek, "openai": openai}, "deepseek", "openai"))
+	a.SetHomeProvider("openai")
+	// Simulate "left on fallback": the provider is deepseek and
+	// the flag says it came from a failover.
+	a.provider = deepseek
+	a.fallbackProvider = true
+	if _, _, err := runWithTurnFinished(t, a, "hello"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if openai.chatCallCount() != 1 {
+		t.Errorf("openai Chat calls = %d, want 1 (home provider restored at turn start)", openai.chatCallCount())
+	}
+	if deepseek.chatCallCount() != 0 {
+		t.Errorf("deepseek Chat calls = %d, want 0 (chain head is not this chat's home)", deepseek.chatCallCount())
+	}
+}

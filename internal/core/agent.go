@@ -96,12 +96,20 @@ type Agent struct {
 	fallback *model.FailoverChain
 	// fallbackProvider is true when the current provider came
 	// from a failover rather than an explicit set: the next turn
-	// restores the chain head when it is healthy again. Guarded
-	// by runMu (set in run() and SetProvider).
+	// restores the home provider when it is healthy again.
+	// Guarded by runMu (set in run() and SetProvider).
 	fallbackProvider bool
-	tools            *tools.Registry
-	memory           memory.Store
-	cfg              *config.Config
+	// homeProvider is the provider restorePrimaryIfNeeded returns
+	// to after a failover: the chain head by default (""), or the
+	// provider the App set for this agent — a chat's override
+	// provider, so an override chat restores to its override and
+	// not to the daemon default. Set via SetHomeProvider; read
+	// only while runMu is held (run()) or under runMu
+	// (SetHomeProvider).
+	homeProvider string
+	tools        *tools.Registry
+	memory       memory.Store
+	cfg          *config.Config
 	// personality is Orion's voice, loaded once at startup from the
 	// data dir (personality.md) or the built-in default. Set in
 	// NewAgent, read-only afterwards, so it needs no lock.
@@ -367,6 +375,19 @@ func (a *Agent) SetFallbackChain(c *model.FailoverChain) {
 	a.fallback = c
 }
 
+// SetHomeProvider names the provider restorePrimaryIfNeeded
+// returns to after a failover (the chat's override provider, or
+// "" for the chain head). It is the explicit-switch companion to
+// SetProvider: the App calls it whenever it builds an agent on a
+// provider that is NOT the chain head, so a failover in that chat
+// restores to the chat's provider instead of the daemon default.
+// An empty name clears the home (chain head again).
+func (a *Agent) SetHomeProvider(name string) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.homeProvider = strings.ToLower(strings.TrimSpace(name))
+}
+
 // SetProvider swaps the agent's provider for the next turn. It waits
 // for an in-flight turn: a switch never interrupts a running turn,
 // which finishes on the provider it started with. The set is
@@ -398,24 +419,38 @@ func (a *Agent) restorePrimaryIfNeeded() {
 	if a.fallback == nil || !a.fallbackProvider {
 		return
 	}
-	first, ok := a.fallback.FirstAvailable(nil)
-	if !ok {
+	// Home first: a chat's override provider (SetHomeProvider),
+	// else the chain head. When the home provider is still
+	// benched, stay where we are — FirstAvailable would pick a
+	// DIFFERENT provider and call it a restore, which would move
+	// an override chat onto the daemon default (or a third
+	// provider) instead of its own provider.
+	home := strings.ToLower(strings.TrimSpace(a.homeProvider))
+	if home == "" {
+		if order := a.fallback.Order(); len(order) > 0 {
+			home = order[0]
+		}
+	}
+	if home == "" {
 		return
 	}
-	if cur := a.getProvider(); cur != nil && strings.EqualFold(cur.Name(), first) {
-		// Already on the first healthy entry (e.g. the primary
-		// is still benched and we sit on the next healthy one):
-		// nothing to restore.
+	if cur := a.getProvider(); cur != nil && strings.EqualFold(cur.Name(), home) {
+		// Already home: clear the flag so later turns do not
+		// keep re-checking.
+		a.fallbackProvider = false
 		return
 	}
-	next, err := a.fallback.Build(first)
+	if a.fallback.IsCooled(home) {
+		return
+	}
+	next, err := a.fallback.Build(home)
 	if err != nil {
-		a.logf("fallback restore: cannot build %s (%v); staying on %s", first, err, a.ProviderName())
+		a.logf("fallback restore: cannot build %s (%v); staying on %s", home, err, a.ProviderName())
 		return
 	}
 	a.setProvider(next)
 	a.fallbackProvider = false
-	a.logf("fallback restore: back on %s for this turn", first)
+	a.logf("fallback restore: back on %s for this turn", home)
 }
 
 // tryFailover attempts one provider switch after a failed step

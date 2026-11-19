@@ -242,7 +242,7 @@ func newChildRegistry(cfg *config.Config, captureBudget *tools.CaptureBudget, pa
 // registry (F-A23-2), so nothing in a child can charge it. Nil
 // means DefaultRegistryWithDeps mints a fresh private budget
 // for the child registry — inert either way, for the same reason.
-func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger, hooksBus *hooks.Bus, parentPlanning *tools.PlanningStore, captureBudget *tools.CaptureBudget) subagent.Executor {
+func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *typedStoreAdapter, logger *log.Logger, hooksBus *hooks.Bus, parentPlanning *tools.PlanningStore, captureBudget *tools.CaptureBudget, chain func() *model.FailoverChain) subagent.Executor {
 	return func(ctx context.Context, brief string) (string, subagent.Usage, error) {
 		childReg, err := newChildRegistry(cfg, captureBudget, parentPlanning)
 		if err != nil {
@@ -252,6 +252,15 @@ func newSubagentExecutor(provider model.Provider, cfg *config.Config, typedSrc *
 		child, err := core.NewAgent(cfg, provider, childReg, mem)
 		if err != nil {
 			return "", subagent.Usage{}, err
+		}
+		// Failover: the child inherits the daemon's chain (resolved
+		// through the accessor at spawn time, so a default switch
+		// that happened after Build is already visible). A child
+		// whose provider is down fails over exactly like a parent
+		// turn instead of dying on the parent's dead provider.
+		// The accessor is nil-safe: a nil chain means no failover.
+		if chain != nil {
+			child.SetFallbackChain(chain())
 		}
 		// Permission gate (F-A23-2): the child runs under a
 		// non-interactive deny-by-default gate — destructive

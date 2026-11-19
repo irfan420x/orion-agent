@@ -151,7 +151,7 @@ type Config struct {
 	// not shadow a real provider name, and its target must be a
 	// known, configured provider (Validate enforces both).
 	ProviderAliases map[string]string `json:"provider_aliases"`
-	TelegramToken   string                    `json:"telegram_token"`
+	TelegramToken   string            `json:"telegram_token"`
 	// TelegramAllowedChats is the allowlist of Telegram chat IDs that
 	// may drive the agent. When non-empty, the gateway drops messages
 	// from any other chat before the handler runs: without it, anyone

@@ -90,9 +90,20 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 	var stats *core.TurnStats
 	wrapped := func(ev core.ProgressEvent) {
 		if ev.Kind == core.EventTurnFinished {
+			// The SERVING provider names the turn, not the
+			// provider it started on (see runChatTurn): a turn
+			// that fell back mid-turn is reported under the
+			// provider that answered it.
+			servingProvider, servingModel := ev.ServingProvider, ev.ServingModel
+			if servingProvider == "" {
+				servingProvider = providerName
+			}
+			if servingModel == "" {
+				servingModel = modelName
+			}
 			stats = &core.TurnStats{
-				Provider:         providerName,
-				Model:            modelName,
+				Provider:         servingProvider,
+				Model:            servingModel,
 				Tokens:           ev.Usage.TotalTokens,
 				PromptTokens:     ev.Usage.PromptTokens,
 				CompletionTokens: ev.Usage.CompletionTokens,
@@ -104,7 +115,9 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 				// MemoriesUsed comes from the TurnFinished event
 				// (the agent counts typed memories injected this
 				// turn); the footer renders it when non-zero.
-				MemoriesUsed: ev.MemoriesUsed,
+				MemoriesUsed:  ev.MemoriesUsed,
+				FallbackHops:  ev.FallbackHops,
+				ProviderUsage: ev.ProviderUsage,
 			}
 		}
 		if emit != nil {
@@ -112,6 +125,9 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 		}
 	}
 	reply, err := agent.RunWithEventHandler(ctx, input, wrapped)
+	if stats != nil && err == nil && len(stats.FallbackHops) > 0 {
+		reply = appendFallbackNotice(reply, stats.FallbackHops)
+	}
 	if a.Audit != nil {
 		_, _ = a.Audit.Append("user", "agent_run", truncateRunes(security.RedactSecrets(input), 200))
 	}
@@ -131,43 +147,65 @@ func providerNeedsAPIKey(name string) bool {
 	}
 }
 
-// resolveProvider validates a provider name and builds the
+// resolveProvider validates a provider route and builds the
 // provider, without changing any state. It is the shared
 // validation/construction step for SwitchProvider (daemon default)
 // and SwitchProviderForChat (one chat's override): both must reject
 // the same unknown/misconfigured providers, and neither may install
-// a half-built provider. It returns the provider, the resolved
-// config entry, and the canonical (lowercase) provider key.
-func (a *App) resolveProvider(name string) (model.Provider, config.ProviderConfig, string, error) {
-	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" {
-		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: unknown provider %q (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
+// a half-built provider. A route is an alias, a "provider/model"
+// pair or a bare provider name — the same resolution /model
+// accepts — so a switch, a chain entry and an alias can never
+// disagree about what a name means. It returns the provider, the
+// resolved config entry (with the route's model applied), and the
+// canonical (lowercase) provider key.
+func (a *App) resolveProvider(route string) (model.Provider, config.ProviderConfig, string, error) {
+	if a == nil || a.Config == nil {
+		return nil, config.ProviderConfig{}, "", errors.New("app: no config loaded")
 	}
-	if !config.KnownProvider(name) {
-		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: unknown provider %q (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
+	name, modelName, err := a.Config.ResolveRoute(route)
+	if err != nil {
+		return nil, config.ProviderConfig{}, "", err
 	}
-	// Resolve the entry case-insensitively: the map key is the
-	// canonical lowercase name, but never assume it.
-	var entry config.ProviderConfig
-	var key string
-	found := false
-	for k, p := range a.Config.Providers {
-		if strings.EqualFold(k, name) {
-			entry, key, found = p, k, true
-			break
-		}
-	}
+	entry, key, found := a.lookupProviderEntry(name)
 	if !found {
 		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q is not configured (supported providers: %s)", name, strings.Join(config.KnownProviderNames(), ", "))
 	}
+	return a.buildProviderEntry(entry, key, modelName)
+}
+
+// lookupProviderEntry resolves a provider name to its config entry
+// case-insensitively (the map key is the canonical lowercase name,
+// but never assume it).
+func (a *App) lookupProviderEntry(name string) (config.ProviderConfig, string, bool) {
+	if a == nil || a.Config == nil {
+		return config.ProviderConfig{}, "", false
+	}
+	for k, p := range a.Config.Providers {
+		if strings.EqualFold(k, name) {
+			return p, k, true
+		}
+	}
+	return config.ProviderConfig{}, "", false
+}
+
+// buildProviderEntry builds a provider from a config entry with an
+// explicit model applied: a non-empty model overrides the entry's
+// model (a route's model, or a chat override's model); an empty one
+// keeps the entry's model with the global model as fallback. The
+// returned entry carries the model that was actually built, so
+// callers can persist or report it. The API-key check runs here,
+// so every build path rejects a keyless paid provider the same way.
+func (a *App) buildProviderEntry(entry config.ProviderConfig, key, modelName string) (model.Provider, config.ProviderConfig, string, error) {
 	if strings.TrimSpace(entry.Name) == "" {
 		entry.Name = key
 	}
-	if strings.TrimSpace(entry.Model) == "" {
+	if strings.TrimSpace(modelName) != "" {
+		entry.Model = modelName
+	} else if strings.TrimSpace(entry.Model) == "" && a.Config != nil {
 		entry.Model = a.Config.Model
 	}
-	if providerNeedsAPIKey(name) && strings.TrimSpace(entry.APIKey) == "" {
-		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q requires an API key (set providers.%s.api_key or ORION_API_KEY)", name, name)
+	if providerNeedsAPIKey(key) && strings.TrimSpace(entry.APIKey) == "" {
+		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q requires an API key (set providers.%s.api_key or ORION_API_KEY)", key, key)
 	}
 	provider, err := model.NewProvider(model.ProviderConfig{
 		Name:    entry.Name,
@@ -176,9 +214,20 @@ func (a *App) resolveProvider(name string) (model.Provider, config.ProviderConfi
 		Model:   entry.Model,
 	})
 	if err != nil {
-		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q: %w", name, err)
+		return nil, config.ProviderConfig{}, "", fmt.Errorf("app: provider %q: %w", key, err)
 	}
 	return provider, entry, key, nil
+}
+
+// applyFallbackWiring installs the daemon's failover chain on an
+// agent (nil-safe: a hand-built App has no chain). Every agent the
+// App builds — global, per-chat, rebuilt — goes through this, so
+// no agent can silently lose the chain on a rebuild.
+func (a *App) applyFallbackWiring(agent *core.Agent) {
+	if a == nil || agent == nil {
+		return
+	}
+	agent.SetFallbackChain(a.fallbackChain)
 }
 
 // SwitchProvider switches the daemon's default provider, persists the
@@ -207,18 +256,31 @@ func (a *App) SwitchProvider(name string) error {
 	if a == nil || a.Config == nil {
 		return errors.New("app: SwitchProvider called on uninitialised App")
 	}
-	provider, _, _, err := a.resolveProvider(name)
+	// Route-aware: a "provider/model" switch also changes the
+	// model's model, and an alias resolves first.
+	provider, entry, key, err := a.resolveProvider(name)
 	if err != nil {
 		return err
 	}
-	name = strings.ToLower(strings.TrimSpace(name))
 	// Persist first, then swap: if the save fails the daemon keeps
 	// running on the old provider instead of diverging from disk.
 	a.mu.Lock()
 	oldDefault := a.Config.DefaultProvider
-	a.Config.DefaultProvider = name
+	oldEntry := a.Config.Providers[key]
+	a.Config.DefaultProvider = key
+	if strings.TrimSpace(entry.Model) != "" {
+		// A route with an explicit model updates the entry, so
+		// the model survives a restart (the same-provider model
+		// switch, persisted). A bare provider switch leaves the
+		// entry's model untouched.
+		if p, ok := a.Config.Providers[key]; ok {
+			p.Model = entry.Model
+			a.Config.Providers[key] = p
+		}
+	}
 	if err := a.Config.Save(""); err != nil {
 		a.Config.DefaultProvider = oldDefault
+		a.Config.Providers[key] = oldEntry
 		a.mu.Unlock()
 		return fmt.Errorf("app: switch provider: save config: %w", err)
 	}
@@ -246,18 +308,29 @@ func (a *App) SwitchProvider(name string) error {
 	// subsequent turn (same class as Audit 4 B P1-1 for Memory v2).
 	agent.SetSkills(a.Skills)
 	agent.SetHooks(a.Hooks)
+	// The daemon default moved: the chain head follows it (the
+	// cooldown table is kept — a provider that just failed stays
+	// benched), and the new agent gets the chain like every agent
+	// the App builds.
+	if a.fallbackChain != nil {
+		a.fallbackChain.SetOrder(a.Config.FallbackChain())
+	}
+	a.applyFallbackWiring(agent)
+	agent.SetHomeProvider(key)
 	a.Agent = agent
 	a.Provider = provider
 	if a.Subagents != nil {
 		// Re-point the subagent executor at a child-agent factory
 		// built on the NEW provider (children share the active
 		// provider). The factory builds a fresh child per spawn,
-		// so it never captures the old agent.
+		// so it never captures the old agent. The chain accessor
+		// reads the live chain, so children follow a default
+		// switch without another re-point.
 		// The subagent tools' usage sink resolves the CURRENT
 		// agent on every call (see Build), so no re-pointing is
 		// needed here: tokens from consumed results accrue to
 		// this new agent automatically.
-		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger, a.Hooks, a.planningStore, a.captureBudget))
+		a.Subagents.SetExecutor(newSubagentExecutor(provider, a.Config, a.typedAdapter, a.Logger, a.Hooks, a.planningStore, a.captureBudget, func() *model.FailoverChain { return a.fallbackChain }))
 	}
 	a.mu.Unlock()
 	// Chats without an override follow the new default; chats with

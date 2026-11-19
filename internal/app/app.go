@@ -43,6 +43,15 @@ type App struct {
 	// config.PerChatDailyTokenBudget in Build; nil for hand-built
 	// Apps, which are then unbudgeted.
 	Budget *budget.Budget
+	// fallbackChain is the daemon-wide provider failover chain
+	// (opt-in via config.fallback_providers), built in Build and
+	// shared by every agent the App creates: global, per-chat and
+	// subagent children. Nil for hand-built Apps (no failover).
+	// A chain with only the default provider still benches it
+	// after a failure, but with no second entry the turn fails
+	// exactly as before — the chain only switches when a next
+	// provider exists.
+	fallbackChain *model.FailoverChain
 	// toolJournal is the durable per-update record of completed
 	// tool calls (F-A9-1), built from <dataDir>/tool-journal in
 	// Build; nil for hand-built Apps and when the journal could
@@ -265,8 +274,11 @@ func Build(path string) (*App, error) {
 	// SHARED agent, which deadlocks (runMu is held for the whole
 	// parent turn) and pollutes the parent's history. The child
 	// shares only the provider (concurrent-safe) and the typed
-	// memories (read-only view).
-	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, planningStore, captureBudget), cfg.DataDir)
+	// memories (read-only view). The chain accessor is resolved
+	// at spawn time (not build time): app.fallbackChain is only
+	// set after the App is assembled below, so the executor must
+	// read it through the closure, never capture a nil chain.
+	mgr := subagent.NewManagerWithExecutorAndStore(4, newSubagentExecutor(provider, cfg, typedAdapter, logger, hookBus, planningStore, captureBudget, func() *model.FailoverChain { return app.fallbackChain }), cfg.DataDir)
 
 	// Model-visible subagent tools, registered on the PARENT
 	// registry only (children get a registry without them, so no
@@ -329,6 +341,23 @@ func Build(path string) (*App, error) {
 		StartedAt:     time.Now(),
 		typedStore:    typedStore, sessionLog: sessionLog, typedAdapter: typedAdapter, driftRoot: driftRoot,
 	}
+	// Provider fallback chain (opt-in via config): the factory
+	// resolves each chain entry through the App, so entries use
+	// their configured models and keys and unconfigured entries
+	// fail at build time (Validate already rejects them at load).
+	// The chain is shared daemon-wide — one cooldown table across
+	// all chats — and installed on the global agent here and on
+	// every per-chat agent at build time (see
+	// applyFallbackWiring), so no agent can silently lose the
+	// chain on a rebuild.
+	app.fallbackChain = model.NewFailoverChain(cfg.FallbackChain(), func(name string) (model.Provider, error) {
+		p, _, _, err := app.resolveProvider(name)
+		return p, err
+	})
+	app.applyFallbackWiring(agent)
+	// Home: the daemon default, so a failover on the global agent
+	// restores to the default at the next turn.
+	agent.SetHomeProvider(cfg.DefaultProvider)
 	// Budget persistence (Audit 5 F-A5-P2-19): without a file, a
 	// daemon restart resets every chat's daily spend to zero. The
 	// file holds today's per-chat totals (atomic write-temp+rename

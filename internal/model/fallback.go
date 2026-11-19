@@ -32,6 +32,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,6 +103,31 @@ func (c *FailoverChain) Order() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.order...)
+}
+
+// SetOrder replaces the chain's provider order, keeping the
+// cooldown table: a provider benched under the old order stays
+// benched under the new one. Used when the daemon default changes
+// — the chain head follows the new default without forgetting
+// that a provider just failed. Nil-safe: a chain that was never
+// built has nothing to reorder.
+func (c *FailoverChain) SetOrder(names []string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := map[string]bool{}
+	order := make([]string, 0, len(names))
+	for _, n := range names {
+		key := strings.ToLower(strings.TrimSpace(n))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		order = append(order, key)
+	}
+	c.order = order
 }
 
 // Build constructs the provider named by name through the factory.

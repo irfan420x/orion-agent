@@ -127,3 +127,25 @@ func TestFailoverChainBuild(t *testing.T) {
 		t.Error("Build without factory: expected an error, got nil")
 	}
 }
+
+func TestFailoverChainSetOrderKeepsCooldowns(t *testing.T) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	c := NewFailoverChain([]string{"deepseek", "openai"}, fakeChainProvider)
+	c.now = func() time.Time { return now }
+	c.MarkFailed("deepseek", FailoverBilling)
+	// The daemon default moves: the chain head follows it, but
+	// the bench on deepseek survives the reorder.
+	c.SetOrder([]string{"openai", "deepseek"})
+	if got := c.Order(); len(got) != 2 || got[0] != "openai" || got[1] != "deepseek" {
+		t.Errorf("Order after SetOrder = %v, want [openai deepseek]", got)
+	}
+	if !c.IsCooled("deepseek") {
+		t.Error("SetOrder cleared the deepseek bench, want it kept")
+	}
+	if next, ok := c.NextAvailable(map[string]bool{"openai": true}); ok {
+		t.Errorf("NextAvailable after SetOrder = %q, want none (deepseek still benched)", next)
+	}
+	// A nil chain reorders to nothing instead of panicking.
+	var nilChain *FailoverChain
+	nilChain.SetOrder([]string{"openai"})
+}
