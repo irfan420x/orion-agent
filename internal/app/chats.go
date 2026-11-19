@@ -597,7 +597,15 @@ func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input str
 	// case in place; this covers the --once case, which only the
 	// App can see.
 	agent = a.applyTurnStartRoute(chatID, agent)
-	if a.Budget != nil {
+	// The daily budget gate binds non-owner chats only: the
+	// owner's own chat is warning-only (isOwnerChat) and is
+	// never refused pre-flight or mid-turn — the owner used
+	// ~247K tokens across 14 runs on 2026-11-19, so a hard cap
+	// on his own chat would stop the bot mid-day. The owner's
+	// spend is still metered and recorded (turn end), and the
+	// alert threshold warns him once per day. A nil Budget
+	// means unbudgeted, exactly as before.
+	if a.Budget != nil && !a.isOwnerChat(chatID) {
 		if err := a.Budget.Check(chatID, a.projectedTurnTokens(chatID, input)); err != nil {
 			return "", nil, err
 		}
@@ -1366,8 +1374,10 @@ func (a *App) compressForChatWith(ctx context.Context, chatID int64, keepRecent 
 	// against the chat's Budget BEFORE the provider call. The
 	// returned *BudgetExceededError unwraps to
 	// budget.ErrBudgetExceeded. A nil Budget means unbudgeted,
-	// exactly as for turns.
-	if a.Budget != nil {
+	// exactly as for turns. The owner's own chat is warning-only
+	// (isOwnerChat) and is never refused here either — the
+	// recording sink below still accounts its spend.
+	if a.Budget != nil && !a.isOwnerChat(chatID) {
 		if err := a.Budget.Check(chatID, projectedCompressTokens(cs.store, keepRecent, sessionMemory)); err != nil {
 			return 0, 0, 0, err
 		}

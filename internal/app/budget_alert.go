@@ -55,6 +55,31 @@ var ErrBudgetAlertNoOwner = errors.New("budget alert: no owner configured")
 // (and logging) on every record until UTC midnight.
 type BudgetAlertNotifier func(ctx context.Context, chatID int64, text string) error
 
+// ownerChatID returns the bot owner's Telegram chat ID: the
+// first allowlisted chat (the convention the permission gate,
+// the alert notifier and the cron tools all use), or 0 when no
+// allowlist is configured. The owner is the operator who pays
+// the bill; his own chat is warning-only for the daily budget
+// (see isOwnerChat), never hard-refused.
+func (a *App) ownerChatID() int64 {
+	if a == nil || a.Config == nil || len(a.Config.TelegramAllowedChats) == 0 {
+		return 0
+	}
+	return a.Config.TelegramAllowedChats[0]
+}
+
+// isOwnerChat reports whether chatID is the owner's own chat.
+// The daily budget binds every other chat with a hard refusal,
+// but the owner's chat is warning-only: the owner used ~247K
+// tokens across 14 runs on 2026-11-19, so a hard cap on his own
+// chat would stop the bot mid-day. A chatID of 0 (the CLI /
+// unattributed bucket) is never the owner: the guard requires a
+// configured owner, so bucket 0 stays gated.
+func (a *App) isOwnerChat(chatID int64) bool {
+	owner := a.ownerChatID()
+	return owner != 0 && chatID == owner
+}
+
 // SetBudgetAlertNotifier installs the owner-alert sender for daily
 // budget threshold crossings. It is setup-time only (the daemon
 // entrypoints call it before polling starts, like
@@ -132,6 +157,12 @@ func (a *App) maybeAlertBudget(ctx context.Context, chatID int64) {
 		return
 	}
 	text := FormatBudgetAlertMessage(chatID, used, threshold, a.Budget.Limit())
+	if a.isOwnerChat(chatID) && a.Budget.Limit() > 0 {
+		// The owner's own chat is warning-only (never refused
+		// by the budget): say so, or the alert's finite-limit
+		// line would imply a refusal that will not happen.
+		text += "\nThis is your own chat: the daily budget warns but never refuses your turns."
+	}
 	if err := a.budgetAlertNotifier(ctx, chatID, text); err != nil {
 		if errors.Is(err, ErrBudgetAlertNoOwner) {
 			a.budgetAlertNoOwnerMu.Lock()

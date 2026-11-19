@@ -523,6 +523,12 @@ func (a *App) UsageLineForChat(chatID int64) string {
 	} else {
 		fmt.Fprintf(&b, "Daily token budget: %s tokens (%s remaining, resets %s)",
 			formatThousands(limit), formatThousands(a.Budget.Remaining(chatID)), a.Budget.ResetAt().Format("2006-01-02 15:04 UTC"))
+		if a.isOwnerChat(chatID) {
+			// The remaining count is not a refusal countdown
+			// for the owner's own chat (warning-only): say so,
+			// or /usage would imply his turns stop at zero.
+			b.WriteString(" — warning only, your turns are never refused")
+		}
 	}
 	return b.String()
 }
