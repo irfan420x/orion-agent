@@ -534,7 +534,19 @@ func (m *Manager) Forget(id string) bool {
 // recorded, instead of living until the per-task timeout.
 func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.CancelFunc) {
 	defer m.wg.Done()
-	defer func() { <-m.sem }()
+	// Slot release is idempotent and explicit: the slot must be free
+	// BEFORE close(entry.done) lets a waiter observe the finish, or
+	// the next Spawn sees a spurious "at capacity" (the deferred
+	// receive alone runs only when runTask returns, after done is
+	// already closed). `released` is touched only by this goroutine.
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			<-m.sem
+		}
+	}
+	defer release()
 	if cancel != nil {
 		defer cancel()
 	}
@@ -624,6 +636,7 @@ func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.
 	// clobbered by this still-pending persist, and a daemon
 	// killed in the gap lost the result from disk.
 	m.persistSnapshot()
+	release() // slot free before any waiter can observe done
 	m.mu.Lock()
 	close(entry.done)
 	m.mu.Unlock()
