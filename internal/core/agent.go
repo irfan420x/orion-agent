@@ -1194,6 +1194,38 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		}
 		messages = append(messages, history...)
 	}
+	// Fact-aware recall: facts and statements from older turns that
+	// the recent window no longer covers are injected as their OWN
+	// system messages AFTER the history — not inside the system
+	// prompt. The layout is the prompt-caching layout: the system
+	// prompt (identity + rules + personality + skills) and the
+	// history are byte-stable across turns, so the provider can
+	// serve that whole prefix from its prompt cache, while the
+	// recall sections — which vary with every input — sit after
+	// the stable prefix and can never break it. Appending recall
+	// to the system message (the old layout) changed the first
+	// message on every turn, so the history after it could never
+	// match the cache, and a 10,530-token prompt was re-priced in
+	// full on every turn (the 2026-11-19 benchmark: 10,534 tokens
+	// for "17*23+5 = 396"). The recall messages are in-flight
+	// only — never recorded into memory — so they never persist
+	// or re-appear as history. trimHistoryToBudget never drops or
+	// truncates them: system-role content is protected, and the
+	// oldest turns pay for recall — the user's question may depend
+	// on a recalled fact, so recall outranks old history. The
+	// sections are appended only when non-empty, so the request is
+	// byte-identical when nothing is relevant.
+	if items := a.recallFor(input, recent); len(items) > 0 {
+		messages = append(messages, model.Message{Role: "system", Content: formatRecallSection(items)})
+	}
+	// Recall v2: typed memories are injected alongside the v1
+	// items, under their own section header (at most 5, drift
+	// checked, never failing the run). Their count is the turn's
+	// MemoriesUsed, carried on TurnFinished for TurnStats.
+	if typed := a.recallTypedFor(ctx, input, recent); len(typed) > 0 {
+		memoriesUsed = len(typed)
+		messages = append(messages, model.Message{Role: "system", Content: formatTypedMemorySection(typed)})
+	}
 	userMsg := model.Message{Role: "user", Content: input, Images: images}
 	messages = append(messages, userMsg)
 	// recordMessage stores in memory AND appends to the wired
@@ -1207,27 +1239,6 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 	recorded := userMsg
 	recorded.Images = nil
 	a.recordMessage(recorded)
-
-	// Fact-aware recall: facts and statements from older turns that
-	// the recent window no longer covers are injected into the system
-	// message. The section is appended only when non-empty, so the
-	// system prompt is byte-identical when nothing is relevant.
-	// The injected section counts against the history budget like
-	// any other message (trimHistoryToBudget measures the augmented
-	// system message), so recall + history together stay within
-	// budget: when the window is tight, the oldest turns are
-	// dropped to pay for the recall, never the system message.
-	if items := a.recallFor(input, recent); len(items) > 0 {
-		messages[0].Content += formatRecallSection(items)
-	}
-	// Recall v2: typed memories are injected alongside the v1
-	// items, under their own section header (at most 5, drift
-	// checked, never failing the run). Their count is the turn's
-	// MemoriesUsed, carried on TurnFinished for TurnStats.
-	if typed := a.recallTypedFor(ctx, input, recent); len(typed) > 0 {
-		memoriesUsed = len(typed)
-		messages[0].Content += formatTypedMemorySection(typed)
-	}
 
 	// Session-memory extraction is counted at the end of this turn
 	// (deferred: it launches a background goroutine and never
@@ -1260,7 +1271,6 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		// it (the no-loss invariant on Steer: consumed by the
 		// run, or returned by DrainPendingSteer).
 		a.drainSteerForStep(&messages)
-
 		// The request window is trimmed to the history budget
 		// first (see trimHistoryToBudget): the in-flight messages
 		// grow with every tool result, and an unbounded request
@@ -1709,10 +1719,12 @@ func historyUnits(msgs []model.Message) [][2]int {
 // the turn when history (or a single tool result) grows past it:
 //
 //   - the system prompt is never dropped and never truncated — it
-//     carries the identity, the rules, and the fact-aware recall
-//     section, so recall + history together stay within budget
-//     because the recall-augmented system message is measured here
-//     like any other message and the oldest turns pay for it;
+//     carries the identity and the rules. The fact-aware recall
+//     sections ride as their own system messages after the history
+//     (see run) and share the protection: system-role content is
+//     never dropped or truncated, because the user's question may
+//     depend on a recalled fact — the oldest turns pay for recall,
+//     never the recall itself;
 //   - the latest user turn is never dropped, and neither is the
 //     most recent turn as a whole (usually the tool result the
 //     model just produced): if it alone exceeds the budget it is
@@ -1761,9 +1773,10 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 	// Phase 1: drop the oldest droppable units until the window
 	// fits or nothing droppable remains. Units are oldest-first,
 	// so the most recent turns survive longest. Three units are
-	// never dropped: the system prompt, the unit holding the latest
-	// user turn, and the most recent turn itself (usually the
-	// tool result the model just produced — dropping it would
+	// never dropped: any unit holding system-role content (the
+	// system prompt, the recall sections), the unit holding the
+	// latest user turn, and the most recent turn itself (usually
+	// the tool result the model just produced — dropping it would
 	// leave the model with nothing to continue from; if it alone
 	// exceeds the budget, phase 2 truncates it instead).
 	units := historyUnits(out)
@@ -1771,8 +1784,15 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 		if total <= budget {
 			break
 		}
-		if u[0] == 0 {
-			continue // system prompt: never dropped
+		system := false
+		for i := u[0]; i < u[1]; i++ {
+			if out[i].Role == "system" {
+				system = true
+				break
+			}
+		}
+		if system {
+			continue // system prompt / recall: never dropped
 		}
 		if lastUser >= u[0] && lastUser < u[1] {
 			continue // latest user turn: never dropped
@@ -1788,7 +1808,7 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 	}
 	// Phase 2: still over budget — one message alone exceeds it.
 	// Truncate the largest remaining non-system message contents,
-	// head-first, until the window fits. The system prompt is
+	// head-first, until the window fits. System-role content is
 	// never truncated; the latest user turn is truncated only if
 	// it is itself the largest remaining message (dropping it is
 	// forbidden, cutting it with a marker beats failing the turn).
@@ -1800,8 +1820,8 @@ func trimHistoryToBudget(msgs []model.Message, budget int) ([]model.Message, tri
 	// cannot shrink the window. It can never spin.
 	for total > budget {
 		big := -1
-		for i := 1; i < len(out); i++ {
-			if drop[i] || len(out[i].Content) == 0 {
+		for i := 0; i < len(out); i++ {
+			if drop[i] || out[i].Role == "system" || len(out[i].Content) == 0 {
 				continue
 			}
 			if big < 0 || costs[i] > costs[big] {

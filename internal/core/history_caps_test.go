@@ -320,7 +320,7 @@ func TestRunTrimsRecallWithinBudget(t *testing.T) {
 	if totalTokens(req.Messages) > 1500 {
 		t.Fatalf("provider request %d tokens, over the 1500-token budget", totalTokens(req.Messages))
 	}
-	if !strings.Contains(req.Messages[0].Content, "17") {
+	if !strings.Contains(systemMessageOf(t, prov), "17") {
 		t.Fatal("recall fact did not survive trimming in the system message")
 	}
 	if req.Messages[len(req.Messages)-1].Content != "what is my favourite number times 3" {

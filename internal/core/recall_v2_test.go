@@ -451,8 +451,9 @@ func TestRunReportsMemoriesUsedOnTurnFinished(t *testing.T) {
 	if finished.MemoriesUsed != 3 {
 		t.Errorf("TurnFinished.MemoriesUsed = %d, want 3", finished.MemoriesUsed)
 	}
-	// The typed section reached the provider request.
-	if !strings.Contains(prov.lastReq.Messages[0].Content, "favourite-number") {
-		t.Errorf("system message missing injected typed memory; got:\n%s", prov.lastReq.Messages[0].Content)
+	// The typed section reached the provider request (as its own
+	// system message after the history — see TestRunRecallSectionIsSeparateFromSystemPrompt).
+	if !strings.Contains(systemMessageOf(t, prov), "favourite-number") {
+		t.Errorf("system messages missing injected typed memory; got:\n%s", systemMessageOf(t, prov))
 	}
 }

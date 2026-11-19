@@ -196,7 +196,17 @@ func systemMessageOf(t *testing.T, prov *fakeProvider) string {
 	if len(msgs) == 0 || msgs[0].Role != "system" {
 		t.Fatalf("provider received no system message first: %+v", msgs)
 	}
-	return msgs[0].Content
+	// The system content the provider received: the system prompt
+	// plus any recall sections, which ride as their own system
+	// messages after the history (see run) instead of inside
+	// messages[0].
+	var parts []string
+	for _, m := range msgs {
+		if m.Role == "system" {
+			parts = append(parts, m.Content)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // runFillerTurns runs n throwaway turns so earlier turns slide out of
@@ -313,5 +323,98 @@ func TestRunDoesNotDuplicateFactInRecentWindow(t *testing.T) {
 	sys := systemMessageOf(t, prov)
 	if sys != a.SystemPrompt() {
 		t.Errorf("turn 2 system prompt was changed (fact already in window):\n%q\nwant byte-identical system prompt", sys)
+	}
+}
+
+// TestRunRecallSectionIsSeparateFromSystemPrompt pins the
+// prompt-caching layout: the recall section rides as its own system
+// message after the history, and the system prompt itself carries
+// no recall — so the system prompt is byte-identical on every turn.
+func TestRunRecallSectionIsSeparateFromSystemPrompt(t *testing.T) {
+	prov := &fakeProvider{}
+	mem := newFakeStore()
+	if err := mem.AddFact("favourite number", "17"); err != nil {
+		t.Fatalf("AddFact: %v", err)
+	}
+	a := newTestAgent(t, testConfig(5), prov, tools.NewRegistry(), mem)
+	runFillerTurns(t, a, 6)
+	if _, err := a.Run(context.Background(), "What is my favourite number?"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	msgs := prov.lastReq.Messages
+	if len(msgs) == 0 || msgs[0].Role != "system" {
+		t.Fatalf("first message = %+v, want the system prompt first", msgs)
+	}
+	if strings.Contains(msgs[0].Content, "Relevant things the user told you earlier") {
+		t.Errorf("system prompt contains the recall section — recall must ride as its own message after the history, or the prompt prefix can never match the cache")
+	}
+	if msgs[0].Content != a.SystemPrompt() {
+		t.Errorf("system prompt = %q, want exactly SystemPrompt() (byte-stable across turns)", msgs[0].Content)
+	}
+	found := false
+	for _, m := range msgs[1:] {
+		if m.Role == "system" && strings.Contains(m.Content, "Relevant things the user told you earlier") && strings.Contains(m.Content, "favourite number: 17") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no separate recall message after the history: %+v", msgs)
+	}
+}
+
+// TestRunStablePrefixSurvivesChangingRecall pins the property the
+// caching layout exists for: two turns whose recall sections differ
+// (one recalls a fact, the next recalls nothing) still share a
+// byte-identical [system prompt + history] prefix, so a provider
+// can serve that prefix from its prompt cache instead of
+// re-pricing it. Under the old layout the recall section was
+// appended to the system message, so the two turns' first messages
+// differed and the whole history after them could never match the
+// cache.
+func TestRunStablePrefixSurvivesChangingRecall(t *testing.T) {
+	prov := &fakeProvider{}
+	mem := newFakeStore()
+	if err := mem.AddFact("favourite number", "17"); err != nil {
+		t.Fatalf("AddFact: %v", err)
+	}
+	a := newTestAgent(t, testConfig(5), prov, tools.NewRegistry(), mem)
+	// One filler turn so the shared history is non-empty.
+	if _, err := a.Run(context.Background(), "Hello there"); err != nil {
+		t.Fatalf("filler Run: %v", err)
+	}
+	if _, err := a.Run(context.Background(), "What is my favourite number?"); err != nil {
+		t.Fatalf("recall Run: %v", err)
+	}
+	req1 := append([]model.Message(nil), prov.lastReq.Messages...)
+	if _, err := a.Run(context.Background(), "Hello again"); err != nil {
+		t.Fatalf("greeting Run: %v", err)
+	}
+	req2 := prov.lastReq.Messages
+	// req1 = [system][filler user][filler asst][recall][user];
+	// req2 = [system][filler user][filler asst][user][asst][user].
+	// The shared prefix is the first three messages.
+	if len(req1) < 4 || len(req2) < 5 {
+		t.Fatalf("requests too short: req1 %d messages, req2 %d messages", len(req1), len(req2))
+	}
+	for i := 0; i < 3; i++ {
+		if req1[i].Role != req2[i].Role || req1[i].Content != req2[i].Content || len(req1[i].ToolCalls) != len(req2[i].ToolCalls) {
+			t.Errorf("shared prefix message %d differs:\nreq1: %+v\nreq2: %+v", i, req1[i], req2[i])
+		}
+	}
+	// And the recall really did differ: turn 1 carried a recall
+	// section, turn 2 (a greeting) carried none.
+	hasRecall := func(msgs []model.Message) bool {
+		for _, m := range msgs {
+			if m.Role == "system" && strings.Contains(m.Content, "Relevant things the user told you earlier") {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasRecall(req1) {
+		t.Error("turn 1 carried no recall section, want one (the fact was recalled)")
+	}
+	if hasRecall(req2) {
+		t.Error("turn 2 (a greeting) carried a recall section, want none")
 	}
 }
