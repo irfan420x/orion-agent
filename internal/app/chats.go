@@ -1272,6 +1272,15 @@ func (a *App) ExpensiveSwitchWarning(currentProvider, currentModel, targetRoute 
 	if tgtPrice.InputPerMillion < 1 || tgtPrice.InputPerMillion <= 3*curPrice.InputPerMillion {
 		return false, ""
 	}
+	if curPrice.InputPerMillion == 0 {
+		// The current model is free, so there is no multiplier to
+		// quote (x/0 renders +Inf): name the target's absolute
+		// price instead.
+		return true, fmt.Sprintf("switching from %s/%s ($%.2f/M input) to %s/%s ($%.2f/M input) costs $%.2f/M input, up from free — reply with --confirm to accept",
+			currentProvider, currentModel, curPrice.InputPerMillion,
+			targetProvider, targetModel, tgtPrice.InputPerMillion,
+			tgtPrice.InputPerMillion)
+	}
 	return true, fmt.Sprintf("switching from %s/%s ($%.2f/M input) to %s/%s ($%.2f/M input) costs %.1fx more per input token — reply with --confirm to accept",
 		currentProvider, currentModel, curPrice.InputPerMillion,
 		targetProvider, targetModel, tgtPrice.InputPerMillion,

@@ -425,3 +425,34 @@ func TestExpensiveSwitchWarning(t *testing.T) {
 		}
 	}
 }
+
+func TestExpensiveSwitchWarningFreeModelRendersAbsolutePrice(t *testing.T) {
+	a := testApp(t)
+	defer a.Close()
+	// Free local model -> pricey paid model: the warning must name
+	// the target's absolute price, never a "+Inf" multiplier (x/0).
+	warn, warning := a.ExpensiveSwitchWarning("ollama", "llama3.1", "anthropic/claude-opus-4")
+	if !warn {
+		t.Fatalf("ExpensiveSwitchWarning(ollama/llama3.1 -> anthropic/claude-opus-4): no warning, want one")
+	}
+	if strings.Contains(warning, "Inf") || strings.Contains(warning, "NaN") {
+		t.Errorf("warning %q must not contain Inf/NaN", warning)
+	}
+	if !strings.Contains(warning, "$15.00/M input") {
+		t.Errorf("warning %q must render the target's absolute price ($15.00/M input)", warning)
+	}
+	if !strings.Contains(warning, "--confirm") {
+		t.Errorf("warning %q must name --confirm", warning)
+	}
+	// Nonzero current price keeps the multiplier form exactly.
+	warn, warning = a.ExpensiveSwitchWarning("deepseek", "deepseek-flash", "openai/gpt-4o")
+	if !warn {
+		t.Fatalf("ExpensiveSwitchWarning(deepseek/deepseek-flash -> openai/gpt-4o): no warning, want one")
+	}
+	if !strings.Contains(warning, "x more per input token") {
+		t.Errorf("warning %q must keep the multiplier form for nonzero current prices", warning)
+	}
+	if strings.Contains(warning, "Inf") || strings.Contains(warning, "NaN") {
+		t.Errorf("warning %q must not contain Inf/NaN", warning)
+	}
+}
