@@ -136,6 +136,30 @@ func DefaultTable() *Table {
 	return t
 }
 
+// Models returns the models the table prices for provider,
+// sorted alphabetically, as a fresh slice: mutating the result
+// cannot affect the table. An unknown provider (or one with no
+// entries) returns nil. The list is the picker's source for
+// "which models Orion knows for this provider": every entry is
+// a model with a verified price, so a switch to one of them can
+// always be cost-checked. The model names are table keys
+// (lowercase, as stored by add).
+func (t *Table) Models(provider string) []string {
+	if t == nil {
+		return nil
+	}
+	byModel, ok := t.entries[strings.ToLower(strings.TrimSpace(provider))]
+	if !ok || len(byModel) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(byModel))
+	for m := range byModel {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // PriceFor returns the rate card for provider/model. It reports
 // false when the pair is not in the table — the caller must say
 // "price unknown", never $0. Lookup order: exact (provider, model),

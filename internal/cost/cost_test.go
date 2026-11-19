@@ -149,3 +149,47 @@ func TestFormatUSD(t *testing.T) {
 		}
 	}
 }
+
+func TestTableModels(t *testing.T) {
+	tbl := DefaultTable()
+	cases := []struct {
+		provider string
+		want     []string
+	}{
+		{"deepseek", []string{"deepseek-chat", "deepseek-flash", "deepseek-reasoner"}},
+		{"openai", []string{"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o4-mini"}},
+		{"anthropic", []string{"claude-3-5-sonnet", "claude-3-5-sonnet-20241022", "claude-haiku-3-5", "claude-opus-4", "claude-opus-4-20250514", "claude-sonnet-4", "claude-sonnet-4-20250514", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929"}},
+		{"openrouter", []string{"deepseek/deepseek-chat"}},
+		{"ollama", []string{"llama3.1", "qwen2.5-0.5b-local"}},
+		{"unknown-provider", nil},
+		{"", nil},
+	}
+	for _, tc := range cases {
+		got := tbl.Models(tc.provider)
+		if len(got) != len(tc.want) {
+			t.Errorf("Models(%q) = %v, want %v", tc.provider, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("Models(%q) = %v, want %v", tc.provider, got, tc.want)
+				break
+			}
+		}
+	}
+	// Case-insensitive, and the result is a fresh slice: mutating
+	// it cannot affect the table.
+	if got := tbl.Models("DeepSeek"); len(got) != 3 {
+		t.Errorf("Models(DeepSeek) = %v, want 3 deepseek models", got)
+	}
+	got := tbl.Models("deepseek")
+	got[0] = "tampered"
+	if tbl.Models("deepseek")[0] == "tampered" {
+		t.Error("Models returned a slice aliasing the table")
+	}
+	// Nil table: no models, never a panic.
+	var nilTbl *Table
+	if nilTbl.Models("deepseek") != nil {
+		t.Error("nil Table.Models returned non-nil, want nil")
+	}
+}
