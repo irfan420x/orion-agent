@@ -147,6 +147,12 @@ type taskEntry struct {
 	result    Result
 	finished  bool
 	detached  bool
+	// released is set by runTask's release() the first time the
+	// semaphore slot is returned. Guarded by m.mu, so the slot is
+	// released exactly once even though release() is called from
+	// both the explicit site (before close(done)) and the deferred
+	// backstop (early return / panic).
+	released bool
 	// charged is set by MarkCharged once a task's usage has been
 	// charged by a consumer (the per-chat sweep, or a fetch that
 	// recorded the tokens in its own delivered set). Only a
@@ -534,17 +540,26 @@ func (m *Manager) Forget(id string) bool {
 // recorded, instead of living until the per-task timeout.
 func (m *Manager) runTask(entry *taskEntry, ctx context.Context, cancel context.CancelFunc) {
 	defer m.wg.Done()
-	// Slot release is idempotent and explicit: the slot must be free
-	// BEFORE close(entry.done) lets a waiter observe the finish, or
-	// the next Spawn sees a spurious "at capacity" (the deferred
-	// receive alone runs only when runTask returns, after done is
-	// already closed). `released` is touched only by this goroutine.
-	released := false
+	// Slot release is idempotent and per-entry: the slot must be
+	// free BEFORE close(entry.done) lets a waiter observe the
+	// finish, or the next Spawn sees a spurious "at capacity"
+	// (the deferred receive alone runs only when runTask returns,
+	// after done is already closed). entry.released is guarded by
+	// m.mu, so the slot is returned exactly once from both the
+	// explicit site and the deferred backstop. The channel receive
+	// runs WITHOUT the mutex: a Spawn sends under m.mu, so
+	// receiving while holding it could deadlock (an empty
+	// semaphore blocks the receiver while no Spawn can acquire
+	// the mutex to send).
 	release := func() {
-		if !released {
-			released = true
-			<-m.sem
+		m.mu.Lock()
+		if entry.released {
+			m.mu.Unlock()
+			return
 		}
+		entry.released = true
+		m.mu.Unlock()
+		<-m.sem
 	}
 	defer release()
 	if cancel != nil {

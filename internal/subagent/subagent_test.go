@@ -243,6 +243,51 @@ func TestAtCapacity(t *testing.T) {
 	}
 }
 
+// TestWaitThenSpawnNeverAtCapacity is the regression test for the F5
+// ordering bug: runTask used to release the semaphore slot only when
+// it returned, after close(entry.done) — so Wait() could return while
+// the slot was still held and the next Spawn spuriously failed with
+// "at capacity". The slot must be free before done closes, so in a
+// tight Wait -> Spawn loop the Spawn must never report capacity.
+func TestWaitThenSpawnNeverAtCapacity(t *testing.T) {
+	release := make(chan struct{})
+	blocking := func(ctx context.Context, brief string) (string, Usage, error) {
+		select {
+		case <-release:
+			return "released", Usage{}, nil
+		case <-ctx.Done():
+			return "", Usage{}, ctx.Err()
+		}
+	}
+	m := NewManagerWithExecutor(1, blocking)
+	defer m.Shutdown()
+
+	for i := 0; i < 100; i++ {
+		release = make(chan struct{})
+		id, err := m.Spawn("task", time.Minute)
+		if err != nil {
+			t.Fatalf("iteration %d: Spawn: %v", i, err)
+		}
+		waitForStatus(t, m, id, StatusRunning, time.Second)
+
+		close(release)
+		if _, err := m.Wait(context.Background(), id); err != nil {
+			t.Fatalf("iteration %d: Wait: %v", i, err)
+		}
+		// The slot must be free the moment Wait returns.
+		next, err := m.Spawn("next", time.Minute)
+		if err != nil {
+			t.Fatalf("iteration %d: Spawn after Wait: %v", i, err)
+		}
+		// Drain the second task (its executor returns at once:
+		// the release channel is already closed) so the next
+		// iteration starts with a free slot.
+		if _, err := m.Wait(context.Background(), next); err != nil {
+			t.Fatalf("iteration %d: Wait next: %v", i, err)
+		}
+	}
+}
+
 func TestCancelStopsRunningTask(t *testing.T) {
 	m := NewManagerWithExecutor(4, sleepExecutor(time.Minute, "never"))
 	defer m.Shutdown()
