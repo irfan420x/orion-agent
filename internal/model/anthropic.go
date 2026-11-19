@@ -85,6 +85,20 @@ type anthropicResponse struct {
 	Usage      struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
+		// CacheReadInputTokens is usage.cache_read_input_tokens:
+		// the prompt tokens Anthropic served from its prompt
+		// cache. A pointer so "provider did not report" (nil)
+		// stays distinct from "reported zero" — a first turn
+		// that cached nothing still reports 0 honestly instead
+		// of "unknown". Anthropic reports this only when the
+		// request asked for caching (cache_control breakpoints,
+		// which Orion does not yet send); parsing it here means
+		// the split is read whenever the provider reports it.
+		// cache_creation_input_tokens (the tokens written to the
+		// cache, billed at a write premium) stay inside
+		// InputTokens and are priced at the plain input rate:
+		// counted, not hidden, but not at the write premium.
+		CacheReadInputTokens *int `json:"cache_read_input_tokens,omitempty"`
 	} `json:"usage"`
 	Error *anthropicAPIError `json:"error,omitempty"`
 }
@@ -418,10 +432,17 @@ func (p *anthropicProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 		// (e.g. only unknown block types): still not an answer.
 		return nil, fmt.Errorf("anthropic: response contained no content or tool calls")
 	}
+	// The cache split rides along when the provider reported it:
+	// estimateUsage normalises it (clamp hit, derive miss) and a
+	// provider that reported no cache fields leaves the split
+	// unreported, never a fabricated 0.
+	cacheHit, cacheHitOK := intPtrValue(resp.Usage.CacheReadInputTokens)
 	usage := estimateUsage(req, msg, Usage{
-		PromptTokens:     resp.Usage.InputTokens,
-		CompletionTokens: resp.Usage.OutputTokens,
-		TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		PromptTokens:         resp.Usage.InputTokens,
+		CompletionTokens:     resp.Usage.OutputTokens,
+		TotalTokens:          resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		PromptCacheHitTokens: cacheHit,
+		CacheReported:        cacheHitOK,
 	})
 	return &ChatResponse{
 		Message:      msg,
@@ -490,6 +511,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 			return blocks[index]
 		}
 		inputTokens, outputTokens := 0, 0
+		cacheHit, cacheHitOK := 0, false
 		stopReason := ""
 		emitted := 0
 
@@ -536,11 +558,20 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 					Message struct {
 						Usage struct {
 							InputTokens int `json:"input_tokens"`
+							// cache_read_input_tokens, when the
+							// provider reports it: the prompt
+							// tokens served from cache on this
+							// stream (see the Chat path).
+							CacheReadInputTokens *int `json:"cache_read_input_tokens,omitempty"`
 						} `json:"usage"`
 					} `json:"message"`
 				}
 				if err := json.Unmarshal([]byte(data), &ev); err == nil {
 					inputTokens = ev.Message.Usage.InputTokens
+					if ev.Message.Usage.CacheReadInputTokens != nil {
+						cacheHit = *ev.Message.Usage.CacheReadInputTokens
+						cacheHitOK = true
+					}
 				}
 			case "content_block_start":
 				var ev struct {
@@ -684,9 +715,11 @@ func (p *anthropicProvider) Stream(ctx context.Context, req ChatRequest, fn func
 		}
 		msg := Message{Role: "assistant", Content: content.String(), ToolCalls: toolCalls}
 		usage := estimateUsage(req, msg, Usage{
-			PromptTokens:     inputTokens,
-			CompletionTokens: outputTokens,
-			TotalTokens:      inputTokens + outputTokens,
+			PromptTokens:         inputTokens,
+			CompletionTokens:     outputTokens,
+			TotalTokens:          inputTokens + outputTokens,
+			PromptCacheHitTokens: cacheHit,
+			CacheReported:        cacheHitOK,
 		})
 		return &ChatResponse{
 			Message:      msg,
