@@ -410,6 +410,9 @@ func TestExpensiveSwitchWarning(t *testing.T) {
 		{"ollama", "llama3.1", "deepseek", "deepseek-flash", false},
 		// Free local to a pricey model: warn.
 		{"ollama", "llama3.1", "anthropic", "claude-opus-4", true},
+		// Free local to the same free model: no warning (target
+		// under $1/M — the guard silences free→free).
+		{"ollama", "llama3.1", "ollama", "llama3.1", false},
 		// 2.3x dearer: under the 3x bar, no warning.
 		{"openai", "o4-mini", "openai", "gpt-4o", false},
 	}
