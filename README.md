@@ -5,9 +5,9 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (2,038 tests total — 2,034 pass, 0 fail, 4 skip;
+> built and tested (2,100 tests total — 2,096 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
-> Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool (2026-11-15) and the Audit 23 fix batch (2026-11-16) and the Audit 23 fix follow-up batch (2026-11-17) and the Audit 23 F-A23W2-9 element re-check (2026-11-17) — see CHANGELOG for the rc25 audit fixes).
+> Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool (2026-11-15) and the Audit 23 fix batch (2026-11-16) and the Audit 23 fix follow-up batch (2026-11-17) and the Audit 23 F-A23W2-9 element re-check (2026-11-17) and the provider-switching fallback chain (2026-11-19) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
 > `list` / `result` / `stop`), and the footer token count is honest
 > (the 59k-token turn was a real prompt bloat — a stale news feed in
@@ -131,9 +131,9 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 2,038 tests total (2,034 passing, 0 failing, 4 skipped)
+24/24 packages, 2,100 tests total (2,096 passing, 0 failing, 4 skipped)
 (recount in the working tree after the Audit 22 fix batch, the
-provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool, 2026-11-15, and the Audit 23 fix batch, 2026-11-16, and the Audit 23 fix follow-up batch, 2026-11-17, and the Audit 23 F-A23W2-9 element re-check, 2026-11-17; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
+provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool, 2026-11-15, and the Audit 23 fix batch, 2026-11-16, and the Audit 23 fix follow-up batch, 2026-11-17, and the Audit 23 F-A23W2-9 element re-check, 2026-11-17, and the provider-switching fallback chain, 2026-11-19; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
 `go test ./...` or `make test`.
 
