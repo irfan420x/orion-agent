@@ -794,12 +794,30 @@ const (
 	historyBudgetMaxTokens = 1000000
 )
 
+// historyBudgetCeilingTokens is the hard ceiling on the
+// PROVIDER-DERIVED history budget (leg 2 of maxHistoryTokens):
+// no chat derives a budget above this, whatever the provider's
+// declared window. Measured 2026-11-19: 50,508 tokens/turn at
+// 98.9% prompt — the re-sent history dominates every turn, and
+// half a 1M DeepSeek window derives a 500K budget the transcript
+// balloons into before compaction fires. 32768 is the legacy
+// fail-closed budget the bot ran on for months, and ~20x the
+// system prompt (~1.6K) plus the tool definitions (~5.8K), so
+// real history still fits while the re-sent history is bounded.
+// The ceiling does NOT touch an explicit cfg.MaxHistoryTokens:
+// that is the deployer's deliberate choice and passes through
+// unchanged (validated 1024–1M by config.Validate).
+const historyBudgetCeilingTokens = 32768
+
 // maxHistoryTokens returns the token budget for the history fed to
 // the provider on each step, in order:
 //  1. an explicit cfg.MaxHistoryTokens > 0 is returned as-is
-//     (validated 1024–1M by config.Validate);
+//     (validated 1024–1M by config.Validate) — the deployer's
+//     deliberate choice, never capped by the ceiling below;
 //  2. otherwise half the active provider's declared window,
-//     clamped to [1024, 1000000];
+//     clamped to [1024, 1000000] and then to the
+//     historyBudgetCeilingTokens ceiling (32768), so no chat
+//     derives a budget above the ceiling whatever the window;
 //  3. otherwise config.DefaultMaxHistoryTokens (32768): the
 //     fail-closed legacy fallback for a provider that declares
 //     no window at all — exactly today's behaviour, never worse.
@@ -814,6 +832,9 @@ func (a *Agent) maxHistoryTokens() int {
 		}
 		if budget > historyBudgetMaxTokens {
 			budget = historyBudgetMaxTokens
+		}
+		if budget > historyBudgetCeilingTokens {
+			budget = historyBudgetCeilingTokens
 		}
 		return budget
 	}

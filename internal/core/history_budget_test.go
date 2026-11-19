@@ -1,7 +1,9 @@
 // History-budget derivation tests (provider-auto context
 // window): an explicit MaxHistoryTokens overrides; otherwise the
 // budget is half the active provider's declared window, clamped
-// to [1024, 1000000]; a provider that declares no window falls
+// to [1024, 1000000] and then to the historyBudgetCeilingTokens
+// ceiling (32768) — no chat derives a budget above the ceiling
+// whatever the window; a provider that declares no window falls
 // back to the legacy 32768.
 package core
 
@@ -26,13 +28,13 @@ func TestHistoryBudgetDerivedFromProviderWindow(t *testing.T) {
 		window int
 		want   int
 	}{
-		{65536, 32768},    // e.g. a 64K-window provider
-		{131072, 65536},   // Ollama llama3.1
-		{200000, 100000},  // Anthropic 4.5 models
-		{1000000, 500000}, // DeepSeek (1M window): half is 500K
-		{128000, 64000},   // OpenAI gpt-4o-mini
-		{1047576, 523788}, // OpenAI gpt-4.1-mini
-		{32768, 16384},    // Ollama qwen2.5-0.5b
+		{65536, 32768},   // e.g. a 64K-window provider: half is exactly the ceiling
+		{131072, 32768},  // Ollama llama3.1: half 65536, capped to the ceiling
+		{200000, 32768},  // Anthropic 4.5 models: half 100000, capped to the ceiling
+		{1000000, 32768}, // DeepSeek (1M window): half 500000, capped to the ceiling
+		{128000, 32768},  // OpenAI gpt-4o-mini: half 64000, capped to the ceiling
+		{1047576, 32768}, // OpenAI gpt-4.1-mini: half 523788, capped to the ceiling
+		{32768, 16384},   // Ollama qwen2.5-0.5b: half, below the ceiling, unchanged
 	}
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("window-%d", tc.window), func(t *testing.T) {
@@ -72,10 +74,10 @@ func TestHistoryBudgetClamping(t *testing.T) {
 		window int
 		want   int
 	}{
-		{100, 1024},        // half is 50: clamped up to the minimum
-		{2048, 1024},       // half is exactly the minimum
-		{3000000, 1000000}, // half is 1.5M: clamped down to the maximum
-		{2000000, 1000000}, // half is exactly the maximum
+		{100, 1024},      // half is 50: clamped up to the minimum
+		{2048, 1024},     // half is exactly the minimum
+		{3000000, 32768}, // half is 1.5M: clamped to the 1M max, then to the 32768 ceiling
+		{2000000, 32768}, // half is exactly the 1M max, then to the 32768 ceiling
 	}
 	for _, tc := range cases {
 		cfg := testConfig(5)
