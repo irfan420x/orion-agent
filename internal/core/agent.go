@@ -1169,14 +1169,6 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 	// the FIFO cap afterwards. The recent window fed to the model
 	// is re-read after a compaction changes history.
 	messages := []model.Message{{Role: "system", Content: a.SystemPrompt()}}
-	// Skill discovery (lazy bodies): the catalogue names skills
-	// with one-line descriptions only — never bodies. A body's
-	// text enters the context only when the model invokes that
-	// skill (see skills.go). With no skills the section is empty
-	// and the prompt stays byte-identical.
-	if section := a.skillSection(); section != "" {
-		messages[0].Content += section
-	}
 	var recent []model.Message
 	var allHistory []model.Message
 	if r, err := a.memory.RecentMessages(0); err != nil {
@@ -1219,11 +1211,11 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 	// the recent window no longer covers are injected as their OWN
 	// system messages AFTER the history — not inside the system
 	// prompt. The layout is the prompt-caching layout: the system
-	// prompt (identity + rules + personality + skills) and the
-	// history are byte-stable across turns, so the provider can
-	// serve that whole prefix from its prompt cache, while the
-	// recall sections — which vary with every input — sit after
-	// the stable prefix and can never break it. Appending recall
+	// prompt (identity + rules + personality) and the history are
+	// byte-stable across turns, so the provider can serve that
+	// whole prefix from its prompt cache, while the recall
+	// sections — which vary with every input — sit after the
+	// stable prefix and can never break it. Appending recall
 	// to the system message (the old layout) changed the first
 	// message on every turn, so the history after it could never
 	// match the cache, and a 10,530-token prompt was re-priced in
@@ -1246,6 +1238,25 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 	if typed := a.recallTypedFor(ctx, input, recent); len(typed) > 0 {
 		memoriesUsed = len(typed)
 		messages = append(messages, model.Message{Role: "system", Content: formatTypedMemorySection(typed)})
+	}
+	// Skill discovery (lazy bodies): the catalogue names skills
+	// with one-line descriptions only — never bodies — as its OWN
+	// system message immediately before the user turn, NOT inside
+	// the system prompt. A body's text enters the context only
+	// when the model invokes that skill (see skills.go). The
+	// catalogue is data (user data-dir content: skills can be
+	// added, removed or edited), so appending it to messages[0]
+	// changed the first message whenever the registry changed
+	// and the provider's prefix cache could never match the
+	// history after it — the same defect recall had before
+	// 33878e6 moved it out. The skill message is in-flight only
+	// — never recorded into memory — and appended only when
+	// non-empty, so the request is byte-identical when no skills
+	// are installed. Like recall it is system-role content:
+	// trimHistoryToBudget never drops or truncates it, and the
+	// oldest turns pay for it.
+	if section := a.skillSection(); section != "" {
+		messages = append(messages, model.Message{Role: "system", Content: section})
 	}
 	userMsg := model.Message{Role: "user", Content: input, Images: images}
 	messages = append(messages, userMsg)

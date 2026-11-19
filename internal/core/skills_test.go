@@ -143,16 +143,43 @@ func TestSkillDiscoveryListsNamesNotBodies(t *testing.T) {
 	if _, err := agent.Run(context.Background(), "hello"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	sys := firstReq.Messages[0].Content
-	if !strings.Contains(sys, "adder") || !strings.Contains(sys, "Adds numbers with the calculator tool.") {
-		t.Fatalf("system prompt does not list the adder skill: %q", sys)
+	// The catalogue rides as its own system message immediately
+	// before the user turn — never inside messages[0], so the
+	// system prompt stays byte-stable when the registry changes.
+	// messages[0] must not name any skill.
+	if strings.Contains(firstReq.Messages[0].Content, "adder") {
+		t.Fatalf("system prompt names the adder skill (the catalogue must ride in its own message): %q", firstReq.Messages[0].Content)
 	}
-	if strings.Contains(sys, "ADD-BODY-MARKER-9z") {
-		t.Fatalf("system prompt contains the skill BODY (must be lazy-loaded on invocation only): %q", sys)
+	skillMsg := skillMessageBeforeUser(t, firstReq)
+	if !strings.Contains(skillMsg, "adder") || !strings.Contains(skillMsg, "Adds numbers with the calculator tool.") {
+		t.Fatalf("skill message does not list the adder skill: %q", skillMsg)
+	}
+	if strings.Contains(skillMsg, "ADD-BODY-MARKER-9z") {
+		t.Fatalf("skill message contains the skill BODY (must be lazy-loaded on invocation only): %q", skillMsg)
 	}
 	if !hasTool(toolNamesOf(firstReq), "skill") {
 		t.Fatalf("provider was not offered the skill tool: %v", toolNamesOf(firstReq))
 	}
+}
+
+// skillMessageBeforeUser returns the system message immediately
+// before the last user message in req — the skill catalogue's
+// ride — or fails the test when the layout is not that shape.
+func skillMessageBeforeUser(t *testing.T, req model.ChatRequest) string {
+	t.Helper()
+	msgs := req.Messages
+	if len(msgs) < 3 {
+		t.Fatalf("request has %d messages, want at least 3 (system, skill, user): %+v", len(msgs), msgs)
+	}
+	userIdx := len(msgs) - 1
+	if msgs[userIdx].Role != "user" {
+		t.Fatalf("last message is %q, want user: %+v", msgs[userIdx].Role, msgs)
+	}
+	skillIdx := userIdx - 1
+	if msgs[skillIdx].Role != "system" {
+		t.Fatalf("message before the user turn is %q, want system (skill catalogue): %+v", msgs[skillIdx].Role, msgs)
+	}
+	return msgs[skillIdx].Content
 }
 
 func TestSkillDiscoveryAbsentWithoutRegistry(t *testing.T) {
