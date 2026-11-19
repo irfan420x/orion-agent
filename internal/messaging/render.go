@@ -43,7 +43,12 @@ type TurnFunc func(ctx context.Context, chatID int64, text string, images []mode
 // "1,240 tokens (incl. 300 subagent)" — so the footer number
 // honestly includes delegated work instead of silently folding it
 // into the parent's total; it is omitted when zero, so footers with
-// no subagent work render exactly as before.
+// no subagent work render exactly as before. When the provider
+// reported a cache split with a non-zero hit (stats.CacheReported,
+// stats.CacheHitTokens), the tokens segment also breaks out the
+// prompt — "1,240 tokens (prompt 1,200, 900 cached)" — so a cached
+// turn shows what the cache saved; it is omitted when unreported
+// or zero, so footers with no cache data render exactly as before.
 func FormatFooter(stats *core.TurnStats) string {
 	if stats == nil {
 		return ""
@@ -55,6 +60,15 @@ func FormatFooter(stats *core.TurnStats) string {
 	tokens := formatThousands(stats.Tokens) + " tokens"
 	if stats.SubagentTokens > 0 {
 		tokens += fmt.Sprintf(" (incl. %s subagent)", formatThousands(stats.SubagentTokens))
+	}
+	// A reported cache hit breaks out of the prompt total —
+	// "10,534 tokens (prompt 10,530, 10,527 cached)" — so the
+	// reader sees how much of the prompt the provider served from
+	// cache instead of re-reading. Shown only when the provider
+	// reported a split and the hit is non-zero; an unreported
+	// split renders exactly as before, never as "0 cached".
+	if stats.CacheReported && stats.CacheHitTokens > 0 {
+		tokens += fmt.Sprintf(" (prompt %s, %s cached)", formatThousands(stats.PromptTokens), formatThousands(stats.CacheHitTokens))
 	}
 	footer := fmt.Sprintf("— %s · %s · %d steps · %s",
 		name, tokens, stats.Steps, formatFooterDuration(stats.Duration))

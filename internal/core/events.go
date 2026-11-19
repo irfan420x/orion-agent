@@ -88,6 +88,16 @@ type TurnStats struct {
 	// Tokens, never additional). The footer breaks it out so the
 	// number honestly shows delegated work.
 	SubagentTokens int
+	// CacheHitTokens is the part of PromptTokens the provider
+	// reported serving from its prompt cache this turn (inside
+	// PromptTokens, never additional). CacheReported says the
+	// provider actually reported a cache split: a zero hit with
+	// CacheReported false means "unknown", never "no cache hit".
+	// The footer breaks the hit out when reported and non-zero,
+	// so a cached turn reads "prompt X, Y cached" instead of
+	// hiding the saving inside the total.
+	CacheHitTokens int
+	CacheReported  bool
 	Steps          int // last step number
 	Duration       time.Duration
 	// MemoriesUsed counts the typed memories injected this turn

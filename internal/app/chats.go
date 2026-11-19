@@ -571,6 +571,8 @@ func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input str
 				PromptTokens:     ev.Usage.PromptTokens,
 				CompletionTokens: ev.Usage.CompletionTokens,
 				SubagentTokens:   ev.SubagentTokens,
+				CacheHitTokens:   ev.Usage.CacheHit(),
+				CacheReported:    ev.Usage.CacheReported,
 				Steps:            ev.Step,
 				Duration:         ev.Duration,
 				MemoriesUsed:     ev.MemoriesUsed,
@@ -611,9 +613,11 @@ func (a *App) runChatTurnWithImages(ctx context.Context, chatID int64, input str
 		// not swallowed: a silent over-limit record is how the
 		// budget looked like a next-turn gate instead of a cap.
 		if recErr := a.Budget.RecordUsageForModel(chatID, providerName, modelName, model.Usage{
-			PromptTokens:     stats.PromptTokens,
-			CompletionTokens: stats.CompletionTokens,
-			TotalTokens:      stats.Tokens,
+			PromptTokens:         stats.PromptTokens,
+			CompletionTokens:     stats.CompletionTokens,
+			TotalTokens:          stats.Tokens,
+			PromptCacheHitTokens: stats.CacheHitTokens,
+			CacheReported:        stats.CacheReported,
 		}, stats.SubagentTokens); recErr != nil && a.Logger != nil {
 			a.Logger.Printf("app: chat %d: turn recorded %d tokens, over daily budget: %v", chatID, stats.Tokens, recErr)
 		}

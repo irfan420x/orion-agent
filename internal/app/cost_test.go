@@ -243,7 +243,7 @@ func TestUsageLineForChat(t *testing.T) {
 		// DeepSeek default is now deepseek-flash (vision fix),
 		// so 3,000 prompt + 337 completion at $0.15/$0.60 per 1M
 		// is $0.0007 — not the old deepseek-chat $0.0010.
-		"Est. cost today (this chat): $0.0007 (est., deepseek-flash, price table v2026-11-13 effective 2026-11-13)",
+		"Est. cost today (this chat): $0.0007 (est., deepseek-flash, price table v2026-11-19 effective 2026-11-19)",
 		"Daily token budget: 100,000 tokens (96,663 remaining, resets ",
 	} {
 		if !strings.Contains(got, want) {
@@ -266,7 +266,7 @@ func TestUsageLineForChatUnknownPrice(t *testing.T) {
 		t.Fatalf("RecordUsage: %v", err)
 	}
 	got := a.UsageLineForChat(111)
-	if !strings.Contains(got, "Est. cost today (this chat): unknown (no price for deepseek/deepseek-v99 in price table v2026-11-13") {
+	if !strings.Contains(got, "Est. cost today (this chat): unknown (no price for deepseek/deepseek-v99 in price table v2026-11-19") {
 		t.Errorf("UsageLineForChat =\n%s\nwant the unknown-price line, not a $0 cost", got)
 	}
 	if strings.Contains(got, "$0.00") {
@@ -289,7 +289,7 @@ func TestUsageLineForChatUnlimitedAndNoBudget(t *testing.T) {
 	if !strings.Contains(got, "Daily token budget: unlimited") {
 		t.Errorf("UsageLineForChat (unlimited) =\n%s\nwant 'Daily token budget: unlimited'", got)
 	}
-	if !strings.Contains(got, "Est. cost today (this chat): $0.0000 (est., llama3.1, price table v2026-11-13") {
+	if !strings.Contains(got, "Est. cost today (this chat): $0.0000 (est., llama3.1, price table v2026-11-19") {
 		t.Errorf("UsageLineForChat (ollama) =\n%s\nwant the $0.0000 local-model estimate", got)
 	}
 

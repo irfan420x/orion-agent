@@ -97,6 +97,8 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 				PromptTokens:     ev.Usage.PromptTokens,
 				CompletionTokens: ev.Usage.CompletionTokens,
 				SubagentTokens:   ev.SubagentTokens,
+				CacheHitTokens:   ev.Usage.CacheHit(),
+				CacheReported:    ev.Usage.CacheReported,
 				Steps:            ev.Step,
 				Duration:         ev.Duration,
 				// MemoriesUsed comes from the TurnFinished event
@@ -366,9 +368,12 @@ func (a *App) StatusLine() string {
 //
 // The USD figure is an ESTIMATE, labelled as such with the price
 // table's version and effective date: it is the standard on-demand
-// list price for the tokens' split, not the bill (cache hits,
-// peak/off-peak rates and discounts are invisible to Orion). When
-// the chat's model has no price in the table the cost is reported
+// list price for the tokens' split, not the bill (peak/off-peak
+// rates and discounts are invisible to Orion). Prompt tokens the
+// provider reported serving from cache price at the cache-hit rate
+// (the day's cached total rides on the split); a day with no cache
+// report prices the whole prompt at the cache-miss rate, as before.
+// When the chat's model has no price in the table the cost is reported
 // as unknown — never $0. A nil Budget (hand-built Apps) reports
 // the day as untracked instead of inventing numbers. It never
 // returns an error: a missing piece is shown as "unknown" rather
@@ -389,8 +394,16 @@ func (a *App) UsageLineForChat(chatID int64) string {
 	}
 	du := a.Budget.DayUsage(chatID)
 	var b strings.Builder
-	fmt.Fprintf(&b, "Tokens today (this chat): %s (%s prompt + %s completion, incl. %s subagent)\n",
-		formatThousands(du.Total), formatThousands(du.Prompt), formatThousands(du.Completion), formatThousands(du.Subagent))
+	// The prompt part names the cached tokens when the day reported
+	// any — "3,000 prompt, 2,900 cached" — so /usage shows the
+	// saving; with no cache report the line renders exactly as
+	// before, never "0 cached".
+	promptPart := fmt.Sprintf("%s prompt", formatThousands(du.Prompt))
+	if du.CacheHit > 0 {
+		promptPart = fmt.Sprintf("%s prompt, %s cached", formatThousands(du.Prompt), formatThousands(du.CacheHit))
+	}
+	fmt.Fprintf(&b, "Tokens today (this chat): %s (%s + %s completion, incl. %s subagent)\n",
+		formatThousands(du.Total), promptPart, formatThousands(du.Completion), formatThousands(du.Subagent))
 	tbl := cost.DefaultTable()
 	// Per-model pricing (F-A5-P2-18): the budget keeps the day's
 	// split per (provider, model), and each model's tokens are
@@ -438,7 +451,20 @@ func estimateDayCost(tbl *cost.Table, byModel map[budget.ModelKey]budget.DayUsag
 		if prov == "" && mod == "" {
 			prov, mod = providerName, modelName
 		}
-		usd, ok := tbl.EstimateTotalsWithTotal(prov, mod, du.Prompt, du.Completion, du.Subagent, du.Total)
+		// Each bucket prices its own split at its own model's rate,
+		// cache hits included: the day's cached prompt tokens ride
+		// on the DayUsage, and Estimate prices them at the
+		// cache-hit rate — a cached day is no longer priced as if
+		// the whole prompt were a cache miss. A bucket with no
+		// cache report (CacheHit 0) prices the whole prompt at
+		// the input rate, exactly as before.
+		usd, ok := tbl.Estimate(prov, mod, model.Usage{
+			PromptTokens:         du.Prompt,
+			CompletionTokens:     du.Completion,
+			TotalTokens:          du.Total,
+			PromptCacheHitTokens: du.CacheHit,
+			CacheReported:        du.CacheHit > 0,
+		}, du.Subagent)
 		if !ok {
 			return 0, "", false
 		}
