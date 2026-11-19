@@ -114,6 +114,14 @@ type CommandEnv struct {
 	// hand-built envs, where /model shows the current provider
 	// and the provider list only, exactly as before.
 	ModelDetail func() string
+	// ShowModelPicker sends the /model button picker (tap
+	// provider, then model, then confirm) to chatID. The daemon
+	// wires it in cmd/oriond; nil in hand-built envs, where
+	// /model with no arguments shows the text display instead,
+	// exactly as before. When set, the picker message IS the
+	// reply: the handler returns "" (an empty reply sends
+	// nothing) so the user sees exactly one message.
+	ShowModelPicker func(ctx context.Context, chatID int64) error
 	// Usage returns daemon-wide token/turn totals (all chats).
 	Usage func() (tokens int, turns int)
 	// UsageForChat renders the per-chat, per-day usage block for
@@ -913,6 +921,17 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			provider, modelName, providers := env.ModelInfo()
 			args = strings.TrimSpace(args)
 			if args == "" {
+				// Button picker (tap provider -> tap model ->
+				// cost-confirm) when the daemon wired it: the
+				// picker message is the reply, so return ""
+				// (an empty reply sends nothing). Hand-built
+				// envs keep the text display below.
+				if env.ShowModelPicker != nil {
+					if err := env.ShowModelPicker(ctx, env.ChatID); err != nil {
+						return fmt.Sprintf("❌ Could not show the model picker: %v", err), nil
+					}
+					return "", nil
+				}
 				var b strings.Builder
 				fmt.Fprintf(&b, "Current: %s / %s\nAvailable providers: %s", provider, modelName, strings.Join(providers, ", "))
 				if env.ModelDetail != nil {

@@ -18,6 +18,7 @@ import (
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/cost"
 	"github.com/irfan/orion/internal/debug"
 	"github.com/irfan/orion/internal/messaging"
 	"github.com/irfan/orion/internal/model"
@@ -521,6 +522,44 @@ func run(args []string) int {
 		return runTurn(a, store, ctx, chatID, last, nil, nil)
 	}
 	env := buildCommandEnv(a, store, username, allowed, ownerID, restart, retry)
+	// Model picker (button switching): tap provider -> tap model
+	// -> cost-confirm. The picker is stateless (the route and the
+	// requester travel in callback_data), so a duplicate prefix
+	// fails the daemon loudly at startup, like WireTelegram above.
+	// /model with no arguments sends it via env.ShowModelPicker;
+	// the text command keeps working typed.
+	costTable := cost.DefaultTable()
+	picker := messaging.NewModelPicker(messaging.ModelPickerDeps{
+		ModelInfo: a.ModelInfoForChat,
+		ModelsFor: func(provider string) []string { return costTable.Models(provider) },
+		ConfiguredModel: func(provider string) (string, bool) {
+			if a.Config == nil {
+				return "", false
+			}
+			// Provider names here come from
+			// KnownProviderNames (lowercase), matching the
+			// config map keys.
+			entry, ok := a.Config.Providers[provider]
+			if !ok {
+				return "", false
+			}
+			return entry.Model, true
+		},
+		Detail: a.ModelDetail,
+		CostWarning: func(chatID int64, route string) (string, error) {
+			return modelCostWarningForChat(a, chatID, route)
+		},
+		Switch: a.SwitchProviderForChat,
+		Reset:  a.ClearProviderOverrideForChat,
+	}, ownerID, "oriond")
+	if err := gw.RegisterCallbackHandler(picker.CallbackPrefix(), picker); err != nil {
+		fmt.Fprintf(os.Stderr, "oriond: %v\n", err)
+		return 1
+	}
+	env.ShowModelPicker = func(ctx context.Context, chatID int64) error {
+		senderID, _ := messaging.SenderIDFromContext(ctx)
+		return picker.Show(ctx, gw, chatID, senderID)
+	}
 	registry := messaging.DefaultRegistry(env)
 	// A menu failure must not kill the daemon: log and keep polling.
 	if err := gw.SetMyCommands(ctx, registry.BotCommands()); err != nil {
@@ -1034,6 +1073,28 @@ func budgetNoticeAlreadySentToday(job tools.CronJob, now time.Time) bool {
 	return last.UTC().Format("2006-01-02") == now.UTC().Format("2006-01-02")
 }
 
+// modelCostWarningForChat resolves route first (an unresolvable
+// route is an error, not a warning — the switch would fail with
+// the same error) and returns the expensive-switch warning for
+// the chat's current route ("" = no warning). Shared by the /model
+// text command (via the per-turn env) and the button picker, so
+// the cost gate can never drift between them.
+func modelCostWarningForChat(a *app.App, chatID int64, route string) (string, error) {
+	if a == nil {
+		return "", fmt.Errorf("oriond: no app")
+	}
+	if a.Config != nil {
+		if _, _, err := a.Config.ResolveRoute(route); err != nil {
+			return "", err
+		}
+	}
+	curProvider, curModel, _ := a.ModelInfoForChat(chatID)
+	if warn, msg := a.ExpensiveSwitchWarning(curProvider, curModel, route); warn {
+		return msg, nil
+	}
+	return "", nil
+}
+
 // buildTurnHandler builds the PollStream TurnFunc: slash commands are
 // dispatched (no agent run, no footer, no usage recorded); paused
 // chats answer non-command messages with the paused reply; anything
@@ -1072,19 +1133,7 @@ func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messa
 				return a.ClearProviderOverrideForChat(chatID)
 			}
 			turnEnv.SwitchCostWarning = func(route string) (string, error) {
-				// Resolve first: an unresolvable route is an
-				// error, not a warning (the switch would fail
-				// with the same error).
-				if a.Config != nil {
-					if _, _, err := a.Config.ResolveRoute(route); err != nil {
-						return "", err
-					}
-				}
-				curProvider, curModel, _ := a.ModelInfoForChat(chatID)
-				if warn, msg := a.ExpensiveSwitchWarning(curProvider, curModel, route); warn {
-					return msg, nil
-				}
-				return "", nil
+				return modelCostWarningForChat(a, chatID, route)
 			}
 			turnEnv.ModelDetail = a.ModelDetail
 			turnEnv.ModelInfo = func() (string, string, []string) {
@@ -1178,7 +1227,7 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 			}
 			return a.Config.MaxSteps, a.Config.TimeoutSeconds
 		},
-		SwitchProvider: a.SwitchProvider,
+		SwitchProvider:       a.SwitchProvider,
 		SwitchProviderGlobal: a.SwitchProvider,
 		ModelDetail:          a.ModelDetail,
 		SwitchCostWarning: func(route string) (string, error) {
