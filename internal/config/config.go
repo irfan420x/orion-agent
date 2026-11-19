@@ -133,6 +133,24 @@ type Config struct {
 	DefaultProvider string                    `json:"default_provider"`
 	Providers       map[string]ProviderConfig `json:"providers"`
 	Model           string                    `json:"model"`
+	// FallbackProviders is the ordered list of providers a failed
+	// turn may continue on, AFTER the daemon default (the default
+	// is always the chain head — listing it here again is a
+	// no-op, not an error). Empty (the default) means no fallback:
+	// a provider failure fails the turn, exactly as before.
+	// Fallback is opt-in config, never a surprise: configuring
+	// the chain IS the confirmation for automatic switches (no
+	// cost-confirm is asked mid-turn), and the chain order is
+	// the operator's explicit priority. Each entry must be a
+	// known, configured provider (Validate enforces it).
+	FallbackProviders []string `json:"fallback_providers"`
+	// ProviderAliases maps short names to routes: an alias value
+	// is a provider name ("ollama") or a provider/model route
+	// ("deepseek/deepseek-v4-pro"). Aliases resolve in /model
+	// and in the fallback factory's route parsing. An alias must
+	// not shadow a real provider name, and its target must be a
+	// known, configured provider (Validate enforces both).
+	ProviderAliases map[string]string `json:"provider_aliases"`
 	TelegramToken   string                    `json:"telegram_token"`
 	// TelegramAllowedChats is the allowlist of Telegram chat IDs that
 	// may drive the agent. When non-empty, the gateway drops messages
@@ -576,6 +594,51 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	// Fallback chain: every entry must be a known provider that is
+	// actually configured (a chain entry that cannot be built is
+	// worse than no entry — the turn would fail over into a build
+	// error), with no duplicates. Listing the default again is
+	// allowed: it is the head by construction and is dropped from
+	// the list by FallbackChain.
+	seenFallback := map[string]bool{}
+	for _, name := range c.FallbackProviders {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" {
+			return errors.New("config: fallback_providers must not contain an empty entry")
+		}
+		if !KnownProvider(key) {
+			return fmt.Errorf("config: unknown provider %q in fallback_providers (supported providers: %s)", name, strings.Join(KnownProviderNames(), ", "))
+		}
+		if _, ok := c.providerEntry(key); !ok {
+			return fmt.Errorf("config: fallback provider %q is not in providers (configure providers.%s first)", name, key)
+		}
+		if key == defaultName {
+			continue
+		}
+		if seenFallback[key] {
+			return fmt.Errorf("config: duplicate provider %q in fallback_providers", name)
+		}
+		seenFallback[key] = true
+	}
+	// Aliases: the name must be a single token (no slash or
+	// space — it is matched exactly, never split) and must not
+	// shadow a real provider name; the target must resolve to a
+	// known, configured provider with a non-empty model when one
+	// is given.
+	for alias, target := range c.ProviderAliases {
+		if strings.TrimSpace(alias) == "" || strings.Contains(alias, "/") || strings.Contains(alias, " ") {
+			return fmt.Errorf("config: invalid alias %q (aliases are single tokens: no slash or space)", alias)
+		}
+		if KnownProvider(strings.ToLower(strings.TrimSpace(alias))) {
+			return fmt.Errorf("config: alias %q shadows a real provider name", alias)
+		}
+		if strings.TrimSpace(target) == "" {
+			return fmt.Errorf("config: alias %q has an empty target (want a provider or provider/model route)", alias)
+		}
+		if _, _, err := c.ResolveRoute(target); err != nil {
+			return fmt.Errorf("config: alias %q: %w", alias, err)
+		}
+	}
 	active, ok := c.providerEntry(c.DefaultProvider)
 	if !ok {
 		return fmt.Errorf("config: default_provider %q is not in providers", c.DefaultProvider)
@@ -920,4 +983,94 @@ func (c *Config) ActiveProvider() (ProviderConfig, error) {
 		return ProviderConfig{}, fmt.Errorf("config: provider %q has no model configured (set providers.%s.model or the top-level model)", c.DefaultProvider, strings.ToLower(strings.TrimSpace(c.DefaultProvider)))
 	}
 	return p, nil
+}
+
+// FallbackChain returns the failover chain in order: the daemon
+// default first, then FallbackProviders in configured order. The
+// default is dropped when re-listed (it is the head by
+// construction) and duplicates are removed, so the chain never
+// tries a provider twice. The returned slice is a fresh copy.
+func (c *Config) FallbackChain() []string {
+	if c == nil {
+		return nil
+	}
+	head := strings.ToLower(strings.TrimSpace(c.DefaultProvider))
+	chain := []string{}
+	seen := map[string]bool{}
+	if head != "" {
+		chain = append(chain, head)
+		seen[head] = true
+	}
+	for _, name := range c.FallbackProviders {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		chain = append(chain, key)
+	}
+	return chain
+}
+
+// ResolveRoute resolves a /model route to a (provider, model) pair:
+// an exact alias first, then a "provider/model" route, then a bare
+// provider name (whose model is the entry's model, else the global
+// model). The provider is returned as its canonical lowercase key.
+// Resolution is exact-match only — deliberately no fuzzy
+// family-matching (Hermes picks a "best" versioned model when a
+// bare family name matches several; Orion refuses to guess which
+// model the operator meant and reports the ambiguity as an error
+// instead: name the model explicitly). An unresolvable route is an
+// error naming the problem; a resolvable route never consults the
+// network, so it is safe to call for validation before switching.
+func (c *Config) ResolveRoute(route string) (provider, modelName string, err error) {
+	route = strings.TrimSpace(route)
+	if route == "" {
+		return "", "", errors.New("config: empty provider route")
+	}
+	// Aliases resolve first, case-insensitively, and an alias
+	// value is itself a route (an alias may point at another
+	// alias's target form, but alias-to-alias chains are NOT
+	// followed: one expansion only, so a typo cannot loop).
+	lookup := strings.ToLower(route)
+	for alias, target := range c.ProviderAliases {
+		if strings.ToLower(strings.TrimSpace(alias)) == lookup {
+			route = strings.TrimSpace(target)
+			if route == "" {
+				return "", "", fmt.Errorf("config: alias %q has an empty target", alias)
+			}
+			break
+		}
+	}
+	providerPart, modelPart := route, ""
+	if i := strings.Index(route, "/"); i >= 0 {
+		providerPart, modelPart = route[:i], route[i+1:]
+		// A slash promises a model: an empty or slashed model
+		// part is a malformed route, not a bare provider.
+		if strings.TrimSpace(modelPart) == "" || strings.Contains(modelPart, "/") {
+			return "", "", fmt.Errorf("config: invalid route %q (want provider or provider/model)", route)
+		}
+	}
+	provider = strings.ToLower(strings.TrimSpace(providerPart))
+	if provider == "" {
+		return "", "", fmt.Errorf("config: invalid route %q (missing provider)", route)
+	}
+	if !KnownProvider(provider) {
+		return "", "", fmt.Errorf("config: unknown provider %q (supported providers: %s)", provider, strings.Join(KnownProviderNames(), ", "))
+	}
+	entry, ok := c.providerEntry(provider)
+	if !ok {
+		return "", "", fmt.Errorf("config: provider %q is not configured (supported providers: %s)", provider, strings.Join(KnownProviderNames(), ", "))
+	}
+	modelName = strings.TrimSpace(modelPart)
+	if modelName == "" {
+		modelName = strings.TrimSpace(entry.Model)
+		if modelName == "" {
+			modelName = strings.TrimSpace(c.Model)
+		}
+	}
+	if modelName == "" {
+		return "", "", fmt.Errorf("config: provider %q has no model configured (set providers.%s.model or the top-level model)", provider, provider)
+	}
+	return provider, modelName, nil
 }
