@@ -351,6 +351,16 @@ func (a *Agent) AddSideChannelUsage(u model.Usage) {
 	a.sideUsage.PromptTokens += u.PromptTokens
 	a.sideUsage.CompletionTokens += u.CompletionTokens
 	a.sideUsage.TotalTokens += u.TotalTokens
+	// The cache split accumulates with the counts, so a side
+	// query that hit the cache still reports its cached tokens
+	// when the turn folds the side usage in — never dropped, and
+	// never double-counted (takeSideChannelUsage resets the
+	// accumulator after one fold).
+	a.sideUsage.PromptCacheHitTokens += u.PromptCacheHitTokens
+	a.sideUsage.PromptCacheMissTokens += u.PromptCacheMissTokens
+	if u.CacheReported {
+		a.sideUsage.CacheReported = true
+	}
 }
 
 // takeSideChannelUsage returns the accumulated side-channel usage
@@ -402,6 +412,15 @@ func (a *Agent) checkTurnUsageLimit(usage model.Usage) error {
 	usage.PromptTokens += side.PromptTokens
 	usage.CompletionTokens += side.CompletionTokens
 	usage.TotalTokens += side.TotalTokens
+	// Cache fields ride along so the check sees the same split
+	// the turn will record; a side query that reported no cache
+	// data contributes no hit, so its tokens stay priced at the
+	// miss rate (conservative, never a discount without a report).
+	usage.PromptCacheHitTokens += side.PromptCacheHitTokens
+	usage.PromptCacheMissTokens += side.PromptCacheMissTokens
+	if side.CacheReported {
+		usage.CacheReported = true
+	}
 	return fn(usage)
 }
 
@@ -816,6 +835,11 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		usage.PromptTokens += side.PromptTokens
 		usage.CompletionTokens += side.CompletionTokens
 		usage.TotalTokens += side.TotalTokens
+		usage.PromptCacheHitTokens += side.PromptCacheHitTokens
+		usage.PromptCacheMissTokens += side.PromptCacheMissTokens
+		if side.CacheReported {
+			usage.CacheReported = true
+		}
 		a.emit(ProgressEvent{
 			Kind:            EventTurnFinished,
 			Step:            lastStep,
@@ -1025,10 +1049,22 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 			return "", nerr
 		}
 		// Accumulate this step's reported usage verbatim; a zero
-		// report leaves the totals unchanged.
+		// report leaves the totals unchanged. The cache split
+		// accumulates the same way: a multi-step turn reports one
+		// split per step, and the turn's split is the sum — each
+		// step's response is added exactly once, so nothing is
+		// double-counted, and a step that reported no cache data
+		// contributes no hit, so its tokens stay priced at the
+		// miss rate (conservative: a discount is never claimed
+		// without a provider report).
 		usage.PromptTokens += resp.Usage.PromptTokens
 		usage.CompletionTokens += resp.Usage.CompletionTokens
 		usage.TotalTokens += resp.Usage.TotalTokens
+		usage.PromptCacheHitTokens += resp.Usage.PromptCacheHitTokens
+		usage.PromptCacheMissTokens += resp.Usage.PromptCacheMissTokens
+		if resp.Usage.CacheReported {
+			usage.CacheReported = true
+		}
 		// Mid-turn budget enforcement (F-A5-6): the pre-flight
 		// check cannot bound a turn whose first response already
 		// costs more than the remaining budget, so after every
