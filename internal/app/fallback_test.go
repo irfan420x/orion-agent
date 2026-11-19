@@ -22,6 +22,7 @@ import (
 	"github.com/irfan/orion/internal/budget"
 	"github.com/irfan/orion/internal/config"
 	"github.com/irfan/orion/internal/core"
+	"github.com/irfan/orion/internal/cost"
 	"github.com/irfan/orion/internal/memory"
 	"github.com/irfan/orion/internal/model"
 	"github.com/irfan/orion/internal/security"
@@ -423,6 +424,26 @@ func TestExpensiveSwitchWarning(t *testing.T) {
 		if tc.wantWarning && !(strings.Contains(warning, "$") && strings.Contains(warning, "--confirm")) {
 			t.Errorf("warning %q must carry the $ figures and name --confirm", warning)
 		}
+		if tc.wantWarning {
+			// No warning text may ever carry an Inf/NaN figure:
+			// a free current model divides by zero (x/0 is +Inf).
+			if strings.Contains(warning, "Inf") || strings.Contains(warning, "NaN") {
+				t.Errorf("warning %q must not contain Inf/NaN", warning)
+			}
+			// The "Nx more" multiplier appears ONLY when the
+			// current model has a nonzero price; a free model
+			// quotes the target's absolute price instead.
+			curPrice, ok := cost.DefaultTable().PriceFor(tc.fromProvider, tc.fromModel)
+			if !ok {
+				t.Errorf("test setup: no price for %s/%s", tc.fromProvider, tc.fromModel)
+			} else if curPrice.InputPerMillion > 0 {
+				if !strings.Contains(warning, "x more per input token") {
+					t.Errorf("warning %q must carry the multiplier for a priced current model", warning)
+				}
+			} else if strings.Contains(warning, "x more per input token") {
+				t.Errorf("warning %q must not carry a multiplier for a free current model", warning)
+			}
+		}
 	}
 }
 
@@ -440,6 +461,9 @@ func TestExpensiveSwitchWarningFreeModelRendersAbsolutePrice(t *testing.T) {
 	}
 	if !strings.Contains(warning, "$15.00/M input") {
 		t.Errorf("warning %q must render the target's absolute price ($15.00/M input)", warning)
+	}
+	if strings.Contains(warning, "more per input token") {
+		t.Errorf("warning %q must not carry a multiplier for a free current model", warning)
 	}
 	if !strings.Contains(warning, "--confirm") {
 		t.Errorf("warning %q must name --confirm", warning)
