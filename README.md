@@ -5,7 +5,7 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (2,100 tests total — 2,096 pass, 0 fail, 4 skip;
+> built and tested (2,115 tests total — 2,111 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
 > Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool (2026-11-15) and the Audit 23 fix batch (2026-11-16) and the Audit 23 fix follow-up batch (2026-11-17) and the Audit 23 F-A23W2-9 element re-check (2026-11-17) and the provider-switching fallback chain (2026-11-19) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
@@ -131,7 +131,7 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 2,100 tests total (2,096 passing, 0 failing, 4 skipped)
+24/24 packages, 2,115 tests total (2,111 passing, 0 failing, 4 skipped)
 (recount in the working tree after the Audit 22 fix batch, the
 provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool, 2026-11-15, and the Audit 23 fix batch, 2026-11-16, and the Audit 23 fix follow-up batch, 2026-11-17, and the Audit 23 F-A23W2-9 element re-check, 2026-11-17, and the provider-switching fallback chain, 2026-11-19; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with
@@ -195,10 +195,13 @@ with a marker — instead of failing the turn.
   `model.CountTokens` (~4 runes/token, the same estimate the
   model layer uses for usage). With the default `0` the budget is
   derived from the active provider's declared context window:
-  **half the window** (the old 32768-token budget was this same
+  **half the window**, capped by a hard **32,768-token ceiling**
+  on the derived budget (the old 32768-token budget was this same
   rule for the old, incorrect 64K DeepSeek window). Half a window
-  leaves headroom for the tool definitions and the completion.
-  An explicit value overrides the derivation. When the window is
+  leaves headroom for the tool definitions and the completion;
+  the ceiling bounds the re-sent history (measured 50,508
+  tokens/turn at 98.9% prompt on 2026-11-19). An explicit value
+  overrides the derivation and is never capped by the ceiling. When the window is
   over budget the agent loop trims the oldest turns first and
   never drops the system prompt, never drops the latest user turn
   or the most recent turn, and never breaks a tool-call/tool-result
@@ -216,29 +219,32 @@ with a marker — instead of failing the turn.
   automatically.
 
   Provider context windows (verified against the official provider
-  docs on 2026-11-15; unknown models fall back to the provider's
-  smallest verified window, and a provider that declares no window
-  at all falls back to the legacy 32768-token budget):
+  docs on 2026-11-15; DeepSeek re-validated live 2026-11-20;
+  unknown models fall back to the provider's smallest verified
+  window, and a provider that declares no window at all falls
+  back to the legacy 32768-token budget):
 
   | Provider | Model | Window | Derived history budget |
   |---|---|---|---|
-  | DeepSeek | deepseek-chat, deepseek-reasoner, deepseek-flash, deepseek-v4-pro | 1,000,000 | 500,000 |
-  | OpenAI | gpt-4o, gpt-4o-mini | 128,000 | 64,000 |
-  | OpenAI | gpt-4.1, gpt-4.1-mini | 1,047,576 | 523,788 |
-  | Anthropic | claude-sonnet-4-5, claude-opus-4-5, claude-haiku-4-5 | 200,000 | 100,000 |
-  | Ollama | llama3.1, llama3.2 | 131,072 | 65,536 |
+  | DeepSeek | deepseek-flash, deepseek-v4-pro | 1,000,000 | 32,768 (ceiling) |
+  | DeepSeek | deepseek-chat, deepseek-reasoner (retired aliases) | 131,072 | 32,768 (ceiling) |
+  | OpenAI | gpt-4o, gpt-4o-mini | 128,000 | 32,768 (ceiling) |
+  | OpenAI | gpt-4.1, gpt-4.1-mini | 1,047,576 | 32,768 (ceiling) |
+  | Anthropic | claude-sonnet-4-5, claude-opus-4-5, claude-haiku-4-5 | 200,000 | 32,768 (ceiling) |
+  | Ollama | llama3.1, llama3.2 | 131,072 | 32,768 (ceiling) |
   | Ollama | qwen2.5-0.5b, qwen2.5-7b, qwen2.5-14b | 32,768 | 16,384 |
 
-  DeepSeek's aliases currently route to deepseek-v4-flash at a 1M
-  context (the old 64K figure was stale) and retire 2026-07-24;
-  the derived DeepSeek budget is therefore 500,000 tokens, not
-  32768 — the faithful result of deriving half the verified
-  window, with no extra ceiling. Ollama's `mistral` has no
-  verified window (no official statement found) and falls to the
-  32,768 unknown-model fallback. For Ollama, every chat request
-  also sends `options.num_ctx` set to the declared window, so the
-  server default (4096 per the current official FAQ) can never
-  silently truncate a derived budget.
+  DeepSeek's `deepseek-chat` / `deepseek-reasoner` aliases were
+  retired 2026-07-24 15:59 UTC and no longer resolve; their table
+  values are the models' native 128K windows, and an unknown
+  DeepSeek model falls to 131,072 (the smallest verified window),
+  never 1M. The derived budget is capped at 32,768 for every
+  provider above — half the window, then the ceiling. Ollama's
+  `mistral` has no verified window (no official statement found)
+  and falls to the 32,768 unknown-model fallback. For Ollama,
+  every chat request also sends `options.num_ctx` set to the
+  declared window, so the server default (4096 per the current
+  official FAQ) can never silently truncate a derived budget.
 
 Switch providers without rebuilding:
 
@@ -424,26 +430,34 @@ after a provider response that crosses it (it reads the main
 agent's usage; subagent spend is charged at turn end by the sweep
 — Audit 6, F-A6-P2-6), and the turn's spend is
 recorded even when the turn fails (so an over-budget turn is logged,
-and the *next* turn is the one refused). Spend is persisted to
-`<data_dir>/budget.json`, so a daemon restart does not reset any
-chat's daily total; yesterday's spend never counts against today.
-A usage alert threshold (`daily_budget_alert_threshold_tokens` in
-`config.json`, 0 = disabled, 1–10,000,000) notifies the owner once
-per chat per day via Telegram when that chat's usage reaches it —
-an absolute token count, so it works with an unlimited budget too,
-where it watches usage that nothing refuses. The "alerted today"
-flag is persisted in `budget.json` alongside the usage, so a
-restart never re-alerts for the same day. Side-channel provider
+and the *next* turn is the one refused). The refusal binds
+non-owner chats only: the owner's own chat (first allowlisted
+chat) is warning-only and is never refused — his heavy use must
+not stop the bot mid-day — while his spend is still metered,
+recorded and alerted. `/compress` is refused the same way
+(rc12, Audit 7 F-A7-1), again except for the owner. Spend is
+persisted to `<data_dir>/budget.json`, so a daemon restart does
+not reset any chat's daily total; yesterday's spend never counts
+against today. A usage alert threshold
+(`daily_budget_alert_threshold_tokens` in `config.json`, default
+**80,000** = 80% of the default budget, 0 = disabled,
+1–10,000,000) notifies the owner once per chat per day via
+Telegram when that chat's usage reaches it — an absolute token
+count, so it works with an unlimited budget too, where it watches
+usage that nothing refuses. The warning fires before any refusal.
+The "alerted today" flag is persisted in `budget.json` alongside
+the usage, so a restart never re-alerts for the same day. The
+limit is owner-configurable in config or with `/budget
+[limit|infinity]` (owner-only, persisted). Side-channel provider
 calls (selector, extraction, auto-compact) and finished-but-unfetched
 subagent tasks are charged to the owning
 chat at turn end, so they count against the same budget. Metering of
 `/compress` itself landed in rc11 (Audit 6, F-A6-1 — no production
 caller passed the metering sink on the `/compress` path in rc10);
 Audit 7 verified it live (the 218-token `/compress` summarisation
-recorded in `budget.json`). The remaining gap — `/compress` is
-metered but never refused at the daily limit (Audit 7, F-A7-1) —
-is rc12 scope. See [SECURITY.md](SECURITY.md) for the enforcement
-points and the known metering gaps.
+recorded in `budget.json`). The `/compress` refusal itself landed
+in rc12 (Audit 7, F-A7-1). See [SECURITY.md](SECURITY.md) for the
+enforcement points and the known metering gaps.
 
 `/usage` shows the chat's day: tokens today with the
 prompt/completion/subagent split, the daily budget (limit,
