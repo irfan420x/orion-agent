@@ -1062,6 +1062,31 @@ func buildTurnHandler(a *app.App, store *messaging.SessionStore, registry *messa
 			turnEnv.SwitchProvider = func(name string) error {
 				return a.SwitchProviderForChat(chatID, name)
 			}
+			turnEnv.SwitchProviderOnce = func(route string) error {
+				return a.SwitchOnceForChat(chatID, route)
+			}
+			turnEnv.SwitchProviderGlobal = func(route string) error {
+				return a.SwitchProvider(route)
+			}
+			turnEnv.ResetProvider = func() error {
+				return a.ClearProviderOverrideForChat(chatID)
+			}
+			turnEnv.SwitchCostWarning = func(route string) (string, error) {
+				// Resolve first: an unresolvable route is an
+				// error, not a warning (the switch would fail
+				// with the same error).
+				if a.Config != nil {
+					if _, _, err := a.Config.ResolveRoute(route); err != nil {
+						return "", err
+					}
+				}
+				curProvider, curModel, _ := a.ModelInfoForChat(chatID)
+				if warn, msg := a.ExpensiveSwitchWarning(curProvider, curModel, route); warn {
+					return msg, nil
+				}
+				return "", nil
+			}
+			turnEnv.ModelDetail = a.ModelDetail
 			turnEnv.ModelInfo = func() (string, string, []string) {
 				return a.ModelInfoForChat(chatID)
 			}
@@ -1154,6 +1179,22 @@ func buildCommandEnv(a *app.App, store *messaging.SessionStore, botUsername stri
 			return a.Config.MaxSteps, a.Config.TimeoutSeconds
 		},
 		SwitchProvider: a.SwitchProvider,
+		SwitchProviderGlobal: a.SwitchProvider,
+		ModelDetail:          a.ModelDetail,
+		SwitchCostWarning: func(route string) (string, error) {
+			// Global env (chat 0 fallback): the current route
+			// is the daemon default; a reset has no chat to
+			// act on, so ResetProvider stays nil here.
+			if a.Config != nil {
+				if _, _, err := a.Config.ResolveRoute(route); err != nil {
+					return "", err
+				}
+			}
+			if warn, msg := a.ExpensiveSwitchWarning(a.ProviderName(), a.ActiveModel(), route); warn {
+				return msg, nil
+			}
+			return "", nil
+		},
 		Usage: func() (int, int) {
 			return store.Totals()
 		},

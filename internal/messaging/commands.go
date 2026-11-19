@@ -83,6 +83,37 @@ type CommandEnv struct {
 	// chats with an override keep their provider. Returns an error
 	// naming the problem.
 	SwitchProvider func(name string) error
+	// SwitchProviderOnce switches this chat's provider for the
+	// next turn only (--once): the route is validated and built
+	// now, but nothing is persisted and the override is untouched;
+	// the turn after the --once turn restores the override (or
+	// the daemon default). Nil in hand-built envs, where /model
+	// --once reports the flag as unavailable instead of panicking.
+	SwitchProviderOnce func(route string) error
+	// SwitchProviderGlobal switches the daemon default provider
+	// (persisted, effective next turn) for chats without a
+	// per-chat override; chats with an override keep their
+	// provider. It is SwitchProvider under its /model --global
+	// name: the two are the same operation, kept separate so the
+	// handler can report the scope honestly. Nil in hand-built
+	// envs.
+	SwitchProviderGlobal func(route string) error
+	// ResetProvider clears this chat's provider override (and any
+	// pending --once) and returns the chat to the daemon default.
+	// Nil in hand-built envs, where /model reset reports itself
+	// as unavailable.
+	ResetProvider func() error
+	// SwitchCostWarning returns the cost warning for a manual
+	// switch to route ("" = no warning), or an error when the
+	// route cannot be resolved. The /model handler shows the
+	// warning and refuses the switch until --confirm is given.
+	// Nil in hand-built envs, where no warning is shown.
+	SwitchCostWarning func(route string) (string, error)
+	// ModelDetail renders the extra /model lines: the alias map
+	// and the fallback chain, for the no-args display. Nil in
+	// hand-built envs, where /model shows the current provider
+	// and the provider list only, exactly as before.
+	ModelDetail func() string
 	// Usage returns daemon-wide token/turn totals (all chats).
 	Usage func() (tokens int, turns int)
 	// UsageForChat renders the per-chat, per-day usage block for
@@ -882,15 +913,120 @@ func DefaultRegistry(env *CommandEnv) *Registry {
 			provider, modelName, providers := env.ModelInfo()
 			args = strings.TrimSpace(args)
 			if args == "" {
-				return fmt.Sprintf("Current: %s / %s\nAvailable providers: %s\n\n/model <name> switches this chat's provider (persisted for this chat, effective from the next turn). Other chats are unaffected.",
-					provider, modelName, strings.Join(providers, ", ")), nil
+				var b strings.Builder
+				fmt.Fprintf(&b, "Current: %s / %s\nAvailable providers: %s", provider, modelName, strings.Join(providers, ", "))
+				if env.ModelDetail != nil {
+					if detail := strings.TrimSpace(env.ModelDetail()); detail != "" {
+						b.WriteString("\n\n")
+						b.WriteString(detail)
+					}
+				}
+				b.WriteString("\n\n/model <name> switches this chat's provider (persisted for this chat, effective from the next turn). Other chats are unaffected.\n/model <name> --once switches for the next turn only.\n/model <name> --global switches the daemon default for chats without an override.\n/model reset clears this chat's override and returns to the daemon default.")
+				return b.String(), nil
 			}
-			name := strings.ToLower(strings.Fields(args)[0])
-			if err := env.SwitchProvider(name); err != nil {
-				return fmt.Sprintf("❌ %v\nAvailable providers: %s", err, strings.Join(providers, ", ")), nil
+			// Flags and the route: exactly one route word, any
+			// of --once/--global/--confirm, in any order. A
+			// route word is a provider name, a provider/model
+			// pair or an alias; "reset" is the reserved keyword
+			// that clears the override.
+			route := ""
+			once, global, confirm := false, false, false
+			for _, f := range strings.Fields(args) {
+				switch strings.ToLower(f) {
+				case "--once":
+					once = true
+				case "--global":
+					global = true
+				case "--confirm":
+					confirm = true
+				default:
+					if strings.HasPrefix(f, "--") {
+						return fmt.Sprintf("❌ Unknown flag %q.\nUsage: /model [provider|provider/model|alias] [--once|--global] [--confirm]\n/model reset", f), nil
+					}
+					if route != "" {
+						return "❌ /model takes one provider route.\nUsage: /model [provider|provider/model|alias] [--once|--global] [--confirm]\n/model reset", nil
+					}
+					// The route passes through verbatim: only the
+					// provider part is case-insensitive (inside
+					// ResolveRoute), and a model name may be
+					// mixed-case.
+					route = f
+				}
 			}
-			provider, modelName, _ = env.ModelInfo()
-			return fmt.Sprintf("✅ Switched to %s / %s. This switches the provider for this chat. Other chats are unaffected.", provider, modelName), nil
+			// Conflicts are reported before anything switches:
+			// a conflicting command must not half-apply.
+			switch {
+			case once && global:
+				return "❌ /model --once and --global conflict: --once is one turn for this chat, --global is the daemon default for every chat.", nil
+			case strings.EqualFold(route, "reset") && (once || global || confirm):
+				return "❌ /model reset takes no flags: it clears this chat's override and returns to the daemon default.", nil
+			case once && route == "":
+				return "❌ /model --once needs a provider route: /model <provider> --once.", nil
+			case global && route == "":
+				return "❌ /model --global needs a provider route: /model <provider> --global.", nil
+			}
+			if strings.EqualFold(route, "reset") {
+				if env.ResetProvider == nil {
+					return "❌ /model reset is not available in this environment.", nil
+				}
+				if err := env.ResetProvider(); err != nil {
+					return fmt.Sprintf("❌ %v", err), nil
+				}
+				provider, modelName, _ = env.ModelInfo()
+				return fmt.Sprintf("✅ Provider reset to the daemon default: %s / %s.", provider, modelName), nil
+			}
+			if route == "" {
+				return "❌ /model needs a provider route.\nUsage: /model [provider|provider/model|alias] [--once|--global] [--confirm]\n/model reset", nil
+			}
+			// Cost-confirm gate (manual switches only): when the
+			// target is expensive enough to warn about, the
+			// switch is refused until --confirm is given. The
+			// warning names the figures; the handler adds the
+			// --confirm pointer when the warning does not.
+			if env.SwitchCostWarning != nil {
+				warning, err := env.SwitchCostWarning(route)
+				if err != nil {
+					return fmt.Sprintf("❌ %v\nAvailable providers: %s", err, strings.Join(providers, ", ")), nil
+				}
+				if warning != "" && !confirm {
+					if !strings.Contains(warning, "--confirm") {
+						warning += "\n\nReply with /model " + route + " --confirm to accept."
+					}
+					return warning, nil
+				}
+			}
+			switch {
+			case once:
+				if env.SwitchProviderOnce == nil {
+					return "❌ /model --once is not available in this environment.", nil
+				}
+				if err := env.SwitchProviderOnce(route); err != nil {
+					return fmt.Sprintf("❌ %v\nAvailable providers: %s", err, strings.Join(providers, ", ")), nil
+				}
+				provider, modelName, _ = env.ModelInfo()
+				// ModelInfo still names the persistent route:
+				// the --once provider is reported from the
+				// switch itself, not from it.
+				return fmt.Sprintf("✅ Switched to %s for the next turn only (--once). The turn after returns to %s / %s.", route, provider, modelName), nil
+			case global:
+				if env.SwitchProviderGlobal == nil {
+					return "❌ /model --global is not available in this environment.", nil
+				}
+				if err := env.SwitchProviderGlobal(route); err != nil {
+					return fmt.Sprintf("❌ %v\nAvailable providers: %s", err, strings.Join(providers, ", ")), nil
+				}
+				provider, modelName, _ = env.ModelInfo()
+				return fmt.Sprintf("✅ Switched the daemon default (global) to %s / %s. Chats without an override follow it from the next turn; chats with an override are unaffected.", provider, modelName), nil
+			default:
+				if env.SwitchProvider == nil {
+					return "❌ /model switching is not available in this environment.", nil
+				}
+				if err := env.SwitchProvider(route); err != nil {
+					return fmt.Sprintf("❌ %v\nAvailable providers: %s", err, strings.Join(providers, ", ")), nil
+				}
+				provider, modelName, _ = env.ModelInfo()
+				return fmt.Sprintf("✅ Switched to %s / %s. This switches the provider for this chat. Other chats are unaffected.", provider, modelName), nil
+			}
 		},
 	})
 

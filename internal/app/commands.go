@@ -230,6 +230,30 @@ func (a *App) applyFallbackWiring(agent *core.Agent) {
 	agent.SetFallbackChain(a.fallbackChain)
 }
 
+// ModelDetail renders the /model detail block: the alias map and
+// the fallback chain, one line each. It is daemon-wide (aliases
+// and the chain do not vary per chat). Empty when there are no
+// aliases and no chain beyond the default — a single-provider
+// daemon shows nothing extra.
+func (a *App) ModelDetail() string {
+	if a == nil || a.Config == nil {
+		return ""
+	}
+	var lines []string
+	if len(a.Config.ProviderAliases) > 0 {
+		aliases := make([]string, 0, len(a.Config.ProviderAliases))
+		for alias, target := range a.Config.ProviderAliases {
+			aliases = append(aliases, alias+" -> "+target)
+		}
+		sort.Strings(aliases)
+		lines = append(lines, "Aliases: "+strings.Join(aliases, ", "))
+	}
+	if chain := a.Config.FallbackChain(); len(chain) > 1 {
+		lines = append(lines, "Fallback chain: "+strings.Join(chain, " -> "))
+	}
+	return strings.Join(lines, "\n")
+}
+
 // SwitchProvider switches the daemon's default provider, persists the
 // choice to the config file, and rebuilds the agent for subsequent
 // turns. Mechanism: the agent holds its provider by value, so there
