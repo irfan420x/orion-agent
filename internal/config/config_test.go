@@ -40,6 +40,23 @@ func TestDefaultDeepSeekModelIsFlash(t *testing.T) {
 	}
 }
 
+func TestDefaultOpenRouterEntry(t *testing.T) {
+	cfg := Default()
+	entry, ok := cfg.Providers["openrouter"]
+	if !ok {
+		t.Fatal("default config should include openrouter")
+	}
+	if entry.BaseURL != "https://openrouter.ai/api/v1" {
+		t.Fatalf("default openrouter base_url = %q, want https://openrouter.ai/api/v1", entry.BaseURL)
+	}
+	if entry.Model != "deepseek/deepseek-chat" {
+		t.Fatalf("default openrouter model = %q, want deepseek/deepseek-chat (vendor/model id)", entry.Model)
+	}
+	if !providerNeedsAPIKey("openrouter") {
+		t.Fatal("providerNeedsAPIKey(openrouter) = false, want true (OpenRouter is a hosted API)")
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	cfg := Default()
 	cfg.MaxSteps = 0
@@ -519,7 +536,7 @@ func TestDefaultHomeUnset(t *testing.T) {
 // through helpers, case-insensitively, and the name list is a fresh
 // copy that callers cannot use to mutate the set.
 func TestKnownProviderHelpers(t *testing.T) {
-	for _, name := range []string{"openai", "OpenAI", "OPENAI", " anthropic ", "ollama", "deepseek", "DeepSeek"} {
+	for _, name := range []string{"openai", "OpenAI", "OPENAI", " anthropic ", "ollama", "deepseek", "DeepSeek", "openrouter", "OpenRouter"} {
 		if !KnownProvider(name) {
 			t.Errorf("KnownProvider(%q) = false, want true", name)
 		}
@@ -528,7 +545,7 @@ func TestKnownProviderHelpers(t *testing.T) {
 		t.Error("KnownProvider must reject unknown/empty names")
 	}
 	names := KnownProviderNames()
-	want := []string{"anthropic", "deepseek", "ollama", "openai"}
+	want := []string{"anthropic", "deepseek", "ollama", "openai", "openrouter"}
 	if len(names) != len(want) {
 		t.Fatalf("KnownProviderNames() = %v, want %v", names, want)
 	}

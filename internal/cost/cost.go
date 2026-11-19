@@ -86,6 +86,13 @@ func DefaultTable() *Table {
 	add("deepseek", "deepseek-chat", 0.28, 0.42)
 	add("deepseek", "deepseek-reasoner", 0.55, 2.19)
 	add("deepseek", "deepseek-flash", 0.15, 0.60)
+	// OpenRouter (openrouter.ai/api/v1/models, checked 2026-11-19):
+	// deepseek/deepseek-chat prompt $0.0000002574/token
+	// ($0.2574/1M) and completion $0.0000010287/token
+	// ($1.0287/1M), rounded to the table's two decimals.
+	// OpenRouter prices the same model per provider route; the
+	// table holds the listed model price, like the other entries.
+	add("openrouter", "deepseek/deepseek-chat", 0.26, 1.03)
 	// OpenAI (openai.com/api/pricing list prices).
 	add("openai", "gpt-4o", 2.50, 10.00)
 	add("openai", "gpt-4o-mini", 0.15, 0.60)

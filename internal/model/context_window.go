@@ -108,6 +108,27 @@ func openAIContextWindow(model string) int {
 	return openAIUnknownModelWindow
 }
 
+// --- OpenRouter ---
+//
+// deepseek/deepseek-chat: 128,000 (openrouter.ai/api/v1/models,
+// top_provider context_length, checked 2026-11-19; the model's
+// own context_length is 163,840 across providers, so the table
+// holds the conservative per-route figure). Unknown OpenRouter
+// model -> 128,000, the smallest verified window, so an unknown
+// model never over-claims.
+var openRouterContextWindows = map[string]int{
+	"deepseek/deepseek-chat": 128000,
+}
+
+const openRouterUnknownModelWindow = 128000
+
+func openRouterContextWindow(model string) int {
+	if w, ok := openRouterContextWindows[normaliseModel(model)]; ok {
+		return w
+	}
+	return openRouterUnknownModelWindow
+}
+
 // --- Anthropic ---
 //
 // claude-sonnet-4-5 / claude-opus-4-5 / claude-haiku-4-5: 200,000
@@ -157,11 +178,15 @@ func ollamaContextWindow(model string) int {
 // ContextWindow returns the window for this provider's configured
 // model. The DeepSeek provider is an openAIProvider with
 // name="deepseek" (see NewProvider), so it branches on the provider
-// name: DeepSeek models use the DeepSeek table, OpenAI models the
-// OpenAI table — never the other way round.
+// name: DeepSeek models use the DeepSeek table, OpenRouter models
+// the OpenRouter table, OpenAI models the OpenAI table — never the
+// other way round.
 func (p *openAIProvider) ContextWindow() int {
 	if p.Name() == "deepseek" {
 		return deepSeekContextWindow(p.cfg.Model)
+	}
+	if p.Name() == "openrouter" {
+		return openRouterContextWindow(p.cfg.Model)
 	}
 	return openAIContextWindow(p.cfg.Model)
 }

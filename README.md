@@ -5,7 +5,7 @@ subagents — built in Go, local-first, Linux/macOS first.
 
 > **Status: v0.2.0-rc25.** The Go core, agent loop, tools, memory, security,
 > Telegram gateway, CLI channel, subagents, skills, and CLI are fully
-> built and tested (2,003 tests total — 1,999 pass, 0 fail, 4 skip;
+> built and tested (2,007 tests total — 2,003 pass, 0 fail, 4 skip;
 > 24/24 packages; recount in the working tree after the
 > Audit 22 fix batch, the provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool (2026-11-15) and the Audit 23 fix batch (2026-11-16) and the Audit 23 fix follow-up batch (2026-11-17) and the Audit 23 F-A23W2-9 element re-check (2026-11-17) — see CHANGELOG for the rc25 audit fixes).
 > The model can now delegate to subagents (`subagent_spawn` /
@@ -131,7 +131,7 @@ fresh binaries in `bin/`.
 
 ## Tests
 
-24/24 packages, 2,003 tests total (1,999 passing, 0 failing, 4 skipped)
+24/24 packages, 2,007 tests total (2,003 passing, 0 failing, 4 skipped)
 (recount in the working tree after the Audit 22 fix batch, the
 provider-auto context-window change, the cron tool, the behavior fix, the busy-input acknowledgement, the computer-use M3 input tool, 2026-11-15, and the Audit 23 fix batch, 2026-11-16, and the Audit 23 fix follow-up batch, 2026-11-17, and the Audit 23 F-A23W2-9 element re-check, 2026-11-17; rc25 clean-clone baseline was 1,389 total / 1,385 passing).
 Run the suite with

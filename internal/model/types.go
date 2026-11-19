@@ -131,7 +131,7 @@ type Provider interface {
 // ProviderConfig selects and configures one provider. It is the only
 // provider configuration the core ever sees.
 type ProviderConfig struct {
-	Name    string `json:"name"`     // openai | anthropic | ollama
+	Name    string `json:"name"`     // openai | deepseek | anthropic | ollama | openrouter
 	APIKey  string `json:"api_key"`  // empty for local providers
 	BaseURL string `json:"base_url"` // override endpoint; empty = provider default
 	Model   string `json:"model"`

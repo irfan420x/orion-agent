@@ -28,6 +28,7 @@ func TestPriceForKnownModels(t *testing.T) {
 		{"deepseek", "deepseek-chat", 0.28, 0.42},
 		{"deepseek", "deepseek-reasoner", 0.55, 2.19},
 		{"deepseek", "deepseek-flash", 0.15, 0.60},
+		{"openrouter", "deepseek/deepseek-chat", 0.26, 1.03},
 		{"openai", "gpt-4o", 2.50, 10.00},
 		{"openai", "gpt-4o-mini", 0.15, 0.60},
 		{"anthropic", "claude-sonnet-4", 3.00, 15.00},

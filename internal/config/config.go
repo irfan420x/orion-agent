@@ -91,17 +91,18 @@ func KnownProviderNames() []string {
 }
 
 var knownProviders = map[string]bool{
-	"openai":    true,
-	"deepseek":  true,
-	"anthropic": true,
-	"ollama":    true,
+	"openai":     true,
+	"deepseek":   true,
+	"anthropic":  true,
+	"ollama":     true,
+	"openrouter": true,
 }
 
 // providerNeedsAPIKey reports whether the named provider refuses to
 // run without an API key. Ollama is local and needs none.
 func providerNeedsAPIKey(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "openai", "deepseek", "anthropic":
+	case "openai", "deepseek", "anthropic", "openrouter":
 		return true
 	default:
 		return false
@@ -349,10 +350,11 @@ func defaultConfig(dataDir string) *Config {
 	cfg := &Config{
 		DefaultProvider: "ollama",
 		Providers: map[string]ProviderConfig{
-			"openai":    {Name: "openai", Model: "gpt-4o-mini"},
-			"deepseek":  {Name: "deepseek", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-flash"},
-			"anthropic": {Name: "anthropic", Model: "claude-sonnet-4-5"},
-			"ollama":    {Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.1"},
+			"openai":     {Name: "openai", Model: "gpt-4o-mini"},
+			"deepseek":   {Name: "deepseek", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-flash"},
+			"anthropic":  {Name: "anthropic", Model: "claude-sonnet-4-5"},
+			"ollama":     {Name: "ollama", BaseURL: "http://localhost:11434", Model: "llama3.1"},
+			"openrouter": {Name: "openrouter", BaseURL: "https://openrouter.ai/api/v1", Model: "deepseek/deepseek-chat"},
 		},
 		Model:   "",
 		DataDir: dataDir,

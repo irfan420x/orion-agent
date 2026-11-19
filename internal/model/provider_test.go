@@ -28,6 +28,9 @@ func TestNewProviderErrors(t *testing.T) {
 	if _, err := NewProvider(ProviderConfig{Name: "deepseek"}); err == nil {
 		t.Fatal("expected error for deepseek without API key, got nil")
 	}
+	if _, err := NewProvider(ProviderConfig{Name: "openrouter"}); err == nil {
+		t.Fatal("expected error for openrouter without API key, got nil")
+	}
 	if _, err := NewProvider(ProviderConfig{Name: ""}); err == nil {
 		t.Fatal("expected error for empty provider name, got nil")
 	}
@@ -74,6 +77,27 @@ func TestNewProviderDefaults(t *testing.T) {
 	// only thing asserting it — this literal is the tripwire.
 	if defaultDeepSeekModel != "deepseek-flash" {
 		t.Fatalf("defaultDeepSeekModel = %q, want deepseek-flash", defaultDeepSeekModel)
+	}
+
+	// OpenRouter is OpenAI-compatible: same client, its own endpoint,
+	// model and name.
+	p, err = NewProvider(ProviderConfig{Name: "openrouter", APIKey: testKey})
+	if err != nil {
+		t.Fatalf("openrouter NewProvider: %v", err)
+	}
+	if p.Name() != "openrouter" {
+		t.Fatalf("Name() = %q, want openrouter", p.Name())
+	}
+	if got := p.(*openAIProvider).cfg.BaseURL; got != defaultOpenRouterBaseURL {
+		t.Fatalf("openrouter BaseURL = %q, want %q", got, defaultOpenRouterBaseURL)
+	}
+	if got := p.(*openAIProvider).cfg.Model; got != defaultOpenRouterModel {
+		t.Fatalf("openrouter Model = %q, want %q", got, defaultOpenRouterModel)
+	}
+	// The OpenRouter default must be the literal vendor/model id —
+	// a bare model name would route nowhere on OpenRouter.
+	if defaultOpenRouterModel != "deepseek/deepseek-chat" {
+		t.Fatalf("defaultOpenRouterModel = %q, want deepseek/deepseek-chat", defaultOpenRouterModel)
 	}
 
 	// Ollama needs no API key and gets a local default.

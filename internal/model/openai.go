@@ -19,16 +19,18 @@ import (
 
 type openAIProvider struct {
 	// name is the provider name reported by Name() and used in error
-	// labels. Empty means "openai" (the default); the DeepSeek case in
-	// NewProvider sets it to "deepseek" so a DeepSeek endpoint is
-	// never mislabelled as OpenAI.
+	// labels. Empty means "openai" (the default); the DeepSeek and
+	// OpenRouter cases in NewProvider set it to "deepseek" /
+	// "openrouter" so a DeepSeek or OpenRouter endpoint is never
+	// mislabelled as OpenAI.
 	name   string
 	cfg    ProviderConfig
 	client *http.Client
 }
 
 // Name reports the provider name: "openai" by default, "deepseek"
-// when this client was built for a DeepSeek endpoint.
+// when this client was built for a DeepSeek endpoint, "openrouter"
+// when built for an OpenRouter endpoint.
 func (p *openAIProvider) Name() string {
 	if p.name != "" {
 		return p.name

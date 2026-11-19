@@ -116,13 +116,13 @@ func (a *App) HandleStream(ctx context.Context, input string, emit func(core.Pro
 	return reply, stats, err
 }
 
-// providerNeedsAPIKey mirrors config's rule (openai/deepseek/anthropic
-// need a key, ollama does not). It lives here because config's
+// providerNeedsAPIKey mirrors config's rule (openai/deepseek/anthropic/
+// openrouter need a key, ollama does not). It lives here because config's
 // providerNeedsAPIKey is unexported and SwitchProvider must name the
 // missing key in its error before it builds anything.
 func providerNeedsAPIKey(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "openai", "deepseek", "anthropic":
+	case "openai", "deepseek", "anthropic", "openrouter":
 		return true
 	default:
 		return false
