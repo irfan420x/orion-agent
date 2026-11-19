@@ -63,21 +63,32 @@ func ollamaModelName(model string) string {
 
 // --- DeepSeek ---
 //
-// deepseek-chat / deepseek-reasoner currently route to
-// deepseek-v4-flash (non-thinking / thinking) at a 1M context
-// (DeepSeek Models & Pricing + V4 Preview release, 2026-11-15;
-// the aliases retire 2026-07-24). The historical native spec was
-// 128K — do NOT code 128K: the effective window today is 1M.
-// Unknown DeepSeek model -> 1,000,000: every verified DeepSeek
-// model is 1M, so the smallest verified window is 1M.
+// Validated live 2026-11-20 against the official DeepSeek Models
+// & Pricing page (api-docs.deepseek.com/quick_start/pricing,
+// crawled 2026-11-19): the current API models are deepseek-flash
+// (DeepSeek-V4.1-Flash-1017) and deepseek-v4-pro
+// (DeepSeek-V4-Pro-0813), both at a 1M context. deepseek-chat /
+// deepseek-reasoner were legacy aliases routing to
+// deepseek-v4-flash; DeepSeek retired them 2026-07-24 15:59 UTC
+// ("fully retired and inaccessible", V4 Preview release
+// news260424) and the pricing page no longer lists them. Their
+// table values are therefore the models' native documented
+// windows — 128K for both (DeepSeek-V3.1 release news250821:
+// "128K context for both"), 131,072 per this file's "128K"
+// convention — NOT the 1M the pre-retirement routing used to
+// imply. A stale config naming a retired alias degrades to a
+// conservative budget instead of claiming 1M. Unknown DeepSeek
+// model -> 131,072: the smallest verified window, so an unknown
+// model never over-claims (the same principle as every other
+// provider's fallback in this file).
 var deepSeekContextWindows = map[string]int{
-	"deepseek-chat":     1000000,
-	"deepseek-reasoner": 1000000,
+	"deepseek-chat":     131072,
+	"deepseek-reasoner": 131072,
 	"deepseek-flash":    1000000,
 	"deepseek-v4-pro":   1000000,
 }
 
-const deepSeekUnknownModelWindow = 1000000
+const deepSeekUnknownModelWindow = 131072
 
 func deepSeekContextWindow(model string) int {
 	if w, ok := deepSeekContextWindows[normaliseModel(model)]; ok {

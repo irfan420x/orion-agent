@@ -38,8 +38,8 @@ func TestContextWindowHelper(t *testing.T) {
 		t.Fatalf("NewProvider(deepseek): %v", err)
 	}
 	w, ok := ContextWindow(p)
-	if !ok || w != 1000000 {
-		t.Fatalf("ContextWindow(deepseek-chat) = (%d, %v), want (1000000, true)", w, ok)
+	if !ok || w != 131072 {
+		t.Fatalf("ContextWindow(deepseek-chat) = (%d, %v), want (131072, true)", w, ok)
 	}
 }
 
@@ -49,13 +49,16 @@ func TestContextWindowTables(t *testing.T) {
 		model    string
 		want     int
 	}{
-		// DeepSeek: 1M for every verified model (currently routing
-		// to deepseek-v4-flash; the old 64K/128K figures are stale).
-		{"deepseek", "deepseek-chat", 1000000},
-		{"deepseek", "deepseek-reasoner", 1000000},
+		// DeepSeek: 1M for the two current models (deepseek-flash,
+		// deepseek-v4-pro); the retired deepseek-chat /
+		// deepseek-reasoner aliases keep their native 128K window,
+		// and an unknown model falls to the smallest verified
+		// window (131072), never over-claiming 1M.
+		{"deepseek", "deepseek-chat", 131072},
+		{"deepseek", "deepseek-reasoner", 131072},
 		{"deepseek", "deepseek-flash", 1000000},
 		{"deepseek", "deepseek-v4-pro", 1000000},
-		{"deepseek", "deepseek-something-new", 1000000}, // unknown -> 1M fallback
+		{"deepseek", "deepseek-something-new", 131072}, // unknown -> 131072 fallback
 		// OpenAI.
 		{"openai", "gpt-4o-mini", 128000},
 		{"openai", "gpt-4o", 128000},
@@ -99,7 +102,7 @@ func TestContextWindowModelNameNormalisation(t *testing.T) {
 		model    string
 		want     int
 	}{
-		{"deepseek", "  DeepSeek-Chat  ", 1000000}, // case + whitespace
+		{"deepseek", "  DeepSeek-Chat  ", 131072}, // case + whitespace
 		{"openai", "GPT-4O-MINI", 128000},
 		{"anthropic", "Claude-Sonnet-4-5", 200000},
 		{"ollama", "LLAMA3.1:LATEST", 131072}, // case + :tag suffix
@@ -123,24 +126,24 @@ func TestContextWindowModelNameNormalisation(t *testing.T) {
 // TestDeepSeekUsesDeepSeekTableNotOpenAI proves the branch that
 // matters: the DeepSeek provider is an openAIProvider with
 // name="deepseek", so its window must come from the DeepSeek table
-// (1M), not the OpenAI table (128K for gpt-4o-mini-class models).
-// A DeepSeek provider configured with an OpenAI model name must
-// still fall to the DeepSeek unknown-model fallback (1M), never
-// an OpenAI table value.
+// (1M for the current models), not the OpenAI table (128K for
+// gpt-4o-mini-class models). A DeepSeek provider configured with
+// an OpenAI model name must still fall to the DeepSeek
+// unknown-model fallback (131072), never an OpenAI table value.
 func TestDeepSeekUsesDeepSeekTableNotOpenAI(t *testing.T) {
 	p, err := NewProvider(ProviderConfig{Name: "deepseek", APIKey: testKey, Model: "gpt-4o-mini"})
 	if err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}
-	if got := p.(ContextWindowProvider).ContextWindow(); got != 1000000 {
-		t.Fatalf("deepseek provider with model gpt-4o-mini: ContextWindow = %d, want 1000000 (DeepSeek fallback, not OpenAI's 128000)", got)
+	if got := p.(ContextWindowProvider).ContextWindow(); got != 131072 {
+		t.Fatalf("deepseek provider with model gpt-4o-mini: ContextWindow = %d, want 131072 (DeepSeek fallback, not OpenAI's 128000)", got)
 	}
 	p2, err := NewProvider(ProviderConfig{Name: "openai", APIKey: testKey, Model: "deepseek-chat"})
 	if err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}
 	if got := p2.(ContextWindowProvider).ContextWindow(); got != 128000 {
-		t.Fatalf("openai provider with model deepseek-chat: ContextWindow = %d, want 128000 (OpenAI fallback, not DeepSeek's 1000000)", got)
+		t.Fatalf("openai provider with model deepseek-chat: ContextWindow = %d, want 128000 (OpenAI fallback, not DeepSeek's 131072)", got)
 	}
 }
 
