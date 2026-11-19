@@ -143,6 +143,82 @@ type openAIChatRequest struct {
 	Temperature *float64        `json:"temperature,omitempty"`
 	MaxTokens   *int            `json:"max_tokens,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
+	// StreamOptions is set on streaming requests only: with
+	// include_usage the provider sends one final SSE chunk
+	// carrying the real usage (including the cache split) instead
+	// of leaving the turn to the token estimator. Without it a
+	// streamed turn can never report a cache hit — the usage was
+	// silently estimated all along.
+	StreamOptions *openAIStreamOptions `json:"stream_options,omitempty"`
+}
+
+// openAIStreamOptions is the OpenAI stream_options object. Only
+// include_usage is used: DeepSeek and OpenAI both honour it on
+// /chat/completions.
+type openAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// openAIUsage is the usage object of an OpenAI-compatible response.
+// The cache fields are pointers so "provider did not report" (nil)
+// stays distinct from "reported zero": a missing field must never
+// be read as a measured 0 cache hits. DeepSeek reports
+// prompt_cache_hit_tokens / prompt_cache_miss_tokens and also
+// prompt_tokens_details.cached_tokens (documented as the same
+// number as the hit count); OpenAI reports only the details form.
+type openAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+	// PromptCacheHitTokens / PromptCacheMissTokens are the
+	// DeepSeek top-level fields.
+	PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens,omitempty"`
+	PromptTokensDetails   struct {
+		CachedTokens *int `json:"cached_tokens,omitempty"`
+	} `json:"prompt_tokens_details,omitempty"`
+}
+
+// toModelUsage converts a wire usage object to the provider-neutral
+// model.Usage, keeping the cache split. The hit count prefers the
+// top-level prompt_cache_hit_tokens (DeepSeek) and falls back to
+// prompt_tokens_details.cached_tokens (OpenAI, and DeepSeek's
+// duplicate of the same number) when the top-level field is
+// absent. The miss is taken from the wire when present, else
+// derived as prompt − hit by estimateUsage. CacheReported is set
+// whenever any cache field arrived, so a first turn that missed
+// everything still reports "0 cached" honestly instead of
+// "unknown".
+func toModelUsage(u openAIUsage) Usage {
+	out := Usage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+	hit, hitOK := intPtrValue(u.PromptCacheHitTokens)
+	if !hitOK {
+		hit, hitOK = intPtrValue(u.PromptTokensDetails.CachedTokens)
+	}
+	miss, missOK := intPtrValue(u.PromptCacheMissTokens)
+	if hitOK || missOK {
+		out.CacheReported = true
+	}
+	if hitOK {
+		out.PromptCacheHitTokens = hit
+	}
+	if missOK {
+		out.PromptCacheMissTokens = miss
+	}
+	return out
+}
+
+// intPtrValue returns the pointed-to int and whether the pointer
+// was non-nil.
+func intPtrValue(p *int) (int, bool) {
+	if p == nil {
+		return 0, false
+	}
+	return *p, true
 }
 
 type openAIChatResponse struct {
@@ -154,11 +230,7 @@ type openAIChatResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage openAIUsage     `json:"usage"`
 	Error *openAIAPIError `json:"error,omitempty"`
 }
 
@@ -170,6 +242,12 @@ type openAIStreamChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
+	// Usage arrives on the final chunk when the request set
+	// stream_options.include_usage: an empty-choices chunk
+	// carrying the turn's real usage, including the cache split.
+	// A provider that ignores stream_options sends no such
+	// chunk, and the caller falls back to the estimator.
+	Usage *openAIUsage `json:"usage,omitempty"`
 	// Error is set on SSE error events (data: {"error": {...}}): a
 	// provider-side failure delivered inside a 200 stream. It must
 	// surface as an error, never be skipped as an unusable chunk —

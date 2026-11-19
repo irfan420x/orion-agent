@@ -92,10 +92,59 @@ type ChatRequest struct {
 }
 
 // Usage reports token consumption when the provider supplies it.
+//
+// PromptCacheHitTokens / PromptCacheMissTokens are the provider's
+// cache split of PromptTokens (DeepSeek: usage.prompt_cache_hit_tokens
+// / prompt_cache_miss_tokens; OpenAI-compatible:
+// usage.prompt_tokens_details.cached_tokens; Anthropic:
+// usage.cache_read_input_tokens). CacheReported says the provider
+// actually reported a cache split on this response: a zero hit count
+// with CacheReported false means "unknown", never "no cache hit" —
+// a provider that does not report caching (Ollama, or a stream
+// whose usage chunk never arrived) must not be displayed as 0
+// cached. Hit + miss normally sum to PromptTokens; when a provider
+// reports only the hit side, the miss is derived (prompt − hit).
+// Use CacheHit() / CacheMiss() to read the split: they clamp the
+// hit into [0, PromptTokens] so a malformed provider report can
+// never price more tokens as cached than the prompt contained.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// PromptCacheHitTokens is the part of PromptTokens the
+	// provider served from its prompt cache, billed at the
+	// cache-hit rate (see internal/cost). Zero unless the
+	// provider reported it — see CacheReported.
+	PromptCacheHitTokens  int  `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens int  `json:"prompt_cache_miss_tokens,omitempty"`
+	CacheReported         bool `json:"cache_reported,omitempty"`
+}
+
+// CacheHit returns the cache-hit prompt tokens, clamped into
+// [0, PromptTokens]: a provider report of more cached tokens than
+// prompt tokens is malformed input, never a larger discount.
+func (u Usage) CacheHit() int {
+	if u.PromptCacheHitTokens < 0 {
+		return 0
+	}
+	if u.PromptCacheHitTokens > u.PromptTokens {
+		return u.PromptTokens
+	}
+	return u.PromptCacheHitTokens
+}
+
+// CacheMiss returns the cache-miss prompt tokens, derived as
+// prompt − hit (never negative), so pricing is always consistent
+// with prompt = hit + miss. The provider's own miss number is
+// kept on PromptCacheMissTokens for reporting; a disagreement
+// between the two is a provider inconsistency, and the derived
+// split is the one that is billed.
+func (u Usage) CacheMiss() int {
+	miss := u.PromptTokens - u.CacheHit()
+	if miss < 0 {
+		return 0
+	}
+	return miss
 }
 
 // ChatResponse is the model's reply.

@@ -651,7 +651,12 @@ func doStreamRequest(ctx context.Context, client *http.Client, method, url strin
 // zero, from a rough token estimate, and derives the total from the
 // (possibly estimated) components. A reported non-zero field is never
 // overwritten: a provider that reports prompt tokens but no total
-// keeps its prompt count.
+// keeps its prompt count. Cache fields are normalised, never
+// invented: a reported hit above the prompt is clamped to the
+// prompt, and a missing miss is derived as prompt − hit — but only
+// when the provider actually reported a cache split (CacheReported);
+// an estimated prompt with no cache data stays unreported, so a
+// fabricated estimate is never displayed as a measured 0 hits.
 func estimateUsage(req ChatRequest, msg Message, reported Usage) Usage {
 	if reported.PromptTokens == 0 {
 		reported.PromptTokens = CountTokens(joinContents(req.Messages))
@@ -661,6 +666,20 @@ func estimateUsage(req ChatRequest, msg Message, reported Usage) Usage {
 	}
 	if reported.TotalTokens == 0 {
 		reported.TotalTokens = reported.PromptTokens + reported.CompletionTokens
+	}
+	if reported.CacheReported {
+		if reported.PromptCacheHitTokens > reported.PromptTokens {
+			reported.PromptCacheHitTokens = reported.PromptTokens
+		}
+		if reported.PromptCacheHitTokens < 0 {
+			reported.PromptCacheHitTokens = 0
+		}
+		if reported.PromptCacheMissTokens == 0 && reported.PromptCacheHitTokens > 0 {
+			reported.PromptCacheMissTokens = reported.PromptTokens - reported.PromptCacheHitTokens
+		}
+		if reported.PromptCacheMissTokens < 0 {
+			reported.PromptCacheMissTokens = 0
+		}
 	}
 	return reported
 }
