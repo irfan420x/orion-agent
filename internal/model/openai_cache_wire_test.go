@@ -113,10 +113,31 @@ func TestOpenAIStreamSendsIncludeUsageAndReportsSplit(t *testing.T) {
 	}
 }
 
-// TestOpenAIStreamWithoutUsageChunkFallsBack: a provider that
-// ignores stream_options sends no usage chunk — the turn falls back
-// to the estimator and the split stays unreported, never a
-// fabricated 0 cached.
+// TestOpenAIStreamIgnoresUsageOnFinishChunk: a usage object
+// attached to the finish chunk (empty delta + finish_reason) is a
+// cumulative snapshot, not the turn's usage — it must be ignored
+// like per-content-chunk usage, or the 59,635-token footer bug
+// returns through the finish chunk instead of a content chunk.
+func TestOpenAIStreamIgnoresUsageOnFinishChunk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":59635,\"completion_tokens\":3,\"total_tokens\":59638}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	resp, err := mustProvider(t, "openai", srv.URL).Stream(context.Background(), sampleRequest(), func(chunk string) error { return nil })
+	if err != nil {
+		t.Fatalf("openai Stream: %v", err)
+	}
+	if resp.Usage.CacheReported {
+		t.Fatal("CacheReported must be false when usage rode on the finish chunk")
+	}
+	if resp.Usage.PromptTokens == 59635 {
+		t.Fatal("PromptTokens must not take the finish chunk's cumulative usage (59635)")
+	}
+}
 func TestOpenAIStreamWithoutUsageChunkFallsBack(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

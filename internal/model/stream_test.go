@@ -235,11 +235,16 @@ func TestOllamaChatNullContent(t *testing.T) {
 // total). Summing those per-chunk values would multiply the real
 // count by the number of chunks — the 59,635-token footer on a
 // one-step turn was investigated for exactly this failure and ruled
-// out: Stream ignores chunk usage entirely and estimates from the
-// request/response (see TestStreamChunkUsageIsNeverSummed). The real
-// cause was the prompt itself (see CountTokens calibration), but
-// this test pins the no-summing invariant so a future chunk-usage
-// reader cannot reintroduce it.
+// out: Stream ignores usage riding on a content/tool/finish chunk
+// and estimates from the request/response (see
+// TestStreamChunkUsageIsNeverSummed). The real cause was the prompt
+// itself (see CountTokens calibration), but this test pins the
+// no-summing invariant so a future chunk-usage reader cannot
+// reintroduce it. The one usage Stream DOES accept is the dedicated
+// final chunk (empty choices) that include_usage produces — a chunk
+// carrying no usable content — because that chunk is the turn's
+// real usage, not a running snapshot (see
+// TestOpenAIStreamSendsIncludeUsageAndReportsSplit).
 
 func TestStreamChunkUsageIsNeverSummed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -610,12 +610,35 @@ func (p *openAIProvider) Stream(ctx context.Context, req ChatRequest, fn func(ch
 				continue
 			}
 			if chunk.Usage != nil {
-				// The final usage chunk (sent because the
-				// request set stream_options.include_usage):
-				// the turn's real usage, including the cache
-				// split. Keep the last one seen — a provider
-				// sends at most one, on the final chunk.
-				streamUsage = chunk.Usage
+				// The usage chunk is accepted ONLY when it rides
+				// on a chunk carrying no usable content — the
+				// dedicated final chunk (empty choices) that
+				// stream_options.include_usage produces. A usage
+				// object attached to a content/tool/finish chunk
+				// is a cumulative per-chunk snapshot: taking it
+				// (or summing several) would report the running
+				// total as the turn's usage — the 59,635-token
+				// footer on a one-step turn (see
+				// TestStreamChunkUsageIsNeverSummed). Such a chunk
+				// is ignored and the turn falls back to the
+				// estimator, which is the safe direction: the
+				// footer then shows no cache split rather than a
+				// bogus one.
+				usable := false
+				for _, choice := range chunk.Choices {
+					if choice.Delta.Content != "" || len(choice.Delta.ToolCalls) > 0 || choice.FinishReason != "" {
+						usable = true
+						break
+					}
+				}
+				if !usable {
+					// The final usage chunk (sent because the
+					// request set stream_options.include_usage):
+					// the turn's real usage, including the cache
+					// split. Keep the last one seen — a provider
+					// sends at most one, on the final chunk.
+					streamUsage = chunk.Usage
+				}
 			}
 			if chunk.Error != nil {
 				// An explicit provider error inside the
