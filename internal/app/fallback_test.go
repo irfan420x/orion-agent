@@ -85,6 +85,12 @@ func (f *fakeProviderServer) setAnswer(answer string) {
 	f.failWith, f.answer = 0, answer
 }
 
+func (f *fakeProviderServer) setUsage(usage string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.usage = usage
+}
+
 func (f *fakeProviderServer) requests() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -216,6 +222,43 @@ func TestChatTurnFallsBackOnBillingError(t *testing.T) {
 	}
 	if !found {
 		t.Error("no openai request in the second turn carried the first turn's user text (history lost across the switch)")
+	}
+}
+
+func TestChatTurnFallbackRecordsCacheSplit(t *testing.T) {
+	// The serving provider reports the 2026-11-19 benchmark
+	// shape (10,530 prompt, 9,000 cache hits, 3 completion): after
+	// a deepseek 402 failover the turn's stats and the budget
+	// bucket carry the split under openai — the failed leg spent
+	// nothing reportable, and the cache saving is visible, not
+	// hidden inside the total.
+	a, deepseekSrv, openaiSrv := fallbackTestApp(t)
+	defer a.Close()
+	deepseekSrv.setFail(402, `{"error":{"message":"Insufficient Balance","type":"insufficient_quota"}}`)
+	openaiSrv.setUsage(`"prompt_tokens":10530,"completion_tokens":3,"total_tokens":10533,"prompt_cache_hit_tokens":9000,"prompt_cache_miss_tokens":1530`)
+	const chatID = 11
+	reply, stats, err := a.HandleStreamForChat(context.Background(), chatID, "cache question", nil)
+	if err != nil {
+		t.Fatalf("HandleStreamForChat with deepseek 402: %v", err)
+	}
+	if !strings.Contains(reply, "from-openai") {
+		t.Errorf("reply = %q, want the openai answer", reply)
+	}
+	if stats == nil {
+		t.Fatal("stats = nil, want TurnStats from the continued turn")
+	}
+	if stats.CacheHitTokens != 9000 || !stats.CacheReported {
+		t.Errorf("stats cache = %d hits (reported=%v), want 9000 hits reported", stats.CacheHitTokens, stats.CacheReported)
+	}
+	if stats.PromptTokens != 10530 || stats.Tokens != 10533 {
+		t.Errorf("stats prompt/total = %d/%d, want 10530/10533", stats.PromptTokens, stats.Tokens)
+	}
+	byModel := a.Budget.DayUsageByModel(chatID)
+	if got := byModel[budget.ModelKey{Provider: "openai", Model: "gpt-4o-mini"}].CacheHit; got != 9000 {
+		t.Errorf("budget openai/gpt-4o-mini CacheHit = %d, want 9000", got)
+	}
+	if _, ok := byModel[budget.ModelKey{Provider: "deepseek", Model: "deepseek-flash"}]; ok {
+		t.Errorf("budget has a deepseek bucket %+v, want none (the failed attempt spent nothing reportable)", byModel)
 	}
 }
 
