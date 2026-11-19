@@ -8,8 +8,13 @@
 // cache-hit variants, and offer discounts Orion cannot see, so the
 // number /usage and the footer report is the standard on-demand
 // list price at the table's effective date — never the bill. The
-// version + date make staleness visible: when the table is old, the
-// reader can see it is old.
+// table carries a cache-hit input rate per model (Price.
+// CacheHitPerMillion), so a turn the provider reports as cached
+// prices its cached prompt tokens at the cache-hit rate; peak /
+// off-peak, batch and enterprise rates are still invisible to
+// Orion, and a model with no cache-hit rate prices every prompt
+// token at the cache-miss rate. The version + date make staleness
+// visible: when the table is old, the reader can see it is old.
 //
 // Lookup is by (provider, model), normalised (lowercase, trimmed).
 // A model with no entry is UNKNOWN, never silently $0: reporting
@@ -42,15 +47,21 @@ import (
 // re-checked: a reader comparing the date against today can tell at
 // a glance whether the estimate is fresh.
 const (
-	TableVersion    = "2026-11-13"
-	TableEffective  = "2026-11-13"
-	TableSourceNote = "standard on-demand list prices, USD per 1M tokens, checked 2026-11-13 against the providers' published rate cards (DeepSeek, OpenAI, Anthropic); cache-hit, peak/off-peak, batch and enterprise rates are NOT reflected"
+	TableVersion    = "2026-11-19"
+	TableEffective  = "2026-11-19"
+	TableSourceNote = "standard on-demand list prices, USD per 1M tokens, checked 2026-11-13 against the providers' published rate cards (DeepSeek, OpenAI, Anthropic); cache-hit input rates added 2026-11-19 from the same rate cards (DeepSeek off-peak figures — peak is 2x; OpenAI cached input is half the input price; Anthropic cache reads are 10% of input); peak/off-peak, batch and enterprise rates are NOT reflected"
 )
 
 // Price is one model's rate card: USD per 1,000,000 tokens.
+// CacheHitPerMillion is the USD per 1M prompt tokens served from
+// the provider's prompt cache; 0 means the table carries no
+// cache-hit rate for this model, and Estimate then prices every
+// prompt token at the (cache-miss) input rate — never a discount
+// the table does not know.
 type Price struct {
-	InputPerMillion  float64 // USD per 1M prompt tokens (cache miss)
-	OutputPerMillion float64 // USD per 1M completion tokens
+	InputPerMillion    float64 // USD per 1M prompt tokens (cache miss)
+	OutputPerMillion   float64 // USD per 1M completion tokens
+	CacheHitPerMillion float64 // USD per 1M cached prompt tokens (0 = unknown)
 }
 
 // Table is a versioned price table: provider -> model -> Price.
@@ -66,13 +77,13 @@ type Table struct {
 // (see TableSourceNote). Local models cost $0 by definition.
 func DefaultTable() *Table {
 	t := &Table{Version: TableVersion, Effective: TableEffective, entries: map[string]map[string]Price{}}
-	add := func(provider, modelName string, in, out float64) {
+	add := func(provider, modelName string, in, out, cacheHit float64) {
 		p := strings.ToLower(strings.TrimSpace(provider))
 		m := strings.ToLower(strings.TrimSpace(modelName))
 		if t.entries[p] == nil {
 			t.entries[p] = map[string]Price{}
 		}
-		t.entries[p][m] = Price{InputPerMillion: in, OutputPerMillion: out}
+		t.entries[p][m] = Price{InputPerMillion: in, OutputPerMillion: out, CacheHitPerMillion: cacheHit}
 	}
 	// DeepSeek (api-docs.deepseek.com rate card, via the
 	// widely-reported list prices checked 2026-11-13; deepseek-chat
@@ -82,38 +93,46 @@ func DefaultTable() *Table {
 	// 2026-11-15 (vision fix): peak hours are 2x ($0.30/$1.20)
 	// and cache-hit input is $0.003 off-peak / $0.006 peak — the
 	// table holds one price per model, so it holds the off-peak
-	// cache-miss figure, like the other DeepSeek entries.
-	add("deepseek", "deepseek-chat", 0.28, 0.42)
-	add("deepseek", "deepseek-reasoner", 0.55, 2.19)
-	add("deepseek", "deepseek-flash", 0.15, 0.60)
+	// figures, like the other DeepSeek entries. Cache-hit input
+	// for the legacy aliases (V3-era chat $0.07, R1-era reasoner
+	// $0.14) is from the same rate card.
+	add("deepseek", "deepseek-chat", 0.28, 0.42, 0.07)
+	add("deepseek", "deepseek-reasoner", 0.55, 2.19, 0.14)
+	add("deepseek", "deepseek-flash", 0.15, 0.60, 0.003)
 	// OpenRouter (openrouter.ai/api/v1/models, checked 2026-11-19):
 	// deepseek/deepseek-chat prompt $0.0000002574/token
 	// ($0.2574/1M) and completion $0.0000010287/token
 	// ($1.0287/1M), rounded to the table's two decimals.
 	// OpenRouter prices the same model per provider route; the
 	// table holds the listed model price, like the other entries.
-	add("openrouter", "deepseek/deepseek-chat", 0.26, 1.03)
-	// OpenAI (openai.com/api/pricing list prices).
-	add("openai", "gpt-4o", 2.50, 10.00)
-	add("openai", "gpt-4o-mini", 0.15, 0.60)
-	add("openai", "gpt-4.1", 2.00, 8.00)
-	add("openai", "gpt-4.1-mini", 0.40, 1.60)
-	add("openai", "o4-mini", 1.10, 4.40)
-	// Anthropic (anthropic.com/pricing list prices).
-	add("anthropic", "claude-sonnet-4", 3.00, 15.00)
-	add("anthropic", "claude-sonnet-4-20250514", 3.00, 15.00)
-	add("anthropic", "claude-sonnet-4-5", 3.00, 15.00)
-	add("anthropic", "claude-sonnet-4-5-20250929", 3.00, 15.00)
-	add("anthropic", "claude-opus-4", 15.00, 75.00)
-	add("anthropic", "claude-opus-4-20250514", 15.00, 75.00)
-	add("anthropic", "claude-haiku-3-5", 0.80, 4.00)
-	add("anthropic", "claude-3-5-sonnet", 3.00, 15.00)
-	add("anthropic", "claude-3-5-sonnet-20241022", 3.00, 15.00)
+	// No cache-hit rate is carried (0): OpenRouter's cache pricing
+	// for this route was not in the checked rate card, so a cached
+	// prompt prices at the input rate — never a discount the table
+	// does not know.
+	add("openrouter", "deepseek/deepseek-chat", 0.26, 1.03, 0)
+	// OpenAI (openai.com/api/pricing list prices): cached input is
+	// half the input price on every model.
+	add("openai", "gpt-4o", 2.50, 10.00, 1.25)
+	add("openai", "gpt-4o-mini", 0.15, 0.60, 0.075)
+	add("openai", "gpt-4.1", 2.00, 8.00, 1.00)
+	add("openai", "gpt-4.1-mini", 0.40, 1.60, 0.20)
+	add("openai", "o4-mini", 1.10, 4.40, 0.55)
+	// Anthropic (anthropic.com/pricing list prices): cache reads
+	// are 10% of the input price.
+	add("anthropic", "claude-sonnet-4", 3.00, 15.00, 0.30)
+	add("anthropic", "claude-sonnet-4-20250514", 3.00, 15.00, 0.30)
+	add("anthropic", "claude-sonnet-4-5", 3.00, 15.00, 0.30)
+	add("anthropic", "claude-sonnet-4-5-20250929", 3.00, 15.00, 0.30)
+	add("anthropic", "claude-opus-4", 15.00, 75.00, 1.50)
+	add("anthropic", "claude-opus-4-20250514", 15.00, 75.00, 1.50)
+	add("anthropic", "claude-haiku-3-5", 0.80, 4.00, 0.08)
+	add("anthropic", "claude-3-5-sonnet", 3.00, 15.00, 0.30)
+	add("anthropic", "claude-3-5-sonnet-20241022", 3.00, 15.00, 0.30)
 	// Local inference: no per-token bill. (Any ollama model is
 	// free — see PriceFor — these entries document the two models
 	// Orion itself ships configured.)
-	add("ollama", "llama3.1", 0, 0)
-	add("ollama", "qwen2.5-0.5b-local", 0, 0)
+	add("ollama", "llama3.1", 0, 0, 0)
+	add("ollama", "qwen2.5-0.5b-local", 0, 0, 0)
 	return t
 }
 
@@ -160,14 +179,21 @@ func (t *Table) PriceFor(provider, modelName string) (Price, bool) {
 // Estimate prices usage at the (provider, model) rate card: prompt
 // tokens at the input rate, completion tokens at the output rate,
 // and subagentTokens (whose split is unknown — see the package doc)
-// at the output rate. Tokens the provider reported in TotalTokens
-// above prompt + completion + subagent — the remainder, e.g. cached
-// tokens a provider counts in its total but not in the split — are
-// also priced, at the output rate, so no reported token is silently
-// unpriced (F-A5-P2-23). It returns false when the price is unknown
-// or any count is negative; the caller must then report "unknown",
-// never $0. A zero-token usage on a known model estimates $0 and
-// returns true.
+// at the output rate. When the usage carries a provider-reported
+// cache split (CacheReported), the cache-hit prompt tokens price at
+// the model's cache-hit rate and only the remaining prompt tokens
+// (prompt − hit) at the input rate — so a cached turn is no longer
+// priced as if the whole prompt were a cache miss. A model with no
+// cache-hit rate in the table prices every prompt token at the
+// input rate, never a discount the table does not know. Tokens the
+// provider reported in TotalTokens above prompt + completion +
+// subagent — the remainder, e.g. cached tokens a provider counts
+// in its total but not in the split — are also priced, at the
+// output rate, so no reported token is silently unpriced
+// (F-A5-P2-23). It returns false when the price is unknown or any
+// count is negative; the caller must then report "unknown", never
+// $0. A zero-token usage on a known model estimates $0 and returns
+// true.
 func (t *Table) Estimate(provider, modelName string, u model.Usage, subagentTokens int) (float64, bool) {
 	if u.PromptTokens < 0 || u.CompletionTokens < 0 || u.TotalTokens < 0 || subagentTokens < 0 {
 		return 0, false
@@ -177,7 +203,21 @@ func (t *Table) Estimate(provider, modelName string, u model.Usage, subagentToke
 		return 0, false
 	}
 	const perMillion = 1_000_000.0
-	usd := float64(u.PromptTokens)*pr.InputPerMillion/perMillion +
+	// The cache split is trusted only when the provider reported
+	// it (CacheReported): a hit count without a report is not a
+	// measurement. CacheHit() clamps the hit into [0, prompt], so
+	// a malformed report can never price more tokens as cached
+	// than the prompt contained.
+	hit := 0
+	if u.CacheReported {
+		hit = u.CacheHit()
+	}
+	hitRate := pr.InputPerMillion
+	if pr.CacheHitPerMillion > 0 {
+		hitRate = pr.CacheHitPerMillion
+	}
+	usd := float64(hit)*hitRate/perMillion +
+		float64(u.PromptTokens-hit)*pr.InputPerMillion/perMillion +
 		float64(u.CompletionTokens)*pr.OutputPerMillion/perMillion +
 		float64(subagentTokens)*pr.OutputPerMillion/perMillion
 	// The remainder is the provider-reported total minus every
