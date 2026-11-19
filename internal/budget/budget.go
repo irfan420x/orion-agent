@@ -93,6 +93,12 @@ type modelDay struct {
 	prompt     int
 	completion int
 	subagent   int
+	// cacheHit is the prompt tokens the provider reported serving
+	// from its prompt cache today (sum of Usage.CacheHit() over
+	// records that reported a split). It is inside prompt, never
+	// additional — it exists so the USD estimate can price those
+	// tokens at the cache-hit rate instead of the cache-miss rate.
+	cacheHit int
 }
 
 // modelKey identifies one (provider, model) bucket. Provider and
@@ -118,6 +124,8 @@ func normalizeModelKey(provider, modelName string) modelKey {
 // separately only so the USD estimate can price them at the output
 // rate, since their own split is unknown). used is the budget
 // meter: the sum of TotalTokens as reported, subagent included.
+// cacheHit is the day's prompt tokens reported served from cache
+// (inside prompt, never additional); byModel always sums to it.
 // byModel is the same split per (provider, model); it always sums
 // to the day totals.
 type chatDay struct {
@@ -126,6 +134,7 @@ type chatDay struct {
 	prompt     int
 	completion int
 	subagent   int
+	cacheHit   int
 	byModel    map[modelKey]*modelDay
 	// alerted records that the owner has already been alerted
 	// about this chat's usage today (F-A18-11): the alert fires
@@ -140,12 +149,16 @@ type chatDay struct {
 // USD estimate needs. Total is the budget meter (used); Prompt +
 // Completion + Subagent need not sum to Total: a provider that
 // reports no split leaves Prompt/Completion at 0 while Total still
-// counts, and subagent tokens are already inside Total.
+// counts, and subagent tokens are already inside Total. CacheHit is
+// the prompt tokens reported served from the provider's prompt
+// cache (inside Prompt, never additional); 0 when no turn today
+// reported a cache split.
 type DayUsage struct {
 	Prompt     int
 	Completion int
 	Subagent   int
 	Total      int
+	CacheHit   int
 }
 
 // Budget is a per-chat daily token budget. The zero value is not
@@ -356,8 +369,9 @@ func (b *Budget) RecordUsage(chatID int64, u model.Usage, subagentTokens int) er
 // priced by the caller at the chat's current model. The same
 // negative-count and over-limit rules as RecordUsage apply.
 func (b *Budget) RecordUsageForModel(chatID int64, provider, modelName string, u model.Usage, subagentTokens int) error {
-	if u.PromptTokens < 0 || u.CompletionTokens < 0 || u.TotalTokens < 0 || subagentTokens < 0 {
-		return fmt.Errorf("budget: token counts must not be negative, got prompt=%d completion=%d total=%d subagent=%d", u.PromptTokens, u.CompletionTokens, u.TotalTokens, subagentTokens)
+	if u.PromptTokens < 0 || u.CompletionTokens < 0 || u.TotalTokens < 0 || subagentTokens < 0 ||
+		u.PromptCacheHitTokens < 0 || u.PromptCacheMissTokens < 0 {
+		return fmt.Errorf("budget: token counts must not be negative, got prompt=%d completion=%d total=%d subagent=%d cacheHit=%d cacheMiss=%d", u.PromptTokens, u.CompletionTokens, u.TotalTokens, subagentTokens, u.PromptCacheHitTokens, u.PromptCacheMissTokens)
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -366,6 +380,17 @@ func (b *Budget) RecordUsageForModel(chatID int64, provider, modelName string, u
 	e.prompt += u.PromptTokens
 	e.completion += u.CompletionTokens
 	e.subagent += subagentTokens
+	// The cache hit is trusted only when the provider reported a
+	// split (CacheReported): a hit count without a report is not a
+	// measurement, and CacheHit() clamps it into [0, prompt], so a
+	// malformed report can never record more cached tokens than
+	// the prompt contained. Cached tokens stay inside prompt —
+	// the meter (used) never double-counts them.
+	hit := 0
+	if u.CacheReported {
+		hit = u.CacheHit()
+	}
+	e.cacheHit += hit
 	key := normalizeModelKey(provider, modelName)
 	md := e.byModel[key]
 	if md == nil {
@@ -376,6 +401,7 @@ func (b *Budget) RecordUsageForModel(chatID int64, provider, modelName string, u
 	md.prompt += u.PromptTokens
 	md.completion += u.CompletionTokens
 	md.subagent += subagentTokens
+	md.cacheHit += hit
 	// Best-effort auto-save: a failed persist must never lose the
 	// in-memory accounting or fail the turn that just completed —
 	// the spend is recorded either way, and Save() surfaces the
@@ -395,7 +421,7 @@ func (b *Budget) DayUsage(chatID int64) DayUsage {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	e := b.entryLocked(chatID)
-	return DayUsage{Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent, Total: e.used}
+	return DayUsage{Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent, Total: e.used, CacheHit: e.cacheHit}
 }
 
 // DayUsageByModel returns chatID's token usage for today split by
@@ -410,7 +436,7 @@ func (b *Budget) DayUsageByModel(chatID int64) map[modelKey]DayUsage {
 	e := b.entryLocked(chatID)
 	out := make(map[modelKey]DayUsage, len(e.byModel))
 	for k, md := range e.byModel {
-		out[k] = DayUsage{Prompt: md.prompt, Completion: md.completion, Subagent: md.subagent, Total: md.used}
+		out[k] = DayUsage{Prompt: md.prompt, Completion: md.completion, Subagent: md.subagent, Total: md.used, CacheHit: md.cacheHit}
 	}
 	return out
 }
@@ -478,11 +504,15 @@ type budgetFile struct {
 }
 
 type budgetFileChat struct {
-	Used       int               `json:"used"`
-	Prompt     int               `json:"prompt"`
-	Completion int               `json:"completion"`
-	Subagent   int               `json:"subagent"`
-	Models     []budgetFileModel `json:"models,omitempty"`
+	Used       int `json:"used"`
+	Prompt     int `json:"prompt"`
+	Completion int `json:"completion"`
+	Subagent   int `json:"subagent"`
+	// CacheHit is the day's prompt tokens reported served from
+	// cache (inside Prompt, never additional). omitempty so files
+	// written before this field existed load as 0.
+	CacheHit int               `json:"cache_hit,omitempty"`
+	Models   []budgetFileModel `json:"models,omitempty"`
 	// AlertedToday records that the owner was already alerted
 	// about this chat's usage today (F-A18-11): a reload must
 	// not re-alert for a day that already alerted.
@@ -496,6 +526,8 @@ type budgetFileModel struct {
 	Prompt     int    `json:"prompt"`
 	Completion int    `json:"completion"`
 	Subagent   int    `json:"subagent"`
+	// CacheHit mirrors budgetFileChat.CacheHit per model.
+	CacheHit int `json:"cache_hit,omitempty"`
 }
 
 // SetFile enables persistence at path: it loads today's usage from
@@ -542,7 +574,7 @@ func (b *Budget) SetFile(path string) (int, error) {
 		if err != nil {
 			continue
 		}
-		if fc.Used < 0 || fc.Prompt < 0 || fc.Completion < 0 || fc.Subagent < 0 {
+		if fc.Used < 0 || fc.Prompt < 0 || fc.Completion < 0 || fc.Subagent < 0 || fc.CacheHit < 0 {
 			continue
 		}
 		e := &chatDay{
@@ -551,15 +583,16 @@ func (b *Budget) SetFile(path string) (int, error) {
 			prompt:     fc.Prompt,
 			completion: fc.Completion,
 			subagent:   fc.Subagent,
+			cacheHit:   fc.CacheHit,
 			byModel:    map[modelKey]*modelDay{},
 			alerted:    fc.AlertedToday,
 		}
 		for _, fm := range fc.Models {
-			if fm.Used < 0 || fm.Prompt < 0 || fm.Completion < 0 || fm.Subagent < 0 {
+			if fm.Used < 0 || fm.Prompt < 0 || fm.Completion < 0 || fm.Subagent < 0 || fm.CacheHit < 0 {
 				continue
 			}
 			e.byModel[normalizeModelKey(fm.Provider, fm.Model)] = &modelDay{
-				used: fm.Used, prompt: fm.Prompt, completion: fm.Completion, subagent: fm.Subagent,
+				used: fm.Used, prompt: fm.Prompt, completion: fm.Completion, subagent: fm.Subagent, cacheHit: fm.CacheHit,
 			}
 		}
 		// A chat with no per-model rows (written by an older
@@ -567,7 +600,7 @@ func (b *Budget) SetFile(path string) (int, error) {
 		// totals; the "" bucket is rebuilt so the split still
 		// sums to the totals.
 		if len(e.byModel) == 0 && (fc.Used > 0 || fc.Prompt > 0 || fc.Completion > 0 || fc.Subagent > 0) {
-			e.byModel[modelKey{}] = &modelDay{used: fc.Used, prompt: fc.Prompt, completion: fc.Completion, subagent: fc.Subagent}
+			e.byModel[modelKey{}] = &modelDay{used: fc.Used, prompt: fc.Prompt, completion: fc.Completion, subagent: fc.Subagent, cacheHit: fc.CacheHit}
 		}
 		b.usage[chatID] = e
 		restored++
@@ -614,11 +647,11 @@ func (b *Budget) saveLocked() error {
 		if e.day != f.Day {
 			continue
 		}
-		fc := budgetFileChat{Used: e.used, Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent, AlertedToday: e.alerted}
+		fc := budgetFileChat{Used: e.used, Prompt: e.prompt, Completion: e.completion, Subagent: e.subagent, CacheHit: e.cacheHit, AlertedToday: e.alerted}
 		for k, md := range e.byModel {
 			fc.Models = append(fc.Models, budgetFileModel{
 				Provider: k.Provider, Model: k.Model,
-				Used: md.used, Prompt: md.prompt, Completion: md.completion, Subagent: md.subagent,
+				Used: md.used, Prompt: md.prompt, Completion: md.completion, Subagent: md.subagent, CacheHit: md.cacheHit,
 			})
 		}
 		f.Chats[fmt.Sprintf("%d", chatID)] = fc
