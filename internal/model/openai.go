@@ -38,6 +38,11 @@ func (p *openAIProvider) Name() string {
 	return "openai"
 }
 
+// ModelName reports the model this client is configured for (the
+// optional model.ModelNameProvider capability, used by the agent
+// to name the serving model after a failover).
+func (p *openAIProvider) ModelName() string { return p.cfg.Model }
+
 // --- wire types ---
 
 type openAIFunction struct {

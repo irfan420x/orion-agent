@@ -19,6 +19,11 @@ type ollamaProvider struct {
 
 func (p *ollamaProvider) Name() string { return "ollama" }
 
+// ModelName reports the model this client is configured for (the
+// optional model.ModelNameProvider capability, used by the agent
+// to name the serving model after a failover).
+func (p *ollamaProvider) ModelName() string { return p.cfg.Model }
+
 // --- wire types ---
 
 type ollamaMessage struct {

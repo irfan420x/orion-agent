@@ -80,9 +80,28 @@ Memory — saving what you learn (typed memories):
 // runMu is held. Create it with NewAgent.
 type Agent struct {
 	provider model.Provider
-	tools    *tools.Registry
-	memory   memory.Store
-	cfg      *config.Config
+	// providerMu guards provider: the failover loop swaps it
+	// mid-turn, SetProvider swaps it between turns, and readers
+	// (maxHistoryTokens, ProviderName, the compaction/extraction
+	// paths) take the read lock. The lock is never held across a
+	// provider call — callers snapshot with getProvider and call
+	// outside the lock — so a swap never blocks a call in flight.
+	providerMu sync.RWMutex
+	// fallback is the daemon-wide failover chain (nil = no
+	// failover: a provider error fails the turn, exactly as
+	// before). One chain is shared by every agent (global +
+	// per-chat + subagent children); the chain guards its own
+	// state. Set via SetFallbackChain; read only while runMu is
+	// held (run()) or under runMu (SetFallbackChain).
+	fallback *model.FailoverChain
+	// fallbackProvider is true when the current provider came
+	// from a failover rather than an explicit set: the next turn
+	// restores the chain head when it is healthy again. Guarded
+	// by runMu (set in run() and SetProvider).
+	fallbackProvider bool
+	tools            *tools.Registry
+	memory           memory.Store
+	cfg              *config.Config
 	// personality is Orion's voice, loaded once at startup from the
 	// data dir (personality.md) or the built-in default. Set in
 	// NewAgent, read-only afterwards, so it needs no lock.
@@ -293,6 +312,182 @@ func NewAgent(cfg *config.Config, provider model.Provider, registry *tools.Regis
 		stale:       map[string]struct{}{},
 		compactor:   newCompactor(),
 	}, nil
+}
+
+// --- Provider access + failover ----------------------------------------
+
+// getProvider snapshots the current provider. The lock is never
+// held across a provider call.
+func (a *Agent) getProvider() model.Provider {
+	a.providerMu.RLock()
+	defer a.providerMu.RUnlock()
+	return a.provider
+}
+
+// setProvider swaps the current provider. Callers must hold runMu
+// (run() and SetProvider do), so a swap never races a run starting.
+func (a *Agent) setProvider(p model.Provider) {
+	a.providerMu.Lock()
+	defer a.providerMu.Unlock()
+	a.provider = p
+}
+
+// ProviderName returns the current provider's name ("unknown" when
+// unset). It takes only the provider lock, so it is safe to call
+// from a progress-event handler mid-turn.
+func (a *Agent) ProviderName() string {
+	if p := a.getProvider(); p != nil {
+		return p.Name()
+	}
+	return "unknown"
+}
+
+// ModelName returns the current provider's configured model name:
+// the provider's own declaration when it has one, else the
+// config's model. It names the serving model on TurnFinished and
+// is the turn-start route check's comparison value.
+func (a *Agent) ModelName() string {
+	if p := a.getProvider(); p != nil {
+		if name, ok := model.ModelName(p); ok && strings.TrimSpace(name) != "" {
+			return name
+		}
+	}
+	if a.cfg != nil {
+		return a.cfg.Model
+	}
+	return ""
+}
+
+// SetFallbackChain installs the daemon-wide failover chain (nil
+// clears it). It waits for an in-flight turn, so a chain is never
+// swapped under a running turn.
+func (a *Agent) SetFallbackChain(c *model.FailoverChain) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.fallback = c
+}
+
+// SetProvider swaps the agent's provider for the next turn. It waits
+// for an in-flight turn: a switch never interrupts a running turn,
+// which finishes on the provider it started with. The set is
+// explicit, so it clears the fallback flag — the next turn must not
+// "restore" away from a provider the operator chose. (This is the
+// --once mechanism: the App sets the once provider here, and the
+// following turn restores the persistent route explicitly.)
+func (a *Agent) SetProvider(p model.Provider) {
+	if p == nil {
+		return
+	}
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.setProvider(p)
+	a.fallbackProvider = false
+}
+
+// restorePrimaryIfNeeded moves the agent back to the chain head
+// when the current provider came from a failover and the first
+// healthy chain entry is available again. It runs at the start of
+// every turn, before any provider call, so a recovered primary is
+// picked up by the very next turn. It never overrides an explicit
+// provider (fallbackProvider false) and never switches to a benched
+// provider: when every chain entry is benched the agent keeps its
+// current provider and the turn tries it. A build failure keeps the
+// current provider too — the turn runs on the fallback rather than
+// failing before it starts.
+func (a *Agent) restorePrimaryIfNeeded() {
+	if a.fallback == nil || !a.fallbackProvider {
+		return
+	}
+	first, ok := a.fallback.FirstAvailable(nil)
+	if !ok {
+		return
+	}
+	if cur := a.getProvider(); cur != nil && strings.EqualFold(cur.Name(), first) {
+		// Already on the first healthy entry (e.g. the primary
+		// is still benched and we sit on the next healthy one):
+		// nothing to restore.
+		return
+	}
+	next, err := a.fallback.Build(first)
+	if err != nil {
+		a.logf("fallback restore: cannot build %s (%v); staying on %s", first, err, a.ProviderName())
+		return
+	}
+	a.setProvider(next)
+	a.fallbackProvider = false
+	a.logf("fallback restore: back on %s for this turn", first)
+}
+
+// tryFailover attempts one provider switch after a failed step
+// call. attempted is this turn's tried-provider set (lowercase
+// names); hops accumulates the turn's switch record. It returns
+// the new provider and true when the turn may retry the step on
+// it, or (nil, false) when the turn must fail. It benches the
+// failed provider, records the hop, and swaps the agent — the
+// caller retries the same step with the same request.
+//
+// No switch happens when the chain is disabled, the run was
+// cancelled, the failure class is FailoverNone, the chain is
+// exhausted, or the next provider cannot be built: each of those
+// fails the turn honestly instead of burning another call.
+func (a *Agent) tryFailover(ctx context.Context, failed model.Provider, err error, attempted map[string]bool, hops *[]model.FallbackHop) (model.Provider, bool) {
+	if a.fallback == nil || !a.fallback.Enabled() {
+		return nil, false
+	}
+	if ctx.Err() != nil {
+		// Cancelled (user /stop, shutdown): the turn is ending,
+		// not failing over.
+		return nil, false
+	}
+	class := model.ClassifyProviderError(err)
+	if class == model.FailoverNone {
+		return nil, false
+	}
+	failedName := ""
+	if failed != nil {
+		failedName = strings.ToLower(strings.TrimSpace(failed.Name()))
+	}
+	a.fallback.MarkFailed(failedName, class)
+	next, ok := a.fallback.NextAvailable(attempted)
+	if !ok {
+		return nil, false
+	}
+	np, berr := a.fallback.Build(next)
+	if berr != nil {
+		a.logf("fallback: cannot build %s (%v); turn fails on %s", next, berr, failedName)
+		return nil, false
+	}
+	*hops = append(*hops, model.FallbackHop{
+		From:   failedName,
+		To:     next,
+		Class:  class,
+		Reason: fmt.Sprintf("%s: %s", class, truncateRunesForHop(err.Error())),
+	})
+	attempted[strings.ToLower(strings.TrimSpace(next))] = true
+	a.setProvider(np)
+	a.fallbackProvider = true
+	a.logf("fallback: %s failed (%s); continuing on %s", failedName, class, next)
+	return np, true
+}
+
+// truncateRunesForHop caps a hop reason at 300 runes so one
+// provider's error body cannot bloat the TurnFinished event.
+func truncateRunesForHop(s string) string {
+	r := []rune(s)
+	if len(r) <= 300 {
+		return s
+	}
+	return string(r[:300]) + "…"
+}
+
+// hopSummary renders the turn's hops for an exhausted-chain error
+// ("deepseek->openai (billing)").
+func hopSummary(hops []model.FallbackHop) string {
+	parts := make([]string, 0, len(hops))
+	for _, h := range hops {
+		parts = append(parts, fmt.Sprintf("%s->%s (%s)", h.From, h.To, h.Class))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // AddSubagentUsage adds tokens from a subagent result the parent
@@ -577,7 +772,7 @@ func (a *Agent) maxHistoryTokens() int {
 	if a.cfg.MaxHistoryTokens > 0 {
 		return a.cfg.MaxHistoryTokens
 	}
-	if w, ok := model.ContextWindow(a.provider); ok && w > 0 {
+	if w, ok := model.ContextWindow(a.getProvider()); ok && w > 0 {
 		budget := int(float64(w) * historyBudgetFraction)
 		if budget < historyBudgetMinTokens {
 			budget = historyBudgetMinTokens
@@ -761,6 +956,14 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		return "", fmt.Errorf("core: run cancelled before start: %w", err)
 	}
 
+	// A new turn starts back on the chain head when the previous
+	// turn ended on a fallback provider and the head is healthy
+	// again (restorePrimaryIfNeeded). It runs before anything
+	// provider-related (recall, compaction) so the whole turn —
+	// including its summarisation calls — uses the restored
+	// provider.
+	a.restorePrimaryIfNeeded()
+
 	// A new turn starts with a zero subagent total: tokens from a
 	// subagent that finished after the previous turn ended must not
 	// leak into this turn's accounting (see AddSubagentUsage).
@@ -797,6 +1000,22 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 	turnStart := time.Now()
 	var usage model.Usage
 	var memoriesUsed int
+	// hops records every provider switch inside this turn, and
+	// usageByProvider attributes the reported usage per provider
+	// (lowercase provider name -> usage). Both ride on
+	// TurnFinished so the caller can report and meter the switch
+	// honestly. attempted is this turn's tried-provider set
+	// (lowercase names): each provider is tried at most once per
+	// turn, across all steps.
+	var hops []model.FallbackHop
+	usageByProvider := map[string]model.Usage{}
+	attempted := map[string]bool{}
+	// The provider the turn starts on (after any restore) counts
+	// as attempted: a later step's failover must never retry it
+	// in this turn.
+	if p := a.getProvider(); p != nil {
+		attempted[strings.ToLower(strings.TrimSpace(p.Name()))] = true
+	}
 	// toolCalls counts the tool calls attempted this turn and
 	// gateDeniedCalls how many the permission gate denied before
 	// they ran; both are carried on TurnFinished for TurnStats,
@@ -840,6 +1059,13 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		if side.CacheReported {
 			usage.CacheReported = true
 		}
+		// The per-provider split is copied defensively: the
+		// event escapes to handlers, and the map must not be
+		// mutated under them.
+		providerUsageCopy := make(map[string]model.Usage, len(usageByProvider))
+		for name, u := range usageByProvider {
+			providerUsageCopy[name] = u
+		}
 		a.emit(ProgressEvent{
 			Kind:            EventTurnFinished,
 			Step:            lastStep,
@@ -850,6 +1076,10 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 			SubagentTokens:  subagentTokens,
 			ToolCalls:       turnToolCalls,
 			GateDeniedCalls: turnGateDeniedCalls,
+			ServingProvider: a.ProviderName(),
+			ServingModel:    a.ModelName(),
+			FallbackHops:    append([]model.FallbackHop(nil), hops...),
+			ProviderUsage:   providerUsageCopy,
 		})
 		// Stop hooks (rc9, audit P0 #6): fire once per turn, after
 		// the outcome is known. They observe only — a Stop hook
@@ -996,12 +1226,6 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		// run, or returned by DrainPendingSteer).
 		a.drainSteerForStep(&messages)
 
-		// One provider call per step, under its own timeout. The
-		// step timeout is released as soon as the provider call
-		// returns: tool execution below gets a fresh timeout
-		// derived from the parent ctx, so a slow provider call
-		// cannot starve the tools.
-		//
 		// The request window is trimmed to the history budget
 		// first (see trimHistoryToBudget): the in-flight messages
 		// grow with every tool result, and an unbounded request
@@ -1009,7 +1233,6 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		// the request copy is trimmed — the agent's transcript
 		// (and the MaxStepsError transcript) keeps the full
 		// history, and memory already holds every message.
-		stepCtx, cancel := context.WithTimeout(ctx, a.timeout())
 		reqMessages := messages
 		if trimmed, stats := trimHistoryToBudget(messages, a.maxHistoryTokens()); stats.dropped > 0 || stats.truncated > 0 {
 			a.logf("step %d: history trimmed to %d-token budget: dropped %d message(s), truncated %d bytes", step+1, a.maxHistoryTokens(), stats.dropped, stats.truncated)
@@ -1025,18 +1248,69 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 			Tools:       a.toolDefinitions(),
 			Temperature: a.cfg.Temperature,
 		}
+		// One provider call per step, under its own timeout. The
+		// step timeout is released as soon as the provider call
+		// returns: tool execution below gets a fresh timeout
+		// derived from the parent ctx, so a slow provider call
+		// cannot starve the tools. Each attempt gets a FRESH
+		// step timeout: a failover retry is a new call, not the
+		// remainder of the failed one's budget.
+		//
+		// A step's call retries on the next provider in the chain
+		// when it fails with a failover-eligible error (see
+		// tryFailover): the SAME step, the SAME request — the
+		// in-flight messages (tool results included) are reused,
+		// so nothing already done is re-executed and the history
+		// is never re-sent from scratch. A streaming step that
+		// already delivered chunks never fails over: the caller
+		// has seen the first provider's partial reply, and a
+		// second provider would duplicate it.
 		var resp *model.ChatResponse
 		var err error
-		if stream {
-			resp, err = a.provider.Stream(stepCtx, req, streamFn)
-		} else {
-			resp, err = a.provider.Chat(stepCtx, req)
+		var provider model.Provider
+		for {
+			stepCtx, cancel := context.WithTimeout(ctx, a.timeout())
+			provider = a.getProvider()
+			if provider == nil {
+				cancel()
+				nerr := fmt.Errorf("core: no provider configured at step %d", step+1)
+				finishTurn(nerr)
+				return "", nerr
+			}
+			streamChunks := 0
+			callFn := streamFn
+			if stream {
+				callFn = func(chunk string) error {
+					streamChunks++
+					return streamFn(chunk)
+				}
+			}
+			if stream {
+				resp, err = provider.Stream(stepCtx, req, callFn)
+			} else {
+				resp, err = provider.Chat(stepCtx, req)
+			}
+			cancel()
+			if err == nil {
+				break
+			}
+			if stream && streamChunks > 0 {
+				// Chunks already reached the caller: a second
+				// provider would duplicate them. Fail honestly.
+				a.logf("step %d: provider %s failed after delivering %d chunk(s); not failing over (partial reply already sent)", step+1, provider.Name(), streamChunks)
+				break
+			}
+			if _, ok := a.tryFailover(ctx, provider, err, attempted, &hops); !ok {
+				break
+			}
+			// Swapped to the next provider: retry this step.
 		}
-		cancel()
 		if err != nil {
 			var perr error
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				perr = fmt.Errorf("core: provider call cancelled at step %d: %w", step+1, err)
+			} else if len(hops) > 0 {
+				perr = fmt.Errorf("core: provider call at step %d: %w (provider fallback exhausted after %s)", step+1, err, hopSummary(hops))
 			} else {
 				perr = fmt.Errorf("core: provider call at step %d: %w", step+1, err)
 			}
@@ -1056,7 +1330,11 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		// double-counted, and a step that reported no cache data
 		// contributes no hit, so its tokens stay priced at the
 		// miss rate (conservative: a discount is never claimed
-		// without a provider report).
+		// without a provider report). The step is also
+		// attributed to the provider that served it, so a turn
+		// that switched providers meters each leg under its own
+		// provider instead of lumping the whole turn on the one
+		// that answered last.
 		usage.PromptTokens += resp.Usage.PromptTokens
 		usage.CompletionTokens += resp.Usage.CompletionTokens
 		usage.TotalTokens += resp.Usage.TotalTokens
@@ -1064,6 +1342,19 @@ func (a *Agent) run(ctx context.Context, input string, images []model.ImageConte
 		usage.PromptCacheMissTokens += resp.Usage.PromptCacheMissTokens
 		if resp.Usage.CacheReported {
 			usage.CacheReported = true
+		}
+		if provider != nil {
+			name := strings.ToLower(strings.TrimSpace(provider.Name()))
+			u := usageByProvider[name]
+			u.PromptTokens += resp.Usage.PromptTokens
+			u.CompletionTokens += resp.Usage.CompletionTokens
+			u.TotalTokens += resp.Usage.TotalTokens
+			u.PromptCacheHitTokens += resp.Usage.PromptCacheHitTokens
+			u.PromptCacheMissTokens += resp.Usage.PromptCacheMissTokens
+			if resp.Usage.CacheReported {
+				u.CacheReported = true
+			}
+			usageByProvider[name] = u
 		}
 		// Mid-turn budget enforcement (F-A5-6): the pre-flight
 		// check cannot bound a turn whose first response already

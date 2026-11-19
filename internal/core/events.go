@@ -67,6 +67,28 @@ type ProgressEvent struct {
 	// instead of recording "ok".
 	ToolCalls       int
 	GateDeniedCalls int
+	// ServingProvider / ServingModel name the provider and model
+	// that answered the turn's final step (set on TurnFinished
+	// only). They differ from the provider the turn STARTED on
+	// when a mid-turn failover happened: the footer and the
+	// budget must charge the provider that actually served the
+	// turn, not the one that failed. Without a failover they are
+	// the turn's provider/model, exactly as before.
+	ServingProvider string
+	ServingModel    string
+	// FallbackHops records every provider switch inside the turn
+	// (set on TurnFinished only; empty when the turn never
+	// switched). Each hop names the failed provider, the provider
+	// that took over, and the failure class.
+	FallbackHops []model.FallbackHop
+	// ProviderUsage attributes the turn's reported usage per
+	// provider (set on TurnFinished only; a provider whose calls
+	// all failed reports nothing, so it has no entry). The
+	// values sum to Usage. Callers that meter per (provider,
+	// model) — the per-chat daily budget — record each bucket
+	// under its own provider instead of lumping the whole turn
+	// on the serving provider.
+	ProviderUsage map[string]model.Usage
 }
 
 // EventHandler receives ProgressEvents from an Agent run.
@@ -115,6 +137,15 @@ type TurnStats struct {
 	// failure (F-C8) instead of recording "ok".
 	ToolCalls       int
 	GateDeniedCalls int
+	// FallbackHops records every provider switch inside the turn
+	// (copied from the TurnFinished event; empty when the turn
+	// never switched).
+	FallbackHops []model.FallbackHop
+	// ProviderUsage attributes the turn's reported usage per
+	// provider (copied from the TurnFinished event). Callers
+	// that meter per (provider, model) record each bucket under
+	// its own provider.
+	ProviderUsage map[string]model.Usage
 }
 
 // EventHandler returns the agent's current progress-event handler, or

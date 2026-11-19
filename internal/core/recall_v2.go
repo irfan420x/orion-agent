@@ -518,7 +518,7 @@ func (a *Agent) recallTypedFor(ctx context.Context, input string, recent []model
 // about them. Parse failures and provider errors are returned so
 // the caller can fall back to keyword scoring.
 func (a *Agent) defaultMemorySelector(ctx context.Context, manifest []TypedMemory, input string, recentTools []string, surfaced []string) ([]string, error) {
-	names, usage, err := selectMemoriesWithProviderUsage(ctx, a.provider, manifest, input, recentTools, surfaced)
+	names, usage, err := selectMemoriesWithProviderUsage(ctx, a.getProvider(), manifest, input, recentTools, surfaced)
 	// Meter even on error: a provider call that returned
 	// unparseable text still spent the tokens it reported.
 	a.AddSideChannelUsage(usage)

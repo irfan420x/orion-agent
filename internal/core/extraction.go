@@ -213,11 +213,12 @@ func (a *Agent) sessionExtractorFor() sessionExtractorFunc {
 // folded into the NEXT turn's usage rather than dropped — the
 // budget still sees them, one turn late.
 func (a *Agent) defaultSessionExtractor(ctx context.Context, turns []model.Message) (string, error) {
-	if a.provider == nil {
+	provider := a.getProvider()
+	if provider == nil {
 		return "", fmt.Errorf("no provider available for session extraction")
 	}
 	temp := 0.0
-	resp, err := a.provider.Chat(ctx, model.ChatRequest{
+	resp, err := provider.Chat(ctx, model.ChatRequest{
 		Messages: []model.Message{
 			{Role: "system", Content: "You extract session memory: durable decisions, facts and preferences from a conversation transcript. Reply with a compact markdown bullet list, one fact or decision per line. If nothing durable was decided or stated, reply with nothing."},
 			{Role: "user", Content: extractionPrompt(turns)},

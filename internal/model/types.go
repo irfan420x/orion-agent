@@ -147,6 +147,31 @@ func (u Usage) CacheMiss() int {
 	return miss
 }
 
+// ModelNameProvider is the OPTIONAL capability a provider
+// implements when it can name the model it is configured for. It
+// is optional (same pattern as ContextWindowProvider) so test
+// fakes keep working: ModelName reports ok=false for them and
+// callers fall back to the configured model name. The agent uses
+// it to name the serving model after a failover, so a switched
+// turn meters each leg under its own model.
+type ModelNameProvider interface {
+	// ModelName returns the model this provider is configured for.
+	ModelName() string
+}
+
+// ModelName returns the configured model of p and true when p
+// implements ModelNameProvider, or ("", false) when it does not.
+func ModelName(p Provider) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	mn, ok := p.(ModelNameProvider)
+	if !ok {
+		return "", false
+	}
+	return mn.ModelName(), true
+}
+
 // ChatResponse is the model's reply.
 type ChatResponse struct {
 	Message      Message `json:"message"`

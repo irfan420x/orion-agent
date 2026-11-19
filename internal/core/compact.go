@@ -833,7 +833,8 @@ func (c *compactor) summariserFor(a *Agent) compactionSummariser {
 // /compress: preserve facts, decisions, names, numbers and anything
 // the user asked to remember; invent nothing.
 func (a *Agent) defaultCompactionSummariser(ctx context.Context, old []model.Message) (string, error) {
-	if a.provider == nil {
+	provider := a.getProvider()
+	if provider == nil {
 		return "", errors.New("no provider available for auto-compaction")
 	}
 	// Bound the TOTAL provider-bound input (Audit 6 F-A6-P2-2):
@@ -854,7 +855,7 @@ func (a *Agent) defaultCompactionSummariser(ctx context.Context, old []model.Mes
 		fmt.Fprintf(&b, "%s: %s\n", m.Role, security.RedactSecrets(m.Content))
 	}
 	temp := 0.0
-	resp, err := a.provider.Chat(ctx, model.ChatRequest{
+	resp, err := provider.Chat(ctx, model.ChatRequest{
 		Messages: []model.Message{
 			{Role: "system", Content: "You summarise conversations into compact memories."},
 			{Role: "user", Content: b.String()},

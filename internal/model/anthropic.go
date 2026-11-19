@@ -22,6 +22,11 @@ type anthropicProvider struct {
 
 func (p *anthropicProvider) Name() string { return "anthropic" }
 
+// ModelName reports the model this client is configured for (the
+// optional model.ModelNameProvider capability, used by the agent
+// to name the serving model after a failover).
+func (p *anthropicProvider) ModelName() string { return p.cfg.Model }
+
 // --- wire types ---
 
 // anthropicContentBlock is one block in a message content array, or in a
