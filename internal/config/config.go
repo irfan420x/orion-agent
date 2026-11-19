@@ -49,7 +49,26 @@ const (
 	// per UTC day before the budget check refuses further turns.
 	// 100K is ~30 trivial turns a day; a chat doing real work can
 	// raise it in config, and 0 disables the budget (unlimited).
+	// The limit binds NON-OWNER chats only: the owner's own chat
+	// (first allowlisted chat) is warning-only and never refused
+	// by the budget (see internal/app isOwnerChat) — the owner
+	// used ~247K tokens across 14 runs on 2026-11-19, so a 100K
+	// hard cap on his own chat would stop the bot mid-day. The
+	// owner's spend is still metered, recorded and alerted; the
+	// cap exists to stop a runaway non-owner chat spending the
+	// daemon's whole allowance. Override path: config
+	// per_chat_daily_token_budget, or /budget [limit|infinity]
+	// (owner-only, persisted by App.SetDailyBudget).
 	DefaultPerChatDailyTokenBudget = 100000
+	// DefaultDailyBudgetAlertThresholdTokens is the per-chat
+	// daily usage alert threshold (F-A18-11) in a fresh default
+	// config: 80,000 tokens, i.e. 80% of the default 100K daily
+	// budget — the warning fires BEFORE any refusal, once per
+	// chat per day (layer-0 warning-first shape). If the
+	// deployer changes the budget, set the threshold to 80% of
+	// it alongside; 0 disables the alert, an explicit value
+	// always wins.
+	DefaultDailyBudgetAlertThresholdTokens = 80000
 	// DefaultAllowAllTelegramWindowMinutes is how long the
 	// allow_all_telegram_chats opt-in stays effective (P2-O5): 10
 	// minutes from daemon start, per the audit's suggestion — long
@@ -206,7 +225,11 @@ type Config struct {
 	// the budget for every chat (unlimited); the valid range for a
 	// set budget is 1000-10000000. The budget is per chat, so one
 	// chat cannot spend the daemon's whole allowance, and it resets
-	// at UTC midnight.
+	// at UTC midnight. The cap binds non-owner chats only: the
+	// owner's own chat (first allowlisted chat) is warning-only
+	// and is never refused by the budget — see internal/app
+	// isOwnerChat. Override path: this field, or /budget
+	// [limit|infinity] (owner-only, persisted).
 	PerChatDailyTokenBudget int `json:"per_chat_daily_token_budget"`
 	// DailyBudgetAlertThresholdTokens is the per-chat daily usage
 	// threshold (F-A18-11, rc24) at which the owner is notified
@@ -218,12 +241,15 @@ type Config struct {
 	// percentage of the budget — so it works exactly the same
 	// whether the budget is finite or unlimited (0): an
 	// unlimited budget still alerts, it just never refuses a
-	// turn. 0 disables the alert (the default: no alert is ever
-	// sent). The valid range when set is 1-10000000. The
-	// "alerted today" state is persisted with the usage in
-	// <dataDir>/budget.json, so a daemon restart does not
-	// re-alert for a day that already alerted, and the flag
-	// resets with the UTC day like the usage does.
+	// turn. The DEFAULT is DefaultDailyBudgetAlertThresholdTokens
+	// (80000 = 80% of the default 100K budget): the warning fires
+	// before any refusal. Set it to 80% of the budget if the
+	// budget is changed; 0 disables the alert. The valid range
+	// when set is 1-10000000. The "alerted today" state is
+	// persisted with the usage in <dataDir>/budget.json, so a
+	// daemon restart does not re-alert for a day that already
+	// alerted, and the flag resets with the UTC day like the
+	// usage does.
 	DailyBudgetAlertThresholdTokens int `json:"daily_budget_alert_threshold_tokens"`
 	// Temperature, when set, is passed to the provider on every call.
 	// Nil means the provider default. 0 requests deterministic output
@@ -383,10 +409,12 @@ func defaultConfig(dataDir string) *Config {
 		TimeoutSeconds:     120,
 		MaxToolResultBytes: DefaultMaxToolResultBytes,
 		MaxHistoryTokens:   0, // auto: half the provider's window
-		// P2-O5/P2-O9 defaults: a 10-minute allow-all window and a
-		// 100K-token per-chat daily budget.
+		// P2-O5/P2-O9 defaults: a 10-minute allow-all window, a
+		// 100K-token per-chat daily budget, and the warning-first
+		// alert at 80% of that budget (80000).
 		AllowAllTelegramChatsWindowMinutes: DefaultAllowAllTelegramWindowMinutes,
 		PerChatDailyTokenBudget:            DefaultPerChatDailyTokenBudget,
+		DailyBudgetAlertThresholdTokens:    DefaultDailyBudgetAlertThresholdTokens,
 	}
 	// Sandbox defaults ON (sandbox.DefaultConfig): a fresh install
 	// confines shell_exec, and only an explicit opt-out

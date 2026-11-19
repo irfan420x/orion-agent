@@ -10,12 +10,17 @@ import (
 )
 
 // TestDailyBudgetAlertThresholdDefaults: a fresh default config
-// has the alert disabled (0) — an upgrade never starts alerting
-// until the operator opts in.
+// warns at 80% of the default budget (80000 of 100000) — the
+// layer-0 warning-first shape: the owner is notified once per
+// chat per day BEFORE any refusal at the limit. An operator who
+// wants no alerts sets the threshold to 0 explicitly.
 func TestDailyBudgetAlertThresholdDefaults(t *testing.T) {
 	cfg := Default()
-	if cfg.DailyBudgetAlertThresholdTokens != 0 {
-		t.Errorf("DailyBudgetAlertThresholdTokens = %d, want 0 (disabled by default)", cfg.DailyBudgetAlertThresholdTokens)
+	if cfg.DailyBudgetAlertThresholdTokens != DefaultDailyBudgetAlertThresholdTokens {
+		t.Errorf("DailyBudgetAlertThresholdTokens = %d, want %d (80%% of the default budget)", cfg.DailyBudgetAlertThresholdTokens, DefaultDailyBudgetAlertThresholdTokens)
+	}
+	if cfg.DailyBudgetAlertThresholdTokens != 80000 {
+		t.Errorf("DailyBudgetAlertThresholdTokens = %d, want 80000", cfg.DailyBudgetAlertThresholdTokens)
 	}
 }
 
